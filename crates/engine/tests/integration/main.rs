@@ -1649,6 +1649,7 @@ mod yurlok_of_scorch_thrash;
 mod zhulodok_double_cascade;
 
 mod context_ref_slot_hygiene;
+mod damage_as_counters_counter_added_trigger;
 mod declared_target_damage_source;
 mod dismantle;
 mod exchange_control_of_a_spell;

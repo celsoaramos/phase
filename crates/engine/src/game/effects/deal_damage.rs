@@ -671,18 +671,26 @@ pub(crate) fn apply_damage_after_replacement(
 
             if is_creature && (ctx.has_wither || ctx.has_infect) {
                 // CR 120.3d + CR 702.80 + CR 702.90: Wither/infect damage to a
-                // creature is dealt as -1/-1 counters.
-                if let Some(target_obj) = state.objects.get_mut(obj_id) {
-                    let entry = target_obj
-                        .counters
-                        .entry(CounterType::Minus1Minus1)
-                        .or_insert(0);
-                    *entry += actual_amount;
-                    if ctx.has_deathtouch {
+                // creature is dealt as -1/-1 counters, and the source's controller
+                // is the player who puts them. Route through the single counter
+                // authority so CR 614.1 counter replacements (prevention,
+                // doublers) apply and `CounterAdded { actor }` is emitted for
+                // "whenever you put one or more -1/-1 counters" triggers (CR 122.6).
+                if ctx.has_deathtouch {
+                    if let Some(target_obj) = state.objects.get_mut(obj_id) {
                         target_obj.dealt_deathtouch_damage = true;
                     }
                 }
-                crate::game::layers::mark_layers_full(state);
+                if !super::counters::add_counter_with_replacement(
+                    state,
+                    ctx.controller,
+                    *obj_id,
+                    CounterType::Minus1Minus1,
+                    actual_amount,
+                    events,
+                ) {
+                    return DamageResult::NeedsChoice;
+                }
             } else if is_creature {
                 if let Some(target_obj) = state.objects.get_mut(obj_id) {
                     // CR 120.3e: Damage to a creature marks damage.
