@@ -29052,24 +29052,58 @@ fn refine_damage_target_remainder(target: TargetFilter, remainder: &str) -> (Tar
     (target, remainder)
 }
 
-/// Split a post-"choose" clause into the card-description phrase and any trailing
-/// restriction suffix after `"from it"` (e.g. `"with mana value 2 or less"`).
-/// CR 702.148a: cleave brackets are removed at build time, so the suffix here is
-/// plain text — `combine_choose_filter_parts` merges it and relies on
-/// `parse_search_filter`'s self-bounding terminator to drop any trailing sentence.
-fn choose_filter_parts(text: &str) -> (&str, &str) {
-    if let Ok((_, (before, suffix))) = nom_primitives::split_once_on(text, " card from among those")
-    {
-        return (before.trim(), suffix.trim());
-    }
-    if let Ok((_, (before, suffix))) = nom_primitives::split_once_on(text, " card from among them")
-    {
-        return (before.trim(), suffix.trim());
-    }
-    if let Ok((_, (before, suffix))) = nom_primitives::split_once_on(text, " card from it") {
-        return (before.trim(), suffix.trim());
-    }
-    (text.trim(), "")
+/// The object phrase of a choose-from-revealed-cards clause, split structurally.
+///
+/// `descriptor` is the text between the article and the head noun `card`
+/// (empty for "a card from it", `"nonland"` for "a nonland card from it").
+/// `restriction` is the raw text after the source anaphor (e.g. `"with mana
+/// value 3 or greater"`); `parse_search_filter` self-bounds it later.
+struct ChooseCardObject<'a> {
+    descriptor: &'a str,
+    restriction: &'a str,
+}
+
+/// Source anaphor of a choose-from-revealed-cards object phrase: "card from it",
+/// "card from among them" or "card from among those", ending at a word boundary.
+fn parse_choose_card_source(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        terminated(
+            preceded(
+                tag("card from "),
+                alt((
+                    tag("it"),
+                    preceded(tag("among "), alt((tag("them"), tag("those")))),
+                )),
+            ),
+            peek(alt((eof, tag(" "), tag("."), tag(",")))),
+        ),
+    )
+    .parse(input)
+}
+
+/// CR 608.2d: the card the controller chooses while the effect is applied is
+/// described by "<article> [descriptor] card from {it | among them | among
+/// those} [restriction]". The article is consumed here, so a bare "a card from
+/// it" leaves an empty descriptor instead of a stray `"a"`.
+/// CR 702.148a: cleave brackets are removed at build time, so the restriction
+/// is plain text.
+fn parse_choose_card_object(input: &str) -> OracleResult<'_, ChooseCardObject<'_>> {
+    let (input, _) = opt(nom_primitives::parse_article).parse(input)?;
+    let (input, descriptor) = alt((
+        value("", peek(parse_choose_card_source)),
+        terminated(take_until(" card from "), tag(" ")),
+    ))
+    .parse(input)?;
+    let (input, ()) = parse_choose_card_source(input)?;
+    let (input, restriction) = rest(input)?;
+    Ok((
+        input,
+        ChooseCardObject {
+            descriptor: descriptor.trim(),
+            restriction: restriction.trim(),
+        },
+    ))
 }
 
 fn parse_choose_filter_leading_body(input: &str) -> &str {
@@ -29090,8 +29124,8 @@ fn trailing_bare_article_only(input: &str) -> bool {
     .is_ok_and(|(_, article)| article.is_some())
 }
 
-/// Merge the pre-`from it` card phrase with the plain trailing restriction
-/// suffix that follows `"card from it"` (e.g. `"with mana value 2 or less"`).
+/// Merge the card descriptor with the plain trailing restriction suffix that
+/// follows `"card from it"` (e.g. `"with mana value 2 or less"`).
 ///
 /// CR 702.148a: Cleave's bracketed text is removed at build time before this
 /// parse runs (the base parse sees the bracket *content* without the bracket
@@ -29100,15 +29134,13 @@ fn trailing_bare_article_only(input: &str) -> bool {
 /// `parse_search_filter`, whose `search_filter_region` self-bounds at the first
 /// `". "`/`"."`, so any trailing sentence (Dread Fugue's "That player discards
 /// that card.") is naturally dropped without bracket-specific extraction.
-fn combine_choose_filter_parts(filter_part: &str, suffix_part: &str) -> String {
-    let filter_part = parse_choose_filter_leading_body(filter_part);
-    let suffix = suffix_part.trim();
-    if suffix.is_empty() {
-        filter_part.to_string()
-    } else if filter_part.is_empty() {
-        suffix.to_string()
+fn combine_choose_filter_parts(object: &ChooseCardObject<'_>) -> String {
+    if object.restriction.is_empty() {
+        object.descriptor.to_string()
+    } else if object.descriptor.is_empty() {
+        object.restriction.to_string()
     } else {
-        format!("{filter_part} {suffix}")
+        format!("{} {}", object.descriptor, object.restriction)
     }
 }
 
@@ -29132,11 +29164,17 @@ fn parse_choose_filter(lower: &str, ctx: &mut ParseContext) -> TargetFilter {
         return TargetFilter::ParentTarget;
     }
 
-    let (filter_part, suffix_part) = choose_filter_parts(after_choose);
-    let combined = combine_choose_filter_parts(filter_part, suffix_part);
+    let object = parse_choose_card_object(after_choose)
+        .map(|(_, object)| object)
+        .unwrap_or_else(|_| ChooseCardObject {
+            descriptor: parse_choose_filter_leading_body(after_choose),
+            restriction: "",
+        });
+    let combined = combine_choose_filter_parts(&object);
 
-    // Intentional: bare article "a [card]" or empty string means any card — not a parse failure
-    if combined.is_empty() || combined == "a" {
+    // Intentional: "a card from it" (article consumed, no descriptor, no restriction)
+    // means any card — not a parse failure.
+    if combined.is_empty() {
         return TargetFilter::Any;
     }
 
@@ -29147,7 +29185,7 @@ fn parse_choose_filter(lower: &str, ctx: &mut ParseContext) -> TargetFilter {
         return search_filter;
     }
 
-    let cleaned = filter_part;
+    let cleaned = object.descriptor;
 
     // structural: not dispatch — segmenting pre-extracted type string on comma separator
     // Comma-separated negation: "noncreature, nonland" → intersection of negations

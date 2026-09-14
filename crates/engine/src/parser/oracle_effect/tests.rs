@@ -30116,6 +30116,76 @@ fn parse_choose_filter_merges_trailing_cmc_suffix() {
 }
 
 #[test]
+fn parse_choose_filter_object_phrase_arms() {
+    // CR 608.2d + CR 202.3: every shape the choose-card object phrase accepts or
+    // refuses, pinned through the `parse_choose_filter` authority. Expected values
+    // are measured; each mismatch is reported as PCF-ROW[<id>].
+    fn typed(type_filters: Vec<TypeFilter>, properties: Vec<FilterProp>) -> TargetFilter {
+        TargetFilter::Typed(TypedFilter {
+            type_filters,
+            controller: None,
+            properties,
+        })
+    }
+    fn mv(comparator: Comparator, value: i32) -> FilterProp {
+        FilterProp::Cmc {
+            comparator,
+            value: QuantityExpr::Fixed { value },
+        }
+    }
+    let rows = [
+        // `it` + restriction: the Pelakka Predation class.
+        ("r01_it_restriction_sentence", "you choose a card from it with mana value 3 or greater. that player discards that card.", typed(vec![], vec![mv(Comparator::GE, 3)])),
+        ("r02_it_restriction_eof", "you choose a card from it with mana value 3 or greater", typed(vec![], vec![mv(Comparator::GE, 3)])),
+        ("r03_it_restriction_and_exile", "you choose a card from it with mana value 4 or greater and exile that card.", typed(vec![], vec![mv(Comparator::GE, 4)])),
+        // "." boundary with no restriction: no phantom article subtype. The empty
+        // conjunction means any card (TypedFilter doc).
+        ("r04_it_bare_sentence", "you choose a card from it. that player discards that card.", typed(vec![], vec![])),
+        ("r05_it_bare_eof", "you choose a card from it", TargetFilter::Any),
+        ("r06_an_article_descriptor", "you choose an artifact card from it", typed(vec![TypeFilter::Artifact], vec![])),
+        ("r07_comma_descriptor_sentence", "you choose a noncreature, nonland card from it. that player discards that card.", typed(vec![TypeFilter::Non(Box::new(TypeFilter::Creature)), TypeFilter::Non(Box::new(TypeFilter::Land))], vec![])),
+        ("r08_descriptor_restriction", "you choose a nonland card from it with mana value 2 or less. that player discards that card.", typed(vec![TypeFilter::Non(Box::new(TypeFilter::Land))], vec![mv(Comparator::LE, 2)])),
+        ("r09_among_them_restriction", "you choose a card from among them with mana value 3 or greater", typed(vec![], vec![mv(Comparator::GE, 3)])),
+        ("r10_may_choose_restriction", "you may choose a card from it with mana value 3 or greater", typed(vec![], vec![mv(Comparator::GE, 3)])),
+        // `among those` + head noun "cards" (Break Expectations).
+        ("r11_among_those_cards", "you choose a card from among those cards. exile that card.", typed(vec![TypeFilter::Card], vec![])),
+        // Lobotomy: the object split stops at the first " card from ". This pins the
+        // split only. "other than a basic land" is dropped downstream by
+        // `parse_search_filter` (pre-existing, same at BASE); this expectation changes
+        // when that exclusion is parsed.
+        ("r12_descriptor_contains_card", "you choose a card other than a basic land card from it.", typed(vec![TypeFilter::Card], vec![])),
+        // Word boundary: "items" is not the anaphor `it`; the fallback reads the phrase.
+        ("r13_word_boundary_items", "you choose a card from items", typed(vec![TypeFilter::Card], vec![])),
+        // First probe (5.3a): "," boundary leaf. BASE: Typed { type_filters: [Subtype("A")], properties: [] }.
+        ("fp1_comma_boundary", "you choose a card from it, then that player discards that card.", typed(vec![], vec![])),
+        // First probe (5.3a): descriptor arm followed by the `among them` source. BASE: same value.
+        ("fp2_descriptor_among_them", "you choose a nonland card from among them", typed(vec![TypeFilter::Non(Box::new(TypeFilter::Land))], vec![])),
+        // First probe (5.3a): the first " card from " is not an anaphor, so the source refuses and
+        // the whole object falls back (refusal-arm output, not meaningful semantics for synthetic
+        // text). BASE: Typed { type_filters: [Card, Non(Land)], properties: [] }.
+        ("fp3_first_card_from_not_anaphor", "you choose a nonland card from your hand or a card from it", TargetFilter::Or {
+            filters: vec![
+                TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Card, TypeFilter::Non(Box::new(TypeFilter::Land))],
+                    controller: Some(ControllerRef::You),
+                    properties: vec![FilterProp::InZone { zone: Zone::Hand }],
+                }),
+                typed(vec![TypeFilter::Card], vec![FilterProp::InZone { zone: Zone::Hand }]),
+            ],
+        }),
+    ];
+    let mismatched: Vec<String> = rows
+        .iter()
+        .filter_map(|(id, lower, want)| {
+            let got = parse_choose_filter(lower, &mut ParseContext::default());
+            (got != *want)
+                .then(|| format!("PCF-ROW[{id}] input={lower:?} got={got:?} want={want:?}"))
+        })
+        .collect();
+    assert!(mismatched.is_empty(), "{}", mismatched.join("\n"));
+}
+
+#[test]
 fn seek_from_among_top_cards_carries_library_limit() {
     let details = parse_seek_details(
         "seek an artifact card from among the top ten cards of your library, then shuffle",
