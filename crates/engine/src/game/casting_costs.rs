@@ -2583,25 +2583,7 @@ pub(crate) fn resume_interrupted_cost_payment(
     finish_pending_cost_or_cast(state, player, pending, events)
 }
 
-fn replace_first_one_of_cost(cost: &mut AbilityCost, chosen: AbilityCost) -> bool {
-    match cost {
-        AbilityCost::OneOf { .. } => {
-            *cost = chosen;
-            true
-        }
-        AbilityCost::Composite { costs } => {
-            for cost in costs {
-                if replace_first_one_of_cost(cost, chosen.clone()) {
-                    return true;
-                }
-            }
-            false
-        }
-        _ => false,
-    }
-}
-
-/// CR 118.12a + CR 602.2b: Complete disjunctive activation-cost branch selection.
+/// CR 601.2h + CR 602.2b: Complete disjunctive activation-cost branch selection.
 pub(crate) fn handle_activation_cost_one_of_choice(
     state: &mut GameState,
     player: PlayerId,
@@ -2618,27 +2600,22 @@ pub(crate) fn handle_activation_cost_one_of_choice(
     }
 
     let chosen_cost = &costs[index];
-    if !super::casting::can_pay_ability_cost_now(
-        state,
-        player,
-        pending.object_id,
-        chosen_cost,
-        pending.activation_ability_index,
-    ) {
+    if !super::casting::activation_one_of_branch_payable(state, player, &pending, chosen_cost) {
         return Err(EngineError::ActionNotAllowed(
             "Chosen cost branch is not payable".to_string(),
         ));
     }
 
-    let replaced = pending
+    let Some(resolved) = pending
         .activation_cost
-        .as_mut()
-        .is_some_and(|cost| replace_first_one_of_cost(cost, chosen_cost.clone()));
-    if !replaced {
+        .as_ref()
+        .and_then(|cost| cost.resolve_first_one_of(chosen_cost))
+    else {
         return Err(EngineError::InvalidAction(
             "Pending activation cost no longer has a OneOf branch".to_string(),
         ));
-    }
+    };
+    pending.activation_cost = Some(resolved);
 
     if let Some(waiting_for) =
         surface_next_unpaid_interactive_activation_cost(state, player, &mut pending, events)?
@@ -5372,6 +5349,7 @@ pub(crate) fn surface_next_unpaid_interactive_activation_cost(
             state,
             player,
             source_id,
+            cost,
             costs,
             pending
                 .activation_ability_index
