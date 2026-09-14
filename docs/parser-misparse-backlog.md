@@ -3,8 +3,8 @@
 Consolidated from 50 per-batch clustering passes over the whole card database. Synonymous per-batch clusters were merged into canonical root causes, their card lists unioned and deduped, and ranked by total card appearances (largest first).
 
 - **Canonical root causes:** 29
-- **Distinct cards implicated:** 4599
-- **Total card appearances across root causes:** 4632 (a card may appear under more than one root cause when it exhibits multiple distinct misparses)
+- **Distinct cards implicated:** 4593
+- **Total card appearances across root causes:** 4626 (a card may appear under more than one root cause when it exhibits multiple distinct misparses)
 
 > Counting method: both figures count the per-root-cause card bullets only — the
 > three metadata bullets above are excluded — and are the source of truth.
@@ -459,11 +459,6 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - Mari, the Killing Quill
 - Mark of Eviction
 - Martial Impetus
-- Martyr of Ashes
-- Martyr of Bones
-- Martyr of Frost
-- Martyr of Sands
-- Martyr of Spores
 - Master of Arms
 - Mechtitan Core
 - Memory Theft
@@ -2355,7 +2350,6 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - Huskburster Swarm
 - Hydradoodle
 - Ill-Gotten Gains
-- Illuminated Folio
 - Immortal Coil
 - Impose Hierarchy
 - Infantry Shield

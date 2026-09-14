@@ -9,6 +9,7 @@ use crate::types::ability::{
     QuantityRef, ReplacementDefinition, ResolvedAbility, SacrificeCost, SacrificeRequirement,
     SpellCastingOptionKind, SpellContext, SpellStackToGraveyardReplacement, StaticCondition,
     TapCreaturesSelectionMode, TargetFilter, ThisWayCause, TypeFilter, TypedFilter, EXILE_COST_X,
+    REVEAL_COST_X,
 };
 use crate::types::card_type::CoreType;
 use crate::types::events::{GameEvent, ManaTapState};
@@ -5723,9 +5724,33 @@ pub(crate) fn surface_next_unpaid_interactive_activation_cost(
         })
     {
         if let Some(filter) = filter {
+            // CR 107.3a + CR 601.2b: X in an activation cost is announced; REVEAL_COST_X
+            // marks it until chosen, so the prompt is sized by the announced value.
+            let required = match *count {
+                REVEAL_COST_X => pending.ability.chosen_x.ok_or_else(|| {
+                    EngineError::ActionNotAllowed(
+                        "Reveal X cost without an announced X".to_string(),
+                    )
+                })?,
+                fixed => fixed,
+            };
+            if required == 0 {
+                // CR 107.3a: X = 0 reveals no cards.
+                pending.activation_cost = remove_first_activation_cost_matching(
+                    pending
+                        .activation_cost
+                        .take()
+                        .expect("checked activation cost is present"),
+                    |cost| matches!(cost, AbilityCost::Reveal { .. }),
+                );
+                pending.mark_activation_cost_committed();
+                return surface_next_unpaid_interactive_activation_cost(
+                    state, player, pending, events,
+                );
+            }
             let choices =
                 super::casting::find_eligible_reveal_targets(state, player, source_id, filter);
-            if choices.len() < *count as usize {
+            if choices.len() < required as usize {
                 return Err(EngineError::ActionNotAllowed(
                     "Not enough eligible cards in hand to reveal".to_string(),
                 ));
@@ -5742,7 +5767,7 @@ pub(crate) fn surface_next_unpaid_interactive_activation_cost(
                 player,
                 kind: PayCostKind::Reveal,
                 choices,
-                count: *count as usize,
+                count: required as usize,
                 min_count: 0,
                 resume: CostResume::Spell {
                     spell: Box::new(pending),
@@ -6162,6 +6187,15 @@ fn concretize_chosen_x_cost(cost: &AbilityCost, chosen_x: u32) -> AbilityCost {
         } => AbilityCost::Exile {
             count: chosen_x,
             zone: Some(Zone::Graveyard),
+            filter: filter.clone(),
+        },
+        // CR 107.3a + CR 601.2b: once X is announced, a "reveal X" additional cost
+        // becomes a fixed reveal count.
+        AbilityCost::Reveal {
+            count: REVEAL_COST_X,
+            filter,
+        } => AbilityCost::Reveal {
+            count: chosen_x,
             filter: filter.clone(),
         },
         // CR 107.3a + CR 601.2b: once X is announced, a variable "Pay X {E}"
@@ -8796,6 +8830,16 @@ fn additional_cost_x_max(
                 },
             )
         }
+        // CR 118.3 + CR 601.2b: X can't exceed the matching cards in hand.
+        AbilityCost::Reveal {
+            count: REVEAL_COST_X,
+            filter: Some(filter),
+        } => Some(
+            super::casting::find_eligible_reveal_targets(state, player, source_id, filter)
+                .len()
+                .try_into()
+                .unwrap_or(u32::MAX),
+        ),
         AbilityCost::Composite { costs } => costs
             .iter()
             .filter_map(|cost| additional_cost_x_max(state, player, source_id, cost))
@@ -8835,9 +8879,11 @@ pub(super) fn activation_cost_needs_x_choice(
 /// arm feeds `pay_additional_cost_with_source` directly; `PaySpeed` rides the
 /// mana-ability `PayAmountChoice` channel) so are intentionally not duplicated
 /// here.
-fn cost_needs_activation_x_announcement(cost: &AbilityCost) -> bool {
+pub(super) fn cost_needs_activation_x_announcement(cost: &AbilityCost) -> bool {
     match cost {
         AbilityCost::RemoveCounter { count, .. } => is_chosen_remove_counter_cost_count(*count),
+        // CR 107.3a + CR 601.2b (via CR 602.2b): X in a reveal cost is announced before targets.
+        AbilityCost::Reveal { count, .. } => *count == REVEAL_COST_X,
         AbilityCost::PayEnergy { amount } => amount.contains_x(),
         AbilityCost::Discard {
             filter: Some(filter),
@@ -15437,6 +15483,106 @@ mod tests {
         assert_eq!(
             additional_cost_x_max(&state, PlayerId(0), source, &cost),
             Some(4)
+        );
+    }
+
+    /// CR 118.3 + CR 601.2b: X in "reveal X white cards from your hand" can't
+    /// exceed the matching cards in hand.
+    #[test]
+    fn reveal_x_additional_cost_x_max_counts_matching_hand_cards() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(9_150),
+            PlayerId(0),
+            "Martyr of Sands".to_string(),
+            Zone::Hand,
+        );
+        for (idx, color) in [
+            ManaColor::White,
+            ManaColor::White,
+            ManaColor::White,
+            ManaColor::Red,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = create_object(
+                &mut state,
+                CardId(9_160 + idx as u64),
+                PlayerId(0),
+                format!("Hand card {idx}"),
+                Zone::Hand,
+            );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.color = vec![color];
+            obj.base_color = vec![color];
+        }
+        let filter =
+            TargetFilter::Typed(TypedFilter::card().properties(vec![FilterProp::HasColor {
+                color: ManaColor::White,
+            }]));
+        let x_cost = AbilityCost::Reveal {
+            count: REVEAL_COST_X,
+            filter: Some(filter.clone()),
+        };
+        assert_eq!(
+            additional_cost_x_max(&state, PlayerId(0), source, &x_cost),
+            Some(3)
+        );
+        let fixed_cost = AbilityCost::Reveal {
+            count: 2,
+            filter: Some(filter),
+        };
+        assert_eq!(
+            additional_cost_x_max(&state, PlayerId(0), source, &fixed_cost),
+            None
+        );
+    }
+
+    /// CR 107.3a + CR 601.2b: once X is announced, a "reveal X" cost becomes a
+    /// fixed reveal count, including inside a composite.
+    #[test]
+    fn reveal_x_cost_concretizes_after_x_is_chosen() {
+        let filter =
+            TargetFilter::Typed(TypedFilter::card().properties(vec![FilterProp::HasColor {
+                color: ManaColor::White,
+            }]));
+        assert_eq!(
+            concretize_chosen_x_cost(
+                &AbilityCost::Reveal {
+                    count: REVEAL_COST_X,
+                    filter: Some(filter.clone()),
+                },
+                2
+            ),
+            AbilityCost::Reveal {
+                count: 2,
+                filter: Some(filter.clone()),
+            }
+        );
+        assert_eq!(
+            concretize_chosen_x_cost(
+                &AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Tap,
+                        AbilityCost::Reveal {
+                            count: REVEAL_COST_X,
+                            filter: Some(filter.clone()),
+                        },
+                    ],
+                },
+                2
+            ),
+            AbilityCost::Composite {
+                costs: vec![
+                    AbilityCost::Tap,
+                    AbilityCost::Reveal {
+                        count: 2,
+                        filter: Some(filter),
+                    },
+                ],
+            }
         );
     }
 

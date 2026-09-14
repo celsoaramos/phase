@@ -22,7 +22,7 @@
 use crate::types::ability::{
     is_variable_remove_counter_cost_count, AbilityCost, Comparator, CounterCostSelection,
     FilterProp, PlayerFilter, QuantityExpr, QuantityRef, TapCreaturesAggregateStat,
-    TapCreaturesRequirement, TargetFilter, TypedFilter, EXILE_COST_X,
+    TapCreaturesRequirement, TargetFilter, TypedFilter, EXILE_COST_X, REVEAL_COST_X,
 };
 use crate::types::card_type::CoreType;
 use crate::types::identifiers::ObjectId;
@@ -773,6 +773,10 @@ impl AbilityCost {
             // Filter-less reveal (self-reveal) is always payable — you can always
             // reveal the source spell you're casting.
             AbilityCost::Reveal { count, filter } => {
+                // CR 107.3a + CR 601.2b: X is chosen during announcement and X = 0 is legal; the sentinel is not a literal count.
+                if *count == REVEAL_COST_X {
+                    return true;
+                }
                 let Some(p) = state.players.get(player.0 as usize) else {
                     return false;
                 };

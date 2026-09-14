@@ -1,6 +1,6 @@
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_until};
-use nom::character::complete::multispace0;
+use nom::character::complete::{alpha1, multispace0};
 use nom::combinator::{all_consuming, map, opt, rest, value};
 use nom::error::ParseError;
 use nom::multi::separated_list1;
@@ -29,7 +29,7 @@ use crate::types::ability::{
     AbilityCost, AggregateFunction, BeholdCostAction, ChoiceType, Comparator, ControllerRef,
     CostReduction, CounterCostSelection, FilterProp, ObjectProperty, PlayerScope, QuantityExpr,
     QuantityRef, SacrificeCost, TapCreaturesRequirement, TargetFilter, TypedFilter, EXILE_COST_X,
-    REMOVE_COUNTER_COST_ALL, REMOVE_COUNTER_COST_ANY_NUMBER, REMOVE_COUNTER_COST_X,
+    REMOVE_COUNTER_COST_ALL, REMOVE_COUNTER_COST_ANY_NUMBER, REMOVE_COUNTER_COST_X, REVEAL_COST_X,
 };
 use crate::types::counter::parse_counter_match;
 use crate::types::zones::Zone;
@@ -1274,33 +1274,75 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
         };
     }
 
-    // "Reveal this card from your hand" — reveal self cost
-    if nom_on_lower(text, &lower, |i| {
-        value((), tag("reveal this card from your hand")).parse(i)
-    })
-    .is_some()
-    {
-        return AbilityCost::Reveal {
-            count: 1,
-            filter: None,
-        };
-    }
-
-    // "Reveal a [Type] card from your hand" — reveal from hand with type filter.
+    // CR 701.20a + CR 701.20b: revealing a card as a cost shows it; it stays in hand.
+    // "Reveal <self> from your hand" / "Reveal <N|X> <filter> card(s) from your hand".
     if let Some(((), rest)) = nom_on_lower(text, &lower, |i| value((), tag("reveal ")).parse(i)) {
         let rest_lower = rest.to_lowercase();
-        if let Ok((_, (before, _))) = split_once_on(&rest_lower, "from your hand") {
-            let filter_raw = before.trim();
-            let filter_raw = strip_article(filter_raw, filter_raw);
-            let filter_raw = filter_raw
-                .strip_suffix(" card")
-                .or_else(|| filter_raw.strip_suffix(" cards"))
-                .unwrap_or(filter_raw)
-                .trim();
-            let (filter, _) = parse_target(&format!("target {filter_raw}"));
-            return AbilityCost::Reveal {
-                count: 1,
-                filter: Some(filter),
+        let split = pair(
+            take_until::<_, _, E<'_>>(" from your hand"),
+            tag(" from your hand"),
+        )
+        .parse(rest_lower.as_str());
+        if let Ok((tail, (body, _))) = split {
+            // Any clause after "from your hand" ("that share a color", "or choose …")
+            // constrains the revealed cards in a way this cost cannot represent.
+            if all_consuming(multispace0::<_, E<'_>>).parse(tail).is_err() {
+                return AbilityCost::Unimplemented {
+                    description: text.to_string(),
+                };
+            }
+            // Self-reveal ("~", "this creature", "this card"), mirroring the
+            // Sacrifice self arm; a granted body's by-name reference keeps its
+            // `GrantingObject` filter.
+            if let Ok((_, filter)) = all_consuming(alt((
+                parse_cost_self_reference,
+                value(TargetFilter::SelfRef, preceded(tag("this "), alpha1)),
+            )))
+            .parse(body)
+            {
+                return match filter {
+                    TargetFilter::SelfRef => AbilityCost::Reveal {
+                        count: 1,
+                        filter: None,
+                    },
+                    other => AbilityCost::Reveal {
+                        count: 1,
+                        filter: Some(other),
+                    },
+                };
+            }
+            let Some((quantity, after_count)) = parse_count_expr(body) else {
+                return AbilityCost::Unimplemented {
+                    description: text.to_string(),
+                };
+            };
+            // CR 107.3a + CR 601.2b: X in an activation cost is announced; REVEAL_COST_X marks it until chosen.
+            let count = match quantity {
+                QuantityExpr::Fixed { value } if value >= 1 => value as u32,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::Variable { ref name },
+                } if name == "X" => REVEAL_COST_X,
+                _ => {
+                    return AbilityCost::Unimplemented {
+                        description: text.to_string(),
+                    }
+                }
+            };
+            let noun = after_count.trim_start();
+            let filter = parse_discard_card_filter(noun).or_else(|| {
+                all_consuming(alt((tag::<_, _, E<'_>>("cards"), tag("card"))))
+                    .parse(noun)
+                    .ok()
+                    .map(|_| TargetFilter::Typed(TypedFilter::card()))
+            });
+            return match filter {
+                Some(filter) => AbilityCost::Reveal {
+                    count,
+                    filter: Some(filter),
+                },
+                None => AbilityCost::Unimplemented {
+                    description: text.to_string(),
+                },
             };
         }
     }
@@ -2212,7 +2254,7 @@ mod tests {
         SacrificeRequirement, SharedQuality, TypeFilter, TypedFilter,
     };
     use crate::types::counter::CounterMatch;
-    use crate::types::mana::{ManaCost, ManaCostShard};
+    use crate::types::mana::{ManaColor, ManaCost, ManaCostShard};
 
     /// CR 205.2a + CR 601.2h: a sacrifice cost whose filter is a TYPE UNION with
     /// an article-led right conjunct keeps BOTH legs — "Sacrifice another
@@ -4210,6 +4252,121 @@ mod tests {
                 filter: None
             }
         );
+    }
+
+    fn colored_card_filter(color: ManaColor) -> TargetFilter {
+        TargetFilter::Typed(TypedFilter::card().properties(vec![FilterProp::HasColor { color }]))
+    }
+
+    /// CR 107.3a + CR 601.2b: "Reveal X <color> cards from your hand" (the Martyr
+    /// cycle) keeps the variable count as `REVEAL_COST_X` and the color filter.
+    #[test]
+    fn cost_reveal_x_colored_cards_from_hand() {
+        for (word, color) in [
+            ("white", ManaColor::White),
+            ("blue", ManaColor::Blue),
+            ("black", ManaColor::Black),
+            ("red", ManaColor::Red),
+            ("green", ManaColor::Green),
+        ] {
+            assert_eq!(
+                parse_oracle_cost(&format!("Reveal X {word} cards from your hand")),
+                AbilityCost::Reveal {
+                    count: REVEAL_COST_X,
+                    filter: Some(colored_card_filter(color)),
+                },
+                "{word}"
+            );
+        }
+    }
+
+    #[test]
+    fn cost_reveal_fixed_count_and_typed_cards_from_hand() {
+        assert_eq!(
+            parse_oracle_cost("Reveal two red cards from your hand"),
+            AbilityCost::Reveal {
+                count: 2,
+                filter: Some(colored_card_filter(ManaColor::Red)),
+            }
+        );
+        match parse_oracle_cost("Reveal a Dragon card from your hand") {
+            AbilityCost::Reveal {
+                count: 1,
+                filter: Some(TargetFilter::Typed(filter)),
+            } => assert_eq!(filter.get_subtype(), Some("Dragon")),
+            other => panic!("expected Reveal a Dragon card, got {other:?}"),
+        }
+        match parse_oracle_cost("Reveal a colorless creature card from your hand") {
+            AbilityCost::Reveal {
+                count: 1,
+                filter: Some(TargetFilter::Typed(filter)),
+            } => {
+                assert!(filter.type_filters.contains(&TypeFilter::Creature));
+                assert!(filter.properties.iter().any(|prop| matches!(
+                    prop,
+                    FilterProp::ColorCount {
+                        comparator: Comparator::EQ,
+                        ..
+                    }
+                )));
+            }
+            other => panic!("expected Reveal a colorless creature card, got {other:?}"),
+        }
+        assert_eq!(
+            parse_oracle_cost("Reveal two cards from your hand"),
+            AbilityCost::Reveal {
+                count: 2,
+                filter: Some(TargetFilter::Typed(TypedFilter::card())),
+            }
+        );
+    }
+
+    /// CR 701.20a: revealing the source itself ("this creature", "~", "this card").
+    #[test]
+    fn cost_reveal_self_forms_from_hand() {
+        for text in [
+            "Reveal this creature from your hand",
+            "Reveal ~ from your hand",
+            "Reveal this card from your hand",
+        ] {
+            assert_eq!(
+                parse_oracle_cost(text),
+                AbilityCost::Reveal {
+                    count: 1,
+                    filter: None,
+                },
+                "{text}"
+            );
+        }
+        assert_eq!(
+            parse_oracle_cost(&format!(
+                "Reveal {} from your hand",
+                crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER
+            )),
+            AbilityCost::Reveal {
+                count: 1,
+                filter: Some(TargetFilter::GrantingObject),
+            }
+        );
+    }
+
+    /// A reveal constraint the cost cannot represent fails closed instead of
+    /// dropping the clause (Illuminated Folio: "that share a color").
+    #[test]
+    fn cost_reveal_unrepresentable_forms_are_unimplemented() {
+        for text in [
+            "Reveal two cards from your hand that share a color",
+            "Reveal this creature card from your hand",
+            "Reveal zero red cards from your hand",
+            "Reveal any number of red cards from your hand",
+            "Reveal half X red cards from your hand",
+        ] {
+            assert!(
+                matches!(parse_oracle_cost(text), AbilityCost::Unimplemented { .. }),
+                "{text} must be Unimplemented, got {:?}",
+                parse_oracle_cost(text)
+            );
+        }
     }
 
     #[test]

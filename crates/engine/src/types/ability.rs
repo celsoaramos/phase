@@ -11931,6 +11931,8 @@ pub const REMOVE_COUNTER_COST_ALL: u32 = u32::MAX - 1;
 pub const REMOVE_COUNTER_COST_ANY_NUMBER: u32 = u32::MAX - 2;
 /// Sentinel for literal `X` in exile costs that use the compact numeric count.
 pub const EXILE_COST_X: u32 = u32::MAX;
+/// CR 107.3a + CR 601.2b: "Reveal X … cards from your hand" — X announced during activation.
+pub const REVEAL_COST_X: u32 = u32::MAX;
 
 pub fn is_x_remove_counter_cost_count(count: u32) -> bool {
     count == REMOVE_COUNTER_COST_X
@@ -12422,6 +12424,8 @@ pub enum AbilityCost {
         count: u32,
     },
     Reveal {
+        /// Number of cards to reveal. `REVEAL_COST_X` marks a literal X that
+        /// is announced during activation and resolved to the chosen value.
         count: u32,
         /// Filter on what must be revealed (e.g., "a Dragon card from your hand").
         /// None means reveal any card (self-reveal).

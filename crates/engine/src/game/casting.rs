@@ -19428,6 +19428,13 @@ pub(crate) fn one_of_branch_payable_in(
     branch: &AbilityCost,
     ability_index: Option<usize>,
 ) -> bool {
+    // CR 601.2b + CR 601.2h + CR 118.3: X in a cost is announced before the
+    // cost is paid, but a disjunctive branch is chosen on a route that never
+    // announces X (`handle_activation_cost_one_of_choice`), so a branch whose
+    // payment needs an announced X can't be paid.
+    if casting_costs::cost_needs_activation_x_announcement(branch) {
+        return false;
+    }
     enclosing
         .resolve_first_one_of(branch)
         .is_some_and(|resolved| {
@@ -20912,6 +20919,9 @@ pub fn handle_activate_ability(
             pending_x.activation_cost = remaining;
             pending_x.activation_ability_index = Some(ability_index);
             pending_x.deferred_target_selection = has_effect_targets;
+            // CR 601.2c + CR 602.2b: targets chosen after X obey the ability's target
+            // constraints (Martyr of Bones: "from a single graveyard").
+            pending_x.target_constraints = ability_def.target_constraints.clone();
             // CR 601.2g + CR 601.2h: if a non-self battlefield-removal sub-cost
             // (Sacrifice / battlefield Exile / ReturnToHand) is still
             // outstanding in the residual after X-announcement, mark the
@@ -20949,6 +20959,9 @@ pub fn handle_activate_ability(
             pending_x.activation_cost = remaining;
             pending_x.activation_ability_index = Some(ability_index);
             pending_x.deferred_target_selection = has_effect_targets;
+            // CR 601.2c + CR 602.2b: targets chosen after X obey the ability's target
+            // constraints (Martyr of Bones: "from a single graveyard").
+            pending_x.target_constraints = ability_def.target_constraints.clone();
             // CR 601.2f + CR 601.2h: POSITIVE signal — the residual non-mana tail
             // in `activation_cost` is still OUTSTANDING after mana payment, so
             // `push_activated_ability_to_stack` must re-surface a non-self discard
