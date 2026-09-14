@@ -31,6 +31,7 @@ const HAPATRA_NAME: &str = "Hapatra, Vizier of Poisons";
 const HAPATRA: &str = "Whenever Hapatra deals combat damage to a player, you may put a -1/-1 counter on target creature.\nWhenever you put one or more -1/-1 counters on a creature, create a 1/1 green Snake creature token with deathtouch.";
 const NEST_OF_SCARABS: &str = "Whenever you put one or more -1/-1 counters on a creature, create that many 1/1 black Insect creature tokens.";
 const VORINCLEX: &str = "Trample, haste\nIf you would put one or more counters on a permanent or player, put twice that many of each of those kinds of counters on that permanent or player instead.\nIf an opponent would put one or more counters on a permanent or player, they put half that many of each of those kinds of counters on that permanent or player instead, rounded down.";
+const WINDING_CONSTRICTOR: &str = "If one or more counters would be put on an artifact or creature you control, that many plus one of each of those kinds of counters are put on that permanent instead.\nIf you would get one or more counters, you get that many plus one of each of those kinds of counters instead.";
 const SOLEMNITY: &str = "Players can't get counters.\nCounters can't be put on artifacts, creatures, enchantments, or lands.";
 
 fn tokens(runner: &GameRunner, player: PlayerId, subtype: &str) -> usize {
@@ -65,9 +66,19 @@ struct Combat {
 }
 
 /// `attacker_controller` attacks with a 3/3 carrying `keyword`; the other player
-/// blocks with an 8/8 that survives even doubled counters (or does not block). `setup` adds the permanents under test.
+/// blocks with a 10/10 that survives even doubled counters (or does not block).
+/// `setup` adds the permanents under test.
 fn run_combat(
     keyword: Keyword,
+    attacker_controller: PlayerId,
+    block: bool,
+    setup: impl FnOnce(&mut GameScenario),
+) -> Combat {
+    run_combat_with(&[keyword], attacker_controller, block, setup)
+}
+
+fn run_combat_with(
+    keywords: &[Keyword],
     attacker_controller: PlayerId,
     block: bool,
     setup: impl FnOnce(&mut GameScenario),
@@ -76,11 +87,14 @@ fn run_combat(
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     setup(&mut scenario);
-    let attacker = scenario
-        .add_creature(attacker_controller, "Witherer", 3, 3)
-        .with_keyword(keyword)
-        .id();
-    let blocker = scenario.add_creature(defender, "Blocker", 8, 8).id();
+    let attacker = {
+        let mut builder = scenario.add_creature(attacker_controller, "Witherer", 3, 3);
+        for keyword in keywords {
+            builder.with_keyword(keyword.clone());
+        }
+        builder.id()
+    };
+    let blocker = scenario.add_creature(defender, "Blocker", 10, 10).id();
     let mut runner = scenario.build();
     if attacker_controller == P1 {
         runner.state_mut().active_player = P1;
@@ -237,4 +251,37 @@ fn solemnity_prevents_wither_damage_counters() {
     assert_eq!(minus_counters(&c.runner, c.blocker), 0);
     assert_eq!(c.runner.state().objects[&c.blocker].damage_marked, 0);
     assert_eq!(tokens(&c.runner, P0, "Snake"), 0);
+}
+
+/// CR 616.1 + CR 510.2: Vorinclex (doubles, the attacker's controller) and the
+/// blocker controller's Winding Constrictor (+1) are both applicable and their
+/// order is material, so the placement needs a choice. Combat damage cannot
+/// pause: the damage is still dealt (lifelink gains life), the counters are
+/// placed in a default order, no replacement stays pending, and combat ends.
+#[test]
+fn material_counter_replacement_order_does_not_stall_wither_lifelink_combat() {
+    let c = run_combat_with(&[Keyword::Wither, Keyword::Lifelink], P0, true, |s| {
+        s.add_creature_from_oracle(P0, "Vorinclex, Monstrous Raider", 6, 6, VORINCLEX);
+        s.add_creature_from_oracle(P1, "Winding Constrictor", 2, 3, WINDING_CONSTRICTOR);
+        add_hapatra(s, P0);
+    });
+    let state = c.runner.state();
+    let counters = minus_counters(&c.runner, c.blocker);
+    assert!(
+        counters == 7 || counters == 8,
+        "both replacements apply in some order (3*2+1 or (3+1)*2), got {counters}"
+    );
+    assert_eq!(
+        state.players.iter().find(|p| p.id == P0).unwrap().life,
+        23,
+        "lifelink gains for the wither damage dealt"
+    );
+    assert!(state.pending_replacement.is_none(), "no stale replacement");
+    assert!(
+        matches!(state.phase, Phase::EndCombat | Phase::PostCombatMain),
+        "combat must proceed, got {:?} / {:?}",
+        state.phase,
+        state.waiting_for
+    );
+    assert_eq!(tokens(&c.runner, P0, "Snake"), 1);
 }
