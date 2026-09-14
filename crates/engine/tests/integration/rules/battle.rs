@@ -659,3 +659,374 @@ fn battle_protector_cannot_attack_own_battle() {
         "protector cannot attack the battle it protects"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Invasion of Azgol // Ashen Reaper — a real Siege defeated in combat and its
+// back face cast transformed (CR 310.12b + CR 510.3a + CR 704.5v + CR 614.12).
+// ---------------------------------------------------------------------------
+
+/// What the drive loop observed on its way to a settled priority window.
+struct SiegeDrive {
+    saw_optional: bool,
+    /// Set when the drive stopped on a `NamedChoice` — the loop never answers
+    /// one, so the caller can assert whether it should have appeared at all.
+    stopped_on_named_choice: bool,
+}
+
+/// Pass priority through the game until the CR 310.12b victory trigger's
+/// "you may cast it transformed" has been answered with `accept` and the stack
+/// is empty again. Stops early on a `NamedChoice` without answering it.
+fn drive_siege_victory(runner: &mut GameRunner, accept: bool) -> SiegeDrive {
+    let mut drive = SiegeDrive {
+        saw_optional: false,
+        stopped_on_named_choice: false,
+    };
+    for _ in 0..64 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OptionalEffectChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept })
+                    .expect("answer the Siege's optional victory cast");
+                drive.saw_optional = true;
+            }
+            WaitingFor::NamedChoice { .. } => {
+                drive.stopped_on_named_choice = true;
+                return drive;
+            }
+            WaitingFor::Priority { .. } => {
+                if drive.saw_optional && runner.state().stack.is_empty() {
+                    return drive;
+                }
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("pass priority toward the victory trigger");
+            }
+            other => panic!("unexpected waiting state while driving the Siege: {other:?}"),
+        }
+    }
+    drive
+}
+
+/// P0 controls Invasion of Azgol (protected by P1) and a Hill Giant pumped to
+/// power 4 — exactly the Siege's printed defense. P1 has a 2/2 for T7's
+/// "a permanent was put into a graveyard from the battlefield this turn".
+fn azgol_combat_board(
+    db: &'static engine::database::CardDatabase,
+) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    use engine::game::scenario_db::GameScenarioDbExt;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let siege = scenario.add_real_card(P0, "Invasion of Azgol", Zone::Battlefield, db);
+    let giant = scenario.add_real_card(P0, "Hill Giant", Zone::Battlefield, db);
+    let bear = scenario.add_creature(P1, "Doomed Bear", 2, 2).id();
+    let mut runner = scenario.build();
+    engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+    {
+        let obj = runner.state_mut().objects.get_mut(&giant).unwrap();
+        obj.base_power = Some(4);
+        obj.power = Some(4);
+    }
+    // CR 310.11 + CR 704.5x: the 2-player SBA assigns the only opponent as the
+    // protector, so the controller may attack its own Siege (CR 310.9b).
+    sba::check_state_based_actions(runner.state_mut(), &mut Vec::new());
+    let obj = &runner.state().objects[&siege];
+    assert_eq!(obj.protector(), Some(P1), "setup: P1 protects the Siege");
+    assert_eq!(
+        obj.defense,
+        Some(4),
+        "setup: the Siege enters with 4 defense"
+    );
+    (runner, siege, giant, bear)
+}
+
+/// Attack the Siege with the Hill Giant, no blocks, and let combat damage
+/// remove its last defense counter.
+fn attack_siege_unblocked(runner: &mut GameRunner, siege: ObjectId, giant: ObjectId) {
+    runner.pass_both_players(); // → DeclareAttackers
+    runner
+        .act(GameAction::DeclareAttackers {
+            attacks: vec![(giant, AttackTarget::Battle(siege))],
+            bands: vec![],
+        })
+        .expect("attack the Siege");
+    for _ in 0..8 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::DeclareBlockers { .. } => {
+                runner
+                    .act(GameAction::DeclareBlockers {
+                        assignments: vec![],
+                    })
+                    .expect("no blocks");
+                return;
+            }
+            WaitingFor::Priority { .. } => {
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("pass toward declare blockers");
+            }
+            other => panic!("unexpected waiting state before blocks: {other:?}"),
+        }
+    }
+    panic!("never reached declare blockers");
+}
+
+/// CR 510.3a + CR 704.5v + CR 310.12b: combat damage removes a Siege's last
+/// defense counter. Its victory trigger has triggered but is not yet on the
+/// stack when the combat-damage SBAs run, so the Siege stays on the battlefield
+/// for it — the trigger exiles it and its controller casts it transformed.
+/// Then (Ashen Reaper's end-step trigger, CR 603.2) a permanent put into a graveyard from the
+/// battlefield this turn gives the Reaper a +1/+1 counter at the end step.
+///
+/// REVERT-PROBE: `combat_damage.rs` calling `check_state_based_actions` (no
+/// waiting batch) ⇒ the Siege goes to the graveyard before its trigger is put
+/// on the stack ⇒ the trigger finds nothing to exile or cast ⇒ no Reaper.
+#[test]
+fn siege_defeated_by_combat_damage_casts_back_face_transformed() {
+    let Some(db) = crate::support::shared_card_db() else {
+        eprintln!("skipping: card database unavailable");
+        return;
+    };
+    let (mut runner, siege, giant, bear) = azgol_combat_board(db);
+    attack_siege_unblocked(&mut runner, siege, giant);
+
+    let drive = drive_siege_victory(&mut runner, true);
+    assert!(
+        drive.saw_optional,
+        "reach-guard: the victory trigger must offer the transformed cast"
+    );
+    assert!(!drive.stopped_on_named_choice);
+
+    let obj = &runner.state().objects[&siege];
+    assert_eq!(
+        obj.zone,
+        Zone::Battlefield,
+        "CR 310.12b: the defeated Siege is cast transformed and resolves onto the battlefield"
+    );
+    assert!(obj.transformed, "CR 712.14a: it enters back face up");
+    assert_eq!(obj.name, "Ashen Reaper");
+    assert_eq!((obj.power, obj.toughness), (Some(2), Some(1)));
+    assert!(obj.keywords.contains(&Keyword::Menace));
+    assert_eq!(
+        obj.counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0),
+        0
+    );
+
+    // T7: a permanent is put into a graveyard from the battlefield this turn.
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&bear)
+        .unwrap()
+        .damage_marked = 2;
+    sba::check_state_based_actions(runner.state_mut(), &mut Vec::new());
+    assert_eq!(runner.state().objects[&bear].zone, Zone::Graveyard);
+
+    runner.advance_to_end_step();
+    runner.advance_until_stack_empty();
+    assert_eq!(runner.state().phase, Phase::End);
+    assert_eq!(
+        runner.state().objects[&siege]
+            .counters
+            .get(&CounterType::Plus1Plus1)
+            .copied(),
+        Some(1),
+        "Ashen Reaper's end-step trigger adds a +1/+1 counter"
+    );
+}
+
+/// CR 510.3a + CR 704.5v + CR 310.12b: declining the victory cast leaves the
+/// defeated Siege in exile — the trigger still found it on the battlefield.
+///
+/// REVERT-PROBE: same as the accept arm ⇒ the Siege is in the graveyard.
+#[test]
+fn siege_defeated_by_combat_damage_decline_stays_exiled() {
+    let Some(db) = crate::support::shared_card_db() else {
+        eprintln!("skipping: card database unavailable");
+        return;
+    };
+    let (mut runner, siege, giant, _bear) = azgol_combat_board(db);
+    attack_siege_unblocked(&mut runner, siege, giant);
+
+    let drive = drive_siege_victory(&mut runner, false);
+    assert!(
+        drive.saw_optional,
+        "reach-guard: the victory trigger must offer the transformed cast"
+    );
+
+    let obj = &runner.state().objects[&siege];
+    assert_eq!(
+        obj.zone,
+        Zone::Exile,
+        "CR 310.12b: the Siege is exiled even when its controller declines the cast"
+    );
+    assert!(!obj.transformed);
+    assert!(!runner
+        .state()
+        .battlefield
+        .iter()
+        .any(|id| runner.state().objects[id].name == "Ashen Reaper"));
+}
+
+/// CR 614.12 + CR 712.8e + CR 712.14a: Ashen Reaper, cast transformed after the
+/// Siege is defeated, enters with only its back face's characteristics — it is
+/// not a battle, so the front face's CR 310.12a "choose an opponent to protect
+/// it" replacement does not apply. The defense counters are removed by a real
+/// Vampire Hexmage (noncombat, so this isolates the replacement from D1).
+///
+/// REVERT-PROBE: drop the transformed-entry guard in
+/// `object_replacement_candidate_applies` ⇒ the Reaper pauses on a
+/// `NamedChoice { Opponent }` and records a chosen player.
+#[test]
+fn siege_back_face_cast_transformed_has_no_protector_choice() {
+    use engine::game::scenario_db::GameScenarioDbExt;
+    use engine::types::ability::TargetRef;
+    use engine::types::game_state::PayCostKind;
+
+    let Some(db) = crate::support::shared_card_db() else {
+        eprintln!("skipping: card database unavailable");
+        return;
+    };
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let siege = scenario.add_real_card(P0, "Invasion of Azgol", Zone::Battlefield, db);
+    let hexmage = scenario.add_real_card(P0, "Vampire Hexmage", Zone::Battlefield, db);
+    let mut runner = scenario.build();
+    engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+    sba::check_state_based_actions(runner.state_mut(), &mut Vec::new());
+    assert_eq!(runner.state().objects[&siege].protector(), Some(P1));
+
+    let ability_index = runner.state().objects[&hexmage]
+        .abilities
+        .iter()
+        .position(|ability| matches!(ability.kind, engine::types::ability::AbilityKind::Activated))
+        .expect("Vampire Hexmage has an activated ability");
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: hexmage,
+            ability_index,
+        })
+        .expect("activate Vampire Hexmage");
+    for _ in 0..16 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::TargetSelection { .. } => {
+                runner
+                    .act(GameAction::SelectTargets {
+                        targets: vec![TargetRef::Object(siege)],
+                    })
+                    .expect("target the Siege");
+            }
+            WaitingFor::PayCost {
+                kind: PayCostKind::Sacrifice,
+                ..
+            } => {
+                runner
+                    .act(GameAction::SelectCards {
+                        cards: vec![hexmage],
+                    })
+                    .expect("sacrifice Vampire Hexmage");
+            }
+            WaitingFor::Priority { .. } if !runner.state().stack.is_empty() => break,
+            other => panic!("unexpected waiting state during activation: {other:?}"),
+        }
+    }
+    assert!(
+        !runner.state().stack.is_empty(),
+        "setup: Hexmage's ability is on the stack"
+    );
+
+    let drive = drive_siege_victory(&mut runner, true);
+    assert!(
+        drive.saw_optional,
+        "reach-guard: the victory trigger must offer the transformed cast"
+    );
+    assert!(
+        !drive.stopped_on_named_choice,
+        "CR 614.12: the transformed back face must not choose a Siege protector"
+    );
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { .. }
+    ));
+    let obj = &runner.state().objects[&siege];
+    assert_eq!(obj.zone, Zone::Battlefield);
+    assert!(obj.transformed);
+    assert_eq!(obj.name, "Ashen Reaper");
+    assert!(
+        obj.chosen_attributes.is_empty(),
+        "no protector is recorded on the non-battle back face, got {:?}",
+        obj.chosen_attributes
+    );
+}
+
+/// CR 310.12a sibling guard: the transformed-entry guard must not reach a
+/// Siege cast normally from hand — it still chooses an opponent to protect it.
+#[test]
+fn siege_front_face_entry_still_chooses_protector() {
+    use engine::game::scenario_db::GameScenarioDbExt;
+    use engine::types::game_state::CastPaymentMode;
+    use engine::types::mana::{ManaType, ManaUnit};
+
+    let Some(db) = crate::support::shared_card_db() else {
+        eprintln!("skipping: card database unavailable");
+        return;
+    };
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let siege = scenario.add_real_card(P0, "Invasion of Azgol", Zone::Hand, db);
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Black, siege, false, Vec::new()),
+            ManaUnit::new(ManaType::Red, siege, false, Vec::new()),
+        ],
+    );
+    let mut runner = scenario.build();
+    engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+
+    let card_id = runner.state().objects[&siege].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: siege,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("cast Invasion of Azgol");
+
+    let mut chose = false;
+    for _ in 0..16 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::ManaPayment { .. } => {
+                runner.act(GameAction::PassPriority).expect("pay from pool");
+            }
+            WaitingFor::Priority { .. } if !runner.state().stack.is_empty() => {
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("resolve the Siege");
+            }
+            WaitingFor::NamedChoice { options, .. } => {
+                assert_eq!(options.len(), 1, "2 players: one opponent to choose");
+                runner
+                    .act(GameAction::ChooseOption {
+                        choice: options[0].clone(),
+                    })
+                    .expect("choose the protector");
+                chose = true;
+                break;
+            }
+            other => panic!("unexpected waiting state casting the Siege: {other:?}"),
+        }
+    }
+    assert!(
+        chose,
+        "CR 310.12a: the front-face entry asks for a protector"
+    );
+    let obj = &runner.state().objects[&siege];
+    assert_eq!(obj.zone, Zone::Battlefield);
+    assert!(!obj.transformed);
+    assert_eq!(obj.protector(), Some(P1));
+}

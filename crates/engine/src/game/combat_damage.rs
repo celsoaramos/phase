@@ -64,9 +64,13 @@ fn process_combat_damage_triggers(
     // Steps 2-4: SBA/trigger loop per CR 704.3.
     // SBAs may generate events (ZoneChanged for dying creatures) that need trigger
     // processing (dies triggers). Repeat until no new SBAs and no new triggers.
+    // CR 510.3a + CR 704.5v: the collected `pending` batch has triggered but not
+    // yet been put on the stack, so the SBAs must see it — a Siege whose last
+    // defense counter was removed by combat damage is the source of its
+    // CR 310.12b victory trigger and stays on the battlefield for it.
     loop {
         let events_before = all_events.len();
-        sba::check_state_based_actions(state, all_events);
+        sba::check_state_based_actions_with_waiting_triggers(state, all_events, &pending);
 
         // If SBAs generated new events, process triggers for those events.
         if all_events.len() > events_before {

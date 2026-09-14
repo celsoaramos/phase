@@ -97,6 +97,20 @@ fn mid_resolution_entry_pauses_sba(state: &GameState) -> bool {
 /// CR 704.3: Run state-based actions in a fixpoint loop until no more actions are performed,
 /// capped at MAX_SBA_ITERATIONS.
 pub fn check_state_based_actions(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    check_state_based_actions_with_waiting_triggers(state, events, &[]);
+}
+
+/// CR 704.3 + CR 510.3a: the SBA fixpoint loop for a caller that has collected
+/// triggered abilities it has not yet put on the stack (combat damage collects
+/// its batch, then performs SBAs, then places the batch). `waiting` is that
+/// collected batch: CR 704.5v spares a Siege that is the source of an ability
+/// that has triggered but not yet left the stack, and such an ability has not
+/// left the stack while it is still waiting to be put there.
+pub(crate) fn check_state_based_actions_with_waiting_triggers(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    waiting: &[crate::game::triggers::PendingTriggerContext],
+) {
     // CR 604.2: Re-evaluate layers so computed P/T reflects current static abilities.
     if state.layers_dirty.is_dirty() {
         // Snapshot P/T before layer re-evaluation for delta logging.
@@ -256,7 +270,13 @@ pub fn check_state_based_actions(state: &mut GameState, events: &mut Vec<GameEve
             // ability that has triggered but not yet left the stack is put into its
             // owner's graveyard. CR 704.5w + CR 310.8: a non-Siege battle with defense 0
             // is put into its owner's graveyard with no such deferral.
-            check_zero_defense(state, events, &mut any_performed, &battlefield_snapshot);
+            check_zero_defense(
+                state,
+                events,
+                &mut any_performed,
+                &battlefield_snapshot,
+                waiting,
+            );
             if mid_resolution_entry_pauses_sba(state) {
                 return;
             }
@@ -1811,9 +1831,8 @@ fn check_zero_defense(
     events: &mut Vec<GameEvent>,
     any_performed: &mut bool,
     battlefield_snapshot: &[ObjectId],
+    waiting: &[crate::game::triggers::PendingTriggerContext],
 ) {
-    use crate::types::game_state::StackEntryKind;
-
     let to_destroy: Vec<_> = battlefield_snapshot
         .iter()
         .copied()
@@ -1836,13 +1855,7 @@ fn check_zero_defense(
             // CR 704.5v: a Siege is spared while one of its own abilities has
             // triggered but not yet left the stack (mirrors the CR 714.4 Saga
             // deferral), so its CR 310.12b victory trigger can resolve.
-            let ability_on_stack = state.stack.iter().any(|entry| {
-                matches!(
-                    &entry.kind,
-                    StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == *id
-                )
-            });
-            !ability_on_stack
+            !is_source_of_waiting_trigger(state, *id, waiting)
         })
         .collect();
 
@@ -1862,6 +1875,36 @@ fn check_zero_defense(
     // these permanents left the battlefield together — record the group so
     // co-departing leaves-the-battlefield/dies observers observe each other.
     zones::mark_simultaneous_departures(events, &zones::departed_subset(state, &performed_ids));
+}
+
+/// CR 704.5v: is `id` "the source of an ability that has triggered but not yet
+/// left the stack"? An ability has triggered from the moment its trigger event
+/// occurs (CR 603.2), and it has not left the stack whether it is already on the
+/// stack or still waiting to be put there the next time a player would receive
+/// priority (CR 704.3 + CR 510.3a). The waiting half lives in two places:
+/// the engine-wide `deferred_triggers` queue, and a caller's locally collected
+/// batch (`waiting`) that it performs SBAs before placing.
+fn is_source_of_waiting_trigger(
+    state: &GameState,
+    id: ObjectId,
+    waiting: &[crate::game::triggers::PendingTriggerContext],
+) -> bool {
+    use crate::types::game_state::StackEntryKind;
+
+    let on_stack = state.stack.iter().any(|entry| {
+        matches!(
+            &entry.kind,
+            StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == id
+        )
+    });
+    on_stack
+        || state
+            .deferred_triggers
+            .iter()
+            .any(|context| context.pending.source_id == id)
+        || waiting
+            .iter()
+            .any(|context| context.pending.source_id == id)
 }
 
 /// CR 704.5p (+ CR 310.10 for the battle half): the full "this permanent may not
@@ -4622,6 +4665,142 @@ mod tests {
             );
         }
         id
+    }
+
+    /// A battle at defense 0 controlled by P0. `siege` gives it the Siege
+    /// battle type (protected by P1); otherwise it has no battle type and P0
+    /// protects it (CR 310.9a), so CR 704.5x has nothing to reassign.
+    fn create_zero_defense_battle(state: &mut GameState, siege: bool) -> ObjectId {
+        use crate::types::ability::ChosenAttribute;
+
+        let id = create_object(
+            state,
+            CardId(1),
+            PlayerId(0),
+            "Zero Defense Battle".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Battle);
+        let protector = if siege {
+            obj.card_types.subtypes.push("Siege".to_string());
+            PlayerId(1)
+        } else {
+            PlayerId(0)
+        };
+        obj.base_card_types = obj.card_types.clone();
+        obj.defense = Some(0);
+        obj.base_defense = Some(0);
+        obj.chosen_attributes
+            .push(ChosenAttribute::Player(protector));
+        id
+    }
+
+    /// A triggered ability of `source` that has triggered but has not been put
+    /// on the stack.
+    fn waiting_trigger_of(source: ObjectId) -> crate::game::triggers::PendingTriggerContext {
+        use crate::game::triggers::{PendingTrigger, PendingTriggerContext};
+        use crate::types::ability::{Effect, ResolvedAbility};
+
+        PendingTriggerContext::single(PendingTrigger::ordinary(
+            source,
+            PlayerId(0),
+            None,
+            Box::new(ResolvedAbility::new(
+                Effect::Unimplemented {
+                    name: "victory".into(),
+                    description: None,
+                },
+                vec![],
+                source,
+                PlayerId(0),
+            )),
+            0,
+        ))
+    }
+
+    /// CR 704.5v + CR 510.3a: a 0-defense Siege whose ability has triggered but
+    /// is still in the caller's collected batch (combat damage performs SBAs
+    /// before placing that batch) has not left the stack, so it is spared.
+    ///
+    /// REVERT-PROBE: drop the `waiting` arm of `is_source_of_waiting_trigger`
+    /// ⇒ the Siege goes to the graveyard.
+    #[test]
+    fn zero_defense_siege_spared_by_waiting_trigger_batch() {
+        let mut state = setup();
+        let id = create_zero_defense_battle(&mut state, true);
+
+        let mut events = Vec::new();
+        check_state_based_actions_with_waiting_triggers(
+            &mut state,
+            &mut events,
+            &[waiting_trigger_of(id)],
+        );
+
+        assert!(state.battlefield.contains(&id));
+        assert_eq!(state.objects[&id].zone, Zone::Battlefield);
+    }
+
+    /// CR 704.5v + CR 704.3: a triggered ability parked in `deferred_triggers`
+    /// has triggered and not yet left the stack, so its 0-defense Siege source
+    /// is spared.
+    ///
+    /// REVERT-PROBE: drop the `deferred_triggers` arm ⇒ graveyard.
+    #[test]
+    fn zero_defense_siege_spared_by_deferred_trigger() {
+        let mut state = setup();
+        let id = create_zero_defense_battle(&mut state, true);
+        state.deferred_triggers.push(waiting_trigger_of(id));
+
+        let mut events = Vec::new();
+        check_state_based_actions(&mut state, &mut events);
+
+        assert!(state.battlefield.contains(&id));
+        assert_eq!(state.objects[&id].zone, Zone::Battlefield);
+    }
+
+    /// CR 704.5v: only an ability whose SOURCE is the Siege spares it — a
+    /// waiting trigger of another object does not.
+    #[test]
+    fn zero_defense_siege_not_spared_by_other_sources_trigger() {
+        let mut state = setup();
+        let id = create_zero_defense_battle(&mut state, true);
+        let other = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Other Source".to_string(),
+            Zone::Battlefield,
+        );
+
+        let mut events = Vec::new();
+        check_state_based_actions_with_waiting_triggers(
+            &mut state,
+            &mut events,
+            &[waiting_trigger_of(other)],
+        );
+
+        assert!(!state.battlefield.contains(&id));
+        assert_eq!(state.objects[&id].zone, Zone::Graveyard);
+    }
+
+    /// CR 704.5w: a non-Siege battle at defense 0 has no deferral, so its own
+    /// waiting trigger does not spare it.
+    #[test]
+    fn zero_defense_non_siege_battle_dies_despite_waiting_trigger() {
+        let mut state = setup();
+        let id = create_zero_defense_battle(&mut state, false);
+        state.deferred_triggers.push(waiting_trigger_of(id));
+
+        let mut events = Vec::new();
+        check_state_based_actions_with_waiting_triggers(
+            &mut state,
+            &mut events,
+            &[waiting_trigger_of(id)],
+        );
+
+        assert!(!state.battlefield.contains(&id));
+        assert_eq!(state.objects[&id].zone, Zone::Graveyard);
     }
 
     #[test]
