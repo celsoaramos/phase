@@ -97,6 +97,19 @@ pub fn parse_additional_cost_line(lower: &str, raw: &str) -> Option<AdditionalCo
                 repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
             });
         }
+        // CR 601.2b + CR 601.2f: an optional additional cost the parser cannot read
+        // stays optional. Falling through would hand the body, "you may" included, to
+        // the " or " splits below, which can accept it as a mandatory `Choice`
+        // (Dragon's Fire: "you may reveal a Dragon card from your hand or choose a
+        // Dragon you control"). Same value as the honest-decline tail below.
+        if names_this_spell {
+            return Some(AdditionalCost::Optional {
+                cost: AbilityCost::Unimplemented {
+                    description: opt_raw.to_string(),
+                },
+                repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
+            });
+        }
     }
 
     // "X or pay {M}" → Choice between cost X and mana payment.
@@ -1280,6 +1293,64 @@ Trample";
                     .any(|tf| matches!(tf, TypeFilter::Subtype(name) if name == "Dragon")));
             }
             other => panic!("Expected Optional(Behold Dragon), got {other:?}"),
+        }
+    }
+
+    /// CR 601.2b + CR 601.2f: an optional additional cost whose body the parser
+    /// cannot read stays optional instead of becoming a mandatory `Choice`.
+    #[test]
+    fn parse_additional_cost_optional_disjunction_stays_optional_unimplemented() {
+        let lower = "as an additional cost to cast this spell, you may reveal a dragon card from your hand or choose a dragon you control.";
+        let raw = "As an additional cost to cast this spell, you may reveal a Dragon card from your hand or choose a Dragon you control.";
+        let result = parse_additional_cost_line(lower, raw);
+        assert!(
+            !matches!(result, Some(AdditionalCost::Choice(..))),
+            "Dragon's Fire's optional cost must not become a mandatory Choice: {result:?}"
+        );
+        match result {
+            Some(AdditionalCost::Optional {
+                cost: AbilityCost::Unimplemented { description },
+                repeatability: AdditionalCostRepeatability::Once,
+            }) => assert_eq!(
+                description,
+                "reveal a Dragon card from your hand or choose a Dragon you control"
+            ),
+            other => panic!("Expected Optional(Unimplemented), got {other:?}"),
+        }
+
+        // Reach guard: a readable optional reveal still returns the parsed cost.
+        let lower =
+            "as an additional cost to cast this spell, you may reveal a dragon card from your hand.";
+        let raw =
+            "As an additional cost to cast this spell, you may reveal a Dragon card from your hand.";
+        match parse_additional_cost_line(lower, raw) {
+            Some(AdditionalCost::Optional {
+                cost:
+                    AbilityCost::Reveal {
+                        count: 1,
+                        filter: Some(TargetFilter::Typed(filter)),
+                    },
+                repeatability: AdditionalCostRepeatability::Once,
+            }) => assert_eq!(filter.get_subtype(), Some("Dragon")),
+            other => panic!("Expected Optional(Reveal Dragon), got {other:?}"),
+        }
+
+        // Reach guard: a non-optional "or pay" disjunction is untouched.
+        let lower =
+            "as an additional cost to cast this spell, reveal a pirate card from your hand or pay {2}.";
+        let raw =
+            "As an additional cost to cast this spell, reveal a Pirate card from your hand or pay {2}.";
+        match parse_additional_cost_line(lower, raw) {
+            Some(AdditionalCost::Choice(
+                AbilityCost::Reveal {
+                    count: 1,
+                    filter: Some(TargetFilter::Typed(filter)),
+                },
+                AbilityCost::Mana {
+                    cost: ManaCost::Cost { generic: 2, .. },
+                },
+            )) => assert_eq!(filter.get_subtype(), Some("Pirate")),
+            other => panic!("Expected Choice(Reveal Pirate, Mana {{2}}), got {other:?}"),
         }
     }
 
