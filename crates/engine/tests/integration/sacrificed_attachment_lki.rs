@@ -424,3 +424,37 @@ fn aura_destroyed_in_response_still_pumps_its_last_host() {
         (Some(2), Some(2))
     );
 }
+
+/// CR 400.7: the host is blinked (Battlefield -> Exile -> Battlefield, Cloudshift)
+/// between activation and resolution. It keeps its storage id but is a NEW object,
+/// not the creature the Aura enchanted, so Uneasy Alliance must not exile it. The
+/// rest of the ability (the Ninja) still resolves.
+#[test]
+fn uneasy_alliance_does_not_exile_blinked_host() {
+    let mut b = board(Kind::Aura, "Uneasy Alliance", UNEASY_ALLIANCE, 5);
+    activate_sacrifice(&mut b);
+    let incarnation_before = b.runner.state().objects[&b.host].incarnation;
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(b.runner.state_mut(), b.host, Zone::Exile, &mut events);
+    engine::game::zones::move_to_zone(b.runner.state_mut(), b.host, Zone::Battlefield, &mut events);
+    assert_eq!(
+        b.runner.state().objects[&b.host].zone,
+        Zone::Battlefield,
+        "reach-guard: the host is back on the battlefield"
+    );
+    assert_ne!(
+        b.runner.state().objects[&b.host].incarnation,
+        incarnation_before,
+        "reach-guard: the returned host is a new object with the same storage id"
+    );
+    b.runner.advance_until_stack_empty();
+
+    let state = b.runner.state();
+    assert_eq!(
+        state.objects[&b.host].zone,
+        Zone::Battlefield,
+        "the blinked host is a new object (CR 400.7) and must not be exiled"
+    );
+    assert_eq!(state.objects[&b.other].zone, Zone::Battlefield);
+    assert_eq!(ninjas(&b.runner), 1, "the Ninja is still created");
+}

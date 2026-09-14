@@ -5429,9 +5429,17 @@ fn attached_to_source_referent(
 /// was sacrificed as the ability's own cost, CR 602.2b + CR 601.2h). That successor
 /// incarnation is read from the next row naming the object or, absent one, from
 /// the live object — never derived by arithmetic. A row with no identity context
-/// fails closed. Without an ability (a continuous effect reading its source) the
-/// last departure row answers directly. `zone_changes_this_turn` is cleared each
-/// turn, which is the per-turn ceiling every ledger consumer shares.
+/// fails closed, and so does a read with no resolving ability (there is no source
+/// incarnation to bind the row to).
+///
+/// CR 400.7: the answer names the host OBJECT as it existed when the source left.
+/// `AttachTarget::Object` carries only the storage id, which a zone move keeps, so a
+/// host that itself left the battlefield after that departure (blinked by
+/// Cloudshift, or simply died) is a new object the ability must not find: any later
+/// battlefield-origin row for the host fails the look-back closed. A host that left
+/// BEFORE the source would already have unattached it (CR 704.5m/n), so only later
+/// rows matter. `zone_changes_this_turn` is cleared each turn, which is the per-turn
+/// ceiling every ledger consumer shares.
 fn departed_source_attached_to(
     state: &GameState,
     source_id: ObjectId,
@@ -5442,9 +5450,7 @@ fn departed_source_attached_to(
         .iter()
         .rposition(|row| row.object_id == source_id && row.from_zone == Some(Zone::Battlefield))?;
     let departure = &rows[index];
-    let Some(captured) = ability.and_then(|ability| ability.source_incarnation) else {
-        return departure.attached_to;
-    };
+    let captured = ability.and_then(|ability| ability.source_incarnation)?;
     let incarnation_of = |row: &ZoneChangeRecord| {
         row.trigger_source_context()
             .map(|context| context.identity.reference.incarnation)
@@ -5458,9 +5464,20 @@ fn departed_source_attached_to(
         Some(next) => incarnation_of(next),
         None => state.objects.get(&source_id).map(|obj| obj.incarnation),
     };
-    (captured == departed || successor == Some(captured))
-        .then_some(departure.attached_to)
-        .flatten()
+    if captured != departed && successor != Some(captured) {
+        return None;
+    }
+    let host = departure.attached_to?;
+    if let Some(host_id) = host.as_object() {
+        let host_left_since = rows
+            .iter()
+            .skip(index + 1)
+            .any(|row| row.object_id == host_id && row.from_zone == Some(Zone::Battlefield));
+        if host_left_since {
+            return None;
+        }
+    }
+    Some(host)
 }
 
 fn source_context_from_filter<'a>(
@@ -5518,9 +5535,19 @@ fn source_context_from_filter<'a>(
             // left the battlefield (Uneasy Alliance sacrificed as its own cost) is the
             // object it was attached to as it last existed there. The live back-reference
             // was cleared by the zone-exit sever, so read the departure row instead.
+            // Only an Aura or Equipment has an "enchanted/equipped" referent, so the
+            // ledger scan is skipped for every other off-battlefield source (hand and
+            // stack spells enumerated per candidate).
             let attached_to = match source_obj {
                 Some(source) if source.zone == Zone::Battlefield => source.attached_to,
-                _ => departed_source_attached_to(state, source_id, ability),
+                _ if lki
+                    .subtypes
+                    .iter()
+                    .any(|subtype| subtype == "Aura" || subtype == "Equipment") =>
+                {
+                    departed_source_attached_to(state, source_id, ability)
+                }
+                _ => None,
             };
             (
                 lki,
