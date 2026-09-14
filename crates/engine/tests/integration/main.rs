@@ -1111,6 +1111,7 @@ mod resolution_optional_payments;
 mod resolve_all_consent;
 mod retarget_prompt_softlock;
 mod rev_tithe_extractor_facedown_cast;
+mod reveal_hand_article_only_card_choice;
 mod revealed_card_type_disjunction_518;
 mod rhys_evermore_remove_counters;
 mod riot_control_regression;
