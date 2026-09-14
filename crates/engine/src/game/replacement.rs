@@ -7107,12 +7107,19 @@ fn object_replacement_candidate_applies(
     {
         return false;
     }
-    // CR 712.14a + CR 714.3a: A Saga exiled by its final chapter and returned
-    // transformed enters showing its creature back face. Its front-face
-    // intrinsic lore replacement must not apply to that entry; otherwise NEO
-    // transforming Sagas such as Fable and Kumano return with a stray lore
-    // counter. A transformed back face that actually is a Saga still receives
-    // its intrinsic lore counter through the entry pipeline.
+    // CR 614.12 + CR 712.8e + CR 712.14a: A double-faced card put onto the
+    // battlefield (or cast) transformed enters with its back face up, so the
+    // self "as this enters" replacements that apply are the ones its BACK face
+    // has — CR 614.12 checks the characteristics the permanent would have on
+    // the battlefield. While the card is still in exile or on the stack its
+    // object carries the front face's definitions, so a front-face self entry
+    // replacement the back face does not also have must not apply. Motivating
+    // cases: a Saga exiled by its final chapter returns transformed (Fable,
+    // Kumano) without its front face's intrinsic lore counter (CR 714.3a),
+    // and a Siege cast transformed after its defeat (CR 310.12b) does not
+    // choose a protector for a back face that is not a battle (CR 310.12a).
+    // A back face that is itself a Saga carries its own lore replacement, so it
+    // still receives its lore counter through the entry pipeline.
     if is_entering
         && matches!(
             event,
@@ -7121,24 +7128,17 @@ fn object_replacement_candidate_applies(
                 ..
             }
         )
-        && obj.back_face.as_ref().is_some_and(|back| {
-            !back
-                .card_types
-                .subtypes
-                .iter()
-                .any(|subtype| subtype == "Saga")
-        })
         && repl_def.event == ReplacementEvent::Moved
         && repl_def.destination_zone == Some(Zone::Battlefield)
         && matches!(repl_def.valid_card, Some(TargetFilter::SelfRef))
-        && matches!(
-            repl_def.execute.as_ref().map(|execute| &*execute.effect),
-            Some(Effect::PutCounter {
-                counter_type: CounterType::Lore,
-                target: TargetFilter::SelfRef,
-                ..
-            })
-        )
+        && !obj.transformed
+        && obj.back_face.as_ref().is_some_and(|back| {
+            !back
+                .replacement_definitions
+                .as_slice()
+                .iter()
+                .any(|back_def| back_def == repl_def)
+        })
     {
         return false;
     }
