@@ -1124,6 +1124,7 @@ mod run_for_your_life_escape;
 mod runadi_behemoth_caller_etb_counters;
 mod runaway_steam_kin_fewer_than_counters;
 mod runo_stromkirk_reveal_transform_gate;
+mod sacrificed_attachment_lki;
 mod saddle_become_effect;
 mod saddle_state_model;
 mod saruman_white_hand_amass;
