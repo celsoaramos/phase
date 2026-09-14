@@ -37,6 +37,9 @@ const SPOROGENIC_ORACLE: &str = "Enchant creature\nWhen this Aura enters, target
 const DUE_DILIGENCE_NAME: &str = "Due Diligence";
 const DUE_DILIGENCE_ORACLE: &str = "Enchant creature\nWhen this Aura enters, target creature you control other than enchanted creature gets +2/+2 and gains vigilance until end of turn.\nEnchanted creature gets +2/+2 and has vigilance.";
 
+const SECRET_INVASION_NAME: &str = "Secret Invasion";
+const SECRET_INVASION_ORACLE: &str = "Enchant creature you control\nWhen this Aura enters, exile up to one target creature other than enchanted creature until this Aura leaves the battlefield. Enchanted creature becomes a copy of that creature until this Aura leaves the battlefield.\nEnchanted creature has ward {2}.";
+
 const KJELDORAN_PRIDE_NAME: &str = "Kjeldoran Pride";
 const KJELDORAN_PRIDE_ORACLE: &str = "Enchant creature\nEnchanted creature gets +1/+2.\n{2}{U}: Attach this Aura to target creature other than enchanted creature.";
 
@@ -327,5 +330,65 @@ fn kjeldoran_pride_reattach_targets_every_creature_but_host() {
     assert!(
         state.players[0].mana_pool.mana.is_empty(),
         "the {{2}}{{U}} cost was paid"
+    );
+}
+
+/// CR 115.1d + CR 601.2c via CR 603.3d + CR 303.4b: Secret Invasion's enters
+/// trigger has an optional ("up to one") target slot for a creature other than
+/// the one the Aura enchants. The slot offers every other creature but not the
+/// host, and announcing zero targets is legal: nothing is exiled and the Aura
+/// stays on its host.
+#[test]
+fn secret_invasion_up_to_one_target_excludes_host_and_allows_zero() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let host = scenario.add_creature(P0, "Host", 2, 2).id();
+    let x = scenario.add_creature(P1, "X", 3, 3).id();
+    let mut builder = scenario.add_creature_to_hand(P0, SECRET_INVASION_NAME, 0, 0);
+    builder
+        .as_enchantment()
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(ManaCost::zero())
+        .from_oracle_text_with_keywords(&["Enchant creature you control"], SECRET_INVASION_ORACLE);
+    let aura = builder.id();
+    let mut runner = scenario.build();
+
+    {
+        let _committed = runner.cast(aura).target_object(host).commit();
+    }
+    runner.resolve_top();
+    match &runner.state().waiting_for {
+        WaitingFor::TriggerTargetSelection { target_slots, .. } => {
+            assert_eq!(target_slots.len(), 1);
+            assert_eq!(
+                target_slots[0].legal_targets,
+                vec![TargetRef::Object(x)],
+                "X is offered and the enchanted host is not"
+            );
+            assert!(
+                target_slots[0].optional,
+                "\"up to one\" allows zero targets"
+            );
+        }
+        other => panic!("expected the trigger target prompt, got {other:?}"),
+    }
+
+    runner
+        .act(GameAction::ChooseTarget { target: None })
+        .expect("choosing zero targets is legal for \"up to one\"");
+    runner.advance_until_stack_empty();
+    let state = runner.state();
+    assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+    assert!(state.stack.is_empty());
+    assert_eq!(
+        state.objects[&x].zone,
+        Zone::Battlefield,
+        "nothing was exiled"
+    );
+    assert_eq!(state.objects[&host].zone, Zone::Battlefield);
+    assert_eq!(
+        state.objects[&aura].attached_to,
+        Some(AttachTarget::Object(host)),
+        "the Aura stays on its host"
     );
 }
