@@ -19321,9 +19321,9 @@ declare_game_state! {
     /// persisting or not, and not resolution-scoped) and from the source's
     /// `ChosenAttribute::Color` history (which CR 607.2d readers own).
     ///
-    /// Written only on the exact-object binding path, so a `persist: false`
-    /// printed `Choose a color.` — the F1 class — still writes nothing and
-    /// still resolves to a no-op. That gate is what keeps F1 out of this change.
+    /// Written for every `ChoiceType::Color` answer, including a `persist: false`
+    /// printed `Choose a color.` (Brave the Elements), whose in-chain
+    /// "the chosen color" grant reads it here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chosen_color_this_resolution: Option<crate::types::mana::ManaColor>,
 

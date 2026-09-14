@@ -256,8 +256,6 @@ pub(crate) fn bind_named_choice(
         .as_deref()
         .filter(|source| source.is_exact_object_and_resolution())
         .cloned();
-    let persisting_color_answer =
-        exact_object_source.is_some() && matches!(choice_type, ChoiceType::Color { .. });
     if let Some(pid) = persist_player {
         // CR 607.2d / CR 607.2m (by analogy): per-player anchor. Unlike an
         // object's `chosen_attributes` (which accumulates a history — The
@@ -344,10 +342,15 @@ pub(crate) fn bind_named_choice(
 
     // CR 608.2d then CR 607.2d: record the colour THIS
     // resolution announced, for `resolution_chosen_color`'s primary read.
-    // Gated on the exact-object binding captured above, so a `persist: false`
-    // printed `Choose a color.` (the F1 class) still writes nothing here and
-    // still falls through to `resolution_chosen_color`'s fallback.
-    if persisting_color_answer {
+    // Written for EVERY colour answer, persisting or not: a printed
+    // `Choose a color.` lowers `persist: false` (Brave the Elements, Akroma's
+    // Blessing, Glory), writes no `ChosenAttribute::Color` onto its source, and
+    // its "the chosen color" grant has no other place to read the answer from.
+    // Gating this on the exact-object binding left that grant unresolved, so
+    // the layer applier dropped the protection (CR 609.3 is not a licence to
+    // lose a choice the player actually made). Cleared per top-level
+    // resolution in `effects::resolve_ability_chain`.
+    if matches!(choice_type, ChoiceType::Color { .. }) {
         state.chosen_color_this_resolution = ChoiceValue::from_choice(choice_type, choice)
             .and_then(|value| match value {
                 ChoiceValue::Color(color) => Some(color),
