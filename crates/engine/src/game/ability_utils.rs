@@ -2235,7 +2235,14 @@ fn validate_pinned_targets(
     filter: &TargetFilter,
     ability: &ResolvedAbility,
 ) -> Vec<TargetRef> {
-    targeting::validate_targets_for_ability(state, targets, filter, ability)
+    // CR 608.2b + CR 115.4: a damage "any target" is rechecked against the same
+    // creature/player/planeswalker/battle domain it was chosen from, in addition
+    // to the ordinary ability-context legality check (narrowing only).
+    let mut legal = targeting::validate_targets_for_ability(state, targets, filter, ability);
+    if let Some(domain) = damage_any_target_legal_targets(state, ability, filter) {
+        legal.retain(|t| domain.contains(t));
+    }
+    legal
         .into_iter()
         .filter(|target| target_is_current(ability, target, state))
         .collect()
@@ -2836,6 +2843,18 @@ impl<'a> DamageReplacementTargetRole<'a> {
             Self::DeclaredSource(filter)
             | Self::OriginalRecipient(filter)
             | Self::RedirectRecipient(filter) => filter,
+        }
+    }
+
+    /// CR 115.4: "any target" is a creature, player, planeswalker or battle.
+    /// Only a redirect recipient can be an "any target" damage recipient here:
+    /// a declared source is chosen under CR 609.7a, and an original recipient
+    /// is hosted on its chosen object (`chosen_target_object`), so no producer
+    /// may emit `Any` for either.
+    pub(crate) fn denotes_damage_any_target(self) -> bool {
+        match self {
+            Self::RedirectRecipient(filter) => matches!(filter, TargetFilter::Any),
+            Self::DeclaredSource(_) | Self::OriginalRecipient(_) => false,
         }
     }
 }
@@ -6901,24 +6920,34 @@ fn legal_targets_for_selected_slot(
     exclude_cost_paid_object_that_left_battlefield(state, ability, legal)
 }
 
+/// CR 115.4: "any target" is a creature, player, planeswalker or battle.
+/// Single authority for which declared damage slots use that domain.
+fn effect_slot_denotes_damage_any_target(effect: &Effect, filter: &TargetFilter) -> bool {
+    if !matches!(filter, TargetFilter::Any) {
+        return false;
+    }
+    match effect {
+        Effect::DealDamage { target, .. } => matches!(target, TargetFilter::Any),
+        Effect::CreateDamageReplacement { .. } => damage_replacement_target_roles(effect)
+            .is_some_and(|roles| {
+                roles
+                    .into_iter()
+                    .any(DamageReplacementTargetRole::denotes_damage_any_target)
+            }),
+        _ => false,
+    }
+}
+
 fn damage_any_target_legal_targets(
     state: &GameState,
     ability: &ResolvedAbility,
     filter: &TargetFilter,
 ) -> Option<Vec<TargetRef>> {
-    if !matches!(
-        (&ability.effect, filter),
-        (
-            Effect::DealDamage {
-                target: TargetFilter::Any,
-                ..
-            },
-            TargetFilter::Any
-        )
-    ) {
+    if !effect_slot_denotes_damage_any_target(&ability.effect, filter) {
         return None;
     }
 
+    // CR 115.4: "any target" is a creature, player, planeswalker or battle
     let player_targets = targeting::find_legal_targets(
         state,
         &TargetFilter::Player,
@@ -19066,7 +19095,7 @@ mod tests {
                 combat_scope: None,
                 target_filter: None,
                 modification: None,
-                redirect_to: Some(DamageRedirectTarget::ChosenObjectTarget),
+                redirect_to: Some(DamageRedirectTarget::ChosenTarget),
                 redirect_amount: None,
                 redirect_object_filter: Some(creature_filter()),
                 recipient_object_filter: None,
@@ -19148,7 +19177,8 @@ mod tests {
 
     /// Ordering contract (Nit 1): when BOTH filters are present the recipient
     /// slot is surfaced FIRST, then the redirect slot — matching the resolver's
-    /// `chosen_target_object(_, 0)` / `chosen_redirect_object` indexing.
+    /// `chosen_target_object(_, 0)` recipient read and its positional
+    /// `ability.targets.get(redirect_slot)` redirect-recipient read.
     #[test]
     fn build_target_slots_recipient_slot_precedes_redirect_slot() {
         use crate::types::ability::DamageRedirectTarget;
@@ -19178,7 +19208,7 @@ mod tests {
                 combat_scope: None,
                 target_filter: None,
                 modification: None,
-                redirect_to: Some(DamageRedirectTarget::ChosenObjectTarget),
+                redirect_to: Some(DamageRedirectTarget::ChosenTarget),
                 redirect_amount: None,
                 redirect_object_filter: Some(creature_filter()),
                 recipient_object_filter: Some(creature_filter()),
@@ -19194,6 +19224,93 @@ mod tests {
             2,
             "recipient + redirect slots must both surface when both filters are set"
         );
+    }
+
+    /// CR 608.2b + CR 115.4 (secondary seam — the shared resolution recheck):
+    /// `validate_pinned_targets` narrows a damage "any target" to the
+    /// creature/player/planeswalker/battle domain for BOTH declaring effects
+    /// that use it. A noncreature artifact still on the battlefield is dropped;
+    /// a creature (positive control) is kept. Reverting the domain intersection
+    /// in `validate_pinned_targets` keeps the artifact for both effects.
+    #[test]
+    fn validate_targets_in_chain_rechecks_damage_any_target_domain() {
+        use crate::types::ability::{
+            DamageRedirectTarget, PreventionAmount, QuantityExpr, RedirectionLifetime,
+        };
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".into(),
+            Zone::Battlefield,
+        );
+        let artifact = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Probe Rock".into(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&artifact)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Artifact];
+        let creature = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Bear".into(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&creature)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+
+        let deal_damage = Effect::DealDamage {
+            amount: QuantityExpr::Fixed { value: 3 },
+            target: TargetFilter::Any,
+            damage_source: None,
+            excess: None,
+        };
+        let redirect = Effect::CreateDamageReplacement {
+            redirect_lifetime: RedirectionLifetime::OneOpportunity,
+            source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
+            combat_scope: None,
+            target_filter: None,
+            modification: None,
+            redirect_to: Some(DamageRedirectTarget::ChosenTarget),
+            redirect_amount: Some(PreventionAmount::Next(2)),
+            redirect_object_filter: Some(TargetFilter::Any),
+            recipient_object_filter: None,
+        };
+
+        for (label, effect) in [
+            ("DealDamage", deal_damage),
+            ("CreateDamageReplacement", redirect),
+        ] {
+            let kept = |target: TargetRef| {
+                validate_targets_in_chain(
+                    &state,
+                    &ResolvedAbility::new(effect.clone(), vec![target], source, PlayerId(0)),
+                )
+                .targets
+            };
+            assert_eq!(
+                kept(TargetRef::Object(creature)),
+                vec![TargetRef::Object(creature)],
+                "{label}: a creature stays a legal damage 'any target' on resolution"
+            );
+            assert!(
+                kept(TargetRef::Object(artifact)).is_empty(),
+                "{label}: CR 115.4 — a noncreature artifact is not a legal 'any target'"
+            );
+        }
     }
 
     /// Spawn `count` creatures on the battlefield controlled by `controller`.
