@@ -17888,6 +17888,8 @@ fn try_parse_return_opponent_choice_from_graveyard(text: &str) -> Option<ParsedE
     // CR 400.7: The chosen card changes zones from its owner's graveyard to hand.
     // CR 608.2d: "of an opponent's choice" is a resolution-time card choice.
     let filter = add_inferred_origin_constraints_to_target(target, Some(Zone::Graveyard), &lower);
+    // CR 608.2d: the pool is the whole graveyard ("from your graveyard"), not the
+    // set a preceding mill published (Tasigur, the Golden Fang mills first).
     let mut clause = parsed_clause(Effect::ChooseFromZone {
         count: 1,
         zone: Zone::Graveyard,
@@ -17895,7 +17897,7 @@ fn try_parse_return_opponent_choice_from_graveyard(text: &str) -> Option<ParsedE
         zone_owner: ZoneOwner::Controller,
         filter: Some(filter),
         chooser: Chooser::Opponent.into(),
-        candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+        candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Direct,
         reciprocal_role: None,
         up_to: false,
         selection: crate::types::ability::CardSelectionMode::Chosen,
@@ -22673,12 +22675,48 @@ fn rebind_reanimate_animation_until_leaves(def: &mut AbilityDefinition) {
 /// during-resolution cast (CR 608.2g). The `parent_target_is_chosen` bool is the
 /// `.is_some()` of this result.
 fn chain_prior_chosen_target(clauses: &[ClauseIr]) -> Option<&TargetFilter> {
+    let mut moved_chosen_card = false;
     for prev in clauses.iter().rev() {
         if prev.condition.is_some() {
             return None;
         }
         if let Effect::TargetOnly { target } = &prev.parsed.effect {
             return Some(target);
+        }
+        // CR 608.2c + CR 601.2a: a resolution-time CHOICE of a card left in a
+        // non-exile zone ("choose an instant or sorcery card in your graveyard.
+        // You may cast it this turn." — Mission Briefing) selects its referent
+        // exactly like Emry's `TargetOnly`: the chosen card stays where it is and
+        // the anaphor must bind to it (`CastFromZone { ParentTarget }`, whose
+        // choice resumes with the pick as the chain's targets). A choice made
+        // among cards in EXILE (End-Blaze Epiphany, Author of Shadows) keeps the
+        // tracked exile set its `PlayFromExile { TrackedSet }` grant reads.
+        //
+        // CR 400.7: if a later clause already MOVED the chosen card ("choose a
+        // nonland card from that player's graveyard or hand and exile it. You may
+        // cast that card …" — Psychic Intrusion), the card is a new object in
+        // exile and the anaphor is that exile publish, so the tracked-set grant
+        // stays; `moved_chosen_card` records that the walk passed such a move.
+        if let Effect::ChooseFromZone {
+            zone,
+            additional_zones,
+            filter,
+            ..
+        } = &prev.parsed.effect
+        {
+            let chooses_outside_exile = std::iter::once(zone)
+                .chain(additional_zones)
+                .all(|zone| !matches!(zone, Zone::Exile));
+            if !chooses_outside_exile || moved_chosen_card {
+                return None;
+            }
+            return Some(filter.as_ref().unwrap_or(&TargetFilter::Any));
+        }
+        if matches!(
+            prev.parsed.effect,
+            Effect::ChangeZone { .. } | Effect::ChangeZoneAll { .. }
+        ) {
+            moved_chosen_card = true;
         }
         if has_typed_target_widened(&prev.parsed.effect) {
             // A typed referent that is not a bare target selection (an exile/

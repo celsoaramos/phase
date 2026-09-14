@@ -1030,14 +1030,32 @@ fn resolve_candidate_cards(
 
     match candidate_source {
         ZoneChoiceCandidateSource::Direct => {
-            return collect_direct_zone_cards(
+            // CR 608.2n: an instant or sorcery is put into its graveyard only as
+            // the FINAL part of its resolution, so while its own instructions run
+            // it is not a card in that graveyard (Mission Briefing ruling: it
+            // "can't be" the card it chooses). The engine settles the spell's
+            // stack exit before a paused continuation resumes, so the scan must
+            // exclude the resolving spell explicitly.
+            let resolving_spell = (ability.kind == crate::types::ability::AbilityKind::Spell)
+                .then_some(ability.source_id)
+                .filter(|id| {
+                    state.objects.get(id).is_some_and(|obj| {
+                        obj.card_types
+                            .core_types
+                            .iter()
+                            .any(|t| matches!(t, CoreType::Instant | CoreType::Sorcery))
+                    })
+                });
+            let mut cards = collect_direct_zone_cards(
                 state,
                 ability,
                 zone,
                 additional_zones,
                 zone_owner,
                 filter,
-            );
+            )?;
+            cards.retain(|id| Some(*id) != resolving_spell);
+            return Ok(cards);
         }
         ZoneChoiceCandidateSource::Tracked => {
             return Ok(retain_matching_candidates(
