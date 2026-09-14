@@ -5919,6 +5919,18 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
             up_to,
             selection,
         } => {
+            // CR 608.2c + CR 608.2d: "choose a [filter] card in your graveyard/hand"
+            // names its pool — the declared zone — so a set published by an EARLIER
+            // instruction (Mission Briefing's surveil, Cauldron's Gift's mill) must
+            // not replace it: the pick may be any matching card there, including
+            // one that was already in the zone. A choice among cards in EXILE keeps
+            // the legacy tracked-set read, which is how its "exiled this way" /
+            // linked-exile referents reach the pool.
+            let candidate_source = if zones.iter().all(|zone| !matches!(zone, Zone::Exile)) {
+                crate::types::ability::ZoneChoiceCandidateSource::Direct
+            } else {
+                crate::types::ability::ZoneChoiceCandidateSource::Legacy
+            };
             let mut zones = zones.into_iter();
             let zone = zones.next().unwrap_or(Zone::Hand);
             Effect::ChooseFromZone {
@@ -5928,7 +5940,7 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
                 zone_owner,
                 filter: Some(filter),
                 chooser: chooser.into(),
-                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                candidate_source,
                 reciprocal_role: None,
                 up_to,
                 selection,

@@ -36568,6 +36568,227 @@ fn emry_this_turn_grant_stays_lingering_not_during_resolution() {
     );
 }
 
+/// CR 608.2c + CR 601.2a + CR 614.1a: Mission Briefing — "choose an instant or
+/// sorcery card in your graveyard. You may cast it this turn. If that spell would
+/// be put into your graveyard, exile it instead." The resolution-time graveyard
+/// CHOICE is a chosen referent like Emry's target, so "it" binds to the chosen
+/// card (`CastFromZone { ParentTarget }`, lingering until end of turn), and the
+/// rider stays the cast's `ChangeZone { Exile, ParentTarget }` sub-ability — not
+/// an exile `PlayFromExile { TrackedSet }` grant with a trailing move that exiles
+/// the source.
+#[test]
+fn mission_briefing_graveyard_choice_cast_binds_chosen_card() {
+    let def = parse_effect_chain(
+        "Surveil 2, then choose an instant or sorcery card in your graveyard. You may cast it this turn. If that spell would be put into your graveyard, exile it instead.",
+        AbilityKind::Spell,
+    );
+    let choose = def
+        .sub_ability
+        .as_deref()
+        .expect("surveil must chain the graveyard choice");
+    assert!(
+        matches!(
+            &*choose.effect,
+            Effect::ChooseFromZone {
+                zone: Zone::Graveyard,
+                candidate_source: ZoneChoiceCandidateSource::Direct,
+                ..
+            }
+        ),
+        "choice clause must scan the whole graveyard, not surveil's set; got {:?}",
+        choose.effect
+    );
+    let cast = choose
+        .sub_ability
+        .as_deref()
+        .expect("the choice must chain the cast clause");
+    match &*cast.effect {
+        Effect::CastFromZone {
+            target: TargetFilter::ParentTarget,
+            without_paying_mana_cost: false,
+            mode: CardPlayMode::Cast,
+            duration: Some(Duration::UntilEndOfTurn),
+            driver: LingeringPermission,
+            ..
+        } => {}
+        other => panic!("expected lingering CastFromZone ParentTarget, got {other:?}"),
+    }
+    let rider = cast
+        .sub_ability
+        .as_deref()
+        .expect("the exile-instead rider must stay on the cast");
+    assert!(
+        matches!(
+            &*rider.effect,
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::ParentTarget,
+                ..
+            }
+        ),
+        "rider got {:?}",
+        rider.effect
+    );
+    assert!(
+        rider.sub_ability.is_none(),
+        "no trailing clause after the rider"
+    );
+}
+
+/// CR 400.7 + CR 608.2c: Psychic Intrusion / Covetous Urge — the chosen card is
+/// EXILED before "you may cast that card", so the anaphor is the exiled object
+/// and the grant stays `PlayFromExile { TrackedSet }`; the non-exile choice
+/// referent must not reroute it to a `CastFromZone`.
+#[test]
+fn psychic_intrusion_choose_then_exile_keeps_play_from_exile_grant() {
+    let def = parse_effect_chain(
+        "Target opponent reveals their hand. You choose a nonland card from that player's graveyard or hand and exile it. You may cast that card for as long as it remains exiled, and you may spend mana as though it were mana of any color to cast that spell.",
+        AbilityKind::Spell,
+    );
+    let mut node = Some(&def);
+    let mut grant: Option<&Effect> = None;
+    while let Some(n) = node {
+        if matches!(
+            &*n.effect,
+            Effect::GrantCastingPermission { .. } | Effect::CastFromZone { .. }
+        ) {
+            grant = Some(&*n.effect);
+        }
+        node = n.sub_ability.as_deref();
+    }
+    assert!(
+        matches!(
+            grant,
+            Some(Effect::GrantCastingPermission {
+                permission: CastingPermission::PlayFromExile { .. },
+                target: TargetFilter::TrackedSet { .. },
+                ..
+            })
+        ),
+        "exiled chosen card keeps the PlayFromExile TrackedSet grant, got {grant:?}"
+    );
+}
+
+/// CR 608.2d: Cauldron's Gift mills, then "choose a creature card in your
+/// graveyard" — the pool is the declared zone, not the milled set.
+#[test]
+fn cauldrons_gift_graveyard_choice_scans_zone_not_milled_set() {
+    let def = parse_effect_chain(
+        "Mill four cards. You may choose a creature card in your graveyard. If you do, return it to the battlefield with an additional +1/+1 counter on it.",
+        AbilityKind::Spell,
+    );
+    let mut node = Some(&def);
+    let mut source = None;
+    while let Some(n) = node {
+        if let Effect::ChooseFromZone {
+            zone: Zone::Graveyard,
+            candidate_source,
+            ..
+        } = &*n.effect
+        {
+            source = Some(*candidate_source);
+        }
+        node = n.sub_ability.as_deref();
+    }
+    assert_eq!(
+        source,
+        Some(ZoneChoiceCandidateSource::Direct),
+        "chain {def:?}"
+    );
+}
+
+/// CR 608.2d: Tasigur, the Golden Fang — "Mill two cards, then return a nonland
+/// card of an opponent's choice from your graveyard to your hand." The opponent
+/// picks from the whole graveyard, not only the two milled cards.
+#[test]
+fn tasigur_opponent_choice_scans_whole_graveyard() {
+    let def = parse_effect_chain(
+        "Mill two cards, then return a nonland card of an opponent's choice from your graveyard to your hand.",
+        AbilityKind::Activated,
+    );
+    let choose = def
+        .sub_ability
+        .as_deref()
+        .expect("mill must chain the opponent's choice");
+    assert!(
+        matches!(
+            &*choose.effect,
+            Effect::ChooseFromZone {
+                zone: Zone::Graveyard,
+                chooser: ZoneChoiceChooser::Opponent,
+                candidate_source: ZoneChoiceCandidateSource::Direct,
+                ..
+            }
+        ),
+        "got {:?}",
+        choose.effect
+    );
+}
+
+/// CR 406.6 + CR 607.2a: a choice among EXILED cards (Dauthi Voidwalker's "choose
+/// an exiled card an opponent owns with a void counter on it") keeps the legacy
+/// pool read — the non-exile `Direct` routing must not reach it.
+#[test]
+fn exile_zone_from_zone_choice_keeps_legacy_candidate_source() {
+    let def = parse_effect_chain(
+        "Choose an exiled card an opponent owns with a void counter on it. You may play it this turn without paying its mana cost.",
+        AbilityKind::Activated,
+    );
+    assert!(
+        matches!(
+            &*def.effect,
+            Effect::ChooseFromZone {
+                zone: Zone::Exile,
+                candidate_source: ZoneChoiceCandidateSource::Legacy,
+                ..
+            }
+        ),
+        "got {:?}",
+        def.effect
+    );
+}
+
+/// CR 608.2c + CR 400.7: a choice among cards in EXILE keeps the tracked exile
+/// set as the anaphor's referent (Fireglass Mentor: "exile the top two cards of
+/// your library. Choose one of them. Until end of turn, you may play that
+/// card.") — the non-exile widening above must not reroute it to a
+/// `ParentTarget` cast.
+#[test]
+fn exile_zone_choice_cast_keeps_play_from_exile_grant() {
+    let def = parse_effect_chain(
+        "Exile the top two cards of your library. Choose one of them. Until end of turn, you may play that card.",
+        AbilityKind::Spell,
+    );
+    let mut node = Some(&def);
+    let mut saw_choice = false;
+    let mut grant: Option<&Effect> = None;
+    while let Some(n) = node {
+        match &*n.effect {
+            Effect::ChooseFromZone { zone, .. } => {
+                assert_eq!(*zone, Zone::Exile, "the choice is among exiled cards");
+                saw_choice = true;
+            }
+            effect @ (Effect::GrantCastingPermission { .. } | Effect::CastFromZone { .. }) => {
+                grant = Some(effect);
+            }
+            _ => {}
+        }
+        node = n.sub_ability.as_deref();
+    }
+    assert!(saw_choice, "exile-zone choice must parse; chain {def:?}");
+    assert!(
+        matches!(
+            grant,
+            Some(Effect::GrantCastingPermission {
+                permission: CastingPermission::PlayFromExile { .. },
+                target: TargetFilter::TrackedSet { .. },
+                ..
+            })
+        ),
+        "exile-zone choice must keep the PlayFromExile TrackedSet grant, got {grant:?}"
+    );
+}
+
 /// CR 305.1 + CR 101.2 + CR 201.2: Conjurer's Ban's compound restriction —
 /// "Until your next turn, spells with the chosen name can't be cast and lands
 /// with the chosen name can't be played." The PASSIVE-voice, card-scoped
