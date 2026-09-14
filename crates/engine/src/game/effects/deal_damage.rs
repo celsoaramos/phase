@@ -18,11 +18,11 @@ use crate::types::ability::{
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
-use crate::types::game_state::{DamageRecord, GameState};
+use crate::types::game_state::{DamageRecord, GameState, WaitingFor};
 use crate::types::identifiers::ObjectId;
 use crate::types::keywords::KeywordKind;
 use crate::types::player::{PlayerCounterKind, PlayerId};
-use crate::types::proposed_event::ProposedEvent;
+use crate::types::proposed_event::{CounterPlacement, ProposedEvent};
 
 /// Source attributes needed for damage application (CR 120.3).
 /// Read from the source object before the mutable damage phase to avoid borrow conflicts.
@@ -640,6 +640,11 @@ pub(crate) fn apply_damage_after_replacement(
         TargetRef::Player(_) => (false, false, false, None, None),
     };
 
+    // CR 120.3d + CR 616.1: set when the wither/infect counter placement parked a
+    // replacement-order choice outside combat. The damage is still dealt below
+    // (DamageDealt, record, lifelink); only the counter placement waits.
+    let mut counter_choice_pending = false;
+
     match t {
         TargetRef::Object(obj_id) => {
             if is_planeswalker {
@@ -671,18 +676,31 @@ pub(crate) fn apply_damage_after_replacement(
 
             if is_creature && (ctx.has_wither || ctx.has_infect) {
                 // CR 120.3d + CR 702.80 + CR 702.90: Wither/infect damage to a
-                // creature is dealt as -1/-1 counters.
-                if let Some(target_obj) = state.objects.get_mut(obj_id) {
-                    let entry = target_obj
-                        .counters
-                        .entry(CounterType::Minus1Minus1)
-                        .or_insert(0);
-                    *entry += actual_amount;
-                    if ctx.has_deathtouch {
+                // creature is dealt as -1/-1 counters, and the source's controller
+                // is the player who puts them. Route through the single counter
+                // authority so CR 614.1 counter replacements (prevention,
+                // doublers) apply and `CounterAdded { actor }` is emitted for
+                // "whenever you put one or more -1/-1 counters" triggers (CR 122.6).
+                if ctx.has_deathtouch {
+                    if let Some(target_obj) = state.objects.get_mut(obj_id) {
                         target_obj.dealt_deathtouch_damage = true;
                     }
                 }
-                crate::game::layers::mark_layers_full(state);
+                let waiting_before = state.waiting_for.clone();
+                if !super::counters::add_counter_with_replacement(
+                    state,
+                    ctx.controller,
+                    *obj_id,
+                    CounterType::Minus1Minus1,
+                    actual_amount,
+                    events,
+                ) {
+                    if is_combat {
+                        apply_combat_counter_choice_in_default_order(state, waiting_before, events);
+                    } else {
+                        counter_choice_pending = true;
+                    }
+                }
             } else if is_creature {
                 if let Some(target_obj) = state.objects.get_mut(obj_id) {
                     // CR 120.3e: Damage to a creature marks damage.
@@ -1035,7 +1053,50 @@ pub(crate) fn apply_damage_after_replacement(
         }
     }
 
+    if counter_choice_pending {
+        return DamageResult::NeedsChoice;
+    }
     DamageResult::Applied(actual_amount)
+}
+
+/// CR 510.2 + CR 616.1: combat damage is dealt with no player receiving priority,
+/// so a replacement-order choice parked by a wither/infect counter placement
+/// cannot surface. Resolve it in the default (first-listed) order, place the
+/// counters, and restore the combat step's `waiting_for`, so no
+/// `pending_replacement` is left behind.
+fn apply_combat_counter_choice_in_default_order(
+    state: &mut GameState,
+    waiting_before: WaitingFor,
+    events: &mut Vec<GameEvent>,
+) {
+    // Bounded: each continuation applies one replacement (CR 616.1f).
+    for _ in 0..32 {
+        match replacement::continue_replacement(state, 0, events) {
+            ReplacementResult::NeedsChoice(_) => continue,
+            ReplacementResult::Execute(ProposedEvent::AddCounter {
+                placement:
+                    CounterPlacement::Object {
+                        actor,
+                        object_id,
+                        counter_type,
+                    },
+                count,
+                ..
+            }) => {
+                super::counters::apply_counter_addition(
+                    state,
+                    actor,
+                    object_id,
+                    counter_type,
+                    count,
+                    events,
+                );
+                break;
+            }
+            _ => break,
+        }
+    }
+    state.waiting_for = waiting_before;
 }
 
 /// CR 120.3 + CR 616.1e: Build a one-shot, single-target non-combat `DealDamage`
