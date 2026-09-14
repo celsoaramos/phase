@@ -22,6 +22,7 @@
 
 use engine::game::game_object::AttachTarget;
 use engine::game::scenario::{GameScenario, P0, P1};
+use engine::game::zone_pipeline::{move_object_for_test, ZoneMoveRequest};
 use engine::types::ability::TargetRef;
 use engine::types::actions::GameAction;
 use engine::types::game_state::WaitingFor;
@@ -174,7 +175,14 @@ fn sporogenic_infection_host_stays_excluded_after_aura_leaves() {
         })
         .expect("P1 is a legal target player");
 
-    engine::game::zones::move_to_zone(runner.state_mut(), aura, Zone::Graveyard, &mut Vec::new());
+    assert!(
+        !move_object_for_test(
+            runner.state_mut(),
+            ZoneMoveRequest::effect(aura, Zone::Graveyard, aura),
+            &mut Vec::new(),
+        ),
+        "the Aura's removal must complete without a replacement choice"
+    );
     assert_eq!(runner.state().objects[&aura].zone, Zone::Graveyard);
 
     runner.advance_until_stack_empty();
