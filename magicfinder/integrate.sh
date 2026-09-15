@@ -21,7 +21,7 @@ for b in "$@"; do
       "$D")
         git checkout --ours -- "$D"; git add "$D"; echo "  $b: backlog do upstream mantido" ;;
       "$F")
-        node "$HERE/merge-fixture.mjs" "$(git merge-base HEAD "origin/$b")" HEAD "origin/$b" "$F"
+        python3 "$HERE/merge-fixture.py" "$(git merge-base HEAD "origin/$b")" HEAD "origin/$b" "$F"
         git add "$F"; echo "  $b: fixture mesclada carta a carta" ;;
       *)
         echo "::error::conflito de CÓDIGO em $f ao mesclar $b sobre $TAG — resolva no fork (rebase da branch)"
