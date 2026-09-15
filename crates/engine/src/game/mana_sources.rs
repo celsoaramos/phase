@@ -1912,7 +1912,7 @@ pub(crate) fn auto_tap_mana_options(
 /// — so `max_x_value` treated a full Tron as one mana per land and capped
 /// Walking Ballista's X far below what the caster could pay. The "instead"
 /// swap and the condition evaluation are the same authorities resolution uses.
-fn gross_mana_output(
+pub(crate) fn gross_mana_output(
     state: &GameState,
     ability: &crate::types::ability::AbilityDefinition,
     object_id: ObjectId,
