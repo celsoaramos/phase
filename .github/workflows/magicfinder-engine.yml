@@ -1,0 +1,194 @@
+name: MagicFinder — motor do fork
+
+# Build AUTOMÁTICO do motor da Mesa com regras (MagicFinder) a partir deste fork (2026-09-14).
+#   plan    → tag de release mais nova do phase-rs + branches de carta (magicfinder/branches.json)
+#             que o upstream ainda não aceitou nessa tag. Prefixo já no R2 = nada novo, para aqui.
+#   test    → monta a integração (commits com data fixa: mesmo conteúdo em todo job), gera o
+#             card-data e roda a suíte COMPLETA (phase-engine + phase-ai).
+#   build   → WASM release + worker com as URLs do NOSSO prefixo embutidas.
+#   publish → sobe ao R2, smoke em Node e SÓ ENTÃO publica engine/manifest.json.
+# Conflito só de DADOS (backlog/fixture) é resolvido sozinho; conflito de código FALHA e avisa.
+# Nada disto roda os workflows do upstream: esta branch (padrão do fork) só tem este arquivo.
+# Voltar uma versão: no repo magic, `node scripts/publish-phase-manifest.mjs --rollback`.
+on:
+  schedule:
+    - cron: '30 17 * * *'   # depois da janela de release deles (~14-15 UTC)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Refazer mesmo que o prefixo já exista no R2'
+        type: boolean
+        default: false
+      tag:
+        description: 'Tag do phase-rs a usar (vazio = a mais recente)'
+        type: string
+        default: ''
+
+concurrency:
+  group: magicfinder-engine
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: https://github.com/phase-rs/phase.git
+  CARGO_INCREMENTAL: 0
+  RUST_MIN_STACK: 16777216
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      new: ${{ steps.plan.outputs.new }}
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      prefix: ${{ steps.plan.outputs.prefix }}
+      branches: ${{ steps.plan.outputs.branches }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ci }
+      - uses: actions/checkout@v4
+        with: { path: phase, ref: main, fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - name: Buscar upstream e branches de carta
+        run: bash ci/magicfinder/fetch.sh phase
+      - name: Planejar
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+        run: >
+          node ci/magicfinder/plan.mjs --repo phase --branches ci/magicfinder/branches.json
+          --tag "${{ inputs.tag }}" ${{ inputs.force == true && '--force' || '' }}
+
+  test:
+    needs: plan
+    if: needs.plan.outputs.new == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Liberar disco
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; df -h /
+      - uses: actions/checkout@v4
+        with: { path: ci }
+      - uses: actions/checkout@v4
+        with: { path: phase, ref: main, fetch-depth: 0 }
+      - name: Montar integração
+        run: |
+          bash ci/magicfinder/fetch.sh phase
+          bash ci/magicfinder/integrate.sh phase "${{ needs.plan.outputs.tag }}" ${{ needs.plan.outputs.branches }}
+      - name: Toolchain (rust-toolchain.toml)
+        working-directory: phase
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: phase, shared-key: mf-test }
+      - name: Gerar card-data
+        working-directory: phase
+        run: |
+          ./scripts/gen-card-data.sh
+          git checkout -- crates/engine/data/known-tokens.toml crates/engine/data/mtgjson-vintage crates/engine/data/oracle-subtypes.json 2>/dev/null || true
+          test -s client/public/card-data.json
+      - name: Testes do motor (phase-engine)
+        working-directory: phase
+        run: cargo test -p phase-engine --no-fail-fast
+      - name: Testes da IA (phase-ai)
+        working-directory: phase
+        run: cargo test -p phase-ai --no-fail-fast
+      - uses: actions/upload-artifact@v4
+        with:
+          name: card-data
+          path: phase/client/public/card-data.json
+          retention-days: 3
+          if-no-files-found: error
+
+  build:
+    needs: [plan, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Liberar disco
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; df -h /
+      - uses: actions/checkout@v4
+        with: { path: ci }
+      - uses: actions/checkout@v4
+        with: { path: phase, ref: main, fetch-depth: 0 }
+      - name: Montar integração
+        run: |
+          bash ci/magicfinder/fetch.sh phase
+          bash ci/magicfinder/integrate.sh phase "${{ needs.plan.outputs.tag }}" ${{ needs.plan.outputs.branches }}
+      - name: Toolchain (rust-toolchain.toml)
+        working-directory: phase
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: phase, shared-key: mf-wasm }
+      - uses: taiki-e/install-action@v2
+        with: { tool: wasm-bindgen-cli@0.2.121 }
+      - name: Binaryen (action do próprio phase-rs)
+        uses: ./phase/.github/actions/binaryen
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - uses: pnpm/action-setup@v4
+        with: { version: 9.15.9 }
+      - uses: actions/download-artifact@v4
+        with: { name: card-data, path: phase/client/public }
+      - name: WASM release
+        working-directory: phase
+        run: ./scripts/build-wasm.sh release
+      - name: Worker + artefatos
+        working-directory: phase
+        env:
+          R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          PREFIX: ${{ needs.plan.outputs.prefix }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          BRANCHES: ${{ needs.plan.outputs.branches }}
+        run: bash ../ci/magicfinder/stage-engine.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine
+          path: engine/
+          retention-days: 3
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_PUBLIC_ACCESS_KEY_ID: ${{ secrets.R2_PUBLIC_ACCESS_KEY_ID }}
+      R2_PUBLIC_SECRET_ACCESS_KEY: ${{ secrets.R2_PUBLIC_SECRET_ACCESS_KEY }}
+      R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+      R2_BUCKET_PUBLIC: ${{ secrets.R2_BUCKET_PUBLIC }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ci }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - name: Dependências (só o SDK do S3)
+        working-directory: ci/magicfinder
+        run: npm install --no-audit --no-fund
+      - uses: actions/download-artifact@v4
+        with: { name: engine, path: engine }
+      - name: Subir ao R2
+        run: node ci/magicfinder/upload-engine.mjs --dir engine --prefix "${{ needs.plan.outputs.prefix }}" --out mirrored.json
+      - name: Smoke do motor no prefixo
+        run: node ci/magicfinder/scripts/engine-smoke.mjs --base "$(node -p "require('./mirrored.json').base")"
+      - name: Publicar manifesto
+        run: node ci/magicfinder/scripts/publish-phase-manifest.mjs --mirrored mirrored.json
+
+  report:
+    needs: [plan, test, build, publish]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Avisar o MagicFinder
+        run: |
+          curl -sS -X POST "https://magicfinder.app/api/cron/report-failure?job=magicfinder-engine" \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d '{"detail":"fork celsoaramos/phase: build automático do motor falhou (versão ${{ needs.plan.outputs.version }}); manifesto NÃO foi publicado. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
+            --max-time 30 || true

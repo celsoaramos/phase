@@ -1,0 +1,8 @@
+{
+  "name": "magicfinder-engine-ci",
+  "private": true,
+  "description": "Só o SDK do S3 que publicArtifacts.mjs importa dinamicamente para falar com o R2.",
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1063.0"
+  }
+}
