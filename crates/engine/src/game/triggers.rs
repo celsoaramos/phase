@@ -11446,6 +11446,10 @@ fn object_scope_unbound_at_fire_time(scope: ObjectScope) -> bool {
         | ObjectScope::OtherRevealedCard
         | ObjectScope::AmassedArmy
         | ObjectScope::OwnedLinkedExileCard
+        // CR 603.4: `SpellContext::chain_root_targets` is stamped at
+        // `finalize_cast`, so it is absent when a triggered ability's
+        // intervening-if is checked at fire time. Decline the fire-time half.
+        | ObjectScope::ChainRootTarget
         | ObjectScope::BatchSource => true,
     }
 }

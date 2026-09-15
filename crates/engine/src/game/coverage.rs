@@ -1477,6 +1477,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card",
                 ObjectScope::AmassedArmy => "amassed Army",
                 ObjectScope::BatchSource => "batch source",
+                ObjectScope::ChainRootTarget => "chain-root target",
             };
             match counter_type {
                 Some(ct) => format!("{} counters on {scope_str}", ct.as_str()),
@@ -1505,6 +1506,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card's power".into(),
             ObjectScope::AmassedArmy => "amassed Army's power".into(),
             ObjectScope::BatchSource => "batch source's power".into(),
+            ObjectScope::ChainRootTarget => "chain-root target's power".into(),
         },
         QuantityRef::BasePower { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -1519,6 +1521,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card's base power".into(),
             ObjectScope::AmassedArmy => "amassed Army's base power".into(),
             ObjectScope::BatchSource => "batch source's base power".into(),
+            ObjectScope::ChainRootTarget => "chain-root target's base power".into(),
         },
         QuantityRef::Toughness { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -1533,6 +1536,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card's toughness".into(),
             ObjectScope::AmassedArmy => "amassed Army's toughness".into(),
             ObjectScope::BatchSource => "batch source's toughness".into(),
+            ObjectScope::ChainRootTarget => "chain-root target's toughness".into(),
         },
         QuantityRef::ObjectManaValue { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -1547,6 +1551,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card's mana value".into(),
             ObjectScope::AmassedArmy => "amassed Army's mana value".into(),
             ObjectScope::BatchSource => "batch source's mana value".into(),
+            ObjectScope::ChainRootTarget => "chain-root target's mana value".into(),
         },
         QuantityRef::TargetObjectManaValue { .. } => "target object's mana value".into(),
         QuantityRef::ObjectColorCount { scope } => match scope {
@@ -1562,6 +1567,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card's colors".into(),
             ObjectScope::AmassedArmy => "amassed Army's colors".into(),
             ObjectScope::BatchSource => "batch source's colors".into(),
+            ObjectScope::ChainRootTarget => "chain-root target's colors".into(),
         },
         QuantityRef::ObjectTypelineComponentCount { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -1578,6 +1584,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             }
             ObjectScope::AmassedArmy => "typeline components on amassed Army".into(),
             ObjectScope::BatchSource => "typeline components on batch source".into(),
+            ObjectScope::ChainRootTarget => "typeline components on chain-root target".into(),
         },
         QuantityRef::ObjectNameWordCount { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -1592,6 +1599,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "words in owned linked-exiled card's name".into(),
             ObjectScope::AmassedArmy => "words in amassed Army's name".into(),
             ObjectScope::BatchSource => "words in batch source's name".into(),
+            ObjectScope::ChainRootTarget => "words in chain-root target's name".into(),
         },
         QuantityRef::ManaSymbolsInManaCost { scope, color } => {
             let scope_str = match scope {
@@ -1605,6 +1613,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card",
                 ObjectScope::AmassedArmy => "amassed Army",
                 ObjectScope::BatchSource => "batch source",
+                ObjectScope::ChainRootTarget => "chain-root target",
             };
             match color {
                 Some(c) => format!("{c:?} mana symbols in {scope_str}'s mana cost"),
@@ -9573,6 +9582,10 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardPower", Unhandled),
             ObjectScope::AmassedArmy => ("AmassedArmyPower", Handled),
             ObjectScope::BatchSource => ("BatchSourcePower", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => ("ChainRootTargetPower", Unhandled),
         },
         QuantityRef::BasePower { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -9587,6 +9600,10 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardBasePower", Unhandled),
             ObjectScope::AmassedArmy => ("AmassedArmyBasePower", Handled),
             ObjectScope::BatchSource => ("BatchSourceBasePower", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => ("ChainRootTargetBasePower", Unhandled),
         },
         QuantityRef::Toughness { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -9601,6 +9618,10 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardToughness", Unhandled),
             ObjectScope::AmassedArmy => ("AmassedArmyToughness", Handled),
             ObjectScope::BatchSource => ("BatchSourceToughness", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => ("ChainRootTargetToughness", Unhandled),
         },
         QuantityRef::ObjectManaValue { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -9615,6 +9636,10 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardManaValue", Handled),
             ObjectScope::AmassedArmy => ("AmassedArmyManaValue", Handled),
             ObjectScope::BatchSource => ("BatchSourceManaValue", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => ("ChainRootTargetManaValue", Unhandled),
         },
         QuantityRef::TargetObjectManaValue { .. } => ("TargetObjectManaValue", Handled),
         QuantityRef::ObjectColorCount { scope } => match scope {
@@ -9633,6 +9658,10 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardColorCount", Handled),
             ObjectScope::AmassedArmy => ("AmassedArmyObjectColorCount", Handled),
             ObjectScope::BatchSource => ("BatchSourceObjectColorCount", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => ("ChainRootTargetObjectColorCount", Unhandled),
         },
         QuantityRef::ObjectNameWordCount { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -9647,6 +9676,10 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardNameWordCount", Handled),
             ObjectScope::AmassedArmy => ("AmassedArmyObjectNameWordCount", Handled),
             ObjectScope::BatchSource => ("BatchSourceObjectNameWordCount", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => ("ChainRootTargetObjectNameWordCount", Unhandled),
         },
         QuantityRef::ObjectTypelineComponentCount { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -9663,6 +9696,12 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             }
             ObjectScope::AmassedArmy => ("AmassedArmyObjectTypelineComponentCount", Handled),
             ObjectScope::BatchSource => ("BatchSourceObjectTypelineComponentCount", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => {
+                ("ChainRootTargetObjectTypelineComponentCount", Unhandled)
+            }
         },
         QuantityRef::ManaSymbolsInManaCost { scope, .. } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -9679,6 +9718,10 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             }
             ObjectScope::AmassedArmy => ("AmassedArmyManaSymbolsInManaCost", Handled),
             ObjectScope::BatchSource => ("BatchSourceManaSymbolsInManaCost", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => ("ChainRootTargetManaSymbolsInManaCost", Unhandled),
         },
         QuantityRef::SelfManaValue => ("SelfManaValue", Handled),
         QuantityRef::PropertyAggregate(_) => ("PropertyAggregate", Handled),
