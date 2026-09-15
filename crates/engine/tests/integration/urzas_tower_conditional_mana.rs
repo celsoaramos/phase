@@ -25,9 +25,10 @@
 //! `ControllerControlsMatching` filters is what makes the three lands
 //! reference each other rather than themselves.
 
+use engine::game::max_x_value;
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::scenario_db::GameScenarioDbExt;
-use engine::types::mana::ManaType;
+use engine::types::mana::{ManaCost, ManaCostShard, ManaType};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
@@ -65,5 +66,35 @@ fn urzas_tower_with_mine_and_power_plant_produces_three_colorless() {
         outcome.mana_pool_total(P0),
         3,
         "no other mana types must be produced",
+    );
+}
+
+/// CR 107.1b + CR 601.2f + CR 605.3b: the X cap must see the same Tron output
+/// that tapping produces. With Tower (3) + Mine (2) + Power Plant (2) the caster
+/// has 7 mana, so `{X}{X}` (Walking Ballista) can be announced up to X = 3.
+/// Before the fix the capacity preview read only each land's base `Add {C}`
+/// (1 + 1 + 1 = 3) and capped X at 1 — the engine then refused the larger
+/// announcement the caster could actually pay (field report 2026-09-15).
+#[test]
+fn urza_lands_x_cap_counts_full_tron_output() {
+    let Some(db) = load_db() else {
+        return;
+    };
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_real_card(P0, "Urza's Tower", Zone::Battlefield, db);
+    scenario.add_real_card(P0, "Urza's Mine", Zone::Battlefield, db);
+    scenario.add_real_card(P0, "Urza's Power Plant", Zone::Battlefield, db);
+    let runner = scenario.build();
+
+    let x_x = ManaCost::Cost {
+        shards: vec![ManaCostShard::X, ManaCostShard::X],
+        generic: 0,
+    };
+    assert_eq!(
+        max_x_value(runner.state(), P0, &x_x, None),
+        3,
+        "{{X}}{{X}} with a full Tron (3 + 2 + 2 = 7 mana) must allow X = 3",
     );
 }
