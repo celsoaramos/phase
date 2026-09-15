@@ -2273,6 +2273,9 @@ fn legacy_object_scope(s: &ObjectScope) -> bool {
         // CR 120.1: the per-iteration batch source is resolution-local, not one
         // of the retained legacy refs (mirrors EventTarget).
         | ObjectScope::BatchSource
+        // CR 601.2c: the chain-root spell's declared target is resolution-local,
+        // not one of the retained legacy refs (mirrors AmassedArmy).
+        | ObjectScope::ChainRootTarget
         | ObjectScope::EventTarget => false,
     }
 }
@@ -3729,6 +3732,9 @@ fn current_pt_scope(scope: &ObjectScope) -> CurrentPtReads {
         | ObjectScope::AmassedArmy
         | ObjectScope::EventTarget
         | ObjectScope::OtherRevealedCard
+        // CR 601.2c: no P/T read is wired for the chain-root target (fail-closed
+        // `=> 0` in `game/quantity.rs::resolve_object_pt`).
+        | ObjectScope::ChainRootTarget
         | ObjectScope::OwnedLinkedExileCard => CurrentPtReads::default(),
     }
 }
@@ -3995,6 +4001,11 @@ fn read_object_scope(scope: &ObjectScope, kind: StateKind) -> RwProfile {
         // member-bound so same-event ability ordering (`profiles_conflict` via
         // `reads_member_bound`) does not fail open. Mirrors `AmassedArmy`.
         ObjectScope::OwnedLinkedExileCard => member_bound_read(),
+        // CR 601.2c: an ability-carried object identity read across the
+        // resolution chain (`SpellContext::chain_root_targets`). Member-bound so
+        // a same-event sibling write does not make `profiles_conflict` fail
+        // open. Mirrors `AmassedArmy` / `OwnedLinkedExileCard`.
+        ObjectScope::ChainRootTarget => member_bound_read(),
         ObjectScope::EventSource | ObjectScope::EventTarget => reads_event_live(),
         // §L7 precedent (CR 608.2c): a per-resolution local surfaced by THIS
         // ability's own reveal within the same resolution — observed by no
@@ -4278,6 +4289,14 @@ fn walk_definition(
         sub_link: _,
         iteration_kind_binding: _,
         sibling_condition: _,
+        // Parser scratch, not runtime state: `parse_oracle_pipeline` settles every
+        // deferred guard verdict before it hands a tree out, so this is `None` on
+        // every tree that pipeline produces — which is every tree a runtime walker
+        // sees — and creates no resolution-time dependency. (NOT a universal claim
+        // about the field: `parse_effect_chain` outside the pipeline leaves marks
+        // intact, and no runtime path reaches such a tree. See
+        // `types::ability::UnloweredGuard`.)
+        unlowered_guard: _,
     } = a;
 
     // §4.3.2: own `player_scope` overrides the inherited scope (Brink's Discard
