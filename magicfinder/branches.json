@@ -8,5 +8,6 @@
   { "branch": "card/sacrificed-attachment-lki" },
   { "branch": "card/hapatra-wither-counters" },
   { "branch": "card/mission-briefing" },
-  { "branch": "card/sacrifice-those-tokens" }
+  { "branch": "card/sacrifice-those-tokens" },
+  { "branch": "card/x-cap-conditional-mana" }
 ]
