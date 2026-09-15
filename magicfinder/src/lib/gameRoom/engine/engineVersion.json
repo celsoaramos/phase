@@ -1,0 +1,7 @@
+{
+  "_doc": "Fonte ÚNICA da versão de BUILD do motor phase.rs: lida pelo cliente (phaseEngineClient.ts, fallback quando o manifesto do R2 não responde) e pelos scripts (mirror, smoke, engine-repro). URLs do deploy DELES; o espelho no R2 guarda os mesmos nomes de arquivo. Em produção quem manda é engine/manifest.json no R2 (job phase-engine-update) — mudar aqui só troca o fallback e exige deploy.",
+  "version": "v0.78.0",
+  "worker": "https://phase-rs.dev/assets/engine-worker-Dvw9vq9U.js",
+  "wasm": "https://data.phase-rs.dev/wasm/engine_wasm_bg-26bed1a6f703b300.wasm",
+  "cards": "https://data.phase-rs.dev/card-data-038a49c554606ead.json"
+}

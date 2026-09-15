@@ -21,5 +21,6 @@ publica o manifesto. Qualquer falha = nada publicado + aviso no MagicFinder.
 - **Conflito de código:** o run falha no job `test`; rebaseie a branch sobre a tag nova e dê push.
 - **Voltar uma versão:** no repo magic, `node scripts/publish-phase-manifest.mjs --rollback`.
 - `magicfinder/scripts/` é CÓPIA dos scripts do magic (`engine-smoke.mjs`,
-  `publish-phase-manifest.mjs`, `lib/phaseEngine*.mjs`, `lib/publicArtifacts.mjs`) — copiada para
+  `publish-phase-manifest.mjs`, `lib/phaseEngine*.mjs`, `lib/publicArtifacts.mjs`, e o
+  `src/lib/gameRoom/engine/engineVersion.json` que o `phaseEngineNode.mjs` lê ao iniciar) — copiada para
   este repo público não precisar de token com leitura do repositório privado. Mudou lá, copie aqui.
