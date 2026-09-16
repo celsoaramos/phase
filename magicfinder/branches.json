@@ -15,5 +15,6 @@
   { "branch": "card/sacrifice-those-tokens" },
   { "branch": "card/x-cap-conditional-mana" },
   { "branch": "card/min-waste-auto-tap" },
-  { "branch": "card/spend-restricted-mana-first" }
+  { "branch": "card/spend-restricted-mana-first" },
+  { "branch": "card/linked-exile-anaphor" }
 ]
