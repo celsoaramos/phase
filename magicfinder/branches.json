@@ -9,5 +9,6 @@
   { "branch": "card/hapatra-wither-counters" },
   { "branch": "card/mission-briefing" },
   { "branch": "card/sacrifice-those-tokens" },
-  { "branch": "card/x-cap-conditional-mana" }
+  { "branch": "card/x-cap-conditional-mana" },
+  { "branch": "card/min-waste-auto-tap" }
 ]
