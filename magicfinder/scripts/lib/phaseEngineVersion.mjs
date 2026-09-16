@@ -106,21 +106,45 @@ export function mirrorPrefix(version, workerUrl, taken = false) {
   return taken ? `engine/phase-${safe}-${workerHash(workerUrl)}` : `engine/phase-${safe}`
 }
 
+/**
+ * Caminho COMPARTILHADO do banco de cartas, fora do prefixo da versão.
+ *
+ * O nome do arquivo deles já é o hash do conteúdo — dois builds com o mesmo
+ * banco produzem `card-data-79a38cc6159a4ceb.json` idêntico. Dentro do prefixo
+ * da versão, porém, a URL mudava a cada build e o navegador rebaixava 15,7 MB
+ * de um arquivo que ele já tinha (medido em 16/09: v0.84.0-mf.7f6f597e e
+ * v0.84.0-mf.110ad575 publicaram o MESMO card-data em prefixos diferentes).
+ *
+ * ATENÇÃO, mesma regra do prefixo: o que entra aqui NUNCA é apagado. Todo
+ * prefixo antigo — e o `previous` do manifesto, que é o rollback — aponta para
+ * cá. Limpar esta pasta quebra as versões antigas, não só a atual.
+ */
+export function sharedCardsPath(cardsUrl) {
+  return `engine/cards/${basename(cardsUrl)}`
+}
+
 /** A versão como o cliente a lê: URLs do espelho + as do deploy deles em `source`. */
-export function mirroredRelease(release, publicBase, prefix) {
-  const base = `${publicBase.replace(/\/+$/, '')}/${prefix}`
+export function mirroredRelease(release, publicBase, prefix, extra = {}) {
+  const root = publicBase.replace(/\/+$/, '')
+  const base = `${root}/${prefix}`
   return {
     version: release.version,
     base,
     worker: `${base}/engine-worker.js`,
     wasm: `${base}/${basename(release.wasm)}`,
-    cards: `${base}/${basename(release.cards)}`,
+    // Compartilhado entre versões quando dá; no prefixo quando não deu (colisão
+    // de nome com conteúdo diferente — o espelho prefere repetir a baixar errado).
+    cards: extra.cardsUrl ?? `${base}/${basename(release.cards)}`,
+    // Tamanhos CRUS, para a tela dizer quanto falta de verdade: o `content-length`
+    // do R2 é o do gzip, e o leitor do navegador conta bytes descomprimidos.
+    ...(extra.bytes ? { bytes: extra.bytes } : {}),
     source: { worker: release.worker, wasm: release.wasm, cards: release.cards },
   }
 }
 
 const releaseOnly = (m) => m && ({
-  version: m.version, base: m.base, worker: m.worker, wasm: m.wasm, cards: m.cards, source: m.source,
+  version: m.version, base: m.base, worker: m.worker, wasm: m.wasm, cards: m.cards,
+  ...(m.bytes ? { bytes: m.bytes } : {}), source: m.source,
 })
 
 /** Novo manifesto; o atual vira `previous` (um nível só — o backup é o prefixo, que nunca é apagado). */
