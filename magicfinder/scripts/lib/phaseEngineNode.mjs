@@ -42,7 +42,15 @@ async function resolveUrls(opts) {
     const r = await fetch(`${base}/source.json`)
     if (r.ok) { const j = await r.json(); from = j; version = j.version ?? version }
   } catch { /* prefixo antigo, sem source.json: versão de build */ }
-  const urls = { worker: `${base}/engine-worker.js`, wasm: `${base}/${basename(from.wasm)}`, cards: `${base}/${basename(from.cards)}` }
+  // O banco de cartas mora fora do prefixo desde 16/09 (`engine/cards/<hash>.json`,
+  // compartilhado entre versões). Remapear essa URL para a base traria o arquivo
+  // de um lugar onde ele não está — e o repro rodaria o motor errado, ou nenhum.
+  const sharedCards = /\/engine\/cards\//.test(from.cards)
+  const urls = {
+    worker: `${base}/engine-worker.js`,
+    wasm: `${base}/${basename(from.wasm)}`,
+    cards: sharedCards ? from.cards : `${base}/${basename(from.cards)}`,
+  }
   return { urls, rewrite: { wasm: from.wasm, cards: from.cards }, version, source: base }
 }
 
@@ -97,7 +105,7 @@ export function seat(cards, commander = [], sideboard = []) {
   }
 }
 
-/** O mesmo `legacyFormatConfig` do app (construído = Legacy sempre; o motor não aceita afrouxar o limite de 4). */
+/** O `legacyFormatConfig` do app (Legacy: banlist + limite de 4). A mesa usa o formato da sala ou `FreeForAll` (`formatConfigFor`). */
 export const LEGACY = {
   format: 'Legacy', starting_life: 20, min_players: 2, max_players: 2,
   deck_size: { type: 'Minimum', data: 60 }, singleton: false, command_zone: false,
