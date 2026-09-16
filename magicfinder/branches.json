@@ -1,6 +1,10 @@
 [
-  { "branch": "card/harms-way", "pr": 8869 },
-  { "branch": "card/sporogenic-infection", "pr": 8875 },
+  { "branch": "card/harms-way",
+    "pr": 8869
+  },
+  { "branch": "card/sporogenic-infection",
+    "pr": 8875
+  },
   { "branch": "card/pelakka-predation" },
   { "branch": "card/martyr-of-sands" },
   { "branch": "card/invasion-of-azgol" },
@@ -10,5 +14,6 @@
   { "branch": "card/mission-briefing" },
   { "branch": "card/sacrifice-those-tokens" },
   { "branch": "card/x-cap-conditional-mana" },
-  { "branch": "card/min-waste-auto-tap" }
+  { "branch": "card/min-waste-auto-tap" },
+  { "branch": "card/spend-restricted-mana-first" }
 ]
