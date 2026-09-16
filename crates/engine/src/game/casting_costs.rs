@@ -12239,6 +12239,17 @@ fn auto_tap_mana_sources_inner(
     // sibling ability) and made spells payable only by colorless rocks read as
     // uncastable in the shared affordability preview.
     let mut remaining_generic = generic as usize + deferred_generic;
+    // CR 601.2g + CR 605.3a: the walk below is greedy in priority order, so a
+    // wide row taken in a later class can overshoot a cost the narrower rows
+    // already nearly covered — Dimir Aqueduct's `{T}: Add {U}{B}` after three
+    // Islands paid {4} with five mana and four taps. `generic_picks` records
+    // what this phase chose (index into `to_tap`, credited width, class) so the
+    // prune after the loop can give back any pick the cost does not need.
+    // Tapping fewer permanents is strictly better for the caster: the surplus
+    // only floats until the step ends (CR 500.4) while the untapped permanent
+    // stays available.
+    let generic_needed = remaining_generic;
+    let mut generic_picks: Vec<(usize, usize, u8)> = Vec::new();
     let generic_priority = |option: &ManaSourceOption| -> u8 {
         let color_locked = match &option.atomic_combination {
             Some(combo) => combo.iter().all(|m| *m == ManaType::Colorless),
@@ -12310,9 +12321,37 @@ fn auto_tap_mana_sources_inner(
                 }
             }
             if used_sources.insert(option.object_id) {
+                generic_picks.push((to_tap.len(), eligible_width, class));
                 to_tap.push(option.clone());
                 remaining_generic = remaining_generic.saturating_sub(eligible_width);
             }
+        }
+    }
+
+    // CR 601.2g: give back every Phase 2 pick the cost does not need, least
+    // preferred first (highest class, then widest row), so the caster keeps the
+    // most permanents — and the most flexible ones — untapped. Phase 1's
+    // colored assignments are never candidates: they pay shards, and
+    // `generic_picks` records only the rows this phase added. When the cost was
+    // not fully covered nothing is given back, because no pick is spare.
+    if !generic_picks.is_empty() {
+        let mut provided: usize = generic_picks.iter().map(|(_, width, _)| *width).sum();
+        generic_picks.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)));
+        let mut dropped: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (index, width, _) in &generic_picks {
+            if provided.saturating_sub(*width) >= generic_needed {
+                provided -= *width;
+                dropped.insert(*index);
+                used_sources.remove(&to_tap[*index].object_id);
+            }
+        }
+        if !dropped.is_empty() {
+            let mut index = 0usize;
+            to_tap.retain(|_| {
+                let keep = !dropped.contains(&index);
+                index += 1;
+                keep
+            });
         }
     }
 
@@ -17610,6 +17649,123 @@ mod tests {
             state.players[0].mana_pool.count_color(ManaType::Colorless),
             2,
             "`{{T}}: Add {{C}}{{C}}` must contribute both colorless mana to generic"
+        );
+    }
+
+    /// CR 605.1a: A karoo/bounce land (Dimir Aqueduct's `{T}: Add {U}{B}`) —
+    /// one activation, two colored mana, so auto-tap sees it as a flexible
+    /// combination row (class 3).
+    fn create_two_color_land(
+        state: &mut GameState,
+        name: &str,
+        a: ManaColor,
+        b: ManaColor,
+    ) -> ObjectId {
+        let land = create_object(
+            state,
+            CardId(930),
+            PlayerId(0),
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&land).unwrap();
+        obj.card_types.core_types.push(CoreType::Land);
+        Arc::make_mut(&mut obj.abilities).push(
+            AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Mana {
+                    produced: crate::types::ability::ManaProduction::Fixed {
+                        colors: vec![a, b],
+                        contribution: Default::default(),
+                    },
+                    restrictions: vec![],
+                    grants: vec![],
+                    expiry: None,
+                    target: None,
+                },
+            )
+            .cost(AbilityCost::Tap),
+        );
+        land
+    }
+
+    /// A basic land with a single `{T}: Add <color>` ability (class 1 for the
+    /// generic walk, via the Basic supertype).
+    fn create_basic(state: &mut GameState, name: &str, color: ManaColor) -> ObjectId {
+        let land = create_object(
+            state,
+            CardId(931),
+            PlayerId(0),
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&land).unwrap();
+        obj.card_types.core_types.push(CoreType::Land);
+        obj.card_types
+            .supertypes
+            .push(crate::types::card_type::Supertype::Basic);
+        Arc::make_mut(&mut obj.abilities).push(
+            AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Mana {
+                    produced: crate::types::ability::ManaProduction::Fixed {
+                        colors: vec![color],
+                        contribution: Default::default(),
+                    },
+                    restrictions: vec![],
+                    grants: vec![],
+                    expiry: None,
+                    target: None,
+                },
+            )
+            .cost(AbilityCost::Tap),
+        );
+        land
+    }
+
+    /// CR 601.2g + CR 500.4: paying `{4}` with a bounce land (`{T}: Add {U}{B}`)
+    /// and three Islands must tap THREE permanents (2 + 1 + 1), not all four.
+    /// The generic walk spends basics (class 1) before a colored combination
+    /// (class 3), so the last pick overshot: four taps, five mana, one stranded
+    /// in a pool that empties at end of step. The prune gives the spare Island
+    /// back (field report 2026-09-15).
+    #[test]
+    fn auto_tap_gives_back_the_source_the_generic_cost_does_not_need() {
+        let mut state = GameState::new_two_player(42);
+        let bounce = create_two_color_land(
+            &mut state,
+            "Dimir Aqueduct",
+            ManaColor::Blue,
+            ManaColor::Black,
+        );
+        let islands: Vec<ObjectId> = (0..3)
+            .map(|_| create_basic(&mut state, "Island", ManaColor::Blue))
+            .collect();
+
+        let mut events = Vec::new();
+        auto_tap_mana_sources(
+            &mut state,
+            PlayerId(0),
+            &ManaCost::Cost {
+                shards: vec![],
+                generic: 4,
+            },
+            &mut events,
+            None,
+        );
+
+        let tapped = std::iter::once(&bounce)
+            .chain(islands.iter())
+            .filter(|id| state.objects.get(id).unwrap().tapped)
+            .count();
+        assert_eq!(
+            tapped, 3,
+            "{{4}} from a bounce land plus three Islands must tap three permanents, not four"
+        );
+        assert_eq!(
+            state.players[0].mana_pool.total(),
+            4,
+            "the plan must produce exactly the four mana the cost needs"
         );
     }
 
