@@ -1419,6 +1419,49 @@ pub fn parse_target_with_syntax<'a>(
         );
     }
 
+    // CR 607.2a + CR 608.2c: "the exiled card" inside an ACTIVATED ability of
+    // the permanent that did the exiling names the card LINKED to that
+    // permanent, not a tracked set published earlier in this same resolution.
+    //
+    // Ugin's Labyrinth is the shape: the imprint lives in an enters trigger
+    // ("you may exile a colorless card with mana value 7 or greater from your
+    // hand"), and a SEPARATE activated ability says "{T}: Return the exiled
+    // card to its owner's hand." Nothing in that ability's own chain publishes
+    // a tracked set, so the bare anaphor bound to an empty `TrackedSet` and the
+    // ability tapped the land and returned nothing (field report, 2026-09-16).
+    // Isochron Scepter's "{2}, {T}: You may copy the exiled card" already
+    // resolves through `ExiledBySource` for the same reason, via the CopySpell
+    // arm — this generalizes the same reading to the bare target position.
+    //
+    // Deliberately narrow, on three counts:
+    //  * activated abilities only (`current_ability_index`), never a trigger
+    //    body, where the exile and the reference share one event context;
+    //  * `!in_trigger`, so a delayed trigger created by a resolving chain keeps
+    //    its own anaphora;
+    //  * `bare_card_aggregate_source.is_none()`, so an ability that exiles and
+    //    then refers back inside the SAME chain keeps the tracked-set reading.
+    if ctx.current_ability_index.is_some()
+        && !ctx.in_trigger
+        && ctx.bare_card_aggregate_source.is_none()
+    {
+        static LINKED_EXILE_ANAPHORS: &[&str] = &[
+            "the exiled cards",
+            "the exiled card",
+            "the exiled permanents",
+            "the exiled permanent",
+            "the exiled creature",
+        ];
+        for phrase in LINKED_EXILE_ANAPHORS {
+            if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(*phrase).parse(lower.as_str()) {
+                return (
+                    TargetFilter::ExiledBySource,
+                    &text[lower.len() - rest.len()..],
+                    syntax,
+                );
+            }
+        }
+    }
+
     // CR 603.7: Anaphoric tracked-set pronouns
     static TRACKED_SET_PHRASES: &[&str] = &[
         "the chosen cards",

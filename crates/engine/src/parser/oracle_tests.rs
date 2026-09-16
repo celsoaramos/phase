@@ -10185,6 +10185,65 @@ fn urzas_lands_share_delta_shape() {
     }
 }
 
+/// CR 607.2a + CR 608.2c: in an ACTIVATED ability of the permanent that did the
+/// exiling, "the exiled card" is the LINKED card, not a tracked set published
+/// by an earlier clause of the same resolution. Ugin's Labyrinth imprints in an
+/// enters TRIGGER and returns in a separate activated ability, so the bare
+/// anaphor bound to an empty `TrackedSet` and the ability tapped the land and
+/// returned nothing (field report, 2026-09-16).
+#[test]
+fn ugin_labyrinth_returns_the_card_linked_to_the_land() {
+    let r = parse(
+        "Imprint — When this land enters, you may exile a colorless card with mana value 7 or greater from your hand.\n{T}: Add {C}. If a card is exiled with Ugin's Labyrinth, add {C}{C} instead.\n{T}: Return the exiled card to its owner's hand.",
+        "Ugin's Labyrinth",
+        &[],
+        &["Land"],
+        &[],
+    );
+    let bounce = r
+        .abilities
+        .iter()
+        .find(|a| matches!(a.effect.as_ref(), Effect::Bounce { .. }))
+        .expect("expected the return ability");
+    match bounce.effect.as_ref() {
+        Effect::Bounce { target, .. } => assert_eq!(
+            *target,
+            TargetFilter::ExiledBySource,
+            "the return must name the card linked to this land, not an empty tracked set"
+        ),
+        other => panic!("expected Bounce, got {other:?}"),
+    }
+}
+
+/// Counter-example: when the SAME ability exiles and then refers back, the
+/// reference is to what that chain just published — the tracked set — and must
+/// not be rerouted to the permanent's linked exile.
+#[test]
+fn an_ability_that_exiles_in_its_own_chain_keeps_the_tracked_set_reading() {
+    let r = parse(
+        "{T}: Exile the top two cards of your library. Put the exiled cards into your hand.",
+        "Test Chain Exiler",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    let uses_linked_exile = r.abilities.iter().any(|a| {
+        let mut effects = vec![a.effect.as_ref()];
+        let mut sub = a.sub_ability.as_deref();
+        while let Some(s) = sub {
+            effects.push(s.effect.as_ref());
+            sub = s.sub_ability.as_deref();
+        }
+        effects.iter().any(|e| {
+            format!("{e:?}").contains("ExiledBySource")
+        })
+    });
+    assert!(
+        !uses_linked_exile,
+        "an exile in the ability's own chain keeps the tracked-set anaphor"
+    );
+}
+
 #[test]
 fn parses_ugin_labyrinth_exiled_card_mana_as_delta() {
     let r = parse(

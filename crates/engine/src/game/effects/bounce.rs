@@ -149,7 +149,7 @@ pub fn resolve(
     };
 
     let effective_targets = crate::game::targeting::resolved_targets(ability, target_filter, state);
-    let targets: Vec<_> = effective_targets
+    let mut targets: Vec<_> = effective_targets
         .iter()
         .filter_map(|t| {
             if let TargetRef::Object(id) = t {
@@ -159,6 +159,31 @@ pub fn resolve(
             }
         })
         .collect();
+
+    // CR 406.6 + CR 607.2a (Ugin's Labyrinth, Hideaway / Imprint family): the
+    // generic target pipeline does not resolve `ExiledBySource` — the linked
+    // card is found through the source's durable `exile_links`, which is the
+    // same lookup `copy_spell.rs` (Isochron Scepter) and `cast_from_zone.rs`
+    // already use for this filter. Without it "{T}: Return the exiled card to
+    // its owner's hand" resolved with an EMPTY target list: the land tapped and
+    // the imprinted card stayed in exile for the rest of the game (field
+    // report, 2026-09-16).
+    //
+    // At most one card is linked to a given source under this binding (a single
+    // Imprint / Hideaway exile per source), so there is no ordering ambiguity.
+    if targets.is_empty() && matches!(target_filter, TargetFilter::ExiledBySource) {
+        let ctx = crate::game::filter::FilterContext::from_ability(ability);
+        targets = crate::game::players::linked_exile_cards_for_source(state, ability.source_id)
+            .iter()
+            .map(|link| link.exiled_id)
+            .filter(|id| {
+                state.objects.get(id).is_some_and(|obj| {
+                    obj.zone == Zone::Exile
+                        && crate::game::filter::matches_target_filter(state, *id, target_filter, &ctx)
+                })
+            })
+            .collect();
+    }
 
     // CR 115.6 + CR 601.2c + CR 608.2b: "Return up to one target ... " (Wrenn
     // and Six +1, and every "up to N target" bounce). Such a bounce *requires
@@ -394,6 +419,18 @@ pub fn resolve(
         // combines a multi-target bounce with a double destination redirect).
         let current_zone = state.objects.get(&obj_id).map(|o| o.zone);
         let move_dest = if matches!(current_zone, Some(Zone::Battlefield | Zone::Graveyard)) {
+            Some(destination)
+        } else if current_zone == Some(Zone::Exile)
+            && matches!(target_filter, TargetFilter::ExiledBySource)
+        {
+            // CR 607.2a + CR 406.6: exile is a legal ORIGIN when the effect names
+            // the card linked to this permanent — "{T}: Return the exiled card to
+            // its owner's hand" (Ugin's Labyrinth). The zone ladder above is what
+            // keeps a bounce from yanking an object out of a zone a filter merely
+            // happened to match; `ExiledBySource` is not that case, because the
+            // linked card's only possible zone IS exile (it is classified
+            // `PermanentDomainFalse` for exactly this reason). Before this the
+            // ability tapped the land and moved nothing (field report, 2026-09-16).
             Some(destination)
         } else if current_zone == Some(Zone::Stack) && destination == Zone::Hand {
             stack_spell_casting_variant(state, obj_id).map(|casting_variant| {

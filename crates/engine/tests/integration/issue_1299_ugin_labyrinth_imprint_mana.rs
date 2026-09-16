@@ -21,6 +21,10 @@ use engine::types::mana::{ManaCost, ManaType};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
+const UGIN_LABYRINTH_WITH_RETURN: &str = "Imprint — When this land enters, you may exile a colorless card with mana value 7 or greater from your hand.\n\
+{T}: Add {C}. If a card is exiled with Ugin's Labyrinth, add {C}{C} instead.\n\
+{T}: Return the exiled card to its owner's hand.";
+
 const UGIN_LABYRINTH: &str = "Imprint — When this land enters, you may exile a colorless card with mana value 7 or greater from your hand.\n\
 {T}: Add {C}. If a card is exiled with Ugin's Labyrinth, add {C}{C} instead.";
 
@@ -136,5 +140,61 @@ fn ugin_labyrinth_without_imprint_produces_one_colorless() {
         outcome.mana_pool_color(P0, ManaType::Colorless),
         1,
         "Labyrinth without an imprint must produce only the base colorless mana"
+    );
+}
+
+/// Field report (2026-09-16): activating "{T}: Return the exiled card to its
+/// owner's hand" tapped the land and returned NOTHING — the imprinted card sat
+/// in exile for the rest of the game.
+///
+/// CR 607.2a + CR 608.2c: inside an ACTIVATED ability of the permanent that did
+/// the exiling, "the exiled card" is the LINKED card. The imprint happens in a
+/// separate enters TRIGGER, so this ability's own chain publishes no tracked
+/// set — the bare anaphor bound to an empty `TrackedSet` and moved nothing.
+///
+/// This exercises the whole path, not just the parse: the filter must resolve
+/// through `exile_links` and the return must actually move the card out of
+/// exile and into its owner's hand.
+#[test]
+fn ugin_labyrinth_returns_the_imprinted_card_to_hand() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let labyrinth = scenario
+        .add_land_to_hand(P0, "Ugin's Labyrinth")
+        .from_oracle_text(UGIN_LABYRINTH_WITH_RETURN)
+        .id();
+
+    let mut runner = scenario.build();
+    remove_from_zone(runner.state_mut(), labyrinth, Zone::Hand, P0);
+    add_to_zone(runner.state_mut(), labyrinth, Zone::Battlefield, P0);
+    runner.state_mut().objects.get_mut(&labyrinth).unwrap().zone = Zone::Battlefield;
+    engine::game::trigger_index::reindex_object_triggers(runner.state_mut(), labyrinth);
+
+    let imprint_candidate = add_colorless_imprint_candidate(&mut runner);
+    resolve_imprint_exile(&mut runner, labyrinth, imprint_candidate);
+    assert_eq!(
+        runner.state().objects[&imprint_candidate].zone,
+        Zone::Exile,
+        "the imprint must put the card in exile first"
+    );
+
+    let return_index = runner.state().objects[&labyrinth]
+        .abilities
+        .iter()
+        .position(|a| matches!(a.effect.as_ref(), Effect::Bounce { .. }))
+        .expect("the land must carry the return ability");
+
+    runner.activate(labyrinth, return_index).resolve();
+
+    assert_eq!(
+        runner.state().objects[&imprint_candidate].zone,
+        Zone::Hand,
+        "the card exiled with this land must come back to its owner's hand"
+    );
+    assert!(
+        runner.state().players[P0.0 as usize]
+            .hand
+            .contains(&imprint_candidate),
+        "and it must be in the owner's hand list, not just carry the zone tag"
     );
 }
