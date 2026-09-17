@@ -30,6 +30,39 @@ pub struct EffectProfile {
     pub has_mass_damage_or_mass_shrink_text: bool,
 }
 
+/// CR 111.1 + CR 608.2: a token created or a card drawn is the CASTER's card
+/// advantage only when it accrues to the caster. The parser records the
+/// beneficiary in `Effect::Token { owner }` and `Effect::Draw { target }`, and
+/// the default for both is [`TargetFilter::Controller`] — every ordinary token
+/// maker lands there (verified against the shipped card data: Raise the Alarm,
+/// Lingering Souls, Secure the Wastes, Dragon Fodder, Bitterblossom, Monastery
+/// Mentor, March of the Multitudes, Tempt with Vengeance).
+///
+/// Riders that hand the card to somebody else do not. Stroke of Midnight —
+/// "Destroy target nonland permanent. Its controller creates a 1/1 white Human
+/// creature token." — carries `ParentTargetController`: the controller of the
+/// permanent being destroyed, which is the player the spell is pointed at.
+///
+/// Reading that as the AI's own token priced a pure downside as card
+/// advantage. Aimed at an indestructible permanent, where the destroy half
+/// does nothing at all (CR 702.12b), the spell became a strict loss the AI was
+/// happy to pay for: nothing destroyed, and a free 1/1 handed to the opponent.
+/// `reject_futile_target` in `tactical_gate` does prove that target futile, but
+/// it only ever sees `ChooseTarget`/`SelectTargets` candidates — with a single
+/// legal target the engine binds it at announcement, so the cast is the only
+/// decision there is, and it was scored as a gain.
+///
+/// Anything this function cannot prove belongs to the caster is left out. That
+/// is the safe direction: an unrecognized beneficiary merely forgoes a
+/// positional bonus, while a wrong `true` prices an opponent's gain as the
+/// AI's own.
+fn accrues_to_caster(beneficiary: &TargetFilter) -> bool {
+    matches!(
+        beneficiary,
+        TargetFilter::Controller | TargetFilter::SourceController
+    )
+}
+
 impl EffectProfile {
     /// Build an EffectProfile by scanning a flat list of effects.
     pub fn from_effects(effects: &[&Effect]) -> Self {
@@ -40,8 +73,12 @@ impl EffectProfile {
             has_reveal_hand_or_discard: effects
                 .iter()
                 .any(|e| matches!(e, Effect::RevealHand { .. } | Effect::DiscardCard { .. })),
-            has_draw: effects.iter().any(|e| matches!(e, Effect::Draw { .. })),
-            has_token_creation: effects.iter().any(|e| matches!(e, Effect::Token { .. })),
+            has_draw: effects
+                .iter()
+                .any(|e| matches!(e, Effect::Draw { target, .. } if accrues_to_caster(target))),
+            has_token_creation: effects
+                .iter()
+                .any(|e| matches!(e, Effect::Token { owner, .. } if accrues_to_caster(owner))),
             has_counter_spell: effects.iter().any(|e| matches!(e, Effect::Counter { .. })),
             has_direct_removal_text: effects.iter().any(|e| is_direct_removal(e)),
             has_mass_damage_or_mass_shrink_text: effects
@@ -644,6 +681,79 @@ mod tests {
             generic: 4,
         };
         object
+    }
+
+    /// Stroke of Midnight: "Destroy target nonland permanent. Its controller
+    /// creates a 1/1 white Human creature token." The token is the TARGET's,
+    /// so it is not the caster's card advantage — it is what the caster pays.
+    fn human_token_effect(owner: TargetFilter) -> Effect {
+        Effect::Token {
+            name: "Human".to_string(),
+            power: engine::types::ability::PtValue::Fixed(1),
+            toughness: engine::types::ability::PtValue::Fixed(1),
+            types: vec!["Creature".to_string(), "Human".to_string()],
+            colors: Vec::new(),
+            keywords: Vec::new(),
+            tapped: false,
+            count: QuantityExpr::Fixed { value: 1 },
+            owner,
+            attach_to: None,
+            enters_attacking: false,
+            supertypes: Vec::new(),
+            static_abilities: Vec::new(),
+            enter_with_counters: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn token_for_the_caster_is_card_advantage() {
+        let effect = human_token_effect(TargetFilter::Controller);
+        let profile = EffectProfile::from_effects(&[&effect]);
+        assert!(
+            profile.has_token_creation,
+            "an ordinary token maker (owner = Controller) is the caster's own"
+        );
+    }
+
+    #[test]
+    fn token_for_the_targets_controller_is_not_card_advantage() {
+        let effect = human_token_effect(TargetFilter::ParentTargetController);
+        let profile = EffectProfile::from_effects(&[&effect]);
+        assert!(
+            !profile.has_token_creation,
+            "Stroke of Midnight hands the 1/1 to the permanent's controller — \
+             pricing it as the AI's own is what paid for casting the spell at \
+             an indestructible permanent, where the destroy half does nothing"
+        );
+    }
+
+    #[test]
+    fn draw_for_the_caster_is_card_advantage() {
+        let effect = Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        };
+        let profile = EffectProfile::from_effects(&[&effect]);
+        assert!(profile.has_draw);
+    }
+
+    #[test]
+    fn draw_for_someone_else_is_not_the_casters_card_advantage() {
+        for beneficiary in [
+            TargetFilter::Opponent,
+            TargetFilter::ParentTargetController,
+            TargetFilter::Player,
+        ] {
+            let effect = Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: beneficiary.clone(),
+            };
+            let profile = EffectProfile::from_effects(&[&effect]);
+            assert!(
+                !profile.has_draw,
+                "a card drawn by {beneficiary:?} is not the caster's"
+            );
+        }
     }
 
     #[test]
