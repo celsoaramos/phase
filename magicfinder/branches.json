@@ -16,5 +16,6 @@
   { "branch": "card/x-cap-conditional-mana" },
   { "branch": "card/min-waste-auto-tap" },
   { "branch": "card/spend-restricted-mana-first" },
-  { "branch": "card/linked-exile-anaphor" }
+  { "branch": "card/linked-exile-anaphor" },
+  { "branch": "ai/futile-cast-gate" }
 ]
