@@ -25,6 +25,7 @@ use engine::game::quantity::{
     static_definition_is_cast_stable_for_pre_cast, trigger_definition_is_cast_stable_for_pre_cast,
     try_resolve_quantity_in_source_context,
 };
+use engine::game::targeting::find_legal_targets;
 use engine::game::triggers::{
     synthetic_keyword_spell_cast_trigger_applies, trigger_definition_functions_in_zone,
 };
@@ -271,6 +272,10 @@ fn assess_candidate(ctx: &PolicyContext<'_>) -> GateDecision {
 
 fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     if zero_direct_spell_is_safe_to_reject(ctx) {
+        return GateDecision::Reject;
+    }
+
+    if cast_targets_are_all_futile(ctx) {
         return GateDecision::Reject;
     }
 
@@ -1159,17 +1164,99 @@ fn type_filter_is_proven_disjoint_from_spell(
 /// Hard-reject targets that are provably futile (e.g., destroy vs indestructible).
 /// Called before `target_choice_penalty` so these never reach scoring.
 fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<GateDecision> {
-    let TargetRef::Object(object_id) = target else {
-        return None;
-    };
-    let object = ctx.state.objects.get(object_id)?;
     let effects = ctx.effects();
+    if target_is_provably_futile(ctx, &effects, target) {
+        return Some(GateDecision::Reject);
+    }
+    None
+}
+
+/// CR 601.2c: announcing a spell commits the caster — the rules provide no
+/// strategic rewind. When a spell has a SINGLE legal target the engine binds it
+/// at announcement, so no `ChooseTarget` candidate is ever scored and
+/// [`reject_futile_target`] never runs: the cast is the only decision there is.
+///
+/// That is the seam a field report walked through (2026-09-17). The AI cast
+/// Stroke of Midnight — "Destroy target nonland permanent. Its controller
+/// creates a 1/1 white Human creature token." — on an indestructible Darksteel
+/// Angel. Targeting it is legal (CR 115.2; indestructible is not hexproof), the
+/// destroy then does nothing (CR 702.12b), and the rider hands the OPPONENT a
+/// free 1/1. A strict loss, repeated four times in one game.
+///
+/// Scoring alone cannot prevent it, and that matters for why this is a hard
+/// reject rather than a penalty. Measured on that game with the engine's own
+/// decision receipt, the AI ranked the cast LAST of four candidates, behind
+/// `PassPriority` (-10.64 against -8.36) — and played it anyway, because
+/// selection samples the candidate pool rather than taking the top rank (7.8%
+/// for that cast, per priority window, with ten copies in hand over 27 turns).
+/// Lowering a score lowers the odds; only removing the candidate removes the
+/// play. [`reject_futile_target`] is a hard reject for the same reason.
+///
+/// Conservative in every direction it cannot prove: only effects whose
+/// futility [`target_is_provably_futile`] can demonstrate are considered, the
+/// spell must actually have legal targets, and one non-futile candidate
+/// anywhere leaves the cast alone.
+fn cast_targets_are_all_futile(ctx: &PolicyContext<'_>) -> bool {
+    let GameAction::CastSpell { object_id, .. } = &ctx.candidate.action else {
+        return false;
+    };
+    let Some(object) = ctx.state.objects.get(object_id) else {
+        return false;
+    };
+    // CR 601.2b: a modal spell has not chosen its mode at announcement, so
+    // `effects()` reports every printed mode at once. "Every target is futile"
+    // would be a claim about a spell that has not been assembled yet.
+    if object.modal.is_some() {
+        return false;
+    }
+
+    let effects = ctx.effects();
+    let mut proved_any = false;
+    for effect in &effects {
+        if !matches!(effect, Effect::Destroy { .. } | Effect::DealDamage { .. }) {
+            continue;
+        }
+        let Some(filter) = effect.target_filter() else {
+            continue;
+        };
+        let targets = find_legal_targets(ctx.state, filter, ctx.ai_player, *object_id);
+        // No legal target at all is a different question (the engine decides
+        // whether the spell is castable); this proof is only about a target set
+        // that exists and is worthless.
+        if targets.is_empty() {
+            return false;
+        }
+        if !targets
+            .iter()
+            .all(|target| target_is_provably_futile(ctx, &effects, target))
+        {
+            return false;
+        }
+        proved_any = true;
+    }
+    proved_any
+}
+
+/// The per-target futility proof, shared by the `ChooseTarget`/`SelectTargets`
+/// gate and by the cast-time gate below. Everything it cannot prove is left
+/// alone: this decides that an action is WASTED, never that it is merely weak.
+fn target_is_provably_futile(
+    ctx: &PolicyContext<'_>,
+    effects: &[&Effect],
+    target: &TargetRef,
+) -> bool {
+    let TargetRef::Object(object_id) = target else {
+        return false;
+    };
+    let Some(object) = ctx.state.objects.get(object_id) else {
+        return false;
+    };
 
     // CR 701.8 + CR 702.12b: destroy-based removal can't destroy an
     // indestructible permanent.
     let is_destroy = effects.iter().any(|e| matches!(e, Effect::Destroy { .. }));
     if is_destroy && object.has_keyword(&Keyword::Indestructible) {
-        return Some(GateDecision::Reject);
+        return true;
     }
 
     // CR 702.12b: an indestructible creature ignores the lethal-damage SBA
@@ -1178,10 +1265,10 @@ fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<G
     // 0 kills via CR 704.5f (which indestructible does not prevent), and two
     // shrink spells can combine, so those stay in the judgment layer.
     if object.has_keyword(&Keyword::Indestructible)
-        && deals_damage(&effects)
-        && !has_toughness_shrink(&effects)
+        && deals_damage(effects)
+        && !has_toughness_shrink(effects)
     {
-        return Some(GateDecision::Reject);
+        return true;
     }
 
     // CR 702.21a: targeting a warded permanent triggers ward; if the AI can't
@@ -1190,13 +1277,13 @@ fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<G
     for keyword in &object.keywords {
         if let Keyword::Ward(ward) = keyword {
             if !can_pay_ward_cost(ctx, ward, object) {
-                return Some(GateDecision::Reject);
+                return true;
             }
             break;
         }
     }
 
-    None
+    false
 }
 
 /// Whether any effect deals damage (fixed or variable).
@@ -7148,6 +7235,103 @@ mod tests {
             },
             metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Target),
         }
+    }
+
+    const STROKE_OF_MIDNIGHT_ORACLE: &str =
+        "Destroy target nonland permanent. Its controller creates a 1/1 white Human creature token.";
+
+    /// Run the gate on a `CastSpell` candidate with the AI at priority.
+    fn gate_cast(state: &mut GameState, spell: ObjectId) -> GateDecision {
+        let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        let decision = AiDecisionContext {
+            waiting_for: WaitingFor::Priority { player: P0 },
+            candidates: Vec::new(),
+        };
+        let card_id = state.objects[&spell].card_id;
+        let candidate = CandidateAction {
+            action: GameAction::CastSpell {
+                object_id: spell,
+                card_id,
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            },
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Spell),
+        };
+        let context = AiContext::empty(&config.weights);
+        let ctx = PolicyContext {
+            state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: P0,
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        assess_candidate(&ctx)
+    }
+
+    /// Put Stroke of Midnight in P0's hand and return its id.
+    fn stroke_of_midnight_in_hand(scenario: &mut GameScenario) -> ObjectId {
+        scenario
+            .add_spell_to_hand_from_oracle(
+                P0,
+                "Stroke of Midnight",
+                true,
+                STROKE_OF_MIDNIGHT_ORACLE,
+            )
+            .id()
+    }
+
+    /// CR 702.12b + CR 601.2c: the only legal target can't be destroyed, so the
+    /// destroy half does nothing and the rider hands the OPPONENT a 1/1. With a
+    /// single legal target the engine binds it at announcement — there is no
+    /// `ChooseTarget` candidate for `reject_futile_target` to veto, so the cast
+    /// itself has to be the one rejected.
+    #[test]
+    fn rejects_cast_whose_only_legal_target_is_indestructible() {
+        let mut scenario = GameScenario::new();
+        scenario
+            .add_creature(P1, "Darksteel Angel", 4, 4)
+            .with_keyword(Keyword::Indestructible);
+        let spell = stroke_of_midnight_in_hand(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+
+        assert_eq!(gate_cast(state, spell), GateDecision::Reject);
+    }
+
+    /// Non-vacuity, and the boundary that keeps the proof honest: one
+    /// destructible permanent anywhere in the legal target set makes the cast a
+    /// real removal play again. Without this the gate could reject every
+    /// targeted removal spell and the first test would still pass.
+    #[test]
+    fn allows_cast_when_any_legal_target_is_destructible() {
+        let mut scenario = GameScenario::new();
+        scenario
+            .add_creature(P1, "Darksteel Angel", 4, 4)
+            .with_keyword(Keyword::Indestructible);
+        scenario.add_creature(P1, "Grizzly Bears", 2, 2);
+        let spell = stroke_of_midnight_in_hand(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+
+        assert_ne!(gate_cast(state, spell), GateDecision::Reject);
+    }
+
+    /// The ordinary case: nothing indestructible in sight, nothing to prove.
+    #[test]
+    fn allows_cast_against_an_ordinary_board() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P1, "Grizzly Bears", 2, 2);
+        let spell = stroke_of_midnight_in_hand(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+
+        assert_ne!(gate_cast(state, spell), GateDecision::Reject);
     }
 
     /// CR 702.12b: a damage-only spell can never kill an indestructible creature.
