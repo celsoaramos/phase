@@ -1483,6 +1483,41 @@ fn intervening_if_source_attacked_this_turn_populates_condition() {
 }
 
 #[test]
+fn kytheon_hero_of_akros_intervening_if_gates_the_exile_and_transform() {
+    // CR 508.1 + CR 603.4 + CR 712: the "if Kytheon and at least two other creatures
+    // attacked this combat" clause was swallowed (parse warning Condition_If) and the
+    // trigger ran unconditionally — Kytheon was exiled at EVERY end of combat, even
+    // without attacking, and never came back transformed.
+    let trigger = parse_trigger_line(
+        "At end of combat, if Kytheon and at least two other creatures attacked this combat, \
+         exile Kytheon, then return him to the battlefield transformed under his owner's control.",
+        "Kytheon, Hero of Akros",
+    );
+    assert_eq!(
+        trigger.condition,
+        Some(TriggerCondition::SourceAndOthersAttackedThisCombat { others: 2 }),
+        "the intervening-if is a combat-attack-ledger gate on the source plus two others"
+    );
+    let execute = trigger.execute.as_deref().expect("the exile/return effect still parses");
+    assert!(matches!(
+        &*execute.effect,
+        Effect::ChangeZone { destination: crate::types::zones::Zone::Exile, target: TargetFilter::SelfRef, .. }
+    ));
+    let back = execute.sub_ability.as_deref().expect("then return him transformed");
+    // "him" binds to the object the exile moved (ParentTarget); either binding
+    // reaches the same card — what matters is Battlefield + transformed.
+    assert!(matches!(
+        &*back.effect,
+        Effect::ChangeZone {
+            destination: crate::types::zones::Zone::Battlefield,
+            target: TargetFilter::SelfRef | TargetFilter::ParentTarget,
+            enter_transformed: true,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn tolsimir_midnights_light_preserves_combat_source_and_event_attacker_axes() {
     let trigger = parse_trigger_line(
         "Whenever a Wolf you control attacks, if Tolsimir, Midnight's Light attacked this combat, \

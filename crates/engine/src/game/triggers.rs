@@ -14088,6 +14088,20 @@ fn evaluate_trigger_condition_with_source(
                     .contains(&source.identity.reference)
             })
         }),
+        // CR 508.1 + CR 603.4: the source is in this combat's attack ledger and
+        // at least `others` OTHER entries are too. Every entry was declared by
+        // the one attacking player (CR 508.1a), so the ledger size is the count
+        // of creatures that attacked; the ledger survives an attacker leaving
+        // combat, which is what "attacked this combat" asks.
+        TriggerCondition::SourceAndOthersAttackedThisCombat { others } => {
+            source_context.is_some_and(|source| {
+                state.combat.as_ref().is_some_and(|combat| {
+                    let ledger = &combat.attacking_incarnations_this_combat;
+                    ledger.contains(&source.identity.reference)
+                        && ledger.len().saturating_sub(1) >= *others as usize
+                })
+            })
+        }
         TriggerCondition::EchoDue => {
             source_context.is_some_and(|source| source.source_read(state).echo_due())
         }
@@ -19230,6 +19244,48 @@ pub mod tests {
             validate_blockers(&state, &[(blocker, second_wolf), (second_blocker, wolf)]).is_err(),
             "the two event-attacker bindings cannot cross"
         );
+    }
+
+    /// CR 508.1 + CR 603.4: Kytheon, Hero of Akros — "if Kytheon and at least two
+    /// other creatures attacked this combat". Reads the combat attack LEDGER: false
+    /// with no combat, when Kytheon did not attack, or with fewer than two other
+    /// attackers; true with two others even after one of them left combat.
+    #[test]
+    fn kytheon_source_and_others_attacked_this_combat_reads_the_attack_ledger() {
+        use crate::game::combat::{AttackTarget, AttackerInfo, CombatState};
+
+        let condition = TriggerCondition::SourceAndOthersAttackedThisCombat { others: 2 };
+        let mut state = setup();
+        let kytheon = make_creature(&mut state, PlayerId(0), "Kytheon, Hero of Akros", 2, 1);
+        let first = make_creature(&mut state, PlayerId(0), "First Soldier", 2, 2);
+        let second = make_creature(&mut state, PlayerId(0), "Second Soldier", 2, 2);
+        let third = make_creature(&mut state, PlayerId(0), "Third Soldier", 2, 2);
+        let check = |state: &GameState| check_trigger_condition(state, &condition, PlayerId(0), Some(kytheon), None);
+        let ledger = |state: &GameState, ids: &[ObjectId]| -> HashSet<ObjectIncarnationRef> {
+            ids.iter().map(|id| ObjectIncarnationRef::from_object(&state.objects[id])).collect()
+        };
+
+        assert!(!check(&state), "no combat: nobody attacked");
+
+        state.combat = Some(CombatState {
+            attacking_incarnations_this_combat: ledger(&state, &[first, second, third]),
+            ..CombatState::default()
+        });
+        assert!(!check(&state), "three others attacked, but Kytheon did not");
+
+        state.combat = Some(CombatState {
+            attacking_incarnations_this_combat: ledger(&state, &[kytheon, first]),
+            ..CombatState::default()
+        });
+        assert!(!check(&state), "Kytheon and only ONE other creature attacked");
+
+        state.combat = Some(CombatState {
+            // `attackers` holds only who is STILL in combat: the two others left it.
+            attackers: vec![AttackerInfo::new(kytheon, AttackTarget::Player(PlayerId(1)), PlayerId(1))],
+            attacking_incarnations_this_combat: ledger(&state, &[kytheon, first, second]),
+            ..CombatState::default()
+        });
+        assert!(check(&state), "Kytheon and two others ATTACKED this combat, even though they left combat");
     }
 
     /// Places a battlefield commander object with the given owner/controller.

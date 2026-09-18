@@ -3689,7 +3689,9 @@ fn scan_trigger_condition(x: &TriggerCondition, mode: ScanMode) -> Axes {
             acc = acc.or(scan_player_filter(player, mode));
             acc
         }
-        TriggerCondition::SourceEnteredThisTurn | TriggerCondition::SourceAttackedThisCombat => {
+        TriggerCondition::SourceEnteredThisTurn
+        | TriggerCondition::SourceAttackedThisCombat
+        | TriggerCondition::SourceAndOthersAttackedThisCombat { .. } => {
             Axes {
                 event: false,
                 sibling: false,

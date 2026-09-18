@@ -6006,6 +6006,16 @@ fn parse_first_time_counters_intervening_if(input: &str) -> OracleResult<'_, Tri
     Ok((rest, TriggerCondition::FirstTimeObjectCountersAddedThisTurn))
 }
 
+/// CR 508.1 + CR 603.4: "if ~ and at least <N> other creatures attacked this
+/// combat" → the number of OTHER attackers required alongside the source.
+fn parse_source_and_others_attacked_this_combat(input: &str) -> OracleResult<'_, u32> {
+    let (rest, _) = tag("if ~ and at least ").parse(input)?;
+    let (rest, others) = nom_primitives::parse_number.parse(rest)?;
+    let (rest, _) = alt((tag(" other creatures"), tag(" other creature"))).parse(rest)?;
+    let (rest, _) = tag(" attacked this combat").parse(rest)?;
+    Ok((rest, others))
+}
+
 /// CR 508.1 + CR 603.4: "if a <type> and a <type> [and ...] attacked this combat"
 /// — typed attack-declaration conjunction (Fearless Swashbuckler: "if a Pirate
 /// and a Vehicle attacked this combat"). Each typed noun becomes one
@@ -6616,6 +6626,21 @@ fn extract_if_condition_with_card_name(
                     variant: CastVariantPaid::Escape,
                 }),
             }),
+        );
+    }
+
+    // CR 400.7 + CR 508.1 + CR 603.4: "if ~ and at least N other creatures
+    // attacked this combat" (Kytheon, Hero of Akros). Before the bare "if ~
+    // attacked this combat" production: that one does not match here (the text
+    // continues with " and"), and the clause was left in the effect as a
+    // swallowed condition — the trigger then exiled Kytheon at EVERY end of combat.
+    if let Some((prefix, others, rest)) =
+        scan_preceded(&lower, parse_source_and_others_attacked_this_combat)
+    {
+        let clause_len = lower.len() - prefix.len() - rest.len();
+        return (
+            strip_condition_clause(text, prefix.len(), clause_len),
+            Some(TriggerCondition::SourceAndOthersAttackedThisCombat { others }),
         );
     }
 

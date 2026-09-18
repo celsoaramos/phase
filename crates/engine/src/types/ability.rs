@@ -26252,6 +26252,13 @@ pub enum TriggerCondition {
     /// CR 400.7 + CR 508.1 + CR 603.4: True only when this exact source
     /// incarnation attacked during the current combat.
     SourceAttackedThisCombat,
+    /// CR 400.7 + CR 508.1 + CR 603.4: "if ~ and at least N other creatures
+    /// attacked this combat" (Kytheon, Hero of Akros). True when this exact
+    /// source incarnation AND at least `others` other creatures were declared as
+    /// attackers in the current combat. Reads the combat's attack ledger, so an
+    /// attacker that already left combat (died to first-strike damage) still
+    /// counts — the clause asks who ATTACKED, not who is still attacking.
+    SourceAndOthersAttackedThisCombat { others: u32 },
     /// CR 701.54a/d + CR 603.4: "if you chose a creature other than ~ as your
     /// Ring-bearer" (Aragorn, Company Leader). True when the triggering
     /// `GameEvent::RingTemptsYou` event's immutable `chosen_bearer` snapshot
@@ -26732,6 +26739,7 @@ impl TriggerCondition {
             | TriggerCondition::DuringPlayersTurn { .. }
             | TriggerCondition::SourceEnteredThisTurn
             | TriggerCondition::SourceAttackedThisCombat
+            | TriggerCondition::SourceAndOthersAttackedThisCombat { .. }
             | TriggerCondition::EchoDue
             | TriggerCondition::MinCoAttackers { .. }
             | TriggerCondition::SolveConditionMet
