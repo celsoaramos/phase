@@ -3861,17 +3861,13 @@ mod tests {
             pool.add(make_unit(ManaType::Colorless));
         }
 
+        // Só os campos que o teste exercita; o resto vem do Default. Literal
+        // exaustivo aqui quebra a compilação toda vez que o upstream acrescenta
+        // um campo a SpellMeta (foi o que a v0.86.0 fez, com #8905).
         let eldrazi = SpellMeta {
             types: vec!["Creature".to_string(), "Colorless".to_string()],
             subtypes: vec!["Eldrazi".to_string()],
-            keyword_kinds: vec![],
-            cast_from_zone: None,
-            mana_value: None,
-            color_count: None,
-            colors: vec![],
-            has_x_in_cost: false,
-            is_face_down: false,
-            cant_spend_mana: false,
+            ..Default::default()
         };
         let ctx = PaymentContext::Spell(&eldrazi);
         let cost = ManaCost::Cost {
