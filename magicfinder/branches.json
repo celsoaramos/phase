@@ -1,21 +1,52 @@
 [
-  { "branch": "card/harms-way",
+  {
+    "branch": "card/harms-way",
     "pr": 8869
   },
-  { "branch": "card/sporogenic-infection",
+  {
+    "branch": "card/sporogenic-infection",
     "pr": 8875
   },
-  { "branch": "card/pelakka-predation" },
-  { "branch": "card/martyr-of-sands" },
-  { "branch": "card/invasion-of-azgol" },
-  { "branch": "card/brave-the-elements" },
-  { "branch": "card/sacrificed-attachment-lki" },
-  { "branch": "card/hapatra-wither-counters" },
-  { "branch": "card/mission-briefing" },
-  { "branch": "card/sacrifice-those-tokens" },
-  { "branch": "card/x-cap-conditional-mana" },
-  { "branch": "card/min-waste-auto-tap" },
-  { "branch": "card/spend-restricted-mana-first" },
-  { "branch": "card/linked-exile-anaphor" },
-  { "branch": "ai/futile-cast-gate" }
+  {
+    "branch": "card/pelakka-predation"
+  },
+  {
+    "branch": "card/martyr-of-sands"
+  },
+  {
+    "branch": "card/invasion-of-azgol"
+  },
+  {
+    "branch": "card/brave-the-elements"
+  },
+  {
+    "branch": "card/sacrificed-attachment-lki"
+  },
+  {
+    "branch": "card/hapatra-wither-counters"
+  },
+  {
+    "branch": "card/mission-briefing"
+  },
+  {
+    "branch": "card/sacrifice-those-tokens"
+  },
+  {
+    "branch": "card/x-cap-conditional-mana"
+  },
+  {
+    "branch": "card/min-waste-auto-tap"
+  },
+  {
+    "branch": "card/spend-restricted-mana-first"
+  },
+  {
+    "branch": "card/linked-exile-anaphor"
+  },
+  {
+    "branch": "card/kytheon-attacked-this-combat"
+  },
+  {
+    "branch": "ai/futile-cast-gate"
+  }
 ]
