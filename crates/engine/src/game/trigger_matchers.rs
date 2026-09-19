@@ -2710,7 +2710,27 @@ pub(super) fn match_sacrificed(
     // already be in the graveyard with its granted characteristics pruned (CR 400.7), or
     // — for a token (CR 111.7) — have ceased to exist and been removed from
     // `state.objects` by a prior SBA pass.
-    valid_card_matches_with_lki(trigger, state, *object_id, source_context)
+    if valid_card_matches_with_lki(trigger, state, *object_id, source_context) {
+        return true;
+    }
+    // CR 603.10a + CR 400.7: the sacrificed permanent's OWN "when you sacrifice
+    // ~" trigger (Carrot Cake). The source context is the departed battlefield
+    // incarnation, while the live object is already a new graveyard object, so a
+    // `SelfRef` filter answered against the live object can never hold. When the
+    // trigger's source IS the sacrificed object, answer the filter against its
+    // battlefield departure record — the same look-back authority the ceased
+    // (token) arm of `subject_filter_matches_with_lki` uses.
+    if source_event_subject_id(source_context) != *object_id {
+        return false;
+    }
+    let (Some(filter), Some(record)) = (
+        trigger.valid_card.as_ref(),
+        crate::types::game_state::terminal_battlefield_departure_row(state, *object_id),
+    ) else {
+        return false;
+    };
+    let ctx = super::filter::FilterContext::from_trigger_source(source_context);
+    super::filter::matches_target_filter_on_zone_change_record(state, record, filter, &ctx)
 }
 
 pub(super) fn match_destroyed(
