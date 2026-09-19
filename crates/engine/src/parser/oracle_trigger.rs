@@ -5909,11 +5909,12 @@ fn graveyard_origin_or_condition(owner: Option<ControllerRef>) -> TriggerConditi
 /// matched clause from the effect text.
 ///
 /// Grammar (subject anaphor × graveyard-origin disjunction):
-///   "if " ( "it " | "they " )
-///   ( <compact-form> | <split-your-form> )
+///   "if " ( "it " | "they " | "that creature " )
+///   ( <compact-form> | <split-your-form> | <split-a-form> )
 /// where
 ///   <compact-form>     = "entered or " ( "was" | "were" ) " cast from a graveyard"
 ///   <split-your-form>  = "entered from your graveyard or you cast it from your graveyard"
+///   <split-a-form>     = "entered from a graveyard or you cast it from a graveyard"
 /// CR 701.54a + CR 603.4: "if you chose a creature other than ~ as your
 /// ring-bearer, " — Aragorn, Company Leader's intervening-if. The card name is
 /// already normalized to `~` at the parser entry point (CR 201.5: a name in an
@@ -5928,7 +5929,10 @@ fn parse_chose_other_ring_bearer_intervening_if(input: &str) -> OracleResult<'_,
 
 fn parse_graveyard_origin_intervening_if(input: &str) -> OracleResult<'_, TriggerCondition> {
     let (rest, _) = tag("if ").parse(input)?;
-    let (rest, _) = alt((tag("it "), tag("they "))).parse(rest)?;
+    // "that creature" (Breathless Knight: "Whenever ~ or another creature you
+    // control enters, if that creature entered from a graveyard or you cast it
+    // from a graveyard") is the same anaphor as "it": the entering object.
+    let (rest, _) = alt((tag("it "), tag("they "), tag("that creature "))).parse(rest)?;
     // Compact "a graveyard" form: "entered or (was|were) cast from a graveyard".
     let compact = map(
         (
@@ -5966,7 +5970,27 @@ fn parse_graveyard_origin_intervening_if(input: &str) -> OracleResult<'_, Trigge
             owner,
         },
     );
-    alt((compact, split_your, bare_cast)).parse(rest)
+    // CR 400.3 + CR 404.1: split "a graveyard" form (Breathless Knight) — the
+    // entered arm is unscoped (any graveyard), while the explicit "you cast it"
+    // arm scopes the CASTER only; "a graveyard" leaves the origin owner free.
+    let split_a = map(
+        tag("entered from a graveyard or you cast it from a graveyard"),
+        |_| TriggerCondition::Or {
+            conditions: vec![
+                TriggerCondition::ZoneChangeObjectMatchesFilter {
+                    origin: Some(Zone::Graveyard),
+                    destination: Zone::Battlefield,
+                    filter: TargetFilter::Any,
+                },
+                TriggerCondition::WasCast {
+                    zone: Some(Zone::Graveyard),
+                    controller: Some(ControllerRef::You),
+                    owner: None,
+                },
+            ],
+        },
+    );
+    alt((compact, split_your, split_a, bare_cast)).parse(rest)
 }
 
 /// CR 701.26 + CR 603.4: "if it's the first time that creature/permanent has become
