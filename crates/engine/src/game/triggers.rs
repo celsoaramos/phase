@@ -35457,6 +35457,83 @@ pub mod tests {
         );
     }
 
+    /// CR 603.4 + CR 400.3: Breathless Knight — "Whenever this creature or
+    /// another creature you control enters, if that creature entered from a
+    /// graveyard or you cast it from a graveyard, put a +1/+1 counter on this
+    /// creature." The "that creature" anaphor + "a graveyard" split form used to
+    /// be swallowed by the parser, so the counter landed on EVERY creature ETB.
+    #[test]
+    fn breathless_knight_counter_only_for_graveyard_entries() {
+        let trigger = crate::parser::oracle_trigger::parse_trigger_line(
+            "Whenever this creature or another creature you control enters, if that creature entered from a graveyard or you cast it from a graveyard, put a +1/+1 counter on this creature.",
+            "Breathless Knight",
+        );
+        let condition = trigger
+            .condition
+            .expect("the graveyard-origin intervening-if must be parsed, not swallowed");
+
+        let mut state = setup();
+        let knight = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Breathless Knight".to_string(),
+            Zone::Battlefield,
+        );
+        let entering = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        let check = |state: &GameState, from: Zone| {
+            let event = zone_changed_event(
+                entering,
+                from,
+                Zone::Battlefield,
+                vec![CoreType::Creature],
+                Vec::new(),
+            );
+            check_trigger_condition(state, &condition, PlayerId(0), Some(knight), Some(&event))
+        };
+
+        // Cast from hand: resolves Stack -> Battlefield, never touched a graveyard.
+        state.objects.get_mut(&entering).unwrap().cast_from_zone = Some(Zone::Hand);
+        state.objects.get_mut(&entering).unwrap().cast_controller = Some(PlayerId(0));
+        assert!(
+            !check(&state, Zone::Stack),
+            "a creature cast from hand must not grow the Knight"
+        );
+        // Put onto the battlefield from a hand/library effect: still no.
+        state.objects.get_mut(&entering).unwrap().cast_from_zone = None;
+        state.objects.get_mut(&entering).unwrap().cast_controller = None;
+        assert!(
+            !check(&state, Zone::Hand),
+            "entering from hand is not a graveyard entry"
+        );
+        // Reanimated (Graveyard -> Battlefield): yes.
+        assert!(
+            check(&state, Zone::Graveyard),
+            "entering from a graveyard grows the Knight"
+        );
+        // CR 400.3 + CR 404.1: "a graveyard" includes another owner's card.
+        state.objects.get_mut(&entering).unwrap().owner = PlayerId(1);
+        assert!(check(&state, Zone::Graveyard));
+        // Cast from a graveyard by the Knight's controller: yes.
+        state.objects.get_mut(&entering).unwrap().cast_from_zone = Some(Zone::Graveyard);
+        state.objects.get_mut(&entering).unwrap().cast_controller = Some(PlayerId(0));
+        assert!(
+            check(&state, Zone::Stack),
+            "casting it from a graveyard grows the Knight"
+        );
+        state.objects.get_mut(&entering).unwrap().cast_controller = Some(PlayerId(1));
+        assert!(
+            !check(&state, Zone::Stack),
+            "the cast arm requires the Knight's controller to have cast the card"
+        );
+    }
+
     /// CR 400.3 + CR 404.1 + CR 603.4: "if it was cast from your graveyard"
     /// (Rocket-Powered Goblin Glider) scopes the ORIGIN-ZONE OWNER, not the
     /// caster. A graveyard is owner-specific, so the only thing "your" constrains
