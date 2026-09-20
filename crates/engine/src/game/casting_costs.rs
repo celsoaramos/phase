@@ -874,7 +874,18 @@ pub(crate) fn payable_spell_alternative_cost_details(
     // is not a CR-mandated precedence; honoring full controller choice across a
     // self-option and one or more grants needs a multi-alternative choice
     // surface and is a known limitation tracked for follow-up.
-    let self_option = (origin_zone == Zone::Hand)
+    //
+    // CR 118.9 + CR 601.2b: a spell's own printed alternative cost (Fireblast,
+    // Force of Will) is not a hand-only offer — it applies to any cast that
+    // would otherwise pay the printed mana cost. An impulse-class play
+    // permission (Experimental Synthesizer, Wrenn's Resolve) authorizes exactly
+    // that cast, so the printed option reaches it. CR 118.9a keeps it away
+    // from a cast whose authority already substitutes the mana cost (see
+    // `exile_cast_pays_printed_mana_cost`).
+    let self_option_reaches_cast = origin_zone == Zone::Hand
+        || (origin_zone == Zone::Exile
+            && super::casting::exile_cast_pays_printed_mana_cost(obj, player));
+    let self_option = self_option_reaches_cast
         .then(|| obj.casting_options.iter())
         .into_iter()
         .flatten()
