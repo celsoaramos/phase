@@ -54,5 +54,8 @@
   },
   {
     "branch": "card/breathless-knight-graveyard-origin"
+  },
+  {
+    "branch": "card/alt-cost-cast-from-exile"
   }
 ]
