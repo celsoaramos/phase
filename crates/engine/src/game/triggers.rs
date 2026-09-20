@@ -5093,6 +5093,67 @@ fn collect_pending_triggers_with_collection(
             }
         }
 
+        // CR 603.10a: "When you sacrifice ~" (Carrot Cake) is a look-back
+        // trigger on the SACRIFICED permanent itself. The leaves-the-battlefield
+        // scan above reads the departed object's triggers only against its
+        // `ZoneChanged` event, and `match_sacrificed` only accepts
+        // `PermanentSacrificed` — so a self-sacrifice (e.g. paying its own
+        // "Sacrifice this artifact" cost) never reached its own trigger. Read the
+        // departed object's pre-event context from the batch's matching
+        // battlefield departure and scan it against the sacrifice event.
+        if let GameEvent::PermanentSacrificed {
+            object_id: sacrificed_id,
+            ..
+        } = event
+        {
+            let departure = events[..event_idx].iter().rev().find(|ev| {
+                matches!(
+                    ev,
+                    GameEvent::ZoneChanged {
+                        object_id,
+                        from: Some(Zone::Battlefield),
+                        ..
+                    } if object_id == sacrificed_id
+                )
+            });
+            // CR 400.7 + CR 603.10a: a live successor does not suppress the
+            // departed incarnation. The observer pass already excludes that
+            // successor from events before its own battlefield entry.
+            if let Some(departure) = departure {
+                if let crate::types::game_state::BattlefieldDepartureSourceContext::Present(
+                    source_context,
+                ) = crate::types::game_state::battlefield_departure_trigger_source_context(
+                    departure,
+                ) {
+                    let matched_triggers = collect_matching_triggers_from_context(
+                        state,
+                        event,
+                        events,
+                        source_context,
+                        Some(Zone::Battlefield),
+                        &mut batched_this_pass,
+                        &mut registered_this_event,
+                        &active_suppress_triggers,
+                        collection,
+                        TriggerSourceVisit::EventSubject,
+                    );
+                    for matched in matched_triggers {
+                        if !session.record_match(state, &matched, event) {
+                            continue;
+                        }
+                        if matched.batched {
+                            batched_this_pass.insert((*sacrificed_id, matched.trig_idx));
+                        }
+                        registered_this_event.insert((*sacrificed_id, matched.trig_idx));
+                        pending.push(PendingTriggerContext::batched(
+                            matched.pending,
+                            matched.trigger_events,
+                        ));
+                    }
+                }
+            }
+        }
+
         // CR 603.10a: abilities that trigger when a player sacrifices a
         // permanent look back in time, so an exploiter that is no longer on the
         // battlefield keeps its own "when ~ exploits a creature" trigger. Which
@@ -33614,6 +33675,82 @@ pub mod tests {
     // clearing faithfully. A previous unit test here manually set `obj.zone =
     // Graveyard` while leaving the object's triggers/continuous effects intact,
     // which masked the very clearing it claimed to cover (Gemini [MED]).
+
+    /// CR 603.10a + CR 400.7: exercise the production sacrifice and zone-move
+    /// authorities with one deferred collection batch. A successor on the
+    /// battlefield must neither suppress nor duplicate its predecessor's trigger.
+    #[test]
+    fn self_sacrifice_return_before_collection_uses_departed_incarnation_once() {
+        let mut state = setup();
+        let player = PlayerId(0);
+        let source = make_creature(&mut state, player, "Self Sacrifice Test", 2, 2);
+        let trigger = crate::parser::oracle_trigger::parse_trigger_line(
+            "When you sacrifice this creature, you gain 1 life.",
+            "Self Sacrifice Test",
+        );
+        assert!(
+            trigger.execute.is_some(),
+            "the self-sacrifice trigger must parse"
+        );
+        let object = state.objects.get_mut(&source).unwrap();
+        std::sync::Arc::make_mut(&mut object.base_trigger_definitions).push(trigger);
+        object.materialize_base_trigger_definitions();
+        let departed = object.incarnation;
+        let mut events = Vec::new();
+        assert!(matches!(
+            crate::game::sacrifice::sacrifice_permanent(&mut state, source, player, &mut events)
+                .unwrap(),
+            crate::game::sacrifice::SacrificeOutcome::Complete
+        ));
+        assert_eq!(state.objects[&source].zone, Zone::Graveyard);
+        assert!(events.iter().any(|event| matches!(event,
+            GameEvent::PermanentSacrificed { object_id, .. } if *object_id == source)));
+        assert!(!crate::game::zone_pipeline::move_object_for_test(
+            &mut state,
+            crate::game::zone_pipeline::ZoneMoveRequest::effect(source, Zone::Battlefield, source),
+            &mut events,
+        ));
+        let successor = state.objects[&source].incarnation;
+        assert_ne!(successor, departed);
+        assert_eq!(state.objects[&source].zone, Zone::Battlefield);
+        let pending = collect_pending_triggers(&mut state, &events);
+        let own: Vec<_> = pending
+            .iter()
+            .filter(|p| p.pending.source_id == source)
+            .collect();
+        assert_eq!(
+            own.len(),
+            1,
+            "exactly the departed incarnation observes its sacrifice"
+        );
+        assert_eq!(
+            own[0].pending.ability.trigger_source_incarnation(),
+            Some(departed)
+        );
+
+        // The successor has its own trigger when it is subsequently sacrificed.
+        let mut next_events = Vec::new();
+        assert!(matches!(
+            crate::game::sacrifice::sacrifice_permanent(
+                &mut state,
+                source,
+                player,
+                &mut next_events
+            )
+            .unwrap(),
+            crate::game::sacrifice::SacrificeOutcome::Complete
+        ));
+        let next = collect_pending_triggers(&mut state, &next_events);
+        let own: Vec<_> = next
+            .iter()
+            .filter(|p| p.pending.source_id == source)
+            .collect();
+        assert_eq!(own.len(), 1);
+        assert_eq!(
+            own[0].pending.ability.trigger_source_incarnation(),
+            Some(successor)
+        );
+    }
 
     /// CR 702.110b control + CR 400.7 baseline: a self-referential "sacrifice
     /// this creature" trigger that resolves while its source is still the same
