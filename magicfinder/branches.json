@@ -50,13 +50,16 @@
     "branch": "ai/futile-cast-gate"
   },
   {
-    "branch": "card/carrot-cake-sacrificed-self"
+    "branch": "card/carrot-cake-sacrificed-self",
+    "pr": 9151
   },
   {
-    "branch": "card/breathless-knight-graveyard-origin"
+    "branch": "card/breathless-knight-graveyard-origin",
+    "pr": 9155
   },
   {
-    "branch": "card/alt-cost-cast-from-exile"
+    "branch": "card/alt-cost-cast-from-exile",
+    "pr": 9196
   },
   {
     "branch": "ai/mana-waste-floor"
