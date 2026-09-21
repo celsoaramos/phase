@@ -6,11 +6,13 @@ use crate::types::ability::{
     AbilityKind, AdditionalCost, AdditionalCostInstance, AdditionalCostOrigin, AggregateFunction,
     BeholdCostAction, CastTimingPermission, Comparator, CostPaidObjectSnapshot,
     CounterCostSelection, Effect, KickerVariant, NotedManaPayment, ObjectProperty, QuantityExpr,
-    QuantityRef, ReplacementDefinition, ResolvedAbility, SacrificeCost, SacrificeRequirement,
-    SpellCastingOptionKind, SpellContext, SpellStackToGraveyardReplacement, StaticCondition,
-    TapCreaturesSelectionMode, TargetFilter, ThisWayCause, TypeFilter, TypedFilter, EXILE_COST_X,
+    QuantityRef, ReplacementDefinition, ResolutionCastCleanup, ResolvedAbility, SacrificeCost,
+    SacrificeRequirement, SpellCastingOptionKind, SpellContext, SpellStackToGraveyardReplacement,
+    StaticCondition, TapCreaturesSelectionMode, TargetFilter, TargetRef, ThisWayCause, TypeFilter,
+    TypedFilter, EXILE_COST_X,
 };
 use crate::types::card_type::CoreType;
+use crate::types::casting_costs::{CostReductionElection, CostReductionEntry, ReductionProvenance};
 use crate::types::events::{GameEvent, ManaTapState};
 use crate::types::game_state::{
     ActivationResidual, ActivationTargetSelection, AssistState, CastOccurrence, CastPaymentMode,
@@ -27,7 +29,7 @@ use crate::types::player::PlayerId;
 use crate::types::replacements::ReplacementEvent;
 use crate::types::resolution::OptionalEffectFrame;
 use crate::types::resolved_commands::ResolvedStackEntryFinalizeCommand;
-use crate::types::statics::{CostModifyMode, StaticMode, StaticModeKind};
+use crate::types::statics::{CostModifyMode, CostReductionReach, StaticMode, StaticModeKind};
 use crate::types::zones::{ExileCostSourceZone, Zone};
 
 use super::casting::emit_targeting_events;
@@ -1522,7 +1524,11 @@ pub(crate) fn finish_pending_cost_or_cast(
         state.pending_cast = Some(Box::new(pending));
         return enter_payment_step(state, player, None, events);
     }
-    let waiting_for = pay_and_push(
+    // CR 601.2f: carry this cast's declared additional mana costs and any
+    // reduction the caster already accepted into the lock seam — the seam
+    // recomputes the total from `base_cost` and would otherwise drop them.
+    let lock = CostLockInput::from_pending(&pending);
+    let waiting_for = pay_and_push_with_lock(
         state,
         player,
         pending.object_id,
@@ -1536,6 +1542,7 @@ pub(crate) fn finish_pending_cost_or_cast(
         pending.distribute,
         pending.origin_zone,
         pending.payment_mode,
+        lock,
         events,
     )?;
     Ok(drain_deferred_triggers_after_stack_object_announcement(
@@ -1912,7 +1919,18 @@ pub(crate) fn handle_discard_for_cost(
     // selection excludes all of them — a multi-card non-self discard cost
     // paid before targets are chosen can otherwise let a just-discarded card
     // leak into the ability's own "target card in your graveyard" pool.
-    pending.ability.add_cost_paid_object_ids_recursive(chosen);
+    // CR 400.7 + CR 608.2h: captured HERE, before the discard moves them, so
+    // each snapshot carries the card's pre-move characteristics and its
+    // binding-time incarnation; `repin_cost_paid_object_recursive` fixes the
+    // epoch once the cost's own moves are done.
+    let chosen_snapshots: Vec<CostPaidObjectSnapshot> = chosen
+        .iter()
+        .filter_map(|id| state.objects.get(id))
+        .map(|obj| CostPaidObjectSnapshot::capture(obj, obj.snapshot_for_mana_spent()))
+        .collect();
+    pending
+        .ability
+        .add_cost_paid_objects_recursive(&chosen_snapshots);
 
     // CR 601.2h + CR 616.1: Discard each chosen card through the replacement pipeline
     // so Madness (CR 702.35) etc. can intercept.
@@ -1987,11 +2005,13 @@ fn commit_random_discard_cost_picks(
     pending: &mut PendingCast,
     picks: &[crate::types::game_state::RandomDiscardCostPick],
 ) {
-    let ids = picks
-        .iter()
-        .map(|pick| pick.occurrence.object_id)
-        .collect::<Vec<_>>();
-    pending.ability.add_cost_paid_object_ids_recursive(&ids);
+    // CR 601.2h + CR 602.2b + CR 400.7: each pick already carries the snapshot
+    // `discard_at_random` captured from the live card BEFORE it left the hand
+    // (CR 608.2h), so reuse it rather than re-reading a post-move object here —
+    // by the time this commit runs the discard has happened.
+    let snapshots: Vec<CostPaidObjectSnapshot> =
+        picks.iter().map(|pick| pick.snapshot.clone()).collect();
+    pending.ability.add_cost_paid_objects_recursive(&snapshots);
 
     // CR 400.7j + CR 608.2k + CR 701.9c: A cost-paid card remains a usable
     // referent only when its move delivered it to a public zone. If a future
@@ -3469,7 +3489,18 @@ pub(crate) fn handle_sacrifice_for_cost(
     // — a sacrifice cost paid before targets are chosen (this engine's
     // documented ordering shortcut, see issue #1301) can otherwise let a
     // just-sacrificed object leak into the ability's own candidate pool.
-    pending.ability.add_cost_paid_object_ids_recursive(chosen);
+    // CR 400.7 + CR 608.2h: captured HERE, before the sacrifice moves them, so
+    // each snapshot carries pre-move characteristics and its binding-time
+    // incarnation; `repin_cost_paid_object_recursive` fixes the epoch once the
+    // cost's own moves are done.
+    let chosen_snapshots: Vec<CostPaidObjectSnapshot> = chosen
+        .iter()
+        .filter_map(|id| state.objects.get(id))
+        .map(|obj| CostPaidObjectSnapshot::capture(obj, obj.snapshot_for_mana_spent()))
+        .collect();
+    pending
+        .ability
+        .add_cost_paid_objects_recursive(&chosen_snapshots);
 
     // CR 702.48c / CR 702.119a: Offering and Emerge use different reduction
     // rules, but both must read the sacrificed permanent before it leaves.
@@ -4817,7 +4848,21 @@ fn finish_exile_selection_for_cost(
     // battlefield-permanent exile costs (Food Chain class) — either can
     // otherwise let a just-exiled object leak into an ability's own
     // "target card/permanent in exile" pool.
-    pending.ability.add_cost_paid_object_ids_recursive(chosen);
+    // CR 400.7 + CR 608.2h: captured HERE, before the exile moves them, so each
+    // snapshot carries pre-move characteristics and its binding-time
+    // incarnation. `repin_cost_paid_object_recursive` then re-pins to the
+    // post-cost epoch (CR 400.7j), which is what lets
+    // `ZoneChoiceCandidateSource::CostPaidObjects` read these as live referents
+    // (Coin of Fate) while still rejecting a card that later left exile and
+    // came back as a new object.
+    let chosen_snapshots: Vec<CostPaidObjectSnapshot> = chosen
+        .iter()
+        .filter_map(|id| state.objects.get(id))
+        .map(|obj| CostPaidObjectSnapshot::capture(obj, obj.snapshot_for_mana_spent()))
+        .collect();
+    pending
+        .ability
+        .add_cost_paid_objects_recursive(&chosen_snapshots);
 
     if pending.activation_ability_index.is_some() {
         pending.mark_activation_cost_committed();
@@ -7456,7 +7501,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
 
     // CR 601.2b: Check for Defiler cost reduction — optional life payment for colored mana
     // reduction on matching-color permanent spells.
-    if let Some((life_cost, mana_reduction)) = find_defiler_reduction(state, player, object_id) {
+    if let Some(defiler) = find_defiler_reduction(state, player, object_id) {
         let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
         pending.base_cost = base_cost.clone();
         pending.casting_variant = casting_variant;
@@ -7468,8 +7513,9 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
         pending.additional_cost_flow = imposed_required_cost.clone().map(AdditionalCost::Required);
         return Ok(WaitingFor::DefilerPayment {
             player,
-            life_cost,
-            mana_reduction,
+            life_cost: defiler.life_cost,
+            mana_reduction: defiler.mana_reduction,
+            reach: defiler.reach,
             pending_cast: Box::new(pending),
         });
     }
@@ -7547,14 +7593,29 @@ fn flash_timing_non_mana_additional_cost(
         })
 }
 
-/// CR 601.2b: Find the first applicable Defiler cost reduction for a spell being cast.
-/// Returns `Some((life_cost, mana_reduction))` if a controlled Defiler permanent has
-/// `DefilerCostReduction` matching one of the spell's colors and the spell is a permanent spell.
-fn find_defiler_reduction(
+/// CR 601.2b + CR 118.7b: The matched Defiler static's payable parameters — its
+/// life cost, its mana reduction, and the reach that reduction was printed with
+/// ("This effect reduces only the amount of [color] mana you pay").
+///
+/// Single authority for locating the applicable Defiler, so the offer path and
+/// the apply path cannot disagree about which static is in play.
+struct DefilerReduction {
+    life_cost: u32,
+    mana_reduction: crate::types::mana::ManaCost,
+    reach: CostReductionReach,
+    /// Display label for the CR 601.2f ordering prompt.
+    source_name: String,
+}
+
+/// CR 601.2b: Find the first applicable Defiler cost reduction for a spell being
+/// cast, WITHOUT the life-affordability gate. `Some` when a controlled Defiler
+/// permanent has `DefilerCostReduction` matching one of the spell's colors and
+/// the spell is a permanent spell.
+fn find_defiler_static(
     state: &GameState,
     caster: PlayerId,
     spell_id: ObjectId,
-) -> Option<(u32, crate::types::mana::ManaCost)> {
+) -> Option<DefilerReduction> {
     use crate::types::statics::StaticMode;
 
     let spell = state.objects.get(&spell_id)?;
@@ -7588,29 +7649,77 @@ fn find_defiler_reduction(
         if bf_obj.controller != caster {
             continue;
         }
+        if let StaticMode::DefilerCostReduction {
+            color,
+            life_cost,
+            mana_reduction,
+            reach,
+        } = &def.mode
         {
-            if let StaticMode::DefilerCostReduction {
-                color,
-                life_cost,
-                mana_reduction,
-            } = &def.mode
-            {
-                if spell_colors.contains(color) {
-                    // CR 118.3 + CR 119.4b + CR 119.8: Don't offer the Defiler
-                    // prompt when the caster can't actually pay the life — this
-                    // keeps the UI from presenting an impossible choice.
-                    if !super::life_costs::can_pay_life_cast_or_activation_cost(
-                        state, caster, *life_cost,
-                    ) {
-                        return None;
-                    }
-                    return Some((*life_cost, mana_reduction.clone()));
-                }
+            if spell_colors.contains(color) {
+                return Some(DefilerReduction {
+                    life_cost: *life_cost,
+                    mana_reduction: mana_reduction.clone(),
+                    reach: *reach,
+                    source_name: bf_obj.name.clone(),
+                });
             }
         }
     }
 
     None
+}
+
+/// CR 118.7b/c/d: The reach the applicable Defiler's reduction was printed with.
+/// Read once, at announcement, and carried on the prompt — re-deriving it when
+/// the answer comes back would silently fall back to the rules default if the
+/// source were no longer locatable (CR 601.2f locks cost modification at
+/// announcement, so the announced value is the correct one to apply).
+/// CR 601.2b: Find the first applicable Defiler cost reduction for a spell being cast.
+/// `Some` if a controlled Defiler permanent has `DefilerCostReduction` matching one of
+/// the spell's colors, the spell is a permanent spell, and the life is payable.
+fn find_defiler_reduction(
+    state: &GameState,
+    caster: PlayerId,
+    spell_id: ObjectId,
+) -> Option<DefilerReduction> {
+    let reduction = find_defiler_static(state, caster, spell_id)?;
+    // CR 118.3 + CR 119.4b + CR 119.8: Don't offer the Defiler prompt when the
+    // caster can't actually pay the life — this keeps the UI from presenting an
+    // impossible choice.
+    if !super::life_costs::can_pay_life_cast_or_activation_cost(state, caster, reduction.life_cost)
+    {
+        return None;
+    }
+    Some(reduction)
+}
+
+/// CR 601.2b + CR 601.2f: Package an accepted Defiler life payment as a cost
+/// reduction so it joins the CR 601.2f ordered reduction set instead of being
+/// shaved off an already-floored total.
+///
+/// `display_name` is re-derived from the board for the ordering prompt. The
+/// Defiler itself is a battlefield permanent that is still there in every
+/// realistic case; when it is not, the label falls back to a generic one. Only
+/// the label is re-derived — the amount and reach come from the announced
+/// prompt, which is what CR 601.2f locked in.
+fn accepted_defiler_reduction_entry(
+    state: &GameState,
+    player: PlayerId,
+    spell_id: ObjectId,
+    mana_reduction: &crate::types::mana::ManaCost,
+    reach: CostReductionReach,
+) -> CostReductionEntry {
+    let display_name = find_defiler_static(state, player, spell_id)
+        .map(|found| found.source_name)
+        .unwrap_or_else(|| "Defiler cost reduction".to_string());
+    CostReductionEntry {
+        amount: mana_reduction.clone(),
+        multiplier: 1,
+        reach,
+        provenance: ReductionProvenance::Defiler,
+        display_name,
+    }
 }
 
 /// CR 601.2f + CR 118.7: Preview the locked mana obligation after an
@@ -7622,25 +7731,27 @@ pub(crate) fn defiler_reduced_cost(
     spell_id: ObjectId,
     cost: &ManaCost,
 ) -> Option<ManaCost> {
-    let (_, reduction) = find_defiler_reduction(state, caster, spell_id)?;
+    let reduction = find_defiler_reduction(state, caster, spell_id)?;
     let mut reduced = cost.clone();
-    apply_defiler_mana_reduction(&mut reduced, &reduction);
+    apply_defiler_mana_reduction(&mut reduced, &reduction.mana_reduction, reduction.reach);
     Some(reduced)
 }
 
 /// CR 601.2b: Handle the player's decision on Defiler life payment.
 /// If accepted, pays life and reduces the spell's mana cost, then continues to mana payment.
 /// If declined, continues with the original cost.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_defiler_payment(
     state: &mut GameState,
     player: PlayerId,
     pending: PendingCast,
     life_cost: u32,
     mana_reduction: &crate::types::mana::ManaCost,
+    reach: CostReductionReach,
     pay: bool,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
-    let mut cost = pending.cost.clone();
+    let cost = pending.cost.clone();
 
     if pay {
         super::life_safety::begin_defiler_payment_attempt(
@@ -7663,9 +7774,29 @@ pub(crate) fn handle_defiler_payment(
             PayLifeCostResult::Paid { .. } => {}
             PayLifeCostResult::PaidWithDeferredSubstitution { .. }
             | PayLifeCostResult::DeferredReplacementChoice { .. } => {
-                apply_defiler_mana_reduction(&mut cost, mana_reduction);
+                // CR 601.2b + CR 601.2f: a life-payment replacement effect
+                // paused mid-cost. Record the accepted reduction on the parked
+                // `PendingCast` instead of subtracting it from the announced
+                // cost here: the resume runs `finish_pending_cost_or_cast`,
+                // which rebuilds the `CostLockInput` from this pending, so the
+                // reduction re-enters the CR 601.2f lock seam and is ordered
+                // against the board's reductions before the floor — exactly as
+                // on the unpaused path. Baking it into `pending.cost` instead
+                // would apply it AFTER the announced cost's floor (a total no
+                // legal CR 601.2f order can produce) and would leave
+                // `accepted_cost_reductions` empty, so a board that later
+                // raises an election would drop the discount the caster just
+                // paid life for.
                 let mut pending = pending;
-                pending.cost = cost;
+                pending
+                    .accepted_cost_reductions
+                    .push(accepted_defiler_reduction_entry(
+                        state,
+                        player,
+                        pending.object_id,
+                        mana_reduction,
+                        reach,
+                    ));
                 state.pending_deferred_life_cost_resume =
                     Some(crate::types::game_state::DeferredLifeCostResume::Cast {
                         player,
@@ -7678,7 +7809,8 @@ pub(crate) fn handle_defiler_payment(
             PayLifeCostResult::InsufficientLife | PayLifeCostResult::Prohibited => {
                 // Proceed with the original cost; no reduction.
                 let base_cost = pending.base_cost.clone();
-                return pay_and_push(
+                let lock = CostLockInput::from_pending(&pending);
+                return pay_and_push_with_lock(
                     state,
                     player,
                     pending.object_id,
@@ -7692,16 +7824,39 @@ pub(crate) fn handle_defiler_payment(
                     pending.distribute,
                     pending.origin_zone,
                     pending.payment_mode,
+                    lock,
                     events,
                 );
             }
         }
-
-        apply_defiler_mana_reduction(&mut cost, mana_reduction);
     }
 
+    // CR 601.2b + CR 601.2f: hand the accepted reduction to the lock seam as an
+    // ordinary member of the reduction set instead of subtracting it from the
+    // already-floored announced cost. That is a real behaviour change and it is
+    // the rules-correct one: a cost floor (Trinisphere, CR 601.2f "effects that
+    // directly affect the total cost") is applied AFTER every reduction, so a
+    // {W} permanent spell reduced to {0} by an accepted Defiler floors up to
+    // {3}, where the old post-floor subtraction produced {2}.
+    let lock = CostLockInput {
+        accepted: if pay {
+            let mut accepted = pending.accepted_cost_reductions.clone();
+            accepted.push(accepted_defiler_reduction_entry(
+                state,
+                player,
+                pending.object_id,
+                mana_reduction,
+                reach,
+            ));
+            accepted
+        } else {
+            pending.accepted_cost_reductions.clone()
+        },
+        ..CostLockInput::from_pending(&pending)
+    };
+
     let base_cost = pending.base_cost.clone();
-    pay_and_push(
+    pay_and_push_with_lock(
         state,
         player,
         pending.object_id,
@@ -7715,6 +7870,66 @@ pub(crate) fn handle_defiler_payment(
         pending.distribute,
         pending.origin_zone,
         pending.payment_mode,
+        lock,
+        events,
+    )
+}
+
+/// CR 601.2b + CR 601.2f: Apply the caster's elected cost-determination choices
+/// and continue the cast.
+///
+/// `order` is validated as a strict permutation of the prompt's `reductions`
+/// (no duplicates, no out-of-range indices, exact length) and
+/// `hybrid_announcement` as a legal nonhybrid equivalent for each of the
+/// prompt's hybrid symbols. A malformed election is rejected with
+/// `InvalidAction` and the prompt stays live, so the caster can answer again —
+/// the cast is not silently resolved with an election nobody chose.
+pub(crate) fn handle_order_cost_reductions(
+    state: &mut GameState,
+    player: PlayerId,
+    pending: PendingCast,
+    reductions: &[CostReductionEntry],
+    order: &[usize],
+    hybrid_announcement: &[crate::types::mana::ManaCostShard],
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    let hybrid_symbols = super::casting::prompt_hybrid_symbols(&pending, reductions);
+    super::casting::validate_cost_reduction_election(
+        order,
+        hybrid_announcement,
+        reductions,
+        &hybrid_symbols,
+    )
+    .map_err(EngineError::InvalidAction)?;
+
+    let election = CostReductionElection {
+        order: order
+            .iter()
+            .map(|&index| reductions[index].provenance)
+            .collect(),
+        hybrid_announcement: hybrid_announcement.to_vec(),
+    };
+
+    let lock = CostLockInput {
+        election: Some(election),
+        ..CostLockInput::from_pending(&pending)
+    };
+    let base_cost = pending.base_cost.clone();
+    pay_and_push_with_lock(
+        state,
+        player,
+        pending.object_id,
+        pending.card_id,
+        *pending.ability,
+        &pending.cost,
+        base_cost,
+        pending.casting_variant,
+        pending.casting_permission_index,
+        pending.cast_timing_permission,
+        pending.distribute,
+        pending.origin_zone,
+        pending.payment_mode,
+        lock,
         events,
     )
 }
@@ -7722,6 +7937,7 @@ pub(crate) fn handle_defiler_payment(
 fn apply_defiler_mana_reduction(
     spell_cost: &mut crate::types::mana::ManaCost,
     reduction: &crate::types::mana::ManaCost,
+    reach: CostReductionReach,
 ) {
     let crate::types::mana::ManaCost::Cost {
         shards: spell_shards,
@@ -7738,12 +7954,22 @@ fn apply_defiler_mana_reduction(
         return;
     };
 
-    // CR 118.7b/c/d: unmatched or excess colored reduction spills over to
-    // generic, same as any other cost reduction (`apply_shard_reduction`).
+    // CR 118.7b/c/d + card text: every printed Defiler reads "This effect
+    // reduces only the amount of [color] mana you pay", which overrides the
+    // default spillover — a reduction unit with no matching pip in the spell's
+    // cost is lost rather than shaved off the generic component. (A white
+    // permanent spell whose cost carries no {W} — a color-indicator card or an
+    // MDFC back face — is exactly the case this protects.) `reach` is read off
+    // the static rather than assumed, so a Defiler-shaped ability parsed
+    // without that rider still gets the CR 118.7b default.
     for shard in reduction_shards {
-        super::casting::apply_shard_reduction(spell_shards, spell_generic, *shard);
+        super::casting::apply_shard_reduction(spell_shards, spell_generic, *shard, reach);
     }
-    *spell_generic = spell_generic.saturating_sub(*reduction_generic);
+    // CR 118.7a: the same rider confines the reduction to colored mana, so an
+    // explicit generic component may only apply under the default reach.
+    if matches!(reach, CostReductionReach::SpillsToGeneric) {
+        *spell_generic = spell_generic.saturating_sub(*reduction_generic);
+    }
 }
 
 /// CR 601.2b: Pay an additional cost, returning a WaitingFor if interactive input is needed
@@ -9584,6 +9810,12 @@ pub(super) fn can_pay_jumpstart_additional_cost(
     !super::casting::find_eligible_discard_targets(state, player, object_id, None).is_empty()
 }
 
+/// CR 601.2f: Announce-time entry to the lock seam, for the paths that reach it
+/// with no `PendingCast` in hand — nothing has been declared, accepted or
+/// elected yet. Any caller that DOES hold a `PendingCast` must call
+/// [`pay_and_push_with_lock`] with [`CostLockInput::from_pending`] instead, so
+/// the cast's declared additional mana costs and accepted reductions survive
+/// the seam's recompute.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pay_and_push(
     state: &mut GameState,
@@ -9601,6 +9833,144 @@ pub(super) fn pay_and_push(
     payment_mode: CastPaymentMode,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
+    pay_and_push_with_lock(
+        state,
+        player,
+        object_id,
+        card_id,
+        ability,
+        cost,
+        base_cost,
+        casting_variant,
+        casting_permission_index,
+        cast_timing_permission,
+        distribute,
+        origin_zone,
+        payment_mode,
+        CostLockInput::default(),
+        events,
+    )
+}
+
+/// CR 601.2f: What the lock seam at the head of [`pay_and_push_with_lock`] needs
+/// beyond the board to determine the total cost.
+///
+/// The seam rebuilds a probe [`PendingCast`] from `pay_and_push`'s exploded
+/// parameters and hands it to [`super::casting::recompute_pending_mana_total_with`].
+/// EVERY `PendingCast` field that recompute reads and that is not one of those
+/// exploded parameters has to be carried here, or the probe silently drops its
+/// contribution from the locked total. Build it with
+/// [`CostLockInput::from_pending`] whenever a real `PendingCast` is in hand.
+#[derive(Debug, Clone, Default)]
+pub(super) struct CostLockInput {
+    /// CR 601.2b + CR 601.2f: the mana components of additional costs already
+    /// declared for this cast — kicker and every "as an additional cost, pay
+    /// {N}" (`split_declared_mana_addition_and_residual`), splice, and
+    /// modal-only mana. `base_cost` is the announcement-time base ONLY, so a
+    /// recomputing branch that does not re-add these underpays the spell by
+    /// exactly the declared amount (CR 601.2f: base plus all additional costs
+    /// minus reductions).
+    pub declared_mana_additions: Vec<ManaCost>,
+    /// Reductions the caster has accepted that no static reproduces — today
+    /// exactly an accepted Defiler life payment (CR 601.2b).
+    pub accepted: Vec<CostReductionEntry>,
+    /// The caster's answer to `WaitingFor::OrderCostReductions`, when the
+    /// prompt has already been shown and answered. `Some` also means "do not
+    /// re-analyze", which is what keeps the resume from prompting forever.
+    pub election: Option<CostReductionElection>,
+}
+
+impl CostLockInput {
+    /// Carry a live cast's cost-determination state into the seam. Use this in
+    /// preference to building the struct field-by-field: it is the single place
+    /// a newly added `PendingCast` cost input has to be wired up.
+    pub(super) fn from_pending(pending: &PendingCast) -> Self {
+        Self {
+            declared_mana_additions: pending.declared_mana_additions.clone(),
+            accepted: pending.accepted_cost_reductions.clone(),
+            election: pending.cost_reduction_election.clone(),
+        }
+    }
+
+    /// Stamp the carried state back onto a `PendingCast` the payment pipeline
+    /// builds from exploded fields, so the cast that is stashed in
+    /// `state.pending_cast` can still recompute its own total (CR 601.2f) —
+    /// the `{X}` re-derivation in `apply_post_x_cost_modifiers` reads exactly
+    /// these fields.
+    fn apply_to(&self, pending: &mut PendingCast) {
+        pending
+            .declared_mana_additions
+            .clone_from(&self.declared_mana_additions);
+        pending.accepted_cost_reductions.clone_from(&self.accepted);
+        pending.cost_reduction_election.clone_from(&self.election);
+    }
+}
+
+/// CR 601.2f: The single seam where a spell's total cost becomes "locked in".
+///
+/// Both the ordinary cast path and the Defiler resume funnel through here, so
+/// an accepted Defiler reduction is ordered against the board's reductions
+/// instead of being shaved off an already-floored total. If two legal reduction
+/// orders lock in different costs, the caster is asked which they want
+/// (`WaitingFor::OrderCostReductions`) before any mana is paid — CR 601.2g puts
+/// mana abilities *after* the total cost is determined, so the prompt has to
+/// come first.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pay_and_push_with_lock(
+    state: &mut GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    card_id: CardId,
+    ability: ResolvedAbility,
+    cost: &crate::types::mana::ManaCost,
+    base_cost: Option<ManaCost>,
+    casting_variant: CastingVariant,
+    casting_permission_index: Option<CastingPermissionIndex>,
+    cast_timing_permission: Option<CastTimingPermission>,
+    distribute: Option<DistributionUnit>,
+    origin_zone: Zone,
+    payment_mode: CastPaymentMode,
+    lock: CostLockInput,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    let build_pending = |cost: &crate::types::mana::ManaCost| {
+        let mut pending = PendingCast::new(object_id, card_id, ability.clone(), cost.clone());
+        pending.base_cost = base_cost.clone();
+        pending.casting_variant = casting_variant;
+        pending.casting_permission_index = casting_permission_index;
+        pending.cast_timing_permission = cast_timing_permission;
+        pending.distribute = distribute.clone();
+        pending.origin_zone = origin_zone;
+        pending.payment_mode = payment_mode;
+        lock.apply_to(&mut pending);
+        pending
+    };
+
+    let probe = build_pending(cost);
+    let locked_cost = match super::casting::lock_in_total_cost(
+        state,
+        player,
+        &probe,
+        &lock.accepted,
+        lock.election.as_ref(),
+    ) {
+        super::casting::CostLockOutcome::Locked(locked) => locked,
+        super::casting::CostLockOutcome::Election {
+            reductions,
+            hybrid_symbols,
+            outcomes,
+        } => {
+            return Ok(WaitingFor::OrderCostReductions {
+                player,
+                reductions,
+                hybrid_symbols,
+                outcomes,
+                pending_cast: Box::new(probe),
+            });
+        }
+    };
+    let cost = &locked_cost;
+
     // CR 702.180a/b: Harmonize — offer optional creature tap to reduce generic mana cost.
     // CR 601.2b: Creature chosen and tapped as part of cost payment step.
     // CR 302.6: Summoning sickness does not restrict tapping for costs.
@@ -9631,6 +10001,7 @@ pub(super) fn pay_and_push(
                 pending.cast_timing_permission = cast_timing_permission;
                 pending.origin_zone = origin_zone;
                 pending.payment_mode = payment_mode;
+                lock.apply_to(&mut pending);
                 return Ok(WaitingFor::HarmonizeTapChoice {
                     player,
                     eligible_creatures: eligible,
@@ -9654,6 +10025,7 @@ pub(super) fn pay_and_push(
         distribute,
         origin_zone,
         payment_mode,
+        lock,
         events,
     )
 }
@@ -9673,6 +10045,7 @@ pub(super) fn pay_and_push_adventure(
     distribute: Option<DistributionUnit>,
     origin_zone: Zone,
     payment_mode: CastPaymentMode,
+    lock: CostLockInput,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     // CR 702.51a: Convoke lets players tap creatures to reduce mana cost.
@@ -9724,6 +10097,11 @@ pub(super) fn pay_and_push_adventure(
         pending.distribute = distribute;
         pending.origin_zone = origin_zone;
         pending.payment_mode = payment_mode;
+        // CR 601.2f: the `{X}` route re-derives the whole total in
+        // `apply_post_x_cost_modifiers` once X is concrete. Without these the
+        // re-derivation would drop the declared additional costs and silently
+        // discard the caster's elected reduction order.
+        lock.apply_to(&mut pending);
         state.pending_cast = Some(Box::new(pending));
         return enter_payment_step(state, player, convoke_mode, events);
     }
@@ -9741,6 +10119,7 @@ pub(super) fn pay_and_push_adventure(
     pending.distribute = distribute;
     pending.origin_zone = origin_zone;
     pending.payment_mode = payment_mode;
+    lock.apply_to(&mut pending);
 
     // CR 702.132a: Assist — the cost is now fully locked (no X / convoke / manual
     // step pending), so before finalizing, a spell with assist and a generic
@@ -9886,7 +10265,7 @@ fn finalize_cast_pre_payment_checks(
             resulting_mv,
             casting_permission_index,
             events,
-        ) {
+        )? {
             CascadeCheck::NotApplicable => None,
             CascadeCheck::Accepted {
                 cast_transformed,
@@ -9895,20 +10274,9 @@ fn finalize_cast_pre_payment_checks(
                 resolution_success_waiting_for = waiting_for.map(|wf| *wf);
                 Some(cast_transformed)
             }
-            CascadeCheck::Rejected {
-                source_id,
-                exiled_misses,
-                reject_action,
-            } => {
-                let waiting_for = handle_resolution_cast_rejection(
-                    state,
-                    player,
-                    object_id,
-                    source_id,
-                    exiled_misses,
-                    reject_action,
-                    events,
-                )?;
+            CascadeCheck::Rejected { cleanup } => {
+                let waiting_for =
+                    handle_resolution_cast_rejection(state, player, object_id, *cleanup, events)?;
                 return Ok(FinalizePrePaymentChecks {
                     early_waiting_for: Some(waiting_for),
                     cascade_cast_transformed: false,
@@ -10225,6 +10593,19 @@ fn finalize_cast_with_phyrexian_choices_inner(
     ability.context.cast_from_zone = Some(source_zone);
     ability.context.cast_controller = Some(player);
     ability.context.cast_phase = Some(state.phase);
+    // CR 601.2c + CR 608.2c: latch the declared object targets so a nested
+    // sub-ability — whose own `targets` may hold a resolution-chosen recipient
+    // instead — can still name the spell's own target with
+    // `ObjectScope::ChainRootTarget` ("If that artifact had counters on it, put
+    // that many … on an artifact you control"). Runs after target selection and
+    // before resolution, so `set_context_recursive` and every later
+    // `apply_parent_chain_context` carry it down the chain.
+    ability.context.chain_root_targets = ability
+        .targets
+        .iter()
+        .filter(|target| matches!(target, TargetRef::Object(_)))
+        .cloned()
+        .collect();
     stamp_controller_controlled_as_cast(state, &mut ability, player, object_id);
 
     // CR 107.3m: Stash the paid X value directly on the permanent so replacement
@@ -10895,9 +11276,9 @@ enum CascadeCheck {
     /// `handle_resolution_cast_rejection`, which sends the hit to its
     /// `reject_action` destination.
     Rejected {
-        source_id: ObjectId,
-        exiled_misses: Vec<ObjectId>,
-        reject_action: crate::types::ability::ResolutionMvRejectAction,
+        /// Rejection is infrequent and the cleanup payload carries the frozen
+        /// authority; keep it indirect so the common outcome stays compact.
+        cleanup: Box<ResolutionCastCleanup>,
     },
 }
 
@@ -10923,7 +11304,7 @@ fn evaluate_cascade_constraint_with_resulting_mv(
     resulting_mv: u32,
     casting_permission_index: Option<CastingPermissionIndex>,
     events: &mut Vec<GameEvent>,
-) -> CascadeCheck {
+) -> Result<CascadeCheck, EngineError> {
     use crate::types::ability::CastingPermission;
 
     let index = match state.objects.get(&object_id) {
@@ -10936,7 +11317,7 @@ fn evaluate_cascade_constraint_with_resulting_mv(
                             state, obj, player, p, None,
                         )
                     }) else {
-                        return CascadeCheck::NotApplicable;
+                        return Ok(CascadeCheck::NotApplicable);
                     };
                     index
                 }
@@ -10951,11 +11332,11 @@ fn evaluate_cascade_constraint_with_resulting_mv(
                 _ => None,
             }
         }
-        None => return CascadeCheck::NotApplicable,
+        None => return Ok(CascadeCheck::NotApplicable),
     };
     let index = match index {
         Some(i) => i,
-        None => return CascadeCheck::NotApplicable,
+        None => return Ok(CascadeCheck::NotApplicable),
     };
 
     let permission = state
@@ -10993,18 +11374,29 @@ fn evaluate_cascade_constraint_with_resulting_mv(
         Some(resulting_mv),
     );
 
+    // This permission can be rehomed into a normal-cost manual payment or
+    // removed on rejection. Validate its immutable cleanup authority before
+    // either mutation so forged receipts cannot alter permissions, objects, or
+    // the parent resolution state.
+    super::engine_resolution_choices::validate_resolution_cast_cleanup_authority(player, &cleanup)?;
+    super::engine_resolution_choices::validate_resolution_cast_delayed_trigger_receipts(
+        state, &cleanup,
+    )?;
+
     if accepted {
         // CR 609.4b: A during-resolution PAID cast (Quistis Trepe, Tinybones the
         // Pickpocket) carries a "mana of any type can be spent to cast that spell"
         // concession on the consumed resolution permission. The CR 608.2g timing
-        // marker (`resolution_cleanup`) is consumed here, but the selected slot
-        // must remain stable through payment and finalization. Re-home a neutral
-        // `ExileWithAltCost` (no cleanup or riders, so this gate never re-fires)
+        // marker's constraint is consumed here, but the exact cleanup receipt
+        // must remain stable through payment: a later `CancelCast` still has to
+        // withdraw the offered tail trigger. Re-home a neutral
+        // `ExileWithAltCost` (no constraint, so this gate never rejects again)
         // at the same index. Its optional CR 609.4b concession remains available
         // to the real mana payment below (`finalize_cast` →
         // `pay_mana_cost_with_choices`), while a no-concession cast cannot shift
         // a sibling permission into the elected slot. Normal zone-exit cleanup
         // removes the neutral entry when the spell leaves exile for the stack.
+        let cleanup_for_pending_cancel = cleanup.clone();
         if let Some(obj) = state.objects.get_mut(&object_id) {
             obj.casting_permissions[index] = CastingPermission::ExileWithAltCost {
                 cost: crate::types::mana::ManaCost::SelfManaCost,
@@ -11014,7 +11406,7 @@ fn evaluate_cascade_constraint_with_resulting_mv(
                 cast_transformed: false,
                 constraint: None,
                 granted_to,
-                resolution_cleanup: None,
+                resolution_cleanup: Some(cleanup_for_pending_cancel),
                 duration: None,
                 // CR 611.2a: no duration, so no host to bind to.
                 source_id: None,
@@ -11022,6 +11414,7 @@ fn evaluate_cascade_constraint_with_resulting_mv(
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
                 mana_spend_permission,
+                cast_cost_modifier: None,
             };
         }
         let waiting_for = handle_resolution_cast_success(
@@ -11035,10 +11428,10 @@ fn evaluate_cascade_constraint_with_resulting_mv(
             cleanup.success_action,
             events,
         );
-        CascadeCheck::Accepted {
+        Ok(CascadeCheck::Accepted {
             cast_transformed,
             waiting_for,
-        }
+        })
     } else {
         state
             .objects
@@ -11046,11 +11439,9 @@ fn evaluate_cascade_constraint_with_resulting_mv(
             .expect("object present above")
             .casting_permissions
             .remove(index);
-        CascadeCheck::Rejected {
-            source_id: cleanup.source_id,
-            exiled_misses: cleanup.exiled_misses,
-            reject_action: cleanup.reject_action,
-        }
+        Ok(CascadeCheck::Rejected {
+            cleanup: Box::new(cleanup),
+        })
     }
 }
 
@@ -11149,10 +11540,9 @@ fn handle_resolution_cast_success(
             controller,
             remaining_casts,
             remaining_mv_budget,
-            filter,
+            face_policy,
             zones,
             graveyard_replacement,
-            source,
             member_pool,
         } => {
             if let Some(destination) = graveyard_replacement.clone() {
@@ -11170,17 +11560,24 @@ fn handle_resolution_cast_success(
             if casts_left == Some(0) {
                 return None;
             }
+            let request = super::effects::free_cast_from_zones::free_cast_window_resolution_request(
+                controller,
+                casts_left,
+                budget_left,
+                (*face_policy).clone(),
+                zones.clone(),
+                graveyard_replacement.clone(),
+                member_pool.clone(),
+            );
             let mut candidates = crate::game::effects::free_cast_from_zones::eligible_candidates(
                 state,
-                controller,
-                source,
-                &filter,
                 &zones,
                 budget_left,
                 // CR 607.2a: the re-offer stays confined to THIS resolution's
                 // "exiled this way" batch (Plargg and Nassari) — see the
                 // window's `member_pool` docs; empty means no restriction.
                 &member_pool,
+                &request,
             );
             // CR 608.2g: Finalize runs before the chosen card is removed from
             // its origin zone; it cannot be offered again while already cast.
@@ -11194,10 +11591,9 @@ fn handle_resolution_cast_success(
                     candidates,
                     remaining_casts: casts_left,
                     remaining_mv_budget: budget_left,
-                    filter,
+                    face_policy: *face_policy,
                     zones,
                     graveyard_replacement,
-                    source,
                     member_pool,
                 },
             }))
@@ -11308,12 +11704,19 @@ fn handle_resolution_cast_rejection(
     state: &mut GameState,
     player: PlayerId,
     object_id: ObjectId,
-    source_id: ObjectId,
-    exiled_misses: Vec<ObjectId>,
-    reject_action: crate::types::ability::ResolutionMvRejectAction,
+    cleanup: ResolutionCastCleanup,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     use crate::types::ability::ResolutionMvRejectAction;
+
+    super::engine_resolution_choices::validate_resolution_cast_cleanup_authority(player, &cleanup)?;
+    super::engine_resolution_choices::withdraw_resolution_cast_delayed_triggers(state, &cleanup)?;
+    let ResolutionCastCleanup {
+        source_id,
+        exiled_misses,
+        reject_action,
+        ..
+    } = cleanup;
 
     // CR 601.2a: Remove the announcement-time stack entry. The spell never
     // finishes entering the stack because we abort before the Hand→Stack
@@ -13048,6 +13451,11 @@ pub(crate) fn post_origin_auto_payment_verdict(
         | WaitingFor::ChooseGiftRecipient { .. }
         | WaitingFor::SpliceOffer { .. }
         | WaitingFor::DefilerPayment { .. }
+        // CR 601.2f: the reduction-order election is an unresolved inline cost
+        // prompt carrying its own `PendingCast`, exactly like `DefilerPayment`
+        // above — the caster has not yet chosen an order, so the mana
+        // obligation is not settled and the offer seam must defer.
+        | WaitingFor::OrderCostReductions { .. }
         | WaitingFor::ActivationCostOneOfChoice { .. }
         | WaitingFor::CostTypeChoice { .. }
         | WaitingFor::BlightChoice { .. }
@@ -13489,6 +13897,12 @@ fn finalize_mana_payment_with_resume(
     // a later spend.)
     state.active_payment_pins = pending.pinned_pool_units.clone();
     state.active_casting_permission_index = pending.casting_permission_index;
+    let spend_only_on_x_count = state
+        .objects
+        .get(&pending.object_id)
+        .map(|obj| super::casting::compute_spend_only_on_x_generic_count(state, obj, &pending))
+        .unwrap_or(0);
+    state.active_spend_only_on_x_count = Some((pending.object_id, spend_only_on_x_count));
     let finalize_result = (|| -> Result<WaitingFor, EngineError> {
         // CR 702.132a + CR 601.2h: payment has reached the Assist contribution;
         // helper resources begin changing only inside this final payment step.
@@ -13835,6 +14249,7 @@ fn finalize_mana_payment_with_resume(
     // CR 118.3a: the transient is self-contained — cleared on Ok and Err alike.
     state.active_payment_pins.clear();
     state.active_casting_permission_index = None;
+    state.active_spend_only_on_x_count = None;
     match finalize_result {
         Ok(waiting_for) => Ok(waiting_for),
         Err(err) if is_abandoned_cast_finalization(&err) => Err(err),
@@ -13913,6 +14328,12 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
     // empty outside an in-progress finalize spend".
     state.active_payment_pins = pending.pinned_pool_units.clone();
     state.active_casting_permission_index = pending.casting_permission_index;
+    let spend_only_on_x_count = state
+        .objects
+        .get(&pending.object_id)
+        .map(|obj| super::casting::compute_spend_only_on_x_generic_count(state, obj, &pending))
+        .unwrap_or(0);
+    state.active_spend_only_on_x_count = Some((pending.object_id, spend_only_on_x_count));
     let finalize_result = (|| -> Result<WaitingFor, EngineError> {
         // CR 702.132a + CR 601.2h: payment has reached the Assist contribution;
         // helper resources begin changing only inside this final payment step.
@@ -14270,6 +14691,7 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
     // CR 118.3a: the transient is self-contained — cleared on Ok and Err alike.
     state.active_payment_pins.clear();
     state.active_casting_permission_index = None;
+    state.active_spend_only_on_x_count = None;
     match finalize_result {
         Ok(waiting_for) => Ok(waiting_for),
         Err(err) if is_abandoned_cast_finalization(&err) => Err(err),
@@ -14681,6 +15103,7 @@ mod tests {
             token: DelayedTriggerToken(token),
             instance: DelayedTriggerInstanceId(token),
             source_id,
+            offer_id: None,
         }
     }
 
@@ -15205,10 +15628,12 @@ mod tests {
         state.current_trigger_event = Some(GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 0,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
         state.current_trigger_events = vec![GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 0,
+            new_total: crate::types::events::LifeTotalReading::default(),
         }];
         state.current_trigger_match_count = Some(2);
         state.die_result_this_resolution = Some(4);
@@ -15329,6 +15754,8 @@ mod tests {
             prepaid_actual_mana_spent: None,
             base_cost: None,
             declared_mana_additions: Vec::new(),
+            accepted_cost_reductions: Vec::new(),
+            cost_reduction_election: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: Some(0),
@@ -16207,6 +16634,7 @@ mod tests {
             None,
             Zone::Hand,
             CastPaymentMode::Manual,
+            CostLockInput::default(),
             &mut events,
         )
         .expect("manual payment should pause before paying mana");
@@ -16365,6 +16793,7 @@ mod tests {
             None,
             Zone::Hand,
             CastPaymentMode::Auto,
+            CostLockInput::default(),
             &mut events,
         )
         .expect("auto payment should fall back to manual mana payment");
@@ -19576,6 +20005,7 @@ mod tests {
                 color: ManaColor::Green,
                 life_cost: 2,
                 mana_reduction: reduction.clone(),
+                reach: crate::types::statics::CostReductionReach::ColoredManaOnly,
             }));
 
         let result = find_defiler_reduction(&state, PlayerId(0), spell_id);
@@ -19583,9 +20013,15 @@ mod tests {
             result.is_some(),
             "Should find Defiler reduction for green spell"
         );
-        let (life, mana_red) = result.unwrap();
-        assert_eq!(life, 2);
-        assert_eq!(mana_red, reduction);
+        let found = result.unwrap();
+        assert_eq!(found.life_cost, 2);
+        assert_eq!(found.mana_reduction, reduction);
+        // CR 118.7b/c/d: the reach printed on the static must survive the lookup
+        // so the apply path can honor "reduces only the amount of green mana".
+        assert_eq!(
+            found.reach,
+            crate::types::statics::CostReductionReach::ColoredManaOnly
+        );
     }
 
     #[test]
@@ -19633,6 +20069,7 @@ mod tests {
                     shards: vec![ManaCostShard::Green],
                     generic: 0,
                 },
+                reach: crate::types::statics::CostReductionReach::ColoredManaOnly,
             }));
 
         let result = find_defiler_reduction(&state, PlayerId(0), spell_id);
@@ -19687,6 +20124,7 @@ mod tests {
                     shards: vec![ManaCostShard::Green],
                     generic: 0,
                 },
+                reach: crate::types::statics::CostReductionReach::ColoredManaOnly,
             }));
 
         let result = find_defiler_reduction(&state, PlayerId(0), spell_id);
@@ -19743,6 +20181,7 @@ mod tests {
             pending,
             2,
             &mana_reduction,
+            CostReductionReach::ColoredManaOnly,
             true,
             &mut events,
         );
@@ -19756,21 +20195,24 @@ mod tests {
                 e,
                 GameEvent::LifeChanged {
                     player_id,
-                    amount: -2
+                    amount: -2,
+                    ..
                 } if *player_id == PlayerId(0)
             )),
             "Should emit LifeChanged event"
         );
     }
 
-    /// CR 118.7b: a Defiler reduction shard with no matching colored component
-    /// in the spell's cost must spill over to reduce generic mana instead of
-    /// being silently dropped. Regression coverage for `apply_defiler_mana_reduction`
-    /// through its actual consumer, `handle_defiler_payment` — a bare
-    /// matching-shard check on `apply_defiler_mana_reduction` alone would not
-    /// catch a future regression that decouples the two.
+    /// CR 118.7b + card text: every printed Defiler reads "This effect reduces
+    /// only the amount of [color] mana you pay", which OVERRIDES the CR 118.7b
+    /// default. A reduction unit with no matching colored component in the
+    /// spell's cost is therefore lost, not spilled onto generic mana — a green
+    /// Defiler must not shave {1} off a green permanent spell that happens to
+    /// have no {G} in its printed cost. Exercised through the actual consumer,
+    /// `handle_defiler_payment`, rather than the private helper, so a future
+    /// regression that decouples the two is still caught.
     #[test]
-    fn handle_defiler_payment_spills_unmatched_colored_shard_to_generic() {
+    fn handle_defiler_payment_does_not_spill_unmatched_colored_shard_to_generic() {
         use crate::types::mana::ManaCostShard;
 
         let mut state = GameState::new_two_player(42);
@@ -19822,6 +20264,7 @@ mod tests {
             pending,
             2,
             &mana_reduction,
+            CostReductionReach::ColoredManaOnly,
             true,
             &mut events,
         )
@@ -19835,18 +20278,19 @@ mod tests {
             pending_cast.cost,
             ManaCost::Cost {
                 shards: vec![],
-                generic: 2,
+                generic: 3,
             },
-            "the unmatched green reduction unit must spill over to generic (3 -> 2), not be dropped (3 -> 3)",
+            "the Defiler rider confines the reduction to colored mana, so an \
+             unmatched green unit leaves {{3}} alone (3 -> 3), not (3 -> 2)",
         );
     }
 
-    /// CR 118.7c: a Defiler reduction that exceeds the spell's matching
-    /// colored component reduces that color to nothing, then spills the
-    /// excess to generic — again exercised through `handle_defiler_payment`
-    /// rather than the private helper directly.
+    /// CR 118.7c + card text: the same rider also suppresses the "excess"
+    /// spillover. Once the spell's pips of that color are exhausted, a further
+    /// reduction unit has no colored mana left to reduce and is lost rather
+    /// than reaching the generic component.
     #[test]
-    fn handle_defiler_payment_spills_excess_beyond_matching_color_to_generic() {
+    fn handle_defiler_payment_does_not_spill_excess_beyond_matching_color_to_generic() {
         use crate::types::mana::ManaCostShard;
 
         let mut state = GameState::new_two_player(42);
@@ -19900,6 +20344,7 @@ mod tests {
             pending,
             2,
             &mana_reduction,
+            CostReductionReach::ColoredManaOnly,
             true,
             &mut events,
         )
@@ -19913,9 +20358,10 @@ mod tests {
             pending_cast.cost,
             ManaCost::Cost {
                 shards: vec![],
-                generic: 1,
+                generic: 2,
             },
-            "both green pips must be removed and the excess third unit must spill to generic (2 -> 1), not leave generic untouched (2 -> 2)",
+            "both green pips must be removed, but the excess third unit is lost \
+             rather than spilling to generic (2 -> 2), not (2 -> 1)",
         );
     }
 
@@ -20259,9 +20705,22 @@ mod tests {
                     granted_to: None,
                     resolution_cleanup: Some(ResolutionCastCleanup {
                         source_id: hit,
+                        offer_id: None,
+                        face_policy: crate::types::ability::ResolutionCastFacePolicy::new(
+                            crate::types::ability::TargetFilter::Any,
+                            hit,
+                            PlayerId(0),
+                            Some(CastPermissionConstraint::ManaValue {
+                                comparator: Comparator::LT,
+                                value: QuantityExpr::Fixed {
+                                    value: source_mv as i32,
+                                },
+                            }),
+                        ),
                         exiled_misses: vec![miss_a, miss_b],
                         reject_action: ResolutionMvRejectAction::BottomWithMisses,
                         success_action: ResolutionCastSuccessAction::BottomMisses,
+                        delayed_trigger_receipts: Vec::new(),
                     }),
                     duration: None,
 
@@ -20269,6 +20728,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
 
             (state, hit, vec![miss_a, miss_b])
@@ -20316,7 +20776,8 @@ mod tests {
                 resulting_mv,
                 Some(CastingPermissionIndex(0)),
                 &mut events,
-            );
+            )
+            .expect("constraint evaluation must succeed");
             assert!(matches!(
                 outcome,
                 CascadeCheck::Accepted {
@@ -20330,7 +20791,7 @@ mod tests {
                 matches!(
                     hit_obj.casting_permissions.as_slice(),
                     [CastingPermission::ExileWithAltCost {
-                        resolution_cleanup: None,
+                        resolution_cleanup: Some(_),
                         mana_spend_permission: None,
                         graveyard_replacement: None,
                         enters_with_counter: None,
@@ -20338,7 +20799,7 @@ mod tests {
                         ..
                     }] if enters_with_modifications.is_empty()
                 ),
-                "the consumed cascade permission must retain a neutral stable slot"
+                "the consumed cascade permission must retain its cleanup receipt for cancellation"
             );
 
             for miss in &misses {
@@ -20375,11 +20836,19 @@ mod tests {
                     granted_to: Some(PlayerId(0)),
                     resolution_cleanup: Some(ResolutionCastCleanup {
                         source_id: hit,
+                        offer_id: None,
+                        face_policy: crate::types::ability::ResolutionCastFacePolicy::new(
+                            crate::types::ability::TargetFilter::Any,
+                            hit,
+                            PlayerId(0),
+                            None,
+                        ),
                         exiled_misses: vec![miss],
                         reject_action: ResolutionMvRejectAction::BottomWithMisses,
                         success_action: ResolutionCastSuccessAction::RippleOfferRemaining {
                             remaining_hits: vec![next_hit],
                         },
+                        delayed_trigger_receipts: Vec::new(),
                     }),
                     duration: None,
 
@@ -20387,6 +20856,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
 
             let outcome = evaluate_cascade_constraint_with_resulting_mv(
@@ -20396,7 +20866,8 @@ mod tests {
                 2,
                 Some(CastingPermissionIndex(0)),
                 &mut Vec::new(),
-            );
+            )
+            .expect("constraint evaluation must succeed");
 
             match outcome {
                 CascadeCheck::Accepted {
@@ -20448,11 +20919,19 @@ mod tests {
                     granted_to: Some(PlayerId(0)),
                     resolution_cleanup: Some(ResolutionCastCleanup {
                         source_id: hit,
+                        offer_id: None,
+                        face_policy: crate::types::ability::ResolutionCastFacePolicy::new(
+                            crate::types::ability::TargetFilter::Any,
+                            hit,
+                            PlayerId(0),
+                            None,
+                        ),
                         exiled_misses: vec![miss],
                         reject_action: ResolutionMvRejectAction::BottomWithMisses,
                         success_action: ResolutionCastSuccessAction::RippleOfferRemaining {
                             remaining_hits: vec![],
                         },
+                        delayed_trigger_receipts: Vec::new(),
                     }),
                     duration: None,
 
@@ -20460,6 +20939,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
 
             let outcome = evaluate_cascade_constraint_with_resulting_mv(
@@ -20469,7 +20949,8 @@ mod tests {
                 2,
                 Some(CastingPermissionIndex(0)),
                 &mut Vec::new(),
-            );
+            )
+            .expect("constraint evaluation must succeed");
 
             assert!(matches!(
                 outcome,
@@ -20509,6 +20990,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             push_announcement_stack_entry(&mut state, hit);
 
@@ -20568,6 +21050,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             hit_obj
                 .casting_permissions
@@ -20585,6 +21068,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             push_announcement_stack_entry(&mut state, hit);
 
@@ -20636,6 +21120,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             state.players[0].mana_pool.add(ManaUnit {
                 color: ManaType::Colorless,
@@ -20707,6 +21192,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             hit_obj
                 .casting_permissions
@@ -20722,9 +21208,20 @@ mod tests {
                     granted_to: Some(PlayerId(0)),
                     resolution_cleanup: Some(ResolutionCastCleanup {
                         source_id: hit,
+                        offer_id: None,
+                        face_policy: crate::types::ability::ResolutionCastFacePolicy::new(
+                            crate::types::ability::TargetFilter::Any,
+                            hit,
+                            PlayerId(0),
+                            Some(CastPermissionConstraint::ManaValue {
+                                comparator: Comparator::LT,
+                                value: QuantityExpr::Fixed { value: 10 },
+                            }),
+                        ),
                         exiled_misses: vec![miss],
                         reject_action: ResolutionMvRejectAction::BottomWithMisses,
                         success_action: ResolutionCastSuccessAction::BottomMisses,
+                        delayed_trigger_receipts: Vec::new(),
                     }),
                     duration: None,
 
@@ -20732,6 +21229,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             push_announcement_stack_entry(&mut state, hit);
 
@@ -20782,9 +21280,20 @@ mod tests {
                     granted_to: Some(PlayerId(1)),
                     resolution_cleanup: Some(ResolutionCastCleanup {
                         source_id: hit,
+                        offer_id: None,
+                        face_policy: crate::types::ability::ResolutionCastFacePolicy::new(
+                            crate::types::ability::TargetFilter::Any,
+                            hit,
+                            PlayerId(1),
+                            Some(CastPermissionConstraint::ManaValue {
+                                comparator: Comparator::LT,
+                                value: QuantityExpr::Fixed { value: 1 },
+                            }),
+                        ),
                         exiled_misses: vec![miss],
                         reject_action: ResolutionMvRejectAction::BottomWithMisses,
                         success_action: ResolutionCastSuccessAction::BottomMisses,
+                        delayed_trigger_receipts: Vec::new(),
                     }),
                     duration: None,
 
@@ -20792,6 +21301,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             hit_obj
                 .casting_permissions
@@ -20809,6 +21319,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             push_announcement_stack_entry(&mut state, hit);
 
@@ -20856,10 +21367,11 @@ mod tests {
                 resulting_mv,
                 Some(CastingPermissionIndex(0)),
                 &mut events,
-            );
+            )
+            .expect("constraint evaluation must succeed");
             match outcome {
-                CascadeCheck::Rejected { exiled_misses, .. } => {
-                    assert_eq!(exiled_misses, misses);
+                CascadeCheck::Rejected { cleanup } => {
+                    assert_eq!(cleanup.exiled_misses, misses);
                 }
                 other => panic!("Expected Rejected, got {:?}", matches_name(&other)),
             }
@@ -20895,7 +21407,8 @@ mod tests {
                 resulting_mv,
                 Some(CastingPermissionIndex(0)),
                 &mut events,
-            );
+            )
+            .expect("constraint evaluation must succeed");
             assert!(matches!(outcome, CascadeCheck::Rejected { .. }));
         }
 
@@ -20924,9 +21437,20 @@ mod tests {
                 &mut state,
                 PlayerId(0),
                 hit,
-                hit,
-                misses.clone(),
-                ResolutionMvRejectAction::BottomWithMisses,
+                ResolutionCastCleanup {
+                    source_id: hit,
+                    offer_id: None,
+                    face_policy: crate::types::ability::ResolutionCastFacePolicy::new(
+                        crate::types::ability::TargetFilter::Any,
+                        hit,
+                        PlayerId(0),
+                        None,
+                    ),
+                    exiled_misses: misses.clone(),
+                    reject_action: ResolutionMvRejectAction::BottomWithMisses,
+                    success_action: ResolutionCastSuccessAction::BottomMisses,
+                    delayed_trigger_receipts: Vec::new(),
+                },
                 &mut events,
             )
             .expect("rejection handler must succeed");
@@ -21040,6 +21564,8 @@ mod tests {
             prepaid_actual_mana_spent: None,
             base_cost: None,
             declared_mana_additions: Vec::new(),
+            accepted_cost_reductions: Vec::new(),
+            cost_reduction_election: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -21179,6 +21705,8 @@ mod tests {
             prepaid_actual_mana_spent: None,
             base_cost: None,
             declared_mana_additions: Vec::new(),
+            accepted_cost_reductions: Vec::new(),
+            cost_reduction_election: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -21287,6 +21815,8 @@ mod tests {
             prepaid_actual_mana_spent: None,
             base_cost: None,
             declared_mana_additions: Vec::new(),
+            accepted_cost_reductions: Vec::new(),
+            cost_reduction_election: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -21384,6 +21914,8 @@ mod tests {
             prepaid_actual_mana_spent: None,
             base_cost: None,
             declared_mana_additions: Vec::new(),
+            accepted_cost_reductions: Vec::new(),
+            cost_reduction_election: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -21514,6 +22046,8 @@ mod tests {
             prepaid_actual_mana_spent: None,
             base_cost: None,
             declared_mana_additions: Vec::new(),
+            accepted_cost_reductions: Vec::new(),
+            cost_reduction_election: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -23848,6 +24382,7 @@ its replicate cost was paid.)\nDraw a card.";
                 filter: Box::new(TargetFilter::Typed(TypedFilter::creature())),
                 caused_by: None,
             }),
+            reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
         })
         .affected(TargetFilter::SelfRef)
         .condition(StaticCondition::And {
@@ -24835,6 +25370,7 @@ its replicate cost was paid.)\nDraw a card.";
                 granted_to: Some(PlayerId(0)),
                 duration: None,
                 source_id: None,
+                cast_cost_modifier: None,
             });
 
         let ability = ResolvedAbility::new(
