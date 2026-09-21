@@ -535,6 +535,14 @@ fn parse_behold_cost(lower: &str) -> Option<AbilityCost> {
 /// text after a "behold" keyword:
 ///   - "choose a creature you control or reveal a creature card from your hand"
 ///     (Monstrous Emergence)
+///   - "reveal a Dragon card from your hand or choose a Dragon you control"
+///     (Dragon's Fire — the same action with the legs printed in the other order)
+///
+/// The two printed orders are one grammar with its disjuncts swapped, so both
+/// fold to the same `BeholdCostAction::ChooseOrReveal`. Reading only the
+/// choose-first order left Dragon's Fire with an unimplemented cost: the spell
+/// cast for its mana cost alone and its "instead" rider could never fire, so it
+/// was permanently a flat 3 damage.
 ///
 /// This is the exact action of `BeholdCostAction::ChooseOrReveal`: choose a
 /// matching permanent you control OR reveal a matching card from your hand,
@@ -549,31 +557,8 @@ fn parse_behold_cost(lower: &str) -> Option<AbilityCost> {
 /// `eligible_behold_choices`, so that card is handled by honest deferral, not
 /// here.
 fn parse_choose_or_reveal_behold_cost(lower: &str) -> Option<AbilityCost> {
-    type E<'a> = super::oracle_nom::error::OracleError<'a>;
-    let (input, _) = tag::<_, _, E<'_>>("choose ").parse(lower).ok()?;
-    let (input, _) = alt((tag::<_, _, E<'_>>("a "), tag("an ")))
-        .parse(input)
-        .ok()?;
-    // First leg type phrase, bounded by " you control or reveal ".
-    let (_, choose_type_text) = take_until::<_, _, E<'_>>(" you control or reveal ")
-        .parse(input)
-        .ok()?;
-    let (after_choose, _) = terminated(
-        take_until::<_, _, E<'_>>(" you control or reveal "),
-        tag(" you control or reveal "),
-    )
-    .parse(input)
-    .ok()?;
-    // Second leg: "a/an <type> card from your hand".
-    let (after_article, _) = alt((tag::<_, _, E<'_>>("a "), tag("an ")))
-        .parse(after_choose)
-        .ok()?;
-    let (_, reveal_type_text) = all_consuming(terminated(
-        take_until::<_, _, E<'_>>(" card from your hand"),
-        tag(" card from your hand"),
-    ))
-    .parse(after_article)
-    .ok()?;
+    let (choose_type_text, reveal_type_text) =
+        parse_choose_first_behold_legs(lower).or_else(|| parse_reveal_first_behold_legs(lower))?;
 
     let (choose_filter, choose_rem) = parse_type_phrase_folding(choose_type_text.trim());
     let (reveal_filter, reveal_rem) = parse_type_phrase_folding(reveal_type_text.trim());
@@ -591,6 +576,62 @@ fn parse_choose_or_reveal_behold_cost(lower: &str) -> Option<AbilityCost> {
         action: BeholdCostAction::ChooseOrReveal,
         type_choice: None,
     })
+}
+
+/// Choose-first printing: "choose a/an \<type\> you control or reveal a/an
+/// \<type\> card from your hand" (Monstrous Emergence). Returns the two legs'
+/// type phrases as `(choose, reveal)` — the same tuple order as the
+/// reveal-first sibling, so the caller's folding/validation tail is shared.
+fn parse_choose_first_behold_legs(lower: &str) -> Option<(&str, &str)> {
+    type E<'a> = super::oracle_nom::error::OracleError<'a>;
+    let (input, _) = tag::<_, _, E<'_>>("choose ").parse(lower).ok()?;
+    let (input, _) = alt((tag::<_, _, E<'_>>("a "), tag("an ")))
+        .parse(input)
+        .ok()?;
+    let (after_choose, choose_type_text) = terminated(
+        take_until::<_, _, E<'_>>(" you control or reveal "),
+        tag(" you control or reveal "),
+    )
+    .parse(input)
+    .ok()?;
+    let (after_article, _) = alt((tag::<_, _, E<'_>>("a "), tag("an ")))
+        .parse(after_choose)
+        .ok()?;
+    let (_, reveal_type_text) = all_consuming(terminated(
+        take_until::<_, _, E<'_>>(" card from your hand"),
+        tag(" card from your hand"),
+    ))
+    .parse(after_article)
+    .ok()?;
+    Some((choose_type_text, reveal_type_text))
+}
+
+/// Reveal-first printing: "reveal a/an \<type\> card from your hand or choose
+/// a/an \<type\> you control" (Dragon's Fire). The legs are the same two of
+/// CR 701.4a in the other order; the `" card from your hand or choose "` needle
+/// keeps this apart from a bare `Reveal` cost, whose sentence ends at the hand.
+fn parse_reveal_first_behold_legs(lower: &str) -> Option<(&str, &str)> {
+    type E<'a> = super::oracle_nom::error::OracleError<'a>;
+    let (input, _) = tag::<_, _, E<'_>>("reveal ").parse(lower).ok()?;
+    let (input, _) = alt((tag::<_, _, E<'_>>("a "), tag("an ")))
+        .parse(input)
+        .ok()?;
+    let (after_reveal, reveal_type_text) = terminated(
+        take_until::<_, _, E<'_>>(" card from your hand or choose "),
+        tag(" card from your hand or choose "),
+    )
+    .parse(input)
+    .ok()?;
+    let (after_article, _) = alt((tag::<_, _, E<'_>>("a "), tag("an ")))
+        .parse(after_reveal)
+        .ok()?;
+    let (_, choose_type_text) = all_consuming(terminated(
+        take_until::<_, _, E<'_>>(" you control"),
+        tag(" you control"),
+    ))
+    .parse(after_article)
+    .ok()?;
+    Some((choose_type_text, reveal_type_text))
 }
 
 fn parse_remove_counter_kind(

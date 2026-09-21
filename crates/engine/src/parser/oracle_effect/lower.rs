@@ -9420,6 +9420,38 @@ pub(super) fn try_parse_damage_with_remainder<'a>(
         let consumed = after_lower.len() - rem.len();
         let amount_text = &after[consumed..];
         let amount_lower = amount_text.to_lowercase();
+        // CR 614.1a + CR 608.2c + CR 120.3: An "instead" override prints NO
+        // recipient — the replacement keeps the replaced event's one ("Dragon's
+        // Fire deals damage equal to the power of that card or creature
+        // instead"). By the time the clause reaches here the gating condition
+        // and the word "instead" are already stripped, so what is left is the
+        // bare amount with no " to " preposition to read. Bind the recipient to
+        // `ParentTarget` — the same referent the "itself" arm above produces —
+        // and only inside an override body: outside one there is no parent event
+        // to inherit from, so the shape must keep strict-failing to
+        // `Unimplemented` (a guessed recipient is a silent wrong answer, and
+        // `parse_target("")` would widen it to "any target").
+        if ctx.instead_override_body
+            && take_until::<_, _, OracleError<'_>>(" to ")
+                .parse(amount_lower.as_str())
+                .is_err()
+        {
+            let qty_text = amount_text.trim().trim_end_matches('.').trim();
+            let qty = crate::parser::oracle_quantity::parse_event_context_quantity(qty_text)
+                .or_else(|| {
+                    crate::parser::oracle_quantity::parse_cda_quantity_with_context(qty_text, ctx)
+                })
+                .or_else(|| parse_contextual_bare_card_aggregate(qty_text, ctx))?;
+            return Some((
+                Effect::DealDamage {
+                    amount: qty,
+                    target: TargetFilter::ParentTarget,
+                    damage_source: None,
+                    excess: None,
+                },
+                "",
+            ));
+        }
         let (_, before_to) = take_until::<_, _, OracleError<'_>>(" to ")
             .parse(amount_lower.as_str())
             .ok()?;

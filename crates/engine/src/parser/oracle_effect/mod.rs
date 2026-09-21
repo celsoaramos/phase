@@ -38926,6 +38926,19 @@ pub(crate) fn parse_effect_chain_ir(
                 None
             }
         });
+        // CR 614.1a + CR 608.2c: mark the body of an "instead" override. Its
+        // condition is one of the `*Instead` gates and
+        // `strip_additional_cost_conditional` has already removed the word, so
+        // the text reaching the grammar below is the replacement effect alone —
+        // and a replacement inherits the replaced event's recipient, which the
+        // printed clause may therefore omit entirely (Dragon's Fire). Assigned
+        // on EVERY chunk (not just the override ones) so the flag never outlives
+        // the chunk that set it.
+        ctx.instead_override_body = matches!(
+            condition,
+            Some(AbilityCondition::AdditionalCostPaidInstead)
+                | Some(AbilityCondition::CastVariantPaidInstead { .. })
+        );
         let (clause, repeat_for) = if let Some(retained_type_clause) = retained_type_clause {
             let duration_binding = retained_type_duration_binding(builder.clauses());
             (retained_type_clause.lower(duration_binding), repeat_for)

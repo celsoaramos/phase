@@ -4239,15 +4239,23 @@ fn parse_cost_paid_object_demonstrative_ref(input: &str) -> OracleResult<'_, Qua
 /// single beheld object (CR 608.2k) via the disjunction printed on the card:
 ///   - "the chosen creature or card"                     (Close Encounter)
 ///   - "the creature you chose or the card you revealed" (Monstrous Emergence)
+///   - "that card or creature"                           (Dragon's Fire)
 ///
 /// The two legs of each disjunction are alternative descriptions of the SAME
 /// stamped `cost_paid_object` (a creature chosen on the battlefield OR a card
 /// chosen/revealed elsewhere), so the whole phrase collapses to one referent
 /// rather than a multi-object set.
+///
+/// CR 608.2k: Dragon's Fire prints the demonstrative form ("…equal to the power
+/// of that card or creature"), whose antecedent is its own behold rider ("if you
+/// revealed a Dragon card or chose a Dragon as you cast this spell"). The
+/// disjunction of a CARD with a CREATURE is what keeps it in this axis and out
+/// of the target demonstratives ("that creature"), which name one object class.
 fn parse_chosen_revealed_object_phrase(input: &str) -> OracleResult<'_, ()> {
     alt((
         value((), tag("the chosen creature or card")),
         value((), tag("the creature you chose or the card you revealed")),
+        value((), tag("that card or creature")),
     ))
     .parse(input)
 }

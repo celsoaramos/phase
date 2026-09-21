@@ -193,6 +193,19 @@ pub(crate) struct ParseContext {
     /// Whether we are inside a replacement effect.
     #[allow(dead_code)] // Retained for future nom combinator consumers (D-02).
     pub in_replacement: bool,
+    /// CR 614.1a + CR 608.2c: whether the clause being lowered is the BODY of an
+    /// "instead" override — the chunk whose condition is one of the `*Instead`
+    /// gates, with the word "instead" already stripped by
+    /// `strip_additional_cost_conditional`.
+    ///
+    /// A replacement keeps the replaced event's recipient, so such a clause may
+    /// print none at all ("Dragon's Fire deals damage equal to the power of that
+    /// card or creature instead"). Only the damage grammar reads this, and only
+    /// to bind that MISSING recipient to `ParentTarget`; a clause that names its
+    /// own recipient is unaffected. Outside an override the same shape stays a
+    /// strict failure, because there is no parent event to inherit from and a
+    /// guessed recipient would be a silent wrong answer.
+    pub instead_override_body: bool,
     /// Parser-internal scope: whether the trigger CONDITION being parsed is printed
     /// card text or a DELAYED trigger created from a resolving effect chain. Gates
     /// delayed-only anaphoric subject resolution; see [`TriggerConditionScope`].
@@ -608,6 +621,10 @@ impl ParseContext {
     pub fn clone_for_independent_body(&self) -> Self {
         Self {
             trigger_zone_change: TriggerZoneChangeProvenance::none(),
+            // CR 614.1a: an independent body is a NEW event, never the body of
+            // the enclosing "instead" override, so it inherits no parent
+            // recipient to fall back on.
+            instead_override_body: false,
             ..self.clone()
         }
     }

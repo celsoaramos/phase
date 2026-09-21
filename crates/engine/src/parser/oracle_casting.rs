@@ -83,7 +83,7 @@ pub fn parse_additional_cost_line(lower: &str, raw: &str) -> Option<AdditionalCo
     // damage clause references a chosen object no cost ever produces. Surface an
     // honest unimplemented cost so coverage stays red. Scoped to exactly this
     // prefix shape so ordinary "X or Y" alternative costs are unaffected.
-    if is_choose_behold_prefix(body_lower) {
+    if is_spelled_out_behold_prefix(body_lower) {
         return Some(AdditionalCost::Required(AbilityCost::Unimplemented {
             description: body_raw.to_string(),
         }));
@@ -175,27 +175,39 @@ pub fn parse_additional_cost_line(lower: &str, raw: &str) -> Option<AdditionalCo
     None
 }
 
-/// CR 701.4a: Detect the *opening* of a spelled-out choose-behold cost —
-/// "choose a/an <type> you control or " — on an already-lowercase body slice.
+/// CR 701.4a: Detect the *opening* of a spelled-out behold cost, in either
+/// printed order, on an already-lowercase body slice:
+///   - "choose a/an <type> you control or "                 (Monstrous Emergence)
+///   - "reveal a/an <type> card from your hand or choose "  (Dragon's Fire)
 ///
 /// `parse_choose_or_reveal_behold_cost` (oracle_cost.rs) recognizes the FULL
-/// shape "choose a/an <type> you control or reveal a/an <type> card from your
-/// hand" and yields a `Behold`. When only this prefix matches but the full
-/// behold parse declined (an unrecognized alternative leg such as Close
+/// shape of both orders and yields a `Behold`. When only this prefix matches but
+/// the full behold parse declined (an unrecognized alternative leg such as Close
 /// Encounter's "a warped creature card you own in exile"), the line is
-/// unambiguously a choose-behold cost the engine cannot model. This guard lets
-/// the caller surface an honest unimplemented cost instead of misparsing the
-/// fragment. The bare `take_until` for the type phrase keeps the prefix as
-/// narrow as possible — any line lacking " you control or " falls through.
-fn is_choose_behold_prefix(body_lower: &str) -> bool {
-    fn parse(i: &str) -> nom::IResult<&str, (), OracleError<'_>> {
+/// unambiguously a behold cost the engine cannot model. This guard lets the
+/// caller surface an honest unimplemented cost instead of misparsing the
+/// fragment. The bare `take_until` for the type phrase keeps each prefix as
+/// narrow as possible — any line lacking the needle falls through.
+///
+/// The reveal-first arm demands the trailing "choose " so a bare `Reveal` cost
+/// offered against a real alternative ("reveal a Dragon card from your hand or
+/// pay {2}") stays an ordinary `Choice` and is not stolen by this guard.
+fn is_spelled_out_behold_prefix(body_lower: &str) -> bool {
+    fn choose_first(i: &str) -> nom::IResult<&str, (), OracleError<'_>> {
         let (i, _) = tag("choose ").parse(i)?;
         let (i, _) = alt((tag("a "), tag("an "))).parse(i)?;
         let (i, _) = take_until(" you control or ").parse(i)?;
         let (i, _) = tag(" you control or ").parse(i)?;
         Ok((i, ()))
     }
-    parse(body_lower).is_ok()
+    fn reveal_first(i: &str) -> nom::IResult<&str, (), OracleError<'_>> {
+        let (i, _) = tag("reveal ").parse(i)?;
+        let (i, _) = alt((tag("a "), tag("an "))).parse(i)?;
+        let (i, _) = take_until(" card from your hand or choose ").parse(i)?;
+        let (i, _) = tag(" card from your hand or choose ").parse(i)?;
+        Ok((i, ()))
+    }
+    choose_first(body_lower).is_ok() || reveal_first(body_lower).is_ok()
 }
 
 pub(crate) fn parse_spell_casting_option_line(
@@ -1420,6 +1432,80 @@ Trample";
                 );
             }
             other => panic!("Expected Required(Behold creature ChooseOrReveal), got {other:?}"),
+        }
+    }
+
+    /// CR 701.4a + CR 601.2b/f: the spelled-out behold cost with its legs in the
+    /// OTHER printed order, and optional (Dragon's Fire). Same `Behold
+    /// { ChooseOrReveal }` shape, wrapped in `Optional` by the "you may" arm.
+    /// Before this the line fell through every arm to an unimplemented cost, so
+    /// the spell cast for mana alone and its "instead" rider never fired.
+    #[test]
+    fn parse_additional_cost_spelled_out_reveal_or_choose_behold_optional() {
+        let lower =
+            "as an additional cost to cast this spell, you may reveal a dragon card from your hand or choose a dragon you control.";
+        let raw =
+            "As an additional cost to cast this spell, you may reveal a Dragon card from your hand or choose a Dragon you control.";
+        let result = parse_additional_cost_line(lower, raw);
+        match result {
+            Some(AdditionalCost::Optional {
+                cost:
+                    AbilityCost::Behold {
+                        count: 1,
+                        filter: TargetFilter::Typed(filter),
+                        action: BeholdCostAction::ChooseOrReveal,
+                        ..
+                    },
+                ..
+            }) => {
+                assert!(
+                    filter
+                        .type_filters
+                        .iter()
+                        .any(|tf| matches!(tf, TypeFilter::Subtype(name) if name == "Dragon")),
+                    "reveal-first behold must carry the Dragon subtype filter: {filter:?}"
+                );
+            }
+            other => panic!("Expected Optional(Behold Dragon ChooseOrReveal), got {other:?}"),
+        }
+    }
+
+    /// The same order printed as a MANDATORY cost is `Required`, not `Optional`
+    /// — the word order and the "you may" are independent axes.
+    #[test]
+    fn parse_additional_cost_spelled_out_reveal_or_choose_behold_required() {
+        let lower =
+            "as an additional cost to cast this spell, reveal a dragon card from your hand or choose a dragon you control.";
+        let raw =
+            "As an additional cost to cast this spell, reveal a Dragon card from your hand or choose a Dragon you control.";
+        match parse_additional_cost_line(lower, raw) {
+            Some(AdditionalCost::Required(AbilityCost::Behold {
+                action: BeholdCostAction::ChooseOrReveal,
+                ..
+            })) => {}
+            other => panic!("Expected Required(Behold ChooseOrReveal), got {other:?}"),
+        }
+    }
+
+    /// CR 701.4a: the two legs must name the SAME type — they describe one
+    /// object. A mismatch is not a behold and must not be stapled to the face as
+    /// one; the reveal-first prefix guard keeps it an honest unimplemented cost.
+    #[test]
+    fn parse_additional_cost_reveal_or_choose_mismatched_types_is_unimplemented() {
+        let lower =
+            "as an additional cost to cast this spell, reveal a dragon card from your hand or choose a goblin you control.";
+        let raw =
+            "As an additional cost to cast this spell, reveal a Dragon card from your hand or choose a Goblin you control.";
+        match parse_additional_cost_line(lower, raw) {
+            Some(AdditionalCost::Required(AbilityCost::Unimplemented { description })) => {
+                assert_eq!(
+                    description,
+                    "reveal a Dragon card from your hand or choose a Goblin you control"
+                );
+            }
+            other => {
+                panic!("mismatched behold legs must be Required(Unimplemented), got {other:?}")
+            }
         }
     }
 

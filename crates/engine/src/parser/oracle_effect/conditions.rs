@@ -681,22 +681,34 @@ pub(super) fn strip_additional_cost_conditional(text: &str) -> (Option<AbilityCo
                 );
             }
         }
-        nom_primitives::split_once_on(lower.as_str(), " was kicked, ")
-            .or_else(|_| nom_primitives::split_once_on(lower.as_str(), " was bargained, "))
-            .or_else(|_| nom_primitives::split_once_on(lower.as_str(), " was beheld, "))
-            // CR 601.2b/f: Teamwork is an optional additional cast cost; "if this
-            // spell was cast using teamwork" gates the body on the same
-            // `additional_cost_paid` flag as kicker/bargain. The leading-"instead"
-            // form (Cruel Alliance, Too Evil to Stay Dead) is folded to
-            // `AdditionalCostPaidInstead` by the shared `instead` handling below.
-            .or_else(|_| {
-                nom_primitives::split_once_on(lower.as_str(), " was cast using teamwork, ")
-            })
-            .ok()
-            .map(|(_, (_, rest))| {
-                let offset = text.len() - rest.len();
-                text[offset..].to_string()
-            })
+        // CR 701.4a + CR 601.2b/f: the SPELLED-OUT behold rider — "if you revealed
+        // a <T> card or chose a <T> as you cast this spell, [body]" (Dragon's
+        // Fire). It names the very payment the keyworded "if a <T> was beheld"
+        // rider names, printed longhand, so it feeds the same body/`instead`
+        // tail below and folds to `AdditionalCostPaidInstead`. Tried before the
+        // literal splits because it needs the two legs to agree on the type,
+        // which no fixed needle can check.
+        if let Some(rest) = strip_spelled_out_behold_paid_head(lower.as_str()) {
+            let offset = text.len() - rest.len();
+            Some(text[offset..].to_string())
+        } else {
+            nom_primitives::split_once_on(lower.as_str(), " was kicked, ")
+                .or_else(|_| nom_primitives::split_once_on(lower.as_str(), " was bargained, "))
+                .or_else(|_| nom_primitives::split_once_on(lower.as_str(), " was beheld, "))
+                // CR 601.2b/f: Teamwork is an optional additional cast cost; "if this
+                // spell was cast using teamwork" gates the body on the same
+                // `additional_cost_paid` flag as kicker/bargain. The leading-"instead"
+                // form (Cruel Alliance, Too Evil to Stay Dead) is folded to
+                // `AdditionalCostPaidInstead` by the shared `instead` handling below.
+                .or_else(|_| {
+                    nom_primitives::split_once_on(lower.as_str(), " was cast using teamwork, ")
+                })
+                .ok()
+                .map(|(_, (_, rest))| {
+                    let offset = text.len() - rest.len();
+                    text[offset..].to_string()
+                })
+        }
     } else {
         None
     };
@@ -833,6 +845,46 @@ pub(super) fn strip_additional_cost_conditional(text: &str) -> (Option<AbilityCo
         }
         None => (None, text.to_string()),
     }
+}
+
+/// CR 701.4a + CR 601.2b/f + CR 608.2c: Strip the head of the SPELLED-OUT behold
+/// rider — "if you revealed a/an \<T\> card or chose a/an \<T\> as you cast this
+/// spell, " — and return the body that follows. `None` when the text is not this
+/// shape.
+///
+/// CR 701.4a: beholding is one action with two legs (reveal from hand OR choose
+/// on the battlefield), so a rider that names both legs names the PAYMENT, which
+/// is what `AdditionalCostPaidInstead` tests. Both legs must name the same type,
+/// for the same reason the cost parser requires it: they describe one object.
+///
+/// Deliberately NOT matched: "if you revealed a Dragon card or **controlled** a
+/// Dragon as you cast this spell" (Draconic Roar and its cycle). Controlling a
+/// Dragon is a casting-time board snapshot, not a cost anyone paid, so folding
+/// it to "the additional cost was paid" would fire the rider for a player who
+/// paid nothing.
+fn strip_spelled_out_behold_paid_head(lower: &str) -> Option<&str> {
+    let (input, _) = tag::<_, _, OracleError<'_>>("if you revealed ")
+        .parse(lower)
+        .ok()?;
+    let (input, _) = alt((tag::<_, _, OracleError<'_>>("a "), tag("an ")))
+        .parse(input)
+        .ok()?;
+    let (after_reveal, revealed_type) = terminated(
+        take_until::<_, _, OracleError<'_>>(" card or chose "),
+        tag(" card or chose "),
+    )
+    .parse(input)
+    .ok()?;
+    let (after_article, _) = alt((tag::<_, _, OracleError<'_>>("a "), tag("an ")))
+        .parse(after_reveal)
+        .ok()?;
+    let (body, chosen_type) = terminated(
+        take_until::<_, _, OracleError<'_>>(" as you cast this spell, "),
+        tag(" as you cast this spell, "),
+    )
+    .parse(after_article)
+    .ok()?;
+    (revealed_type.trim() == chosen_type.trim()).then_some(body)
 }
 
 /// Strip optional punctuation/space between a parsed reflexive clause and its body.
