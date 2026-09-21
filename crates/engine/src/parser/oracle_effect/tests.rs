@@ -9155,6 +9155,49 @@ fn effect_exile_target_player_graveyard_is_change_zone_all() {
         );
 }
 
+/// CR 400.12 + CR 404 + CR 406 + CR 601.2c: the PLURAL form of the same
+/// instruction — "exile any number of target players' graveyards" (Thraben
+/// Charm) — is a mass-zone exile with a VARIABLE number of player targets, not a
+/// single-object move. Before this, the plural possessive missed the mass-zone
+/// head and fell through to `ChangeZone { target: Player }`: an instruction to
+/// move ONE object whose target is a player, so it resolved and did nothing
+/// (field report on the released build, 2026-09-21). The `multi_target` spec
+/// must survive on the clause — it is what makes the runtime fan-out repeat the
+/// mass move for every chosen player.
+#[test]
+fn effect_exile_any_number_of_target_players_graveyards_is_change_zone_all() {
+    let mut ctx = ParseContext::default();
+    let clause = parse_effect_clause("exile any number of target players' graveyards", &mut ctx);
+    assert!(
+        matches!(
+            clause.effect,
+            Effect::ChangeZoneAll {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Exile,
+                target: TargetFilter::Player,
+                ..
+            }
+        ),
+        "plural graveyard exile should be ChangeZoneAll with origin=Graveyard, target=Player, got {:?}",
+        clause.effect
+    );
+    assert_eq!(
+        clause.multi_target,
+        Some(MultiTargetSpec::unlimited(0)),
+        "\"any number of target players'\" must keep the unlimited (min 0) target count"
+    );
+}
+
+/// The singular form keeps its single-target shape: the quantifier strip added
+/// for the plural must not invent a target count where the card prints none.
+#[test]
+fn effect_exile_target_player_graveyard_keeps_no_multi_target() {
+    let mut ctx = ParseContext::default();
+    let clause = parse_effect_clause("exile target player's graveyard", &mut ctx);
+    assert!(matches!(clause.effect, Effect::ChangeZoneAll { .. }));
+    assert_eq!(clause.multi_target, None);
+}
+
 #[test]
 fn suffer_the_past_exiles_from_target_player_graveyard() {
     let def = parse_effect_chain(

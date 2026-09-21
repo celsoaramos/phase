@@ -9303,7 +9303,8 @@ pub(super) fn parse_destroy_ast(
     None
 }
 
-/// Detect "target {player,opponent}'s {graveyard,library,hand}" prefixes.
+/// Detect "target {player,opponent}'s {graveyard,library,hand}" prefixes and
+/// return the zone they name.
 ///
 /// CR 400.12: A zone-targeting effect operates on every card in the named zone.
 /// "target player's" and "target opponent's" are not in the shared `POSSESSIVES`
@@ -9311,15 +9312,40 @@ pub(super) fn parse_destroy_ast(
 /// they appear only in *zone-as-operand* contexts like Nihil Spellbomb, Bojuka
 /// Bog, Tormod's Crypt, Cremate, Faerie Macabre, etc. — so we recognize them
 /// here at the dispatch site rather than widening `POSSESSIVES` globally.
-fn starts_with_target_possessive_zone(rest_lower: &str) -> bool {
-    fn inner(i: &str) -> nom::IResult<&str, &str, OracleError<'_>> {
-        preceded(
-            alt((tag("target player's "), tag("target opponent's "))),
-            alt((tag("graveyard"), tag("library"), tag("hand"))),
-        )
+///
+/// CR 601.2c + CR 115.1d: the PLURAL possessive is the same zone-as-operand
+/// head under a variable target count — "exile any number of target players'
+/// graveyards" (Thraben Charm). The caller strips the count quantifier, so what
+/// reaches here is the bare plural subject. Plural possessive pairs only with
+/// the PLURAL zone noun: "target players' graveyard" is not printed Oracle text,
+/// and accepting it would claim a reading no card has.
+///
+/// The zone is returned because `infer_origin_zone` scans at word boundaries and
+/// therefore does not see "graveyards" as "graveyard": without this the plural
+/// form would lower with `origin: None` and move nothing.
+fn target_possessive_zone(rest_lower: &str) -> Option<Zone> {
+    fn inner(i: &str) -> nom::IResult<&str, Zone, OracleError<'_>> {
+        alt((
+            preceded(
+                alt((tag("target player's "), tag("target opponent's "))),
+                alt((
+                    value(Zone::Graveyard, tag("graveyard")),
+                    value(Zone::Library, tag("library")),
+                    value(Zone::Hand, tag("hand")),
+                )),
+            ),
+            preceded(
+                alt((tag("target players' "), tag("target opponents' "))),
+                alt((
+                    value(Zone::Graveyard, tag("graveyards")),
+                    value(Zone::Library, tag("libraries")),
+                    value(Zone::Hand, tag("hands")),
+                )),
+            ),
+        ))
         .parse(i)
     }
-    inner(rest_lower).is_ok()
+    inner(rest_lower).ok().map(|(_, zone)| zone)
 }
 
 /// CR 400.12 + CR 115.1: Match a "[card|cards] of [a player]'s library" suffix
@@ -9858,21 +9884,33 @@ pub(super) fn parse_exile_ast(
     // act on all cards in that zone. Bare possessive zone references and
     // "target {player,opponent}'s <zone>" share semantics with "exile all/each".
     // CR 404 (graveyard) / CR 406 (exile) — the zone itself is the operand.
-    let mass_zone = starts_with_possessive(rest_lower, "", "graveyard")
-        || starts_with_possessive(rest_lower, "", "library")
-        || starts_with_possessive(rest_lower, "", "hand")
-        || starts_with_target_possessive_zone(rest_lower);
+    //
+    // CR 601.2c + CR 115.1d: the same instruction also appears with a VARIABLE
+    // number of player targets — "exile any number of target players'
+    // graveyards" (Thraben Charm). Strip the count quantifier here and carry the
+    // spec as the clause's `multi_target`: the runtime's multi-target
+    // player-subject fan-out (`game/effects`) then performs the mass move once
+    // per chosen player. Without this the clause fell through to the
+    // single-object `ChangeZone` fallback below, which has NO object to move
+    // when its target is a player — it resolved and did nothing at all.
+    let (zone_text, zone_multi_target) = super::strip_optional_target_prefix(rest_text);
+    let zone_lower = &rest_lower[rest_lower.len() - zone_text.len()..];
+    let head_zone = target_possessive_zone(zone_lower);
+    let mass_zone = starts_with_possessive(zone_lower, "", "graveyard")
+        || starts_with_possessive(zone_lower, "", "library")
+        || starts_with_possessive(zone_lower, "", "hand")
+        || head_zone.is_some();
     if mass_zone {
-        let (target, _rem) = parse_target(rest_text);
+        let (target, _rem) = parse_target(zone_text);
         #[cfg(debug_assertions)]
         assert_no_compound_remainder(_rem, text);
-        let origin = super::infer_origin_zone(rest_lower);
+        let origin = super::infer_origin_zone(zone_lower).or(head_zone);
         return Some(ZoneCounterImperativeAst::Exile {
             origin,
             target,
             all: true,
             enter_with_counters: vec![],
-            multi_target: None,
+            multi_target: zone_multi_target,
         });
     }
 

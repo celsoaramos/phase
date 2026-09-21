@@ -3649,13 +3649,34 @@ fn collect_target_slots_inner(
             if player_targets.is_empty() && !ability.optional_targeting {
                 return Err(no_legal_target_slots());
             }
-            acc.push(TargetSelectionSlot {
-                legal_targets: player_targets,
-                optional: ability.optional_targeting,
-                chooser: None,
-                effect_kind: acc.current_effect_kind,
-                effect_detail: acc.current_effect_detail,
-            });
+            // CR 601.2c: the player axis can itself carry the target COUNT
+            // ("exile any number of target players' graveyards" — Thraben Charm):
+            // one slot per allowed target, exactly like the primary-filter branch
+            // below. With the single companion slot the second chosen player was
+            // never announced and their graveyard survived the resolution.
+            // `companion_target_player_slot_bounds` is the shared authority the
+            // assignment walkers read, so the three cannot drift.
+            if let Some(bounds) =
+                companion_target_player_slot_bounds(state, ability, player_targets.len())?
+            {
+                for slot_index in 0..bounds.max {
+                    acc.push(TargetSelectionSlot {
+                        legal_targets: player_targets.clone(),
+                        optional: slot_index >= bounds.min,
+                        chooser: None,
+                        effect_kind: acc.current_effect_kind,
+                        effect_detail: acc.current_effect_detail,
+                    });
+                }
+            } else {
+                acc.push(TargetSelectionSlot {
+                    legal_targets: player_targets,
+                    optional: ability.optional_targeting,
+                    chooser: None,
+                    effect_kind: acc.current_effect_kind,
+                    effect_detail: acc.current_effect_detail,
+                });
+            }
         }
         if ability.target_choice_timing == TargetChoiceTiming::Stack
             && effect_needs_target_creature_quantity_slot(&ability.effect)
@@ -4769,6 +4790,57 @@ fn effect_references_target_player(effect: &Effect) -> bool {
 /// discriminator only.
 fn effect_references_target_opponent(effect: &Effect) -> bool {
     effect_bound_filter_matches(effect, filter_references_target_opponent)
+}
+
+/// CR 601.2c: how many companion player slots this ability declares.
+///
+/// `None` = the single slot every companion-player shape has always declared.
+/// `Some(bounds)` = the player axis itself carries the target COUNT: a mass
+/// effect scanned by a bare `TargetFilter::Player` under a `multi_target` spec —
+/// "exile any number of target players' graveyards" (Thraben Charm) is one
+/// graveyard scan per chosen player, so it needs one slot per allowed target.
+///
+/// Single authority on purpose: the slot BUILDER (`collect_target_slots`) and
+/// the two assignment walkers (`assign_targets_recursive`,
+/// `assign_selected_slots_recursive`) have to agree on the number, or a cast
+/// dies with "Unused selected target slots" — the builder offering slots the
+/// walker never consumes.
+///
+/// Narrow by construction: the other companion-slot shapes ("each creature
+/// target player controls" — DamageAll / PutCounterAll) declare ONE player, and
+/// their count, when they have one, belongs to the object axis.
+fn companion_target_player_slot_bounds(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    legal_target_count: usize,
+) -> Result<Option<MultiTargetBounds>, EngineError> {
+    let Some(spec) = ability.multi_target.as_ref() else {
+        return Ok(None);
+    };
+    if !mass_all_target_filter(&ability.effect)
+        .is_some_and(|filter| matches!(filter, TargetFilter::Player))
+    {
+        return Ok(None);
+    }
+    Ok(Some(resolve_multi_target_bounds(
+        state,
+        ability,
+        spec,
+        legal_target_count,
+    )?))
+}
+
+/// The same bounds as seen by the assignment walkers, which do not carry the
+/// builder's legal-target list: `companion_target_player_legal_targets` is a
+/// pure function of state + ability, so both sides derive the same number.
+/// Returns `(slot_count, bounds)`; `bounds` is `None` for the single-slot shape.
+fn companion_target_player_walk_bounds(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Result<(usize, Option<MultiTargetBounds>), EngineError> {
+    let legal = companion_target_player_legal_targets(state, ability);
+    let bounds = companion_target_player_slot_bounds(state, ability, legal.len())?;
+    Ok((bounds.as_ref().map(|b| b.max).unwrap_or(1), bounds))
 }
 
 fn ability_needs_companion_target_player_slot(ability: &ResolvedAbility) -> bool {
@@ -8263,13 +8335,20 @@ fn assign_targets_recursive(
     if ability.target_choice_timing == TargetChoiceTiming::Stack
         && ability_needs_companion_target_player_slot(ability)
     {
-        if let Some(target) = targets.get(*next_target) {
-            ability.targets.push(target.clone());
-            *next_target += 1;
-        } else if !ability.optional_targeting {
-            return Err(EngineError::InvalidAction(
-                "Missing required target".to_string(),
-            ));
+        // CR 601.2c: one player, or one per allowed target when the player axis
+        // carries the count (Thraben Charm) — same authority the builder uses.
+        let (slot_count, bounds) = companion_target_player_walk_bounds(state, ability)?;
+        for index in 0..slot_count {
+            if let Some(target) = targets.get(*next_target) {
+                ability.targets.push(target.clone());
+                *next_target += 1;
+            } else if !ability.optional_targeting
+                && !bounds.as_ref().is_some_and(|b| index >= b.min)
+            {
+                return Err(EngineError::InvalidAction(
+                    "Missing required target".to_string(),
+                ));
+            }
         }
     }
     if ability.target_choice_timing == TargetChoiceTiming::Stack
@@ -8697,21 +8776,30 @@ fn assign_selected_slots_recursive(
     if ability.target_choice_timing == TargetChoiceTiming::Stack
         && ability_needs_companion_target_player_slot(ability)
     {
-        let Some(selected_slot) = selected_slots.get(*next_slot) else {
-            return Err(EngineError::InvalidAction(
-                "Missing target selection".to_string(),
-            ));
-        };
-        match selected_slot {
-            Some(target) => ability.targets.push(target.clone()),
-            None if ability.optional_targeting => {}
-            None => {
+        // CR 601.2c: one player, or one per allowed target when the player axis
+        // carries the count (Thraben Charm) — same authority the builder uses.
+        // A DECLINED slot is representable here, and "any number of" (min 0)
+        // means declining is legal: that is how the caster chooses fewer
+        // players than the table has.
+        let (slot_count, bounds) = companion_target_player_walk_bounds(state, ability)?;
+        for index in 0..slot_count {
+            let Some(selected_slot) = selected_slots.get(*next_slot) else {
                 return Err(EngineError::InvalidAction(
-                    "Missing required target".to_string(),
+                    "Missing target selection".to_string(),
                 ));
+            };
+            match selected_slot {
+                Some(target) => ability.targets.push(target.clone()),
+                None if ability.optional_targeting
+                    || bounds.as_ref().is_some_and(|b| index >= b.min) => {}
+                None => {
+                    return Err(EngineError::InvalidAction(
+                        "Missing required target".to_string(),
+                    ));
+                }
             }
+            *next_slot += 1;
         }
-        *next_slot += 1;
     }
     if ability.target_choice_timing == TargetChoiceTiming::Stack
         && effect_needs_target_creature_quantity_slot(&ability.effect)
@@ -17965,6 +18053,22 @@ mod tests {
             slots.len(),
             1,
             "expected a single TargetFilter::Player slot for graveyard-mass exile"
+        );
+        // CR 601.2c: the COUNTED sibling ("exile any number of target players'
+        // graveyards", Thraben Charm) must surface one slot per allowed target —
+        // with a single slot the second chosen player is never announced and
+        // their graveyard survives the resolution.
+        let mut counted = ability.clone();
+        counted.multi_target = Some(crate::types::ability::MultiTargetSpec::unlimited(0));
+        let counted_slots = build_target_slots(&state, &counted).expect("should build");
+        assert_eq!(
+            counted_slots.len(),
+            2,
+            "expected one optional player slot per player at the table"
+        );
+        assert!(
+            counted_slots.iter().all(|slot| slot.optional),
+            "\"any number of\" targets are all optional (min 0)"
         );
         assert!(slots[0]
             .legal_targets
