@@ -1820,6 +1820,30 @@ fn split_comma_clause_boundary(current: &str, remainder: &str) -> Option<(Clause
         return None;
     }
 
+    // CR 611.2a: a chunk that is NOTHING BUT a duration phrase is the lifetime prefix
+    // of the instruction after the comma, never an instruction of its own — "This turn,
+    // each creature you control enters with an additional +1/+1 counter on it" (Zameck
+    // Guildmage, Combine Guildmage). Splitting there bisects the sentence: the head
+    // becomes a bare `Unimplemented{"This turn"}` and the real clause is parsed with NO
+    // lifetime, which for a grant means FOREVER — a silent rules error, strictly worse
+    // than not parsing it at all.
+    //
+    // `starts_prefix_clause` already keeps "until …" / "for as long as …" whole; this is
+    // the same rule for the leading durations that do not open with those words, and it
+    // is what lets `strip_leading_duration` reach the sentence at all.
+    //
+    // The gate is EXACT-MATCH on purpose, and that is what bounds it: a chunk that
+    // consumes entirely as a duration phrase cannot also be a standalone instruction, so
+    // no clause can be swallowed by it. Measured over the corpus: 9 cards print a leading
+    // "This turn, …" (7 of them clauses this change leaves exactly as unparsed as they
+    // were); the two Guildmages are the members it repairs end to end.
+    if all_consuming(crate::parser::oracle_nom::duration::parse_duration)
+        .parse(current_lower.trim())
+        .is_ok()
+    {
+        return None;
+    }
+
     // CR 205.2a + CR 205.3a + CR 608.2c: keep an "exile all/each A, all B, and
     // all C" union intact — a comma before a "[all|each] <type>" continuation is
     // a union delimiter, not a clause boundary (Everything Comes to Dust). Legs

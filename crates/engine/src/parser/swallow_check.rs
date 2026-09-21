@@ -402,6 +402,27 @@ fn detect_replacement(
         )
     }) || evidence.any::<ContinuousModification>(|m| {
         matches!(m, ContinuousModification::AddCounterOnEnter { .. })
+            // CR 614.1c + CR 611.2a: the DURATION-BOUND member of this same class —
+            // the enters-with-counters replacement granted by a resolving ability
+            // instead of printed as a permanent's own line (Arlinn, the Pack's Hope
+            // [+1]: "Until your next turn, ... each creature you control enters with
+            // an additional +1/+1 counter on it"). It IS the represented CR 614.1c
+            // replacement; it just lives on a `GrantReplacement` modification rather
+            // than in `parsed.replacements`.
+            //
+            // Pinned to the replaced EVENT, exactly like the static-mode arms above
+            // and for the same reason: a bare `GrantReplacement` arm would also
+            // exempt grants that replace something else entirely (the
+            // leave-battlefield exile rider `keyword_grant.rs` mints), and the
+            // detector would stop reporting a genuinely swallowed "enters with"
+            // on any card that happens to grant an unrelated replacement.
+            || matches!(
+                m,
+                ContinuousModification::GrantReplacement { replacement }
+                    if matches!(replacement.event, crate::types::replacements::ReplacementEvent::ChangeZone)
+                        && replacement.destination_zone
+                            == Some(crate::types::zones::Zone::Battlefield)
+            )
     }) || evidence.any_effect(|e| {
         matches!(
             e,
@@ -5417,6 +5438,286 @@ mod tests {
             &types.iter().map(|ty| (*ty).to_string()).collect::<Vec<_>>(),
             &[],
         )
+    }
+
+    /// CR 601.3b + CR 702.8a + CR 614.1c + CR 611.2a: Arlinn, the Pack's Hope's [+1]
+    /// is a COMPOUND instruction under one stated lifetime — a flash-timing grant AND
+    /// an enters-with-counters replacement, joined by ", and".
+    ///
+    /// THE DEFECT, as reported from play ("o +1 não funciona"): both halves were dead.
+    /// The trailing conjunct made `try_parse_cast_as_though_flash_permission`'s `eof`
+    /// fail, so the whole sentence slid onto the generic `CastFromZone` path — which
+    /// grants no timing permission at all — and took the conjunct with it. Measured in
+    /// a played game on `v0.89.0`: a creature cast under the +1 entered with
+    /// `counters: {}`, and on the opponent's turn with FIVE UNTAPPED LANDS and five
+    /// castable-cost creatures in hand, the only legal action was `TapLandForMana`.
+    ///
+    /// The fix is not a new mechanism. Teferi, Time Raveler's [+1] — the same sentence
+    /// WITHOUT the conjunct — already lowers to `GrantStaticAbility{CastWithKeyword
+    /// Flash}`, and Renata, Called to the Hunt's printed line already lowers to a
+    /// `ChangeZone`→Battlefield replacement. This asserts Arlinn reaches BOTH, under
+    /// the one stated duration, and that the swallow detector stops crying wolf.
+    #[test]
+    fn arlinn_plus_one_grants_flash_and_the_enters_with_counter_conjunct() {
+        use crate::types::ability::{ContinuousModification, Effect, TargetFilter};
+        use crate::types::replacements::ReplacementEvent;
+        use crate::types::statics::StaticMode;
+        use crate::types::zones::Zone;
+
+        let parsed = parse_named(
+            "Daybound (If a player casts no spells during their own turn, it becomes night next turn.)\n\
+             [+1]: Until your next turn, you may cast creature spells as though they had flash, and each creature you control enters with an additional +1/+1 counter on it.\n\
+             [\u{2212}3]: Create two 2/2 green Wolf creature tokens.",
+            "Arlinn, the Pack's Hope",
+            &["Planeswalker"],
+        );
+
+        let plus_one = parsed
+            .abilities
+            .iter()
+            .find(|a| {
+                matches!(
+                    a.cost,
+                    Some(crate::types::ability::AbilityCost::Loyalty { amount: 1 })
+                )
+            })
+            .expect("the [+1] must parse as a loyalty ability");
+
+        // CR 611.2a: one stated lifetime governs the WHOLE instruction, so it must sit
+        // on the head and on the recovered conjunct alike — not only on the first.
+        let until_next_turn = crate::types::ability::Duration::UntilNextTurnOf {
+            player: crate::types::ability::PlayerScope::Controller,
+        };
+
+        // Half 1 — the flash grant (Teferi's shape), scoped to CREATURE spells you cast.
+        let Effect::GenericEffect {
+            static_abilities,
+            duration,
+            target,
+            ..
+        } = &*plus_one.effect
+        else {
+            panic!(
+                "the [+1] head must be a GenericEffect grant, got {:?}",
+                plus_one.effect
+            );
+        };
+        assert_eq!(duration.as_ref(), Some(&until_next_turn));
+        assert_eq!(target.as_ref(), Some(&TargetFilter::Controller));
+        let [head_static] = static_abilities.as_slice() else {
+            panic!("expected exactly one granted static, got {static_abilities:?}");
+        };
+        let [ContinuousModification::GrantStaticAbility { definition }] =
+            head_static.modifications.as_slice()
+        else {
+            panic!(
+                "expected a GrantStaticAbility, got {:?}",
+                head_static.modifications
+            );
+        };
+        assert!(
+            matches!(
+                definition.mode,
+                StaticMode::CastWithKeyword {
+                    keyword: crate::types::keywords::Keyword::Flash
+                }
+            ),
+            "the head must grant flash TIMING, not a CastFromZone card pick: {:?}",
+            definition.mode
+        );
+        let Some(TargetFilter::Typed(ref spell_filter)) = definition.affected else {
+            panic!(
+                "expected a typed spell filter, got {:?}",
+                definition.affected
+            );
+        };
+        assert_eq!(
+            spell_filter.type_filters,
+            vec![crate::types::ability::TypeFilter::Creature]
+        );
+        assert_eq!(
+            spell_filter.controller,
+            Some(crate::types::ability::ControllerRef::You)
+        );
+
+        // Half 2 — the conjunct the leading duration recovers, carrying the SAME lifetime.
+        let conjunct = plus_one
+            .sub_ability
+            .as_deref()
+            .expect("the ', and ...' conjunct must be recovered, not dropped");
+        let Effect::GenericEffect {
+            static_abilities: tail_statics,
+            duration: tail_duration,
+            ..
+        } = &*conjunct.effect
+        else {
+            panic!(
+                "the conjunct must lower to a granted replacement, got {:?}",
+                conjunct.effect
+            );
+        };
+        assert_eq!(tail_duration.as_ref(), Some(&until_next_turn));
+        let [tail_static] = tail_statics.as_slice() else {
+            panic!("expected exactly one granted static on the conjunct, got {tail_statics:?}");
+        };
+        let [ContinuousModification::GrantReplacement { replacement }] =
+            tail_static.modifications.as_slice()
+        else {
+            panic!(
+                "expected a GrantReplacement, got {:?}",
+                tail_static.modifications
+            );
+        };
+        assert!(matches!(replacement.event, ReplacementEvent::ChangeZone));
+        assert_eq!(replacement.destination_zone, Some(Zone::Battlefield));
+        let execute = replacement
+            .execute
+            .as_ref()
+            .expect("the replacement must execute the counter placement");
+        assert!(
+            matches!(
+                &*execute.effect,
+                Effect::PutCounter {
+                    counter_type: crate::types::counter::CounterType::Plus1Plus1,
+                    target: TargetFilter::SelfRef,
+                    ..
+                }
+            ),
+            "expected one +1/+1 counter on the entering object, got {:?}",
+            execute.effect
+        );
+
+        // The detector must stop reporting the conjunct as swallowed — it is represented
+        // now, just on a `GrantReplacement` rather than in `parsed.replacements`.
+        assert!(
+            !has_swallowed_detector(&parsed, "Replacement"),
+            "the conjunct is represented; the Replacement detector must go quiet: {:?}",
+            parsed.parse_warnings
+        );
+    }
+
+    /// CR 611.2a: the SAME clause standing alone under its own leading lifetime —
+    /// "{G}{U}: This turn, each creature you control enters with an additional +1/+1
+    /// counter on it" (Zameck Guildmage; Combine Guildmage prints it verbatim). This is
+    /// the class witness for the Arlinn change: the conjunct recovered there and the
+    /// whole ability here lower through the same branch.
+    ///
+    /// It is ALSO the boundary that makes the chunk-splitter guard load-bearing. A
+    /// leading "This turn," does not open with "until", so the comma splitter used to
+    /// bisect it: the head became a bare `Unimplemented{"This turn"}` and the real clause
+    /// was parsed with NO lifetime — which, for a grant, means FOREVER. Asserting the
+    /// duration is therefore the point of this test, not decoration: drop the guard and
+    /// it is `None` here, and these two cards start granting the counter permanently.
+    #[test]
+    fn leading_this_turn_keeps_its_lifetime_on_the_enters_with_counter_grant() {
+        use crate::types::ability::{ContinuousModification, Duration, Effect};
+
+        for (name, text) in [
+            (
+                "Zameck Guildmage",
+                "{G}{U}: This turn, each creature you control enters with an additional +1/+1 counter on it.",
+            ),
+            (
+                "Combine Guildmage",
+                "{1}{G}, {T}: This turn, each creature you control enters with an additional +1/+1 counter on it.",
+            ),
+        ] {
+            let parsed = parse_named(text, name, &["Creature"]);
+            let ability = parsed
+                .abilities
+                .first()
+                .unwrap_or_else(|| panic!("{name}: the ability must parse"));
+
+            // The lifetime prefix must not have been severed into its own clause.
+            assert!(
+                !matches!(&*ability.effect, Effect::Unimplemented { .. }),
+                "{name}: the leading duration was bisected off its instruction: {:?}",
+                ability.effect
+            );
+
+            let Effect::GenericEffect {
+                static_abilities,
+                duration,
+                ..
+            } = &*ability.effect
+            else {
+                panic!("{name}: expected a granted replacement, got {:?}", ability.effect);
+            };
+            assert_eq!(
+                duration.as_ref(),
+                Some(&Duration::UntilEndOfTurn),
+                "{name}: the grant must end this turn, not last forever"
+            );
+            let [granted] = static_abilities.as_slice() else {
+                panic!("{name}: expected one granted static, got {static_abilities:?}");
+            };
+            assert!(
+                matches!(
+                    granted.modifications.as_slice(),
+                    [ContinuousModification::GrantReplacement { .. }]
+                ),
+                "{name}: expected a GrantReplacement, got {:?}",
+                granted.modifications
+            );
+        }
+    }
+
+    /// Boundary for the ", and " the flash recognizer now tolerates: Cherished Hatchling
+    /// is the only OTHER card in the corpus whose "as though they had flash" phrase is
+    /// followed by a conjunct, and its conjunct is a delayed trigger, not a replacement.
+    /// It must keep BOTH halves — accepting a prefix must never become "drop the tail".
+    #[test]
+    fn cherished_hatchling_keeps_both_halves_of_its_flash_conjunction() {
+        use crate::types::ability::Effect;
+        use crate::types::statics::StaticMode;
+
+        let parsed = parse_named(
+            "When this creature dies, you may cast Dinosaur spells this turn as though they had flash, and whenever you cast a Dinosaur spell this turn, it gains \"When this creature enters, it fights target creature an opponent controls.\"",
+            "Cherished Hatchling",
+            &["Creature"],
+        );
+
+        let trigger = parsed
+            .triggers
+            .first()
+            .expect("the dies trigger must parse");
+        let body = trigger
+            .execute
+            .as_deref()
+            .expect("the trigger must have a body");
+
+        // Half 1: the flash grant, scoped to Dinosaur spells, for the turn.
+        let Effect::GenericEffect {
+            static_abilities, ..
+        } = &*body.effect
+        else {
+            panic!(
+                "expected the flash grant as the head, got {:?}",
+                body.effect
+            );
+        };
+        assert!(
+            static_abilities.iter().any(|s| s.modifications.iter().any(|m| matches!(
+                m,
+                crate::types::ability::ContinuousModification::GrantStaticAbility { definition }
+                    if matches!(
+                        definition.mode,
+                        StaticMode::CastWithKeyword { keyword: crate::types::keywords::Keyword::Flash }
+                    )
+            ))),
+            "the head must still be the flash grant: {static_abilities:?}"
+        );
+
+        // Half 2: the ", and whenever ..." conjunct is still attached.
+        assert!(
+            body.sub_ability.is_some(),
+            "the delayed-trigger conjunct must not be dropped"
+        );
+        assert!(
+            parsed.parse_warnings.is_empty(),
+            "nothing should read as swallowed here: {:?}",
+            parsed.parse_warnings
+        );
     }
 
     // ── Swallow phrases: each detector carries the phrase its own axis rejected ──

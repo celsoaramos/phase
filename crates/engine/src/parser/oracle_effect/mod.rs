@@ -4502,6 +4502,86 @@ fn try_parse_cast_only_from_zones_restriction(tp: TextPair<'_>) -> Option<Parsed
 /// on `SelfRef` (mirroring `try_parse_combat_tax_effect_clause`), so layer-6
 /// installs it on the source's `static_definitions` where
 /// `collect_battlefield_cost_modifiers` reads it at cast time.
+/// CR 614.1c + CR 611.2a + CR 611.2c: the ETB-counter replacement class stated as a
+/// duration-bound EFFECT rather than printed as a permanent's own static — "each
+/// creature you control enters with an additional +1/+1 counter on it" arriving as
+/// the recovered conjunct of Arlinn, the Pack's Hope's [+1].
+///
+/// The class already has one authority and this reuses it rather than growing a
+/// second: `oracle_replacement::parse_replacement_line` is what lowers the printed
+/// form (Renata, Called to the Hunt; Master Biomancer; Kalain, Reclusive Painter) to
+/// a `ChangeZone`→Battlefield `ReplacementDefinition` executing `PutCounter` on the
+/// entering object. PARSER-AS-DETECTOR: we delegate, then accept only that shape, so
+/// this branch cannot claim any other replacement line.
+///
+/// The grant rides `ContinuousModification::GrantReplacement` on `SelfRef`, the same
+/// seam `try_parse_temporary_spell_cost_modification` and `try_parse_combat_tax_effect_clause`
+/// use for their statics: layer 6 installs it on the source's `replacement_definitions`,
+/// where the battlefield-entry scan already reads the printed members of this class.
+///
+/// `duration: None` is the UNSET SENTINEL, not "forever" — the stated lifetime lives on
+/// the chunk ("Until your next turn") and `apply_duration_to_effect` stamps it onto this
+/// `GenericEffect`. Nothing in the corpus prints this clause WITHOUT a lifetime as an
+/// ability body: the printed, permanent form is a card-level replacement line, which is
+/// claimed by `oracle_replacement` before any effect-clause parsing runs.
+///
+/// KNOWN LIFETIME COMPROMISE, stated rather than hidden: anchoring the grant to `SelfRef`
+/// means `prune_affected_object_left_effects` ends it if Arlinn leaves the battlefield,
+/// while CR 611.2b says the effect should run to its stated end independently of its
+/// source. That is the same trade every member of the `GrantStaticAbility`-on-`SelfRef`
+/// family already makes here, and it is what the battlefield-entry scan
+/// (`zone_pipeline::enters_with_additional_counters_for_entry`, which resolves each
+/// definition through `state.objects.get(source_id)`) can read today. Binding it to the
+/// controller instead — the shape the flash half uses — needs that scan to learn
+/// player-scoped grants first.
+fn try_parse_temporary_enters_with_additional_counters(
+    tp: TextPair<'_>,
+    ctx: &ParseContext,
+) -> Option<ParsedEffectClause> {
+    // Structural pre-filter (word-boundary scan over already-classified clause text),
+    // so the delegated line parse runs only on this class's shape; the parse itself is
+    // the authority below.
+    if !nom_primitives::scan_contains(tp.lower, "counter")
+        || !(nom_primitives::scan_contains(tp.lower, "enters")
+            || nom_primitives::scan_contains(tp.lower, "enter with"))
+    {
+        return None;
+    }
+    let card_name = ctx.card_name.as_deref().unwrap_or("");
+    let replacement = super::oracle_replacement::parse_replacement_line(tp.original, card_name)?;
+
+    // Shape gate (CR 614.1c): a battlefield-entry replacement that puts counters on
+    // the object that is entering, over a set the controller owns. Anything else —
+    // a graveyard redirect, a damage prevention, a token doubler — is not this class.
+    if !matches!(replacement.event, ReplacementEvent::ChangeZone)
+        || replacement.destination_zone != Some(Zone::Battlefield)
+        || replacement.valid_card.is_none()
+    {
+        return None;
+    }
+    let execute = replacement.execute.as_ref()?;
+    if !matches!(
+        execute.effect.as_ref(),
+        Effect::PutCounter {
+            target: TargetFilter::SelfRef,
+            ..
+        }
+    ) {
+        return None;
+    }
+
+    Some(parsed_clause(Effect::GenericEffect {
+        static_abilities: vec![StaticDefinition::continuous()
+            .affected(TargetFilter::SelfRef)
+            .modifications(vec![ContinuousModification::GrantReplacement {
+                replacement: Box::new(replacement),
+            }])],
+        duration: None,
+        target: Some(TargetFilter::SelfRef),
+        end_cost: None,
+    }))
+}
+
 fn try_parse_temporary_spell_cost_modification(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
     // The "this turn" subject duration is the structural discriminator that
     // separates this temporary effect from a printed cost-mod static. The
@@ -10519,6 +10599,13 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     // (Rowan/Will, Scion of …). Tried after the "next spell" handlers since
     // those are the more specific one-spell forms.
     if let Some(clause) = try_parse_temporary_spell_cost_modification(tp) {
+        return clause;
+    }
+
+    // CR 614.1c + CR 611.2a: "each creature you control enters with an additional
+    // +1/+1 counter on it" as a duration-bound effect (Arlinn, the Pack's Hope
+    // [+1]'s recovered conjunct) rather than a printed static.
+    if let Some(clause) = try_parse_temporary_enters_with_additional_counters(tp, ctx) {
         return clause;
     }
 
@@ -27081,7 +27168,30 @@ fn try_parse_cast_as_though_flash_permission(tp: TextPair<'_>) -> Option<ParsedE
             ),
         ))
         .parse(i)?;
-        let (i, _) = eof.parse(i)?;
+        // CR 608.2c: the grant may be the HEAD of a compound instruction — Arlinn,
+        // the Pack's Hope's [+1] ("Until your next turn, you may cast creature
+        // spells as though they had flash, AND each creature you control enters
+        // with an additional +1/+1 counter on it"). Stopping at a printed conjunct
+        // boundary instead of demanding `eof` is what lets this recognizer own its
+        // own clause there; without it the whole sentence slides off onto the
+        // generic `CastFromZone` path, which grants no timing permission at all
+        // and swallows the conjunct (`parse_warnings: SwallowedClause`).
+        //
+        // The tail is NOT dropped by this: a conjunct boundary reaches this
+        // recognizer only inside a chunk whose LEADING DURATION made
+        // `split_clause_sequence` keep the sentence whole (`starts_prefix_clause`
+        // latches "until "). `sequence::expand_leading_duration_chunks` then
+        // recovers it as its own chunk carrying the same duration — and it can
+        // only do so once head and whole-body parses agree, which is exactly what
+        // this `peek` restores. Outside a leading duration the chunker has already
+        // split the conjunct off, so the remainder here is empty and `eof` wins.
+        // Only ", and " — deliberately not a boundary set. A sentence boundary never
+        // reaches here (`split_clause_sequence` splits on "." unconditionally, with no
+        // leading-duration exemption), so a "." alternative would be dead, and the
+        // corpus prints no ", then " after this grant. A narrow gate is also what keeps
+        // the recovery premise true: ", and " is the boundary
+        // `expand_leading_duration_chunks` can actually sever and re-emit.
+        let (i, _) = alt((value((), eof), value((), peek(tag(", and "))))).parse(i)?;
         Ok((i, (type_part.to_string(), duration)))
     })?;
 
