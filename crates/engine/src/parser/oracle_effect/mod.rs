@@ -19,7 +19,8 @@ pub(crate) use lower::{
     capitalize, lower_effect_chain_ir, parse_controls_permanent_object,
     parse_counter_suffix_body_combinator, parse_countless_counter_element,
     parse_with_counters_suffix, parse_with_counters_suffix_spanned,
-    player_lookback_relative_clause_owns_suffix, strip_trailing_duration, strip_trailing_where_x,
+    player_lookback_relative_clause_owns_suffix, publishes_chain_created_referent,
+    strip_trailing_duration, strip_trailing_where_x,
 };
 // pub(super) re-exports used by sibling submodules via `super::fn_name()`.
 pub(super) use lower::{
@@ -46,16 +47,16 @@ use lower::{
     extract_remove_counter_multi_target, extract_switch_pt_multi_target,
     instruction_spine_is_continuation, is_token_creating_effect,
     parse_contextual_bare_card_aggregate, parse_damage_player_scope,
-    parse_for_each_opponent_target_fanout_clause, publishes_chain_created_referent,
-    rebind_clause_recipients_with, rebind_decline_body_recipient,
-    rebind_subject_only_body_recipient, scan_until_next_same_source_exile_invalidation,
-    split_difference_repeat_suffix, strip_any_number_quantifier, strip_each_player_subject,
-    strip_each_scope_who_cant_subject, strip_each_scope_who_didnt_verb_filter_this_way_subject,
-    strip_each_scope_who_does_subject, strip_each_scope_who_doesnt_subject,
-    strip_for_each_opponent_who_doesnt, strip_for_each_prefix, strip_for_each_repeat_suffix,
-    strip_leading_duration, strip_leading_quantifier, strip_leading_return_destination_ext,
-    strip_leading_sequence_connector, strip_optional_effect_prefix, strip_player_scope_subject,
-    strip_redundant_flip_win_quantifier, strip_repeat_count_suffix, strip_return_destination_ext,
+    parse_for_each_opponent_target_fanout_clause, rebind_clause_recipients_with,
+    rebind_decline_body_recipient, rebind_subject_only_body_recipient,
+    scan_until_next_same_source_exile_invalidation, split_difference_repeat_suffix,
+    strip_any_number_quantifier, strip_each_player_subject, strip_each_scope_who_cant_subject,
+    strip_each_scope_who_didnt_verb_filter_this_way_subject, strip_each_scope_who_does_subject,
+    strip_each_scope_who_doesnt_subject, strip_for_each_opponent_who_doesnt, strip_for_each_prefix,
+    strip_for_each_repeat_suffix, strip_leading_duration, strip_leading_quantifier,
+    strip_leading_return_destination_ext, strip_leading_sequence_connector,
+    strip_optional_effect_prefix, strip_player_scope_subject, strip_redundant_flip_win_quantifier,
+    strip_repeat_count_suffix, strip_return_destination_ext,
     strip_return_destination_ext_with_remainder, strip_temporal_prefix, strip_temporal_suffix,
     trim_dangling_target_word, try_parse_damage, try_parse_damage_with_remainder,
     try_parse_distribute_counters, try_parse_distribute_damage,
@@ -115,19 +116,19 @@ use crate::types::ability::{
     DamageModification, DamageSource, DelayedTriggerCondition, DelayedTriggerLifetime,
     DieResultBranch, Duration, Effect, EffectOutcomeSignal, EffectScope, FilterProp,
     GameRestriction, GuardReading, GuessSubject, IntensityScope, IterationKindBinding,
-    KeeperConstraint, LibraryPosition, ManaProduction, ManaSpendPermission, ManaTargetRole,
-    MassLibraryShuffleMode, MultiTargetSpec, NumberDistinctness, ObjectProperty, ObjectScope,
-    OriginConstraint, PerPlayerScope, PerpetualModification, PlayPermissionInvalidation,
-    PlayerChoiceDistinctness, PlayerFilter, PlayerRelation, PlayerScope, PreventionAmount,
-    PreventionScope, ProhibitedActivity, PropertyAggregate, PtValue, QuantityExpr, QuantityRef,
-    ReciprocalZoneChoiceRole, ReplacementCondition, ReplacementDefinition, ResolutionCastWindow,
-    RestrictionExpiry, RestrictionPlayerScope, RevealUntilDisposition, RoundingMode, SharedQuality,
-    SharedQualityRelation, SiblingCondition, SkipScope, SpellStackToGraveyardReplacement,
-    StaticCondition, StaticDefinition, StepSkipTarget, SubAbilityLink, TapStateChange,
-    TargetFilter, TargetSelectionMode, ThisWayCause, TrackedAnaphorSource, TriggerCondition,
-    TriggerDefinition, TurnGate, TypeFilter, TypedFilter, UnlessPayModifier, UnloweredGuard,
-    UntilCondition, VoteSubject, WheneverEventExpiry, ZoneChoiceCandidateSource, ZoneChoiceChooser,
-    ZoneOwner,
+    KeeperConstraint, KeeperCounterMark, LibraryPosition, ManaProduction, ManaSpendPermission,
+    ManaTargetRole, MassLibraryShuffleMode, MultiTargetSpec, NumberDistinctness, ObjectProperty,
+    ObjectScope, OriginConstraint, PerPlayerScope, PerpetualModification,
+    PlayPermissionInvalidation, PlayerChoiceDistinctness, PlayerFilter, PlayerRelation,
+    PlayerScope, PreventionAmount, PreventionScope, ProhibitedActivity, PropertyAggregate, PtValue,
+    QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole, ReplacementCondition,
+    ReplacementDefinition, ResolutionCastWindow, RestrictionExpiry, RestrictionPlayerScope,
+    RevealUntilDisposition, RoundingMode, SharedQuality, SharedQualityRelation, SiblingCondition,
+    SkipScope, SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition, StepSkipTarget,
+    SubAbilityLink, TapStateChange, TargetFilter, TargetSelectionMode, ThisWayCause,
+    TrackedAnaphorSource, TriggerCondition, TriggerDefinition, TurnGate, TypeFilter, TypedFilter,
+    UnlessPayModifier, UnloweredGuard, UntilCondition, VoteSubject, WheneverEventExpiry,
+    ZoneChoiceCandidateSource, ZoneChoiceChooser, ZoneOwner,
 };
 // `DoubleTarget` has no production use in this module since the counter-doubling
 // discriminator moved to `Effect::is_counter_multiplication()`; the child
@@ -173,7 +174,8 @@ use self::subject::{
 };
 use crate::parser::oracle_ir::ast::*;
 pub(crate) use crate::parser::oracle_ir::context::{
-    ChosenColorQualifierScope, ParseContext, TokenPtFollowup, TriggerConditionScope,
+    ChosenColorQualifierScope, ParseContext, PriorZoneChoicePartition, TokenPtFollowup,
+    TriggerConditionScope,
 };
 use crate::parser::oracle_ir::effect_chain::{
     AbilityIr, AbilityRootTransform, AbilityShellIr, AbsorbKind, ClauseDisposition, ClauseIr,
@@ -5588,6 +5590,7 @@ fn try_parse_airbend_clause(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
                         enters_with_counter: None,
                         enters_with_modifications: Vec::new(),
                         mana_spend_permission: None,
+                        cast_cost_modifier: None,
                     },
                     target: TargetFilter::TrackedSet {
                         id: TrackedSetId(0),
@@ -10019,7 +10022,7 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     // CR 120.1 + CR 608.2c: "each <object-class filter> [you control] deals N damage
     // to <recipient>" — every matching object is its own damage source. Intercept
     // BEFORE the generic subject-stripping sites (mod.rs `9705`/`9735`,
-    // `subject.rs:178` via `try_parse_subject_predicate_ast`) flatten the source
+    // `subject.rs::try_parse_subject_predicate_ast`) flatten the source
     // class into a single ability-sourced `DealDamage`. Returns the supported
     // `EachSourceDealsDamage` clause, or a fail-closed `Unimplemented` for the
     // deferred attachment-host recipient (Aura Barbs clause 2).
@@ -14272,7 +14275,7 @@ fn try_parse_per_grantee_play_grant(tp: TextPair<'_>) -> Option<ParsedEffectClau
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: None,
@@ -14414,7 +14417,7 @@ fn try_parse_cast_from_tracked_exile_grant(tp: TextPair<'_>) -> Option<ParsedEff
             card_filter,
             single_use_group: None,
             single_use,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: None,
@@ -14524,7 +14527,7 @@ fn try_parse_exile_play_grant_with_any_mana(tp: TextPair<'_>) -> Option<ParsedEf
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: None,
@@ -14772,7 +14775,7 @@ fn try_parse_play_from_exile(tp: TextPair, ctx: &ParseContext) -> Option<ParsedE
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation,
@@ -14853,7 +14856,7 @@ fn try_parse_play_the_exiled_card_grant(tp: TextPair) -> Option<ParsedEffectClau
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: None,
@@ -15030,7 +15033,7 @@ pub(crate) fn parse_exile_top_each_library_with_collection_counter_ir(
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 invalidation: None,
@@ -15738,116 +15741,534 @@ fn parse_balance_arm_c(input: &str) -> OracleResult<'_, Vec<(EqualizeVerb, Targe
     Ok((input, pairs))
 }
 
-/// CR 608.2c/d + CR 701.8a: Whole-body recognizer for the battlefield
-/// "Choose up to N <permanents>, [then] destroy the rest" class (Duneblast,
-/// Mount Doom). The choice is made during resolution, so it publishes the
-/// spared objects into the chain's tracked set; the following mass destruction
-/// applies to the same typed battlefield filter minus that set.
-fn parse_choose_survivors_destroy_rest_ir(
-    text: &str,
-    kind: AbilityKind,
-    ctx: &ParseContext,
-) -> Option<EffectChainIr> {
-    let lower = text.to_ascii_lowercase();
-    let (max, after_count) = nom_on_lower(text, &lower, |input| {
-        let (input, _) = tag("choose up to ").parse(input)?;
-        let (input, max) = nom_primitives::parse_number.parse(input)?;
-        let (input, _) = space1.parse(input)?;
-        Ok((input, max))
-    })?;
-    let after_count_lower = &lower[lower.len() - after_count.len()..];
+/// The chooser axis of the keeper-and-dispose grammar: WHO nominates the
+/// keepers, and therefore whose permanents the disposal tail sweeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeeperChooserScope {
+    /// No printed subject — the resolving object's controller nominates
+    /// (Duneblast, Mount Doom).
+    Controller,
+    /// "each player …" (Single Combat, Razia's Purification, Planetary
+    /// Annihilation, Limited Resources, Promise of Loyalty).
+    EachPlayer,
+    /// "each opponent …" (No One Will Hear Your Cries).
+    EachOpponent,
+}
 
-    #[derive(Clone, Copy)]
-    enum DestroyRestConnector {
-        Then,
-        Sentence,
+/// The head-verb axis: HOW the keeper is nominated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeeperHead {
+    /// "chooses <quantifier> <domain>".
+    Choose,
+    /// CR 122.1: "puts <quantifier> <type> counter[s] on <quantifier> <domain>".
+    /// The keeper is nominated BY receiving a counter, so the printed counter
+    /// type and count belong to the head rather than to a separate instruction.
+    /// This enum is the one axis that is not `Copy`: `CounterType::Generic`
+    /// owns a `String`.
+    Counter {
+        counter_type: CounterType,
+        count: u32,
+    },
+}
+
+/// The keeper-cardinality axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeeperQuantifier {
+    Exact(u32),
+    UpTo(u32),
+}
+
+/// The disposal axis. CR 701.8a (destroy) and CR 701.21a (sacrifice) are
+/// different keyword actions with different replacement, regeneration and
+/// "who performs it" semantics, so the verb is typed rather than flagged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeeperDisposalVerb {
+    Destroy,
+    Sacrifice,
+}
+
+/// The printed separator between the keeper phrase and the disposal tail.
+/// CR 608.2c: a sentence separator makes the disposal the next printed
+/// instruction; `", then "` and `" and "` keep it a step of the same one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeeperTailConnector {
+    Then,
+    And,
+    Sentence,
+}
+
+impl KeeperTailConnector {
+    fn boundary(self) -> ClauseBoundary {
+        match self {
+            KeeperTailConnector::Then | KeeperTailConnector::And => ClauseBoundary::Then,
+            KeeperTailConnector::Sentence => ClauseBoundary::Sentence,
+        }
+    }
+}
+
+/// One parsed keeper-and-dispose instruction plus the byte spans its lowering
+/// needs for honest clause provenance. Offsets are into the lowercased input
+/// the head combinator ran on; the recognizer maps them onto the original-case
+/// text, which `to_ascii_lowercase` leaves byte-for-byte aligned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeeperDisposeHead {
+    scope: KeeperChooserScope,
+    head: KeeperHead,
+    quantifier: KeeperQuantifier,
+    filter: TargetFilter,
+    verb: KeeperDisposalVerb,
+    connector: KeeperTailConnector,
+    /// Offset at which the keeper phrase ends (the connector's first byte).
+    keeper_end: usize,
+    /// Span of the disposal tail — "sacrifices the rest".
+    disposal_span: (usize, usize),
+    /// Byte length of the trailing sentence that follows the instruction.
+    remainder_len: Option<usize>,
+}
+
+/// The shared count production: a cardinality followed by its separating space.
+///
+/// Both quantifier arms and the counter head compose this, so all three
+/// normalize the separator identically. No `parse_article` arm is needed —
+/// `parse_number` already accepts "a "/"an " through `parse_article_number`,
+/// the last arm of `parse_english_number`.
+fn parse_keeper_count(input: &str) -> OracleResult<'_, u32> {
+    terminated(nom_primitives::parse_number, space1).parse(input)
+}
+
+/// CR 608.2c + CR 701.8a + CR 701.21a: the whole-instruction head grammar for
+/// the keeper-and-dispose class — "[each player|each opponent] <head>
+/// <quantifier> <domain> [they control](, then| and|. )<dispose> the rest".
+///
+/// Every axis is one `alt()`, chained in printed order. The disposal tail must
+/// follow the control clause IMMEDIATELY; that adjacency is what makes the
+/// declined classes decline at a step a test can name rather than being swept
+/// up by a `take_until` reach for the tail. It is why "Choose a creature at
+/// random, then destroy the rest" (Last One Standing) and "Each player chooses
+/// six lands they control. Destroy all other permanents" (Urza's Sylex) fail
+/// here, at the separator and at `" the rest"` respectively.
+///
+/// The supported-combination gate lives INSIDE this combinator, so the
+/// classifier predicate (`is_keeper_dispose_head`) — which runs this same
+/// grammar to decide whether to route a line here at all — never routes away
+/// a line the gate itself refuses. That does not extend past the head: the
+/// lowering that consumes this head's output (`parse_keeper_dispose_rest_ir`)
+/// has its own post-head `return None` paths (for example the
+/// `TargetFilter::Typed` refutation in the `Controller` scope arm), which this
+/// grammar cannot see and which are fail-soft — a line that reaches one is
+/// declined, not misparsed, and no printed card currently reaches one.
+fn parse_keeper_dispose_head(input: &str) -> OracleResult<'_, KeeperDisposeHead> {
+    let start = input;
+    let offset = |rest: &str| start.len() - rest.len();
+
+    let (rest, scope) = map(
+        opt(alt((
+            value(KeeperChooserScope::EachPlayer, tag("each player ")),
+            value(KeeperChooserScope::EachOpponent, tag("each opponent ")),
+        ))),
+        |scope| scope.unwrap_or(KeeperChooserScope::Controller),
+    )
+    .parse(input)?;
+
+    let (rest, head) = alt((
+        value(KeeperHead::Choose, alt((tag("chooses "), tag("choose ")))),
+        map(
+            (
+                alt((tag("puts "), tag("put "))),
+                parse_keeper_count,
+                nom_primitives::parse_counter_type_typed,
+                tag(" counter"),
+                opt(tag("s")),
+                tag(" on "),
+            ),
+            |(_, count, counter_type, ..)| KeeperHead::Counter {
+                counter_type,
+                count,
+            },
+        ),
+    ))
+    .parse(rest)?;
+
+    let (rest, quantifier) = alt((
+        map(
+            preceded(tag("up to "), parse_keeper_count),
+            KeeperQuantifier::UpTo,
+        ),
+        map(parse_keeper_count, KeeperQuantifier::Exact),
+    ))
+    .parse(rest)?;
+
+    let (rest, filter) = nom_target::parse_type_phrase(rest)?;
+
+    // Recognized for its POSITION, not for a payload — which is why this
+    // production is a bare `alt` and carries no typed value. Nothing downstream
+    // could read one: both lowerings leave the emitted keeper filter's
+    // `controller` unset and carry the seat on the clause's player scope
+    // instead, and the per-seat eligibility is enforced at resolution by
+    // `choose_and_sacrifice_rest.rs::compute_eligible_creatures`, whose
+    // `obj.controller == player` test scopes each seat's choice to its own
+    // permanents whether or not the line prints this clause. The spellings are
+    // deliberately NOT routed through `nom_target::parse_controller_suffix` —
+    // that is the authority for `ControllerRef`-valued suffixes and accepts
+    // neither of them, and binding one here would bind the domain to the
+    // SPELL's controller rather than to each nominating seat.
+    //
+    // What this production does contribute is the ADJACENCY the disposal tail
+    // must follow: `keeper_dispose_head_recognizes_the_control_clause_positionally`
+    // pins that both spellings and their absence parse, and that an unmodelled
+    // possessive between the domain and the connector declines.
+    let (rest, _) = opt(alt((tag(" they control"), tag(" that player controls")))).parse(rest)?;
+    let keeper_end = offset(rest);
+
+    let (rest, connector) = alt((
+        value(KeeperTailConnector::Then, tag(", then ")),
+        value(KeeperTailConnector::And, tag(" and ")),
+        value(KeeperTailConnector::Sentence, tag(". ")),
+    ))
+    .parse(rest)?;
+    let disposal_start = offset(rest);
+
+    let (rest, verb) = alt((
+        value(
+            KeeperDisposalVerb::Sacrifice,
+            alt((tag("sacrifices"), tag("sacrifice"))),
+        ),
+        value(
+            KeeperDisposalVerb::Destroy,
+            alt((tag("destroys"), tag("destroy"))),
+        ),
+    ))
+    .parse(rest)?;
+    let (rest, _) = tag(" the rest").parse(rest)?;
+    let disposal_end = offset(rest);
+
+    // A trailing sentence is admitted only at a real sentence boundary, so a
+    // dangling fragment can never be absorbed into the instruction silently.
+    let (rest, remainder_len) = alt((
+        value(None::<usize>, (opt(tag(".")), eof)),
+        map(
+            preceded((tag("."), space1), nom::combinator::rest),
+            |tail: &str| Some(tail.len()),
+        ),
+    ))
+    .parse(rest)?;
+
+    // The supported-combination gate. Exhaustive on (scope, head, quantifier,
+    // verb) with NO wildcard arm, so a future per-player keeper-and-destroy
+    // primitive or a `KeeperConstraint` range variant becomes a compile error
+    // here rather than a silently wrong parse.
+    match (scope, &head, quantifier, verb) {
+        // CR 701.8a: the controller-scope "choose up to N, then destroy the
+        // rest" form. Duneblast, Mount Doom.
+        (
+            KeeperChooserScope::Controller,
+            KeeperHead::Choose,
+            KeeperQuantifier::UpTo(_),
+            KeeperDisposalVerb::Destroy,
+        ) => {}
+        // CR 101.4 + CR 701.21a: the per-player keeper-and-sacrifice class.
+        (
+            KeeperChooserScope::EachPlayer | KeeperChooserScope::EachOpponent,
+            _,
+            KeeperQuantifier::Exact(_),
+            KeeperDisposalVerb::Sacrifice,
+        ) => {}
+        // Zero-card axis: no printed card nominates a controller-scope keeper
+        // BY placing a counter. CR 122.1's counter is what nominates the
+        // keeper, and the controller-scope lowering
+        // (`ChooseObjectsIntoTrackedSet` + `DestroyAll` over the tracked-set
+        // complement) has no step to place one in, so accepting the SEMANTICS
+        // would silently drop the printed instruction. The HEAD is still
+        // accepted (not `Err`) here: MEASURED that refusing it at this
+        // grammar level de-routes the whole line past this recognizer, and
+        // the general effect-chain parser then independently parses "puts N
+        // counters on ... creatures" as a real targeted `Effect::PutCounter`
+        // and "destroy/sacrifice the rest" as `Destroy`/`Sacrifice { target:
+        // TrackedSet(0) }` over a tracked set NOTHING ever publishes — a
+        // coherent-looking but silently WRONG parse with no
+        // `Effect::Unimplemented` anywhere, strictly worse than today's
+        // defect. Accepting the head here keeps the line routed to
+        // `parse_keeper_dispose_rest_ir`, whose `Controller` arm lowers a
+        // `Counter` head to an explicit `Effect::unimplemented(..)` instead.
+        // See `tests::keeper_dispose_gate_marks_a_controller_scope_counter_head_unimplemented`
+        // for the pinned measurement and its mutation coverage.
+        (KeeperChooserScope::Controller, KeeperHead::Counter { .. }, _, _) => {}
+        // Zero-card axis: every printed controller-scope keeper cardinality in
+        // this class is an "up to N". Accepting a bare count here would claim an
+        // instruction no card prints.
+        (KeeperChooserScope::Controller, _, KeeperQuantifier::Exact(_), _) => {
+            return Err(oracle_err(start))
+        }
+        // Zero-card axis: no printed card reaches this combination. A `jq -r
+        // 'to_entries[] | select(.value.oracle_text != null) |
+        // select(.value.oracle_text | test("choose[s]? up to"; "i")) |
+        // select(.value.oracle_text | test("sacrifices? the rest"; "i")) |
+        // .key' client/public/card-data.json` census over "choose(s) up to
+        // ... sacrifice(s) the rest" finds three cards: Archfiend of
+        // Depravity's "that player chooses" declines earlier, at the
+        // head-verb step, on its unmodelled subject
+        // (`keeper_dispose_head_declines_an_unmodelled_subject`). The
+        // controller-scope lowering is also `DestroyAll` over the
+        // tracked-set complement; no controller-scope sacrifice primitive
+        // with that complement exists.
+        (
+            KeeperChooserScope::Controller,
+            _,
+            KeeperQuantifier::UpTo(_),
+            KeeperDisposalVerb::Sacrifice,
+        ) => return Err(oracle_err(start)),
+        // Deferred axis: the "up to N" per-player keeper cardinality. Covetous
+        // Elegy is its only card. `KeeperConstraint` has exactly one variant,
+        // `ExactCount`; a range form pulls `WaitingFor::KeepExactPermanentsChoice`'s
+        // `required_count`, the client adapter and the AI candidate seam into
+        // scope, so it is a separate unit.
+        (
+            KeeperChooserScope::EachPlayer | KeeperChooserScope::EachOpponent,
+            _,
+            KeeperQuantifier::UpTo(_),
+            _,
+        ) => return Err(oracle_err(start)),
+        // Deferred axis: the per-player keeper-and-DESTROY form. Divine
+        // Reckoning is its only card. CR 701.8a destroy and CR 701.21a sacrifice
+        // are different keyword actions, and `Effect::ChooseAndSacrificeRest` is
+        // sacrifice-specific down to its terminal, so this needs its own
+        // primitive rather than a flag on this one.
+        (
+            KeeperChooserScope::EachPlayer | KeeperChooserScope::EachOpponent,
+            _,
+            _,
+            KeeperDisposalVerb::Destroy,
+        ) => return Err(oracle_err(start)),
     }
 
-    let ((filter_len, connector), _) = nom_on_lower(after_count, after_count_lower, |input| {
-        let (input, (filter, connector)) = alt((
-            map(
-                terminated(
-                    take_until(", then destroy the rest"),
-                    tag(", then destroy the rest"),
-                ),
-                |filter: &str| (filter, DestroyRestConnector::Then),
-            ),
-            map(
-                terminated(take_until(". destroy the rest"), tag(". destroy the rest")),
-                |filter: &str| (filter, DestroyRestConnector::Sentence),
-            ),
-        ))
-        .parse(input)?;
-        let (input, _) = opt(tag(".")).parse(input)?;
-        let (input, _) = eof.parse(input)?;
-        Ok((input, (filter.len(), connector)))
-    })?;
+    Ok((
+        rest,
+        KeeperDisposeHead {
+            scope,
+            head,
+            quantifier,
+            filter,
+            verb,
+            connector,
+            keeper_end,
+            disposal_span: (disposal_start, disposal_end),
+            remainder_len,
+        },
+    ))
+}
 
-    let filter_text = after_count.get(..filter_len)?.trim();
-    // Throwaway — the parsed `filter` is KEPT while `filter_ctx` is dropped,
-    // which is exactly the shape rule 1 of `ChosenColorQualifierScope` forbids
-    // inheriting `ChainBound` into: a printed
-    // "… of the color of your choice" filter text here would stamp
-    // `FilterProp::IsChosenColor` and then discard the provenance that injects
-    // the matching chooser.
-    let mut filter_ctx = ctx.clone_throwaway();
-    let filter = parse_choose_object_selection_filter(filter_text, &mut filter_ctx)?;
-    let TargetFilter::Typed(mut destroy_filter) = filter.clone() else {
-        return None;
-    };
-    destroy_filter.properties.push(FilterProp::Not {
-        prop: Box::new(FilterProp::InTrackedSet {
-            id: TrackedSetId(0),
-        }),
-    });
+/// The routing predicate `oracle_classifier::should_defer_spell_to_effect`
+/// consumes. The parser IS the detector: this is the gate-aware head combinator
+/// itself, so a line the recognizer would refuse is never routed away from the
+/// static classifier.
+pub(crate) fn is_keeper_dispose_head(lower: &str) -> bool {
+    parse_keeper_dispose_head(lower).is_ok()
+}
 
-    let prefix_len = text.len().checked_sub(after_count.len())?;
-    let choose_end = prefix_len.checked_add(filter_len)?;
-    let connector_prefix = match connector {
-        DestroyRestConnector::Then => ", then ",
-        DestroyRestConnector::Sentence => ". ",
+/// CR 608.2c + CR 701.8a + CR 701.21a + CR 101.4: Whole-body recognizer for the
+/// keeper-and-dispose class — one keeper nomination followed immediately by a
+/// disposal of everything else in the same domain.
+///
+/// Two lowerings, selected by the chooser axis:
+/// * `Controller` → `ChooseObjectsIntoTrackedSet` + `DestroyAll` over the same
+///   typed filter minus the tracked set (Duneblast, Mount Doom).
+/// * `EachPlayer` / `EachOpponent` → one `ChooseAndSacrificeRest` scoped per
+///   player.
+///
+/// CR 608.2c: "The controller of the spell or ability follows its instructions
+/// in the order written. However, replacement effects may modify these actions."
+/// The printed counter precedes the sacrifice, and CR 614.1 makes that order
+/// observable: replacement effects "apply continuously as events happen — they
+/// aren't locked in ahead of time", so a permanent that would modify the counter
+/// placement and is itself about to be sacrificed must still be on the
+/// battlefield when the counter is placed. The mark therefore rides on
+/// `Effect::ChooseAndSacrificeRest` as `keeper_counter` and is placed inside the
+/// resolver's single funnel, ahead of the disposal — not as a chained clause
+/// after it. Driven by
+/// `tests/integration/promise_of_loyalty.rs::promise_of_loyalty_marks_the_keeper_before_the_sacrifice`.
+fn parse_keeper_dispose_rest_ir(
+    text: &str,
+    kind: AbilityKind,
+    ctx: &mut ParseContext,
+) -> Option<EffectChainIr> {
+    let lower = text.to_ascii_lowercase();
+    let (head, _) = nom_on_lower(text, &lower, parse_keeper_dispose_head)?;
+
+    let keeper_source = text.get(..head.keeper_end)?;
+    let disposal_source = text.get(head.disposal_span.0..head.disposal_span.1)?;
+    let remainder_source = match head.remainder_len {
+        Some(len) => Some(text.get(text.len().checked_sub(len)?..)?),
+        None => None,
     };
-    let destroy_start = choose_end.checked_add(connector_prefix.len())?;
-    let destroy_end = destroy_start.checked_add("destroy the rest".len())?;
-    let choose_source = text.get(..choose_end)?;
-    let destroy_source = text.get(destroy_start..destroy_end)?;
 
     let mut builder = ClauseIrBuilder::new(text);
-    builder
-        .clause(
-            choose_source,
-            parsed_clause(Effect::ChooseObjectsIntoTrackedSet {
-                chooser: TargetFilter::Controller,
-                filter,
-                min: 0,
-                max: Some(max),
-                cardinality: None,
-                eligibility: None,
-            }),
-            Some(match connector {
-                DestroyRestConnector::Then => ClauseBoundary::Then,
-                DestroyRestConnector::Sentence => ClauseBoundary::Sentence,
-            }),
-            ClauseDisposition::Emit {
-                followup: None,
-                intrinsic: None,
-            },
-        )
-        .push();
-    builder
-        .clause(
-            destroy_source,
-            parsed_clause(Effect::DestroyAll {
-                target: TargetFilter::Typed(destroy_filter),
-                cant_regenerate: false,
-            }),
-            None,
-            ClauseDisposition::Emit {
-                followup: None,
-                intrinsic: None,
-            },
-        )
-        .push();
+
+    match head.scope {
+        KeeperChooserScope::Controller => match &head.head {
+            // The gate accepts `KeeperHead::Counter` on this subject
+            // structurally (so this recognizer keeps routing the line, per
+            // the gate's own comment) but no controller-scope lowering exists
+            // for it: `ChooseObjectsIntoTrackedSet` + `DestroyAll` over the
+            // tracked-set complement has no step to place a counter in.
+            // CR 122.1's counter is what nominates the keeper on this
+            // subject, so silently building that lowering would drop the
+            // printed instruction. Claim the whole printed instruction as one
+            // honest gap instead of a per-sub-clause split — the disposal
+            // half is meaningless without the (unmodelled) counter
+            // nomination it depends on, so splitting it into "claimed" and
+            // "gapped" halves would misstate which part is unsupported.
+            KeeperHead::Counter { .. } => {
+                let whole_source = text.get(..head.disposal_span.1)?;
+                builder
+                    .clause(
+                        whole_source,
+                        parsed_clause(Effect::unimplemented(
+                            "keeper_dispose_controller_counter_head",
+                            whole_source,
+                        )),
+                        remainder_source.map(|_| ClauseBoundary::Sentence),
+                        ClauseDisposition::Emit {
+                            followup: None,
+                            intrinsic: None,
+                        },
+                    )
+                    .push();
+            }
+            KeeperHead::Choose => {
+                let TargetFilter::Typed(mut destroy_filter) = head.filter.clone() else {
+                    return None;
+                };
+                destroy_filter.properties.push(FilterProp::Not {
+                    prop: Box::new(FilterProp::InTrackedSet {
+                        id: TrackedSetId(0),
+                    }),
+                });
+                // The gate admits only `UpTo` on this subject for a `Choose`
+                // head; `Exact` is its zero-card `Err` arm, so this cannot be
+                // reached from a parse.
+                let KeeperQuantifier::UpTo(max) = head.quantifier else {
+                    return None;
+                };
+                builder
+                    .clause(
+                        keeper_source,
+                        parsed_clause(Effect::ChooseObjectsIntoTrackedSet {
+                            chooser: TargetFilter::Controller,
+                            filter: head.filter,
+                            min: 0,
+                            max: Some(max),
+                            cardinality: None,
+                            eligibility: None,
+                        }),
+                        Some(head.connector.boundary()),
+                        ClauseDisposition::Emit {
+                            followup: None,
+                            intrinsic: None,
+                        },
+                    )
+                    .push();
+                builder
+                    .clause(
+                        disposal_source,
+                        parsed_clause(Effect::DestroyAll {
+                            target: TargetFilter::Typed(destroy_filter),
+                            cant_regenerate: false,
+                        }),
+                        remainder_source.map(|_| ClauseBoundary::Sentence),
+                        ClauseDisposition::Emit {
+                            followup: None,
+                            intrinsic: None,
+                        },
+                    )
+                    .push();
+            }
+        },
+        KeeperChooserScope::EachPlayer | KeeperChooserScope::EachOpponent => {
+            // The gate admits only `Exact` on this subject; `UpTo` is the
+            // deferred Covetous Elegy axis, so this cannot be reached.
+            let KeeperQuantifier::Exact(printed_count) = head.quantifier else {
+                return None;
+            };
+            let keep_count = i32::try_from(printed_count).ok()?;
+            // CR 101.4: every player in scope nominates, in APNAP order. The
+            // effect iterates players itself, so the keeper filter carries NO
+            // controller and the printed control clause is expressed here.
+            let player_scope = match head.scope {
+                KeeperChooserScope::EachPlayer => PlayerFilter::All,
+                KeeperChooserScope::EachOpponent => PlayerFilter::Opponent,
+                // Unreachable: this whole block is inside the
+                // `KeeperChooserScope::EachPlayer | KeeperChooserScope::EachOpponent`
+                // match arm above (`Controller` is handled by the sibling arm),
+                // so a `Controller` value can never flow through this branch.
+                KeeperChooserScope::Controller => {
+                    unreachable!("excluded by the outer scope match arm above")
+                }
+            };
+            // CR 122.1 + CR 608.2c: a `KeeperHead::Counter` head's printed
+            // counter nominates the keeper AS PART of this same instruction,
+            // so it rides on the effect's `keeper_counter` field rather than a
+            // following `PutCounterAll` clause. `Choose` heads carry no
+            // counter.
+            let keeper_counter = match &head.head {
+                KeeperHead::Choose => None,
+                KeeperHead::Counter {
+                    counter_type,
+                    count,
+                } => Some(KeeperCounterMark {
+                    counter_type: counter_type.clone(),
+                    count: QuantityExpr::Fixed {
+                        value: i32::try_from(*count).ok()?,
+                    },
+                }),
+            };
+            builder
+                .clause(
+                    keeper_source,
+                    // CR 701.21a: each unchosen permanent is sacrificed by its
+                    // own controller, not destroyed by the spell's controller.
+                    parsed_clause(Effect::ChooseAndSacrificeRest {
+                        categories: Vec::new(),
+                        chooser_scope: crate::types::ability::CategoryChooserScope::EachPlayerSelf,
+                        choose_filter: head.filter.clone(),
+                        sacrifice_filter: head.filter,
+                        total_power_cap: None,
+                        // CR 609.3: a player with fewer eligible permanents than
+                        // the printed count keeps as many as they can.
+                        keeper_constraint: Some(KeeperConstraint::ExactCount {
+                            count: QuantityExpr::Fixed { value: keep_count },
+                        }),
+                        keeper_counter,
+                    }),
+                    remainder_source.map(|_| ClauseBoundary::Sentence),
+                    ClauseDisposition::Emit {
+                        followup: None,
+                        intrinsic: None,
+                    },
+                )
+                .player_scope(Some(player_scope))
+                .push();
+        }
+    }
+
+    // CR 608.2c: the trailing sentence is a separate printed instruction, parsed
+    // by the shared clause parser. Text this recognizer does not model therefore
+    // becomes `Effect::Unimplemented` and stays visible to coverage rather than
+    // being dropped.
+    if let Some(remainder_source) = remainder_source {
+        let remainder_clause = remainder_source.trim().trim_end_matches('.').trim_end();
+        let parsed = parse_effect_clause(remainder_clause, ctx);
+        builder
+            .clause(
+                remainder_clause,
+                parsed,
+                None,
+                ClauseDisposition::Emit {
+                    followup: None,
+                    intrinsic: None,
+                },
+            )
+            .push();
+    }
 
     Some(EffectChainIr {
         clauses: builder.finish(),
@@ -16305,6 +16726,7 @@ fn parse_threshold_land_balance_ir(
                 keeper_constraint: Some(KeeperConstraint::ExactCount {
                     count: QuantityExpr::Fixed { value: keep_count },
                 }),
+                keeper_counter: None,
             }),
             None,
             ClauseDisposition::Emit {
@@ -17681,151 +18103,107 @@ fn is_ownership_candidate(reading: GuardReading, effect: &Effect) -> bool {
         && crate::game::effects::cast_from_zone::graveyard_destination_rider(effect).is_some()
 }
 
+fn refine_put_at_library_position(
+    clause: &mut ParsedEffectClause,
+    text: &str,
+    ctx: &mut ParseContext,
+) -> Option<MultiTargetSpec> {
+    // "put [N] [type] on top/bottom of library" — the imperative parser
+    // returns PutAtLibraryPosition { target: Any, count: Fixed(1) }
+    // because it dispatches on the positional suffix without extracting
+    // the noun phrase. This patch re-inspects the imperative text and
+    // assigns both the target filter and the cardinality. Covers:
+    //   - "put target X on top of Y's library"           (count = 1)
+    //   - "put target X on the bottom of Y's library"    (count = 1)
+    //   - "put target X into Y's library Nth from top"   (count = 1)
+    //   - "put two cards from your hand on top of your library in any order"
+    //     (Cavalier of Gales / Brainstorm class — count = N, filter = Card+InZone:Hand)
+    let mut placement_target_set = None;
+    if let Effect::PutAtLibraryPosition {
+        ref mut target,
+        ref mut count,
+        ..
+    } = clause.effect
+    {
+        if parse_exiled_cards_not_cast_cleanup(&text.to_lowercase()).is_some() {
+            *target = TargetFilter::ExiledBySource;
+            *count = QuantityExpr::Fixed { value: 0 };
+            return placement_target_set;
+        }
+        let lower_put = text.to_lowercase();
+        if matches!(*target, TargetFilter::Any | TargetFilter::ParentTarget)
+            && (nom_primitives::scan_contains(&lower_put, "put them on top")
+                || nom_primitives::scan_contains(&lower_put, "put the exiled cards on top")
+                || nom_primitives::scan_contains(&lower_put, "cards exiled this way"))
+        {
+            *target = TargetFilter::ExiledBySource;
+            if matches!(*count, QuantityExpr::Fixed { value: 1 }) {
+                *count = QuantityExpr::Ref {
+                    qty: QuantityRef::CardsExiledBySource,
+                };
+            }
+        }
+        let extracted = (|| -> Option<(Option<TargetFilter>, LibraryPlacementCardinality)> {
+            let lower = text.to_lowercase();
+            let (after_put, _) = tag::<_, _, OracleError<'_>>("put ")
+                .parse(lower.as_str())
+                .ok()?;
+            // Isolate the noun phrase before the first positional terminator.
+            let (_, before) = alt((
+                take_until::<_, _, OracleError<'_>>(" on top of"),
+                take_until(" on the bottom of"),
+                take_until(" into "),
+            ))
+            .parse(after_put)
+            .ok()?;
+            let (cardinality, after_count) = peel_library_placement_cardinality(before);
+            // CR 608.2k: thread the real trigger context so a bare object
+            // pronoun ("put it on the bottom …") binds to the trigger's
+            // `object_pronoun_ref` (the cast spell for spell-cast triggers)
+            // rather than defaulting to `ParentTarget`. `parse_target`
+            // spins up a fresh empty context, which loses that antecedent.
+            let (filter, _) = parse_target_with_ctx(after_count, ctx);
+            let new_target = if matches!(filter, TargetFilter::Any) {
+                None
+            } else {
+                Some(filter)
+            };
+            Some((new_target, cardinality))
+        })();
+        if let Some((maybe_filter, cardinality)) = extracted {
+            if *target == TargetFilter::Any {
+                if let Some(filter) = maybe_filter {
+                    *target = filter;
+                }
+            }
+            match cardinality {
+                LibraryPlacementCardinality::Unstated => {}
+                LibraryPlacementCardinality::Exact(count_expr) => *count = count_expr,
+                // CR 601.2c + CR 115.1: the announced targets, rather than the
+                // effect's default count, define a targeted placement's size.
+                LibraryPlacementCardinality::TargetSet(spec) => placement_target_set = Some(spec),
+                // CR 107.1c + CR 115.10a + CR 608.2d: untargeted "any number"
+                // selects zero through every card in the named population on resolution.
+                LibraryPlacementCardinality::AnyNumber => {
+                    if target.names_enumerable_population() {
+                        *count = QuantityExpr::up_to(QuantityExpr::Ref {
+                            qty: QuantityRef::ObjectCount {
+                                filter: target.clone(),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+    }
+    placement_target_set
+}
+
 fn lower_clause_ast(ast: ClauseAst, ctx: &mut ParseContext) -> ParsedEffectClause {
     match ast {
         ClauseAst::Imperative { text } => {
             let mut clause = lower_imperative_clause(&text, ctx);
-            // "put [N] [type] on top/bottom of library" — the imperative parser
-            // returns PutAtLibraryPosition { target: Any, count: Fixed(1) }
-            // because it dispatches on the positional suffix without extracting
-            // the noun phrase. This patch re-inspects the imperative text and
-            // assigns both the target filter and the cardinality. Covers:
-            //   - "put target X on top of Y's library"           (count = 1)
-            //   - "put target X on the bottom of Y's library"    (count = 1)
-            //   - "put target X into Y's library Nth from top"   (count = 1)
-            //   - "put two cards from your hand on top of your library in any order"
-            //     (Cavalier of Gales / Brainstorm class — count = N, filter = Card+InZone:Hand)
-            // CR 115.1: an announced target set is a CLAUSE-level property, so it
-            // is carried out of the effect-shaped block below and attached after it.
-            let mut placement_target_set: Option<MultiTargetSpec> = None;
-            if let Effect::PutAtLibraryPosition {
-                ref mut target,
-                ref mut count,
-                ..
-            } = clause.effect
-            {
-                if parse_exiled_cards_not_cast_cleanup(&text.to_lowercase()).is_some() {
-                    *target = TargetFilter::ExiledBySource;
-                    *count = QuantityExpr::Fixed { value: 0 };
-                    return clause;
-                }
-                let lower_put = text.to_lowercase();
-                if matches!(*target, TargetFilter::Any | TargetFilter::ParentTarget)
-                    && (nom_primitives::scan_contains(&lower_put, "put them on top")
-                        || nom_primitives::scan_contains(&lower_put, "put the exiled cards on top")
-                        || nom_primitives::scan_contains(&lower_put, "cards exiled this way"))
-                {
-                    *target = TargetFilter::ExiledBySource;
-                    if matches!(*count, QuantityExpr::Fixed { value: 1 }) {
-                        *count = QuantityExpr::Ref {
-                            qty: QuantityRef::CardsExiledBySource,
-                        };
-                    }
-                }
-                let extracted =
-                    (|| -> Option<(Option<TargetFilter>, LibraryPlacementCardinality)> {
-                        let lower = text.to_lowercase();
-                        let (after_put, _) = tag::<_, _, OracleError<'_>>("put ")
-                            .parse(lower.as_str())
-                            .ok()?;
-                        // Isolate the noun phrase before the first positional terminator.
-                        let before = [" on top of", " on the bottom of", " into "]
-                            .iter()
-                            .find_map(|term| {
-                                take_until::<_, _, OracleError<'_>>(*term)
-                                    .parse(after_put)
-                                    .ok()
-                                    .map(|(_, before)| before)
-                            })?;
-                        // Peel the leading cardinality. Recognized forms:
-                        //   - "two cards ..."            → Exact(Fixed(2))
-                        //   - "x cards ..."              → Exact(Variable("X"))
-                        //   - "any number of target ..." → TargetSet(unlimited(0))
-                        //   - "up to N target ..."       → TargetSet(up_to(N))
-                        //   - "any number of cards ..."  → AnyNumber (count = UpTo(ObjectCount))
-                        // The remainder (e.g. "cards from your hand", "target creature
-                        // card from your graveyard" — the article is deliberately left
-                        // in place) is then handed to `parse_target` for filter
-                        // extraction. With no cardinality prefix the noun phrase is fed
-                        // to `parse_target` unchanged (covers "target X" / "it" / "that
-                        // card" — count stays 1).
-                        let (cardinality, after_count) = peel_library_placement_cardinality(before);
-                        // CR 608.2k: thread the real trigger context so a bare object
-                        // pronoun ("put it on the bottom …") binds to the trigger's
-                        // `object_pronoun_ref` (the cast spell for spell-cast triggers)
-                        // rather than defaulting to `ParentTarget`. `parse_target`
-                        // spins up a fresh empty context, which loses that antecedent.
-                        let (filter, _) = parse_target_with_ctx(after_count, ctx);
-                        let new_target = if matches!(filter, TargetFilter::Any) {
-                            None
-                        } else {
-                            Some(filter)
-                        };
-                        Some((new_target, cardinality))
-                    })();
-                if let Some((maybe_filter, cardinality)) = extracted {
-                    if *target == TargetFilter::Any {
-                        if let Some(filter) = maybe_filter {
-                            *target = filter;
-                        }
-                    }
-                    match cardinality {
-                        LibraryPlacementCardinality::Unstated => {}
-                        LibraryPlacementCardinality::Exact(c) => *count = c,
-                        // CR 601.2c + CR 115.1 (CR 115.1a spells / CR 115.1d
-                        // triggers; activated abilities via CR 602.2b): the
-                        // announced target set owns the cardinality. `count` stays
-                        // at the lowering default and is deliberately NOT consulted
-                        // by `put_on_top::resolve` for such an ability (see its
-                        // `multi_target` rule).
-                        LibraryPlacementCardinality::TargetSet(spec) => {
-                            placement_target_set = Some(spec)
-                        }
-                        // CR 107.1c + CR 115.10a + CR 608.2d: an untargeted "any
-                        // number of <population>" is a resolution-time choice of
-                        // zero through every eligible object — the same `UpTo`
-                        // encoding as "sacrifice any number of …". The recipient
-                        // must NAME a population: a deterministic anaphor ("any
-                        // number of them" → `ParentTarget`, the Dig-tail partition
-                        // owned by the Dig continuation grammar) or an unclassified
-                        // recipient (`Any` / a contentless `Typed`) keeps its base
-                        // shape. `names_enumerable_population` is the authored
-                        // population predicate for exactly that question.
-                        LibraryPlacementCardinality::AnyNumber => {
-                            if target.names_enumerable_population() {
-                                *count = QuantityExpr::up_to(QuantityExpr::Ref {
-                                    qty: QuantityRef::ObjectCount {
-                                        filter: target.clone(),
-                                    },
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            // CR 115.1 (+ CR 115.1d for the trigger cohort): attach the announced
-            // target-set spec. This is a CLAUSE-level spec, consulted LAST in
-            // `assembly`'s six-arm precedence chain (four `MULTI_TARGET_VERBS`-gated
-            // text extractors, then the CHUNK-level `clause_ir.multi_target` — the
-            // per-opponent fanout spec — then this one), so an outer authority wins
-            // without this seam having to know about it.
-            //
-            // The `is_none()` check ENCODES THAT PRECEDENCE — it is not input
-            // validation, so do not delete it as unreachable-therefore-dead. It
-            // is the rule itself: a clause-level spec must never overwrite a
-            // spec an outer authority already set.
-            //
-            // It is also unreachable TODAY, and that is a separate fact about
-            // the current call graph rather than a reason to drop the rule:
-            // `lower_imperative_clause` above runs the post-parse multi-target
-            // fixups, but each of them gates on
-            // `MULTI_TARGET_VERBS` — three (`extract_exact_target_multi_target`,
-            // `extract_bounded_target_multi_target`,
-            // `extract_optional_target_multi_target`) directly, and
-            // `extract_verb_up_to_multi_target` indirectly through
-            // `strip_any_number_quantifier`'s first-word check — and that list (in
-            // `lower.rs`) contains no `put`, so a placement clause reaches here with
-            // the field unset.
+            let placement_target_set = refine_put_at_library_position(&mut clause, &text, ctx);
             if clause.multi_target.is_none() {
                 clause.multi_target = placement_target_set;
             }
@@ -22084,6 +22462,7 @@ fn try_parse_per_opponent_graveyard_free_cast(lower: &str) -> Option<Effect> {
         driver: CastFromZoneDriver::DuringResolution,
         mana_spend_permission: None,
         additional_cost: None,
+        cast_cost_modifier: None,
     })
 }
 
@@ -24099,6 +24478,10 @@ fn lower_subject_predicate_ast(
             // pick rewrite in the player-target wrapper below), so sibling
             // predicates keep their original scope.
             let mut clause = lower_imperative_clause(&text, ctx);
+            let placement_target_set = refine_put_at_library_position(&mut clause, &text, ctx);
+            if clause.multi_target.is_none() {
+                clause.multi_target = placement_target_set;
+            }
             // CR 601.2c + CR 603.3d: a printed subject on the sentence that
             // ANNOUNCES this ability's target overrides the default announcer.
             // Recorded on the chunk's `ParseContext`, which `parse_effect_chain_ir`
@@ -24221,7 +24604,9 @@ fn lower_subject_predicate_ast(
             {
                 if matches!(
                     clause.effect,
-                    Effect::ChangeZone { .. } | Effect::ChangeZoneAll { .. }
+                    Effect::ChangeZone { .. }
+                        | Effect::ChangeZoneAll { .. }
+                        | Effect::PutAtLibraryPosition { .. }
                 ) {
                     // CR 115.1c + CR 115.10a + CR 608.2d (issues #6505 / #6446):
                     // reuse `change_zone_target_choice_timing` so battlefield
@@ -24240,6 +24625,9 @@ fn lower_subject_predicate_ast(
                                 clause.multi_target.is_some(),
                                 &pred_lower,
                             ) == crate::types::ability::TargetChoiceTiming::Resolution
+                        }
+                        Effect::PutAtLibraryPosition { .. } => {
+                            !nom_primitives::scan_contains(&pred_lower, "target ")
                         }
                         _ => false,
                     };
@@ -24269,7 +24657,8 @@ fn lower_subject_predicate_ast(
                     if moved_object_is_they_control_pick {
                         match &mut clause.effect {
                             Effect::ChangeZone { target, .. }
-                            | Effect::ChangeZoneAll { target, .. } => {
+                            | Effect::ChangeZoneAll { target, .. }
+                            | Effect::PutAtLibraryPosition { target, .. } => {
                                 rebind_controller_scope(
                                     target,
                                     ControllerRef::You,
@@ -24281,7 +24670,8 @@ fn lower_subject_predicate_ast(
                     } else if !moved_object_is_resolution_pick {
                         match &mut clause.effect {
                             Effect::ChangeZone { target, .. }
-                            | Effect::ChangeZoneAll { target, .. } => {
+                            | Effect::ChangeZoneAll { target, .. }
+                            | Effect::PutAtLibraryPosition { target, .. } => {
                                 rebind_owned_scope(target, ControllerRef::TargetPlayer);
                             }
                             _ => {}
@@ -24469,7 +24859,7 @@ fn lower_subject_predicate_ast(
             if clause.multi_target.is_none() {
                 clause.multi_target = subject.multi_target;
             }
-            // CR 608.2c + CR 117.3a: Propagate the subject phrase's "may" modal
+            // CR 608.2c + CR 608.2d: Propagate the subject phrase's "may" modal
             // so the lowered ability is marked optional (e.g., "its controller
             // may search their library").
             if subject.is_optional {
@@ -25648,7 +26038,6 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
         | Effect::Draw { target, .. }
         | Effect::Scry { target, .. }
         | Effect::Surveil { target, .. }
-        | Effect::PutAtLibraryPosition { target, .. }
             if *target == TargetFilter::Any || *target == TargetFilter::Controller =>
         {
             *target = subject_filter;
@@ -26582,6 +26971,7 @@ fn from_among_batch_cast_effect(
         driver,
         mana_spend_permission: None,
         additional_cost: None,
+        cast_cost_modifier: None,
     }
 }
 
@@ -27418,6 +27808,51 @@ fn parse_owned_plus_lesser_exiled_subject(i: &str) -> OracleResult<'_, ()> {
     Ok((i, ()))
 }
 
+/// CR 406.6 + CR 607.2a: the SOURCE-ANCHORED tail of the plural exiled-cards
+/// anaphor — `" with <host-self-ref>"` ("cards exiled with ~", "cards exiled
+/// with this Class", "cards exiled with this enchantment").
+///
+/// This is the plural analogue of the singular `"the exiled card"` split that
+/// [`resolve_singular_exiled_card_target`] already performs: a permission
+/// naming its own source refers to that source's DURABLE exile ledger
+/// (CR 607.1/607.2a linked abilities), which spans resolutions, whereas the
+/// sibling `"cards exiled this way"` tail refers only to the cards the SAME
+/// resolution just produced and must keep its same-chain `ParentTarget`
+/// binding.
+///
+/// Deliberately accepts only `TargetFilter::SelfRef` — the HOST self-reference
+/// tokens (`~`, "this creature", "this Class", …) that `normalize_card_name_refs`
+/// folds the printed card name into. `TargetFilter::GrantingObject` — the
+/// placeholder a quoted granted body's by-name reference to its GRANTER is
+/// masked to — is rejected: that ledger belongs to the granting object, not to
+/// the granted one that carries the permission, so `ExiledBySource` resolved
+/// against the carrier would name the wrong object.
+fn parse_host_anchored_exiled_cards_tail(i: &str) -> OracleResult<'_, ()> {
+    let (i, _) = verify(
+        preceded(tag(" with "), nom_target::parse_self_reference),
+        |filter: &TargetFilter| matches!(filter, TargetFilter::SelfRef),
+    )
+    .parse(i)?;
+    Ok((i, ()))
+}
+
+/// Which anaphor opened a "cast/play <anaphor>" clause, insofar as the choice
+/// changes how the referent binds. CR 607.2a: a singular "the exiled card" and
+/// the source-anchored plural "cards exiled with ~" both read their source's
+/// durable exile ledger, while every other anaphor refers to the batch this
+/// resolution produced. Typed rather than a matched `&str` so the binding rule
+/// is an exhaustive match instead of stringly-typed dispatch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CastAnaphor {
+    /// "the exiled card" — singular, binds to the source's ledger.
+    SingularExiledCard,
+    /// "cards exiled …" — splits further on its tail (see
+    /// `parse_host_anchored_exiled_cards_tail`).
+    PluralCardsExiled,
+    /// Every other anaphor; keeps `TargetFilter::ParentTarget`.
+    Other,
+}
+
 /// 1. Anaphoric — "cast it", "cast that spell", "cast those cards" — target is
 ///    `ParentTarget` (refers to the cards exiled / chosen by a prior effect).
 /// 2. Constrained — "cast a [type-phrase] [from <zone>] [with mana value <bound>]
@@ -27507,16 +27942,16 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
     // Branch 1: anaphoric forms. Order longer-first ("one of those cards"
     // before "those cards") so the prefix-match doesn't shadow the longer
     // anaphor.
-    if let Ok((_, matched_anaphor)) = alt((
-        tag::<_, _, E>("one of those cards"),
-        tag("the exiled card"),
-        tag("those cards"),
-        tag("cards exiled"),
-        tag("that card"),
-        tag("that spell"),
-        tag("the copy"),
-        tag("them"),
-        tag("it"),
+    if let Ok((after_anaphor, matched_anaphor)) = alt((
+        value(CastAnaphor::Other, tag::<_, _, E>("one of those cards")),
+        value(CastAnaphor::SingularExiledCard, tag("the exiled card")),
+        value(CastAnaphor::Other, tag("those cards")),
+        value(CastAnaphor::PluralCardsExiled, tag("cards exiled")),
+        value(CastAnaphor::Other, tag("that card")),
+        value(CastAnaphor::Other, tag("that spell")),
+        value(CastAnaphor::Other, tag("the copy")),
+        value(CastAnaphor::Other, tag("them")),
+        value(CastAnaphor::Other, tag("it")),
     ))
     .parse(rest)
     {
@@ -27582,11 +28017,29 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
         // separately-resolved ETB); otherwise it keeps `ParentTarget`
         // (Creative Technique later widens `ParentTarget` to `TrackedSet{0}`
         // via the `needs_tracked_set` pass; Discover the Impossible's
-        // same-chain `Dig`-to-exile keeps `ParentTarget` as-is). All other
-        // anaphors in this branch are unaffected.
-        let target = if matched_anaphor == "the exiled card"
-            && ctx.current_ability_exile_cost_zone.is_none()
-        {
+        // same-chain `Dig`-to-exile keeps `ParentTarget` as-is).
+        //
+        // CR 607.2a: the plural "cards exiled …" anaphor splits on its tail.
+        // The SOURCE-ANCHORED form ("cards exiled with ~ / with this Class /
+        // with this enchantment" — Urianger Augurelt's Play Arcanum, Rogue
+        // Class, Pick Up the Pace) names the permission's own source and so
+        // reads that source's durable exile ledger across resolutions; it gets
+        // the same treatment as the singular anaphor. The sibling "cards exiled
+        // this way" form (Chandra, Heart of Fire; Dream Harvest) refers to the
+        // batch this very resolution produced and must keep `ParentTarget`.
+        // Both still defer to `chain_has_prior_exile_producer`, so a
+        // source-anchored tail in a chain that ALSO exiles keeps its
+        // same-chain binding.
+        //
+        // All other anaphors in this branch are unaffected.
+        let anchors_to_source_exile_ledger = match matched_anaphor {
+            CastAnaphor::SingularExiledCard => ctx.current_ability_exile_cost_zone.is_none(),
+            CastAnaphor::PluralCardsExiled => {
+                parse_host_anchored_exiled_cards_tail(after_anaphor).is_ok()
+            }
+            CastAnaphor::Other => false,
+        };
+        let target = if anchors_to_source_exile_ledger {
             resolve_singular_exiled_card_target(
                 ctx.chain_has_prior_exile_producer,
                 TargetFilter::ParentTarget,
@@ -27605,6 +28058,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
             driver,
             mana_spend_permission: None,
             additional_cost: None,
+            cast_cost_modifier: None,
         });
     }
 
@@ -27912,6 +28366,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
             duration: None,
             driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
             mana_spend_permission: None,
+            cast_cost_modifier: None,
             additional_cost: None,
         });
     }
@@ -27973,6 +28428,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
             duration: None,
             driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
             mana_spend_permission: None,
+            cast_cost_modifier: None,
             additional_cost: None,
         });
     }
@@ -28028,6 +28484,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
             driver,
             mana_spend_permission: None,
             additional_cost,
+            cast_cost_modifier: None,
         };
         crate::parser::oracle_ir::ast::refuse_additional_cost_on_lingering_cast(&mut effect);
         return Some(effect);
@@ -28045,6 +28502,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
         driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
         mana_spend_permission: None,
         additional_cost: None,
+        cast_cost_modifier: None,
     })
 }
 
@@ -28555,6 +29013,13 @@ fn attach_alt_cost_to_prior_cast_from_zone(
             // CR 601.2b: the fourth seam that can leave a cast grant on the
             // lingering mechanism; an additional cost cannot stay on it.
             crate::parser::oracle_ir::ast::refuse_additional_cost_on_lingering_cast(
+                def.effect.as_mut(),
+            );
+            // CR 601.2f: the mirror obligation for the opposite mechanism — the
+            // re-derivation above can move an already-absorbed "cast this way"
+            // cost rider OFF `LingeringPermission`, the only driver whose
+            // resolver stamps it onto the permissions it builds.
+            crate::parser::oracle_ir::ast::refuse_cast_cost_modifier_on_unsupported_driver(
                 def.effect.as_mut(),
             );
             return true;
@@ -30488,6 +30953,46 @@ fn clause_ir_hand_reveal_target(clause: &ClauseIr) -> Option<TargetFilter> {
     }
 }
 
+/// CR 400.7j + CR 608.2c + CR 608.2d: The NEAREST earlier `ChooseFromZone`
+/// clause of this chain, when it is a single-card exile partition — reported
+/// as a [`PriorZoneChoicePartition`] carrying that pile's
+/// `ZoneChoiceCandidateSource`.
+///
+/// Feeds `ParseContext::prior_zone_choice_partition`, the state that lets the
+/// very next instruction's bare "the other" name the UNCHOSEN card (Coin of
+/// Fate). The runtime publishes the CHOSEN cards as the continuation's targets —
+/// and, when the continuation consumes one, as the fresh tracked set — while the
+/// complement reaches only the continuation's immediate `sub_ability` targets.
+/// So "the other" must lower to `ParentTarget` on that sub-ability, not to a
+/// `TrackedSet` (which would name the chosen card, i.e. exactly the wrong half).
+///
+/// The scan STOPS at the nearest `ChooseFromZone` rather than searching for a
+/// matching one: a chain whose most recent choice is some OTHER provenance is
+/// not this partition, and must keep its existing binding. Returning the source
+/// rather than a bool is what keeps "no partition here" and "a partition from a
+/// different source" distinguishable — that is what pins Wake to Slaughter ("An
+/// opponent chooses one of them. … Return the other …", `Legacy`) in place while
+/// leaving the distinction visible to consumers.
+fn chain_prior_zone_choice_partition(clauses: &[ClauseIr]) -> Option<PriorZoneChoicePartition> {
+    clauses
+        .iter()
+        .rev()
+        .find_map(|clause| match &clause.parsed.effect {
+            Effect::ChooseFromZone {
+                count: 1,
+                zone: Zone::Exile,
+                candidate_source,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
+                ..
+            } => Some(Some(PriorZoneChoicePartition {
+                candidate_source: *candidate_source,
+            })),
+            Effect::ChooseFromZone { .. } => Some(None),
+            _ => None,
+        })
+        .flatten()
+}
+
 /// The match arms naming every effect that establishes a NON-targeting
 /// object POPULATION — the `*All` / scope-`All` family whose `target` (or
 /// `filter`) is a population filter rather than a chosen target. This is why they
@@ -30668,6 +31173,14 @@ pub(super) fn publishes_exiled_cause_at_resolution(effect: &Effect) -> bool {
 /// wrapper (`conqueror's galleon`, `end-blaze epiphany`, `fire giant's fury`,
 /// `priority boarding`, `storm herald`, `waltz of rage`) back to the
 /// unrewritten `ParentTarget` binding.
+///
+/// `Effect::ChooseAndSacrificeRest` is deliberately absent even though
+/// `sacrifice_unchosen` does publish a tracked set at resolution: the effect
+/// names TWO populations (the keepers and the sacrificed rest), and which one
+/// a following anaphor means is resolved at resolution time by
+/// `publish_fresh_tracked_set`, not classified here. See
+/// `oracle_effect/tests.rs::counter_less_keeper_sibling_still_grants_the_selfref_prohibition`
+/// for the measured argument against widening this predicate.
 fn publishes_tracked_set_from_resolution(effect: &Effect) -> bool {
     is_exile_effect(effect)
         || publishes_exiled_cause_at_resolution(effect)
@@ -35666,6 +36179,80 @@ fn clause_has_anaphoric_control_condition(clause: &ClauseIr) -> bool {
     )
 }
 
+/// CR 118.12 + CR 603.12 + CR 608.2c: bind a trailing `Otherwise, …` inside a
+/// REFLEXIVE OPTIONAL PAYMENT body to the outcome gate that will sit on this
+/// chain's root definition.
+///
+/// The class is CR 118.12's verbatim template — "[A player] may [do something].
+/// If [that player] [does], [effect]" — with a written-order else branch
+/// (CR 608.2c). Rent Is Due is the current corpus member: "you may tap two
+/// untapped creatures and/or Treasures you control. If you do, draw a card.
+/// Otherwise, sacrifice this enchantment."
+///
+/// WHY A SECOND AUTHORITY IS NEEDED, stated once. `oracle_trigger` splits that
+/// body into (cost, connector, "draw a card. Otherwise, sacrifice ~"), so the
+/// `EffectOutcome` connector is NOT part of the text the chain parser sees. The
+/// chain's own clauses therefore all carry `condition: None`, the in-loop
+/// `OtherwiseKind` predicate honestly reports "no antecedent", and the branch
+/// degrades to the `Fallback` marker. Lowering then stamps the connector onto
+/// the chain ROOT (`lower_trigger_ir`: `reflexive_ability.condition = connector`),
+/// which is exactly the node the else branch belongs on.
+///
+/// This runs at PARSE time, before any lowering, and writes the SAME
+/// `AbilityCondition` lowering will write — so the two views cannot diverge and
+/// the in-loop invariant ("Bound/Fallback is decided at parse time, never
+/// recomputed at lowering") is preserved: the decision is simply completed here
+/// with the one fact the chunk loop could not see.
+///
+/// FAIL-CLOSED. It upgrades ONLY the FIRST `Fallback` branch, ONLY when no
+/// clause BEFORE that branch already carries its own condition (a nearer
+/// antecedent inside the chain stays authoritative), and ONLY when a distinct
+/// root clause exists to anchor to. Any later `Otherwise` keeps its honest
+/// `Effect::unimplemented("otherwise", …)` marker, so a shape this does not
+/// genuinely support cannot read as covered.
+pub(crate) fn bind_otherwise_to_reflexive_chain_root(
+    chain: &mut EffectChainIr,
+    connector: &AbilityCondition,
+) {
+    // CR 608.2c: clauses lower in SOURCE ORDER, so only a condition that
+    // PRECEDES the fallback branch can be its nearer antecedent. A whole-chain
+    // scan would let a conditional clause written AFTER the `Otherwise` veto a
+    // binding it can never serve as the antecedent for, leaving the branch as
+    // `Effect::unimplemented`.
+    let Some(fallback_index) = chain.clauses.iter().position(|c| {
+        matches!(
+            c.disposition,
+            ClauseDisposition::BranchOtherwise {
+                kind: OtherwiseKind::Fallback,
+                ..
+            }
+        )
+    }) else {
+        return;
+    };
+    // The root of the lowered chain is the FIRST clause, and `AssemblyEnv`
+    // registers a conditional antecedent off the emitted root def's `condition`
+    // — so stamping clause 0 is what makes `LastWithRole(Conditional)` resolve.
+    // A branch AT index 0 has no root to anchor to.
+    if fallback_index == 0 {
+        return;
+    }
+    if chain.clauses[..fallback_index]
+        .iter()
+        .any(|c| c.condition.is_some())
+    {
+        return;
+    }
+    chain.clauses[0].condition = Some(connector.clone());
+    // Upgrade ONLY this branch. A second `Otherwise` further down the chain has
+    // a different antecedent question and is not answered by the root stamp.
+    if let ClauseDisposition::BranchOtherwise { kind, .. } =
+        &mut chain.clauses[fallback_index].disposition
+    {
+        *kind = OtherwiseKind::Bound;
+    }
+}
+
 /// Produce an intermediate representation of an effect chain from Oracle text.
 ///
 /// This is the IR-production half of the parse/lower split (Phase 48).
@@ -35959,7 +36546,7 @@ pub(crate) fn parse_effect_chain_ir(
     if let Some(ir) = parse_reciprocal_graveyard_choice_ir(text, kind) {
         return ir;
     }
-    if let Some(ir) = parse_choose_survivors_destroy_rest_ir(text, kind, ctx) {
+    if let Some(ir) = parse_keeper_dispose_rest_ir(text, kind, ctx) {
         return ir;
     }
     if let Some(ir) = parse_grant_graveyard_keyword_to_target_ir(text, kind, ctx) {
@@ -36586,20 +37173,12 @@ pub(crate) fn parse_effect_chain_ir(
         }
 
         // CR 608.2c: "Otherwise, [effect]" — attach as else_ability on the
-        // most recent conditional def in the chain.
+        // most recent conditional def in the chain. The connector grammar is the
+        // shared `oracle_nom` authority the trigger-side hoist gate also calls,
+        // so the two sides cannot disagree about which antecedents are bindable.
         let lower_check = normalized_text.to_lowercase();
         let otherwise_rest = nom_on_lower(normalized_text, &lower_check, |i| {
-            value(
-                (),
-                alt((
-                    tag("otherwise, "),
-                    tag("otherwise "),
-                    tag("if not, "),
-                    tag("if no player does, "),
-                    tag("if no one does, "),
-                )),
-            )
-            .parse(i)
+            crate::parser::oracle_nom::condition::parse_otherwise_branch_connector(i)
         });
         if let Some((_, else_text)) = otherwise_rest {
             // CR 608.2c: The else-branch is parsed as its own chain, so its anaphors
@@ -36639,6 +37218,14 @@ pub(crate) fn parse_effect_chain_ir(
             // PARSE-TIME Bound/Fallback determination — this predicate MUST stay
             // exactly here (parse time). Recomputing "prior conditional present?"
             // at lowering could diverge from this state and move output.
+            //
+            // One fact is structurally invisible from inside this loop: a chain
+            // parsed as a CR 603.12 reflexive-payment BODY receives its outcome
+            // gate on the chain ROOT after this loop returns, because the
+            // connector text was split off before the chain parser ever saw it.
+            // `bind_otherwise_to_reflexive_chain_root` completes the decision for
+            // that one shape, still at parse time and with the identical
+            // `AbilityCondition` lowering will use.
             let kind = if has_condition || has_optional_may_head {
                 OtherwiseKind::Bound
             } else {
@@ -37457,7 +38044,10 @@ pub(crate) fn parse_effect_chain_ir(
         // on the text output from strip_if_you_do_conditional. For compound
         // "when you do, if it has N counters" patterns, WhenYouDo is always true for
         // non-optional parents (CR 603.12), so the QuantityCheck is the meaningful gate.
-        let (counter_cond, text) = strip_counter_conditional(&text, ctx.in_trigger);
+        let (counter_cond, text) = strip_counter_conditional(
+            &text,
+            conditions::CounterConditionalContext::from_parse_context(ctx),
+        );
         // CR 202.3 + CR 608.2c: Mana value threshold condition — same priority as counter_cond.
         let (mv_cond, text) = strip_mana_value_conditional(&text);
         // CR 608.2c: Spell-target superlative gate — "if it has the least/greatest
@@ -38329,6 +38919,16 @@ pub(crate) fn parse_effect_chain_ir(
                 .clauses()
                 .iter()
                 .any(clause_ir_is_self_library_peek),
+            // CR 400.7j + CR 608.2c + CR 608.2d: the nearest earlier single-card
+            // exile partition of this chain, with its candidate provenance. When
+            // that provenance is the source-bound cost-paid pile (Coin of Fate),
+            // this chunk's bare "the other" names the UNCHOSEN half — the runtime
+            // forwards it on the continuation's immediate sub-ability targets
+            // (`ParentTarget`), never on the tracked set. Carrying the source
+            // rather than a bool keeps every other `ChooseFromZone` partition
+            // (Wake to Slaughter's `Legacy`) visibly distinct from "no partition",
+            // and forces the consumer to name `CostPaidObjects` explicitly.
+            prior_zone_choice_partition: chain_prior_zone_choice_partition(builder.clauses()),
             // CR 400.1/400.2 + CR 608.2c: most-recent earlier same-chain
             // `RevealHand` target, so a later "cast a spell from among those
             // cards" anaphor (Silent-Blade Oni) binds to that player's hand
@@ -38409,6 +39009,13 @@ pub(crate) fn parse_effect_chain_ir(
             // `Effect::Meld { partner, .. }`. Without this the sub-clause loses
             // the partner and lowers to `Unimplemented`.
             pending_meld_partner: ctx.pending_meld_partner.clone(),
+            // CR 608.2c + CR 603.10: this chunk is ordinary text of the SAME
+            // trigger body, so it keeps the enclosing trigger's proven
+            // zone-change authority — that is what lets a trailing past-tense
+            // predicate ("… if it had a death counter on it") read the event
+            // object's LKI. This struct literal REPLACES the parent context, so
+            // the carry has to be spelled; `..Default::default()` would reset it.
+            trigger_zone_change: ctx.trigger_zone_change.clone(),
             ..Default::default()
         };
         let ctx = &mut chunk_ctx;

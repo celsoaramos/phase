@@ -50,7 +50,7 @@ pub(crate) struct ParsedEffectClause {
     /// Set when `parse_clause_ast` detects a leading conditional and the condition
     /// text is parseable by the nom condition combinator pipeline.
     pub(crate) condition: Option<AbilityCondition>,
-    /// CR 608.2c + CR 117.3a: Set when the parsed subject phrase carried a "may"
+    /// CR 608.2c + CR 608.2d: Set when the parsed subject phrase carried a "may"
     /// modal (e.g., "its controller may search their library"). Lowered into
     /// `AbilityDefinition.optional` so the resolver prompts the acting player.
     pub(crate) optional: bool,
@@ -1528,6 +1528,12 @@ pub(crate) enum ChooseImperativeAst {
         chooser: crate::types::ability::Chooser,
         /// CR 608.2d (override): `Random` for "choose one of them at random".
         selection: crate::types::ability::CardSelectionMode,
+        /// CR 608.2d: WHICH set the anaphor names. The bare "of them"/"of those"
+        /// anaphors keep the historic tracked-set fallback (`Legacy`); the
+        /// source-bound "of the exiled cards" form inside an ability whose own
+        /// cost exiled the cards names that cost-payment record instead
+        /// (`CostPaidObjects`, CR 400.7j).
+        candidate_source: crate::types::ability::ZoneChoiceCandidateSource,
     },
     /// "choose a [filter] card in/from [player's] [zone]" — direct selection
     /// from visible/resolution-scoped zone contents. Lowered to `Effect::ChooseFromZone`.
@@ -1580,6 +1586,22 @@ pub(crate) enum ChooseImperativeAst {
         target: TargetFilter,
         domain: CounterKindDomain,
         chooser: CounterKindChooser,
+    },
+    /// CR 115.1 + CR 608.2d: A standalone, NON-target battlefield-object choice
+    /// ("choose a creature an opponent controls"). The chooser is the ability's
+    /// controller; the pick is made while the effect resolves (CR 608.2d), not
+    /// as a declared target. Parser IR only — it lowers onto the existing
+    /// `Effect::ChooseObjectsIntoTrackedSet`, which publishes the pick into the
+    /// resolution chain's tracked set so a linked "the chosen ‹object›" reader
+    /// (CR 607.2d) can consume it.
+    ///
+    /// `min`/`max` carry the printed quantifier ("a"/"an"/"another" → `(1, Some(1))`,
+    /// "up to N" → `(0, Some(N))` with a dynamic N collapsing to `None`,
+    /// "any number of" → `(0, None)`).
+    BattlefieldObject {
+        filter: TargetFilter,
+        min: u32,
+        max: Option<u32>,
     },
 }
 
@@ -2138,6 +2160,57 @@ pub(crate) fn refuse_additional_cost_on_lingering_cast(effect: &mut Effect) {
         crate::types::ability::ADDITIONAL_COST_ON_LINGERING_CAST_GAP,
         format!("additional cost the lingering permission cannot carry: {cost:?}"),
     );
+}
+
+/// CR 601.2f + CR 608.2c: the honest gap a "cast this way" cost rider becomes
+/// when no preceding grant can carry it.
+///
+/// Both refusal sites below build it here, so the no-host shape and the
+/// unsupported-driver shape name one gap rather than two that can drift. The
+/// description records the MODIFIER that was about to be lost rather than the
+/// Oracle fragment: the driver seam runs after lowering and no longer holds the
+/// source text, and the modifier is the load-bearing fact for anyone auditing
+/// the gap.
+pub(crate) fn cast_cost_modifier_without_host_gap(
+    modifier: &crate::types::ability::CastCostModifier,
+) -> Effect {
+    Effect::unimplemented(
+        crate::types::ability::CAST_COST_MODIFIER_WITHOUT_HOST_GAP,
+        format!("\"cast this way\" cost rider no preceding grant can carry: {modifier:?}"),
+    )
+}
+
+/// CR 601.2f + CR 608.2c: a `CastFromZone` that still carries a
+/// `cast_cost_modifier` on a driver OTHER than `LingeringPermission` would drop
+/// that rider at resolution, so the clause becomes the
+/// `CAST_COST_MODIFIER_WITHOUT_HOST_GAP` instead.
+///
+/// Twin of [`refuse_additional_cost_on_lingering_cast`], inverted on the driver
+/// axis because the two riders ride opposite mechanisms:
+/// `record_lingering_permissions` is the one site that stamps a cost modifier
+/// onto the permissions the grant creates, so `LingeringPermission` is the only
+/// driver with a slot — while an additional cost is charged only by the
+/// during-resolution cast.
+///
+/// Called at the one seam that can DEGRADE an already-stamped grant off the
+/// lingering mechanism (`attach_alt_cost_to_prior_cast_from_zone`, beside its
+/// twin); the absorption site refuses a non-`LingeringPermission` host up front
+/// (`attach_cast_cost_modifier_to_prior_cast_from_zone`), so that path never
+/// stamps one for this to find. Zero printed carriers today.
+pub(crate) fn refuse_cast_cost_modifier_on_unsupported_driver(effect: &mut Effect) {
+    let Effect::CastFromZone {
+        driver,
+        cast_cost_modifier: Some(modifier),
+        ..
+    } = effect
+    else {
+        return;
+    };
+    if *driver == crate::types::ability::CastFromZoneDriver::LingeringPermission {
+        return;
+    }
+    let gap = cast_cost_modifier_without_host_gap(modifier);
+    *effect = gap;
 }
 
 /// CR 611.2a + CR 608.2g + CR 608.2c: Carry a sentence's LEADING duration onto a
@@ -3231,7 +3304,7 @@ mod duration_distribution_tests_7923 {
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             // #7948: a self-standing play permission with full cast authority,
             // which is what this duration fixture models — NOT the
@@ -3260,6 +3333,7 @@ mod duration_distribution_tests_7923 {
             driver: CastFromZoneDriver::LingeringPermission,
             mana_spend_permission: None,
             additional_cost: None,
+            cast_cost_modifier: None,
         }
     }
 
@@ -3291,6 +3365,7 @@ mod duration_distribution_tests_7923 {
                 driver,
                 mana_spend_permission,
                 additional_cost,
+                cast_cost_modifier: None,
             },
             other => other,
         }

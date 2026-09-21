@@ -275,7 +275,7 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
         distribution: _,                 // concrete pre-assigned (TargetRef, u32) portions
         chosen_x: _,                     // concrete cast-time X
         cost_paid_object: _,             // concrete captured-object snapshot
-        cost_paid_object_ids: _,         // concrete captured-object ids
+        cost_paid_objects: _,            // concrete captured-object snapshots
         effect_context_object: _,        // concrete captured-object snapshot
         amassed_army_object: _,          // concrete captured-object snapshot
         ability_index: _,                // usize provenance
@@ -436,8 +436,11 @@ fn scan_target_selection_constraint(c: &TargetSelectionConstraint, mode: ScanMod
 /// `Direct` reads only the named zone, so only a battlefield population can
 /// grow with the loop class. `Tracked` and `Legacy` can instead consume the
 /// current resolution-chain set, whose producer is not visible at this local
-/// effect node; classify both fail-closed. This is intentionally separate from
-/// the choice filter, which is scanned by the caller.
+/// effect node; classify both fail-closed. `CostPaidObjects` reads the
+/// resolving ability's own cost-payment record plus live zone membership —
+/// neither is visible at this node either, so it is classified fail-closed
+/// alongside them rather than as a plain zone read. This is intentionally
+/// separate from the choice filter, which is scanned by the caller.
 fn scan_zone_choice_candidate_source(
     candidate_source: ZoneChoiceCandidateSource,
     zone: crate::types::zones::Zone,
@@ -457,6 +460,10 @@ fn scan_zone_choice_candidate_source(
         ZoneChoiceCandidateSource::Tracked | ZoneChoiceCandidateSource::Legacy => {
             Axes::CONSERVATIVE
         }
+        // CR 400.7j + CR 601.2h: the pool is the ability-bound cost-payment
+        // record, narrowed by live zone membership. Both are ability/state reads
+        // this local node cannot see; fail closed.
+        ZoneChoiceCandidateSource::CostPaidObjects => Axes::CONSERVATIVE,
     }
 }
 
@@ -1644,6 +1651,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             sacrifice_filter,
             total_power_cap,
             keeper_constraint,
+            keeper_counter,
             categories: _,
             chooser_scope: _,
         } => {
@@ -1655,6 +1663,10 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             }
             if let Some(KeeperConstraint::ExactCount { count }) = keeper_constraint {
                 acc = acc.or(scan_quantity_expr(count, mode));
+            }
+            // CR 608.2c + CR 122.1: the printed keeper mark's count.
+            if let Some(mark) = keeper_counter {
+                acc = acc.or(scan_quantity_expr(&mark.count, mode));
             }
             acc
         }
@@ -5454,6 +5466,7 @@ pub(crate) fn keyword_cost_reads_growing_class(kw: &Keyword) -> bool {
         | Keyword::Spectacle(_)
         | Keyword::SplitSecond
         | Keyword::Spree
+        | Keyword::Tiered
         | Keyword::Squad(_)
         | Keyword::Storm
         | Keyword::Surge(_)
@@ -5674,6 +5687,7 @@ fn scan_keyword(kw: &Keyword, mode: ScanMode) -> Axes {
         | Keyword::WebSlinging(_)
         | Keyword::Discover(_)
         | Keyword::Spree
+        | Keyword::Tiered
         | Keyword::Ravenous
         | Keyword::Daybound
         | Keyword::Nightbound

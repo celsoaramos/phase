@@ -28,7 +28,7 @@ use super::phase::Phase;
 use super::player::{PlayerCounterKind, PlayerId};
 use super::proposed_event::AppliedReplacementKey;
 use super::replacements::ReplacementEvent;
-use super::statics::{ActivationExemption, CastFrequency, StaticMode};
+use super::statics::{ActivationExemption, CastFrequency, CostModifyMode, StaticMode};
 use super::stickers::{AppliedSticker, StickerKind};
 use super::triggers::TriggerMode;
 use super::zones::{EtbTapState, Zone};
@@ -102,6 +102,29 @@ pub enum ZoneChoiceCandidateSource {
     Direct,
     /// Read only this resolution chain's active tracked set.
     Tracked,
+    /// Read only the objects this SAME ability's cost moved, filtered to the
+    /// declared zone(s).
+    ///
+    /// CR 601.2h + CR 602.2b: an activated ability's cost is paid while the
+    /// ability is activated, before it resolves; the engine records every object
+    /// a non-mana cost consumed on the resolving ability
+    /// (`ResolvedAbility::cost_paid_objects`). CR 400.7j: because that cost
+    /// moved those objects to a PUBLIC zone (exile), this same ability's effects
+    /// can find them. CR 608.2d: the resolution-time choice then picks from
+    /// exactly that set — "An opponent chooses one of the exiled cards" (Coin of
+    /// Fate) names the cards the cost exiled, not every card in exile and not a
+    /// tracked set some earlier clause published.
+    ///
+    /// CR 400.7: the recorded referents are matched by INCARNATION, not by
+    /// storage id alone. A cost-exiled card that leaves exile and returns is a
+    /// new object with no relation to the one the cost moved, so it is no longer
+    /// one of "the exiled cards" even though the engine reuses its `ObjectId`.
+    ///
+    /// Unlike [`Self::Legacy`], this source has NO fallback: candidates come from
+    /// `cost_paid_objects` alone, live-filtered to the requested zone(s), so a
+    /// cost-paid object that has since left that zone is simply not offered and an
+    /// unrelated object that happens to sit in the zone can never be.
+    CostPaidObjects,
 }
 
 impl ZoneChoiceCandidateSource {
@@ -568,6 +591,29 @@ pub enum KeeperConstraint {
     /// are eligible, the instruction does as much as possible and protects all
     /// of them (CR 609.3).
     ExactCount { count: QuantityExpr },
+}
+
+/// CR 122.1 + CR 608.2c: the counter a keeper-and-dispose instruction places to
+/// NOMINATE its keeper ("Each player puts a vow counter on a creature they
+/// control and sacrifices the rest"). The mark is a step of the SAME printed
+/// instruction as the disposal, not a following one, so it rides on
+/// [`Effect::ChooseAndSacrificeRest`] rather than a chained `PutCounterAll`.
+///
+/// CR 608.2h: `count` is resolved once, when the effect is applied, and the
+/// resolved value is carried on `WaitingFor::KeepExactPermanentsChoice`.
+/// Promise of Loyalty is currently the only card in this class — `jq -r
+/// 'to_entries[] | select(.value.oracle_text != null) |
+/// select(.value.oracle_text | test("counter"; "i")) |
+/// select(.value.oracle_text | test("sacrifices? the rest|destroys? the
+/// rest"; "i")) | .key' client/public/card-data.json` returns it alone once
+/// Ajani, Nacatl Avenger's unrelated `+1/+1`-counter loyalty ability is
+/// excluded — and its printed count is `QuantityExpr::Fixed { value: 1 }`, so "resolve
+/// at `resolve`" and "resolve at placement" are observationally identical
+/// today. A dynamic count would have to be re-derived at placement instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeeperCounterMark {
+    pub counter_type: CounterType,
+    pub count: QuantityExpr,
 }
 
 /// Additional selection constraints for tracked-set card picks during resolution.
@@ -2338,6 +2384,21 @@ pub const CAST_BOUND_LOST_TO_DURATION_GAP: &str = "duration_scoped_cast_bound";
 /// takes that route (issue #8775).
 pub const ADDITIONAL_COST_ON_LINGERING_CAST_GAP: &str = "additional_cost_on_lingering_cast";
 
+/// CR 601.2f + CR 608.2c: The parser gap name for a "[each/a] spell cast this
+/// way costs {N} more/less to cast" rider (CR 608.2c binds "this way" to the
+/// immediately-preceding grant) that no preceding grant can carry.
+///
+/// Two shapes reach it: the rider sentence found no host at all, and the host
+/// it found is an `Effect::CastFromZone` on a driver with no cost-modifier slot
+/// (`DuringResolution` / `ResolutionWindow` cast through
+/// `initiate_cast_during_resolution` / `open_resolution_cast_window`, neither of
+/// which records one). Lowering either shape as a standalone clause would price
+/// EVERY spell its controller casts — a board-wide `StaticMode::ModifyCost` is
+/// the wrong scope for a rider the printed text scopes to one grant — while
+/// `cargo coverage` counted the card supported. The gap keeps the clause
+/// honestly red instead.
+pub const CAST_COST_MODIFIER_WITHOUT_HOST_GAP: &str = "cast_cost_modifier_without_host";
+
 /// CR 702.104a + CR 702.104b: The outcome of the Tribute choice the chosen opponent
 /// made as the creature entered the battlefield. Persisted as a `ChosenAttribute` on
 /// the Tribute creature so the companion "if tribute wasn't paid" trigger (CR
@@ -2401,18 +2462,32 @@ pub enum ChosenAttribute {
     /// label is stored case-canonicalised to match `ChoiceType::Labeled`'s
     /// capitalised option list.
     Label(String),
-    /// CR 613.1f + CR 611.2c + CR 400.7: A remembered card object — the "last
+    /// CR 607.2d + CR 608.2c + CR 400.7: A remembered card object — the "last
     /// chosen card" for cards like Koh, the Face Stealer ("Koh has all activated
     /// and triggered abilities of the last chosen card"). Unlike every other
     /// variant, this is NOT a player-prompted choice category: it is written by
     /// `Effect::RememberCard` directly from the resolution chain's tracked set,
     /// not produced through `ChoiceType`/`ChoiceValue`/`from_choice` (the same
     /// engine-set precedent as `TributeOutcome`). It is consumed by
-    /// `TargetFilter::ChosenCard` at Layer-6 grant evaluation, and — being stored
-    /// in `chosen_attributes` — is cleared automatically when the source permanent
-    /// changes zones (CR 400.7), which is exactly the lifetime Koh's grant needs.
-    /// Replace-on-rechoose: `RememberCard` removes any prior `Card` before pushing.
-    Card(ObjectId),
+    /// `TargetFilter::ChosenCard` — the zone-agnostic remembered-object reader —
+    /// on both the live-object path and the CR 603.10a leaves-the-battlefield
+    /// look-back path. A reader whose linked ability requires a zone (CR 607.2a
+    /// "exiled with") composes `FilterProp::InZone` at its emission site rather
+    /// than in the shared reader. Being stored in `chosen_attributes`, the value
+    /// is cleared automatically when the source permanent changes zones
+    /// (CR 400.7). Replace-on-rechoose: `RememberCard` removes any prior `Card`
+    /// before pushing.
+    ///
+    /// CR 400.7: the value is an [`ObjectIncarnationRef`] pin — the chosen
+    /// object's storage id AND its incarnation at choice time (captured by
+    /// `RememberCard` from the live object). An object that changes zones
+    /// becomes a new object at the same storage id with a bumped incarnation,
+    /// so a stale pin deliberately does not match the returned object. The
+    /// pre-migration wire form stored a bare `ObjectId`; the
+    /// `ObjectIncarnationRef` compat shim deserializes that legacy shape to
+    /// [`LEGACY_INCARNATION`], a value no real incarnation can equal, so a
+    /// legacy record matches nothing (fail-closed).
+    Card(ObjectIncarnationRef),
     /// CR 608.2d + CR 122.1: The counter kind chosen from a `ChoiceType::CounterKind`
     /// option list (The Caves of Androzani "choose a counter on it"). Read by
     /// `Effect::PutChosenCounter` ("put an additional counter of that kind on
@@ -4379,11 +4454,121 @@ impl ExileGrantCostProvenance {
     }
 }
 
+/// CR 601.2f: Why a permission-scoped [`CastCostModifier`] could not be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CastCostModifierError {
+    /// CR 601.2f: the cost FLOOR is the last step of total-cost determination
+    /// and is stated board-wide (Trinisphere class), never as a "spells cast
+    /// this way cost {N} more/less" rider on one grant. A permission-scoped
+    /// modifier therefore has no meaning for it, and the runtime that consumes
+    /// this type has no floor step to route it to.
+    #[error("CostModifyMode::Minimum is not supported for CastCostModifier")]
+    MinimumUnsupported,
+}
+
+/// CR 601.2f: A mana-cost modification scoped to the spells cast via ONE
+/// casting permission — "Each spell cast this way costs {1} more to cast."
+/// (Lightstall Inquisitor, Invasion of Gobakhan) and "Spells you cast this way
+/// cost {2} less to cast." (Urianger Augurelt). It is applied in the CR 601.2f
+/// total-cost step together with every other increase/reduction, so increases
+/// land before reductions and the mana component never falls below `{0}`.
+///
+/// CR 118.9d: cost increases and reductions apply to a spell's total cost
+/// whether that total is built from the printed mana cost or from an
+/// alternative cost, so the same rider rides on `PlayFromExile`,
+/// `ExileWithAltCost`, and `ExileWithAltAbilityCost` grants alike.
+///
+/// CR 305.1: a land is played as a special action and "is never a spell", so a
+/// `mode: Play` grant's land half is never modified by this — only its
+/// spell-cast half is.
+///
+/// Direction is the existing [`CostModifyMode`] axis, not a second
+/// `cast_cost_reduce` sibling field. The fields are private: the only ways to
+/// build one are [`CastCostModifier::new`], [`CastCostModifier::raise`], and
+/// [`CastCostModifier::reduce`], all of which refuse
+/// [`CostModifyMode::Minimum`], and the hand-written [`Deserialize`] applies
+/// the same refusal so no wire payload can smuggle in a mode the runtime has
+/// no step for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CastCostModifier {
+    mode: CostModifyMode,
+    amount: ManaCost,
+}
+
+impl CastCostModifier {
+    /// CR 601.2f: build a permission-scoped modifier, rejecting
+    /// [`CostModifyMode::Minimum`] (see [`CastCostModifierError`]).
+    pub fn new(mode: CostModifyMode, amount: ManaCost) -> Result<Self, CastCostModifierError> {
+        match mode {
+            CostModifyMode::Raise | CostModifyMode::Reduce => Ok(Self { mode, amount }),
+            CostModifyMode::Minimum => Err(CastCostModifierError::MinimumUnsupported),
+        }
+    }
+
+    /// CR 601.2f: "… costs {N} more to cast."
+    pub fn raise(amount: ManaCost) -> Self {
+        Self {
+            mode: CostModifyMode::Raise,
+            amount,
+        }
+    }
+
+    /// CR 601.2f: "… cost {N} less to cast."
+    pub fn reduce(amount: ManaCost) -> Self {
+        Self {
+            mode: CostModifyMode::Reduce,
+            amount,
+        }
+    }
+
+    /// The direction this modifier moves the total cost in.
+    pub fn mode(&self) -> CostModifyMode {
+        self.mode
+    }
+
+    /// The printed amount the total cost moves by.
+    pub fn amount(&self) -> &ManaCost {
+        &self.amount
+    }
+}
+
+/// Wire shapes accepted for a [`CastCostModifier`].
+///
+/// `Modern` is what is written today. `LegacyRaise` is the bare `ManaCost` the
+/// field held before the direction axis existed, when the only printed form was
+/// an increase — so it loads as [`CostModifyMode::Raise`]. `ManaCost` is
+/// internally tagged (`type`), and the modern form has no `type` key, so the
+/// two shapes are unambiguous.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CastCostModifierRepr {
+    Modern {
+        mode: CostModifyMode,
+        amount: ManaCost,
+    },
+    LegacyRaise(ManaCost),
+}
+
+impl<'de> Deserialize<'de> for CastCostModifier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let (mode, amount) = match CastCostModifierRepr::deserialize(deserializer)? {
+            CastCostModifierRepr::Modern { mode, amount } => (mode, amount),
+            CastCostModifierRepr::LegacyRaise(amount) => (CostModifyMode::Raise, amount),
+        };
+        // CR 601.2f: the same refusal `new` applies, so a deserialized grant can
+        // never carry a mode the runtime has no step for.
+        Self::new(mode, amount).map_err(de::Error::custom)
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum CastingPermission {
-    /// CR 715.5: After Adventure resolves to exile, creature face castable from exile.
+    /// CR 715.3d: After Adventure resolves to exile, creature face castable from exile.
     AdventureCreature,
     /// Card may be cast from exile for the specified cost by its owner.
     /// Building block for Airbending, Suspend, and similar "cast from exile" mechanics.
@@ -4516,6 +4701,14 @@ pub enum CastingPermission {
         /// payment unchanged for every other exile/graveyard alt-cost grant.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mana_spend_permission: Option<ManaSpendPermission>,
+        /// CR 601.2f + CR 118.9d: Optional cost modification for the spell cast
+        /// under this grant — "Spells you cast this way cost {2} less to cast."
+        /// (Urianger Augurelt). CR 118.9d: increases and reductions apply to a
+        /// total cost built from an alternative cost exactly as they do to one
+        /// built from the printed mana cost, so an alternative-cost grant is a
+        /// legitimate carrier. `None` for every grant with no printed rider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cast_cost_modifier: Option<CastCostModifier>,
     },
     /// CR 400.7i: Play from exile until duration expires (impulse draw).
     /// Building block for "exile top N, choose one, you may play it this turn" patterns.
@@ -4593,10 +4786,23 @@ pub enum CastingPermission {
         /// within-window impulse-draw behavior.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         single_use: bool,
-        /// CR 601.2f: Optional mana-cost raise for spells cast via this permission
-        /// ("Each spell cast this way costs {1} more to cast." — Lightstall Inquisitor).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cast_cost_raise: Option<ManaCost>,
+        /// CR 601.2f: Optional mana-cost modification for spells cast via this
+        /// permission ("Each spell cast this way costs {1} more to cast." —
+        /// Lightstall Inquisitor; "Spells you cast this way cost {2} less to
+        /// cast." — Urianger Augurelt). CR 305.1: a land played via this same
+        /// grant is never a spell, so the land half is unaffected.
+        ///
+        /// Serde: the legacy key named in the `alias` below held a bare
+        /// `ManaCost` that was always an increase. The key is accepted by that
+        /// `alias`; the bare payload is accepted by [`CastCostModifier`]'s own
+        /// `Deserialize`. Both spellings name this one field, so carrying both
+        /// is a duplicate-field error rather than a silent last-one-wins.
+        #[serde(
+            default,
+            alias = "cast_cost_raise",
+            skip_serializing_if = "Option::is_none"
+        )]
+        cast_cost_modifier: Option<CastCostModifier>,
         /// CR 118.9 + CR 119.4: Optional non-mana alternative cost that REPLACES
         /// the mana cost for a spell cast via this permission ("If you cast a
         /// spell this way, pay life equal to its mana value rather than pay its
@@ -4685,6 +4891,13 @@ pub enum CastingPermission {
         /// grants serialized before the field existed carry `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_id: Option<ObjectId>,
+        /// CR 601.2f + CR 118.9d: Mirrors `ExileWithAltCost.cast_cost_modifier`
+        /// — the "spells cast this way cost {N} more/less to cast" rider still
+        /// modifies the total cost when the base of that total is a non-mana
+        /// alternative cost (CR 118.9d). `None` for every grant with no printed
+        /// rider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cast_cost_modifier: Option<CastCostModifier>,
     },
     /// CR 702.185a: Warp — card may be cast from exile at its normal mana cost,
     /// but only after the specified turn ends. Persists for as long as card remains exiled.
@@ -4841,6 +5054,49 @@ impl CastingPermission {
             | Self::Foretold { .. } => (None, None),
         }
     }
+
+    /// CR 601.2f: read the cost modification this permission applies to a spell
+    /// cast under it — "Each spell cast this way costs {1} more to cast."
+    /// (Lightstall Inquisitor), "Spells you cast this way cost {2} less to
+    /// cast." (Urianger Augurelt).
+    ///
+    /// This is the single place that knows WHICH variants can carry a
+    /// permission-scoped cost modifier, exactly as [`Self::lifetime`] is for
+    /// stated lifetimes. Cost determination reads a permission through it
+    /// rather than matching one variant and silently pricing the other two at
+    /// their unmodified cost.
+    ///
+    /// The match is wildcard-free, so a new permission variant is a COMPILE
+    /// ERROR here and must state whether it can carry a modifier.
+    ///
+    /// CR 305.1: this answers for a *cast*. A land played under a `mode: Play`
+    /// grant is never a spell, so the land-play path never consults it.
+    pub fn cast_cost_modifier(&self) -> Option<&CastCostModifier> {
+        match self {
+            // CR 118.9d: a cost increase/reduction applies to the total cost
+            // whether it was built from the printed mana cost or from an
+            // alternative one, so all three carrying forms answer alike.
+            Self::PlayFromExile {
+                cast_cost_modifier, ..
+            }
+            | Self::ExileWithAltCost {
+                cast_cost_modifier, ..
+            }
+            | Self::ExileWithAltAbilityCost {
+                cast_cost_modifier, ..
+            } => cast_cost_modifier.as_ref(),
+            // CR 702.170a + CR 702.143a + CR 715.3d: the card-native exile
+            // casting methods carry their own printed cost and no grant-scoped
+            // rider slot — no printed card attaches a "cast this way costs
+            // {N} more/less" rider to Adventure, Energy, Warp, Plot, or
+            // Foretell.
+            Self::AdventureCreature
+            | Self::ExileWithEnergyCost
+            | Self::WarpExile { .. }
+            | Self::Plotted { .. }
+            | Self::Foretold { .. } => None,
+        }
+    }
 }
 
 /// CR 611.2a: Non-time condition that invalidates a per-card play permission.
@@ -4923,6 +5179,55 @@ pub enum CastPermissionConstraint {
     },
 }
 
+/// CR 712.11b-c / CR 709.3-3a: a modal double-faced card or split card elects
+/// a face before it is put onto the stack, and only that face is evaluated for
+/// castability. This immutable, serialized policy is the engine transaction
+/// authority for one such cast made while an effect is resolving. It is not a
+/// standalone game object defined by those rules. A saved interactive state
+/// must either carry the exact route that created it or fail to deserialize.
+///
+/// `filter` is normalized when the policy is constructed.  `source_id` and
+/// `controller` are the real resolution context used to interpret that filter;
+/// `constraint` is the fixed cast-time condition, including the explicit
+/// `None` case for a route with no additional condition.  None of these fields
+/// has a serde default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolutionCastFacePolicy {
+    pub filter: TargetFilter,
+    pub source_id: ObjectId,
+    pub controller: PlayerId,
+    pub constraint: Option<CastPermissionConstraint>,
+}
+
+impl ResolutionCastFacePolicy {
+    pub fn new(
+        filter: TargetFilter,
+        source_id: ObjectId,
+        controller: PlayerId,
+        constraint: Option<CastPermissionConstraint>,
+    ) -> Self {
+        Self {
+            filter: filter.normalized(),
+            source_id,
+            controller,
+            constraint,
+        }
+    }
+}
+
+/// The provenance of one delayed trigger installed after a resolution cast was
+/// offered.  Retaining all three values makes cancellation exact even when the
+/// same source installs several otherwise similar triggers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolutionCastDelayedTriggerReceipt {
+    /// The producer-issued paid offer that owns this receipt. Never inferred
+    /// from its otherwise equivalent-looking trigger fields.
+    pub offer_id: super::identifiers::ResolutionCastOfferId,
+    pub token: super::identifiers::DelayedTriggerToken,
+    pub instance: super::identifiers::DelayedTriggerInstanceId,
+    pub source_id: super::identifiers::ObjectId,
+}
+
 /// CR 608.2g: Rejection-cleanup state carried by a cast-during-resolution
 /// `ExileWithAltCost` permission. Its presence is the engine's marker that the
 /// cast happens *during the resolution* of its source ability (CR 608.2g —
@@ -4939,6 +5244,15 @@ pub struct ResolutionCastCleanup {
     /// post-offer library placement. The during-resolution cast can outlive the
     /// original `CastOffer`, so its cleanup payload is the typed source carrier.
     pub source_id: super::identifiers::ObjectId,
+    /// Set for a paid `GraveyardPaidCast` offer and retained through the
+    /// temporary manual-payment permission. Free cleanup remains ownerless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offer_id: Option<super::identifiers::ResolutionCastOfferId>,
+    /// Exact policy from the window/request that elected this temporary
+    /// permission.  It remains mandatory after the original offer has been
+    /// consumed so cancellation, payment pauses, and cleanup cannot rebuild a
+    /// merely compatible route from current state.
+    pub face_policy: ResolutionCastFacePolicy,
     /// Cards exiled/revealed during the dig that were not the hit.
     /// Empty for Suspend's self-free-cast (no dig). For Ripple (CR 701.20b)
     /// these are still in the controller's library — the "exiled" name is
@@ -4952,6 +5266,10 @@ pub struct ResolutionCastCleanup {
     /// cards from the same reveal first (CR 702.60a).
     #[serde(default)]
     pub success_action: ResolutionCastSuccessAction,
+    /// Delayed tail triggers which are withdrawn if this offer is not cast.
+    /// Legacy saves have no trustworthy receipt and decode to an empty list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delayed_trigger_receipts: Vec<ResolutionCastDelayedTriggerReceipt>,
 }
 
 /// CR 608.2g + CR 609.4b: how a cast-during-resolution pays.
@@ -5036,7 +5354,9 @@ pub enum ResolutionCastSuccessAction {
         remaining_casts: Option<u8>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remaining_mv_budget: Option<u32>,
-        filter: TargetFilter,
+        /// The exact policy from the consumed `FreeCastWindow`.  This is a
+        /// required serialized field; a pre-bridge re-offer must fail closed.
+        face_policy: Box<ResolutionCastFacePolicy>,
         zones: Vec<Zone>,
         #[serde(
             default,
@@ -5045,13 +5365,6 @@ pub enum ResolutionCastSuccessAction {
             deserialize_with = "deserialize_graveyard_replacement_compat"
         )]
         graveyard_replacement: Option<SpellStackToGraveyardReplacement>,
-        /// CR 406.6: Source object of the granting ability, threaded so
-        /// `ExiledBySource`-style filters (Plargg and Nassari) can rebuild the
-        /// re-offer candidate set against the right exile links. Zero sentinel
-        /// for saved states predating the field (graveyard/hand windows never
-        /// read it).
-        #[serde(default = "super::game_state::zero_object_id")]
-        source: super::identifiers::ObjectId,
         /// CR 607.2a + CR 608.2g: THIS resolution's "exiled this way" batch,
         /// threaded from the window that offered the cast so the re-offer's
         /// candidate set stays confined to the current resolution's exile
@@ -5062,6 +5375,104 @@ pub enum ResolutionCastSuccessAction {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         member_pool: Vec<super::identifiers::ObjectId>,
     },
+}
+
+#[cfg(test)]
+mod resolution_cast_face_policy_serde_tests {
+    use super::*;
+    use crate::types::game_state::CastOfferKind;
+
+    fn policy() -> ResolutionCastFacePolicy {
+        ResolutionCastFacePolicy::new(
+            TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant)),
+            ObjectId(701),
+            PlayerId(1),
+            Some(CastPermissionConstraint::ManaValue {
+                comparator: Comparator::LE,
+                value: QuantityExpr::Fixed { value: 4 },
+            }),
+        )
+    }
+
+    fn window(policy: ResolutionCastFacePolicy) -> CastOfferKind {
+        CastOfferKind::FreeCastWindow {
+            candidates: vec![ObjectId(702)],
+            remaining_casts: Some(2),
+            remaining_mv_budget: Some(7),
+            face_policy: policy,
+            zones: vec![Zone::Exile],
+            graveyard_replacement: None,
+            member_pool: vec![ObjectId(702)],
+        }
+    }
+
+    #[test]
+    fn resolution_cast_face_policy_round_trips_exactly_through_every_window_carrier() {
+        let policy = policy();
+        let cleanup = ResolutionCastCleanup {
+            source_id: ObjectId(701),
+            offer_id: None,
+            face_policy: policy.clone(),
+            exiled_misses: Vec::new(),
+            reject_action: ResolutionMvRejectAction::RemainExiled,
+            success_action: ResolutionCastSuccessAction::FreeCastOfferRemaining {
+                controller: PlayerId(1),
+                remaining_casts: Some(2),
+                remaining_mv_budget: Some(7),
+                face_policy: Box::new(policy.clone()),
+                zones: vec![Zone::Exile],
+                graveyard_replacement: None,
+                member_pool: vec![ObjectId(702)],
+            },
+            delayed_trigger_receipts: Vec::new(),
+        };
+        let round_tripped_policy: ResolutionCastFacePolicy =
+            serde_json::from_value(serde_json::to_value(&policy).unwrap()).unwrap();
+        let round_tripped_window: CastOfferKind =
+            serde_json::from_value(serde_json::to_value(window(policy.clone())).unwrap()).unwrap();
+        let round_tripped_cleanup: ResolutionCastCleanup =
+            serde_json::from_value(serde_json::to_value(&cleanup).unwrap()).unwrap();
+
+        assert_eq!(round_tripped_policy, policy);
+        assert_eq!(round_tripped_window, window(policy.clone()));
+        assert_eq!(round_tripped_cleanup, cleanup);
+        let ResolutionCastSuccessAction::FreeCastOfferRemaining { face_policy, .. } =
+            round_tripped_cleanup.success_action
+        else {
+            panic!("fixture must carry the re-offer chain");
+        };
+        assert_eq!(*face_policy, policy);
+    }
+
+    #[test]
+    fn missing_or_malformed_window_face_policy_fails_closed() {
+        let mut old_shape = serde_json::to_value(window(policy())).unwrap();
+        old_shape
+            .as_object_mut()
+            .expect("enum serializes as object")
+            .remove("face_policy");
+        assert!(serde_json::from_value::<CastOfferKind>(old_shape).is_err());
+
+        let mut malformed = serde_json::to_value(window(policy())).unwrap();
+        malformed["face_policy"] = serde_json::json!({"filter": "not-a-filter"});
+        assert!(serde_json::from_value::<CastOfferKind>(malformed).is_err());
+
+        let mut cleanup = serde_json::to_value(ResolutionCastCleanup {
+            source_id: ObjectId(701),
+            offer_id: None,
+            face_policy: policy(),
+            exiled_misses: Vec::new(),
+            reject_action: ResolutionMvRejectAction::RemainExiled,
+            success_action: ResolutionCastSuccessAction::BottomMisses,
+            delayed_trigger_receipts: Vec::new(),
+        })
+        .unwrap();
+        cleanup
+            .as_object_mut()
+            .expect("struct serializes as object")
+            .remove("face_policy");
+        assert!(serde_json::from_value::<ResolutionCastCleanup>(cleanup).is_err());
+    }
 }
 
 /// CR 603.7b: lifetime of a one-shot `WhenNextEvent` delayed trigger. CR 603.7b
@@ -6060,8 +6471,12 @@ pub enum FilterProp {
     /// count predicates like Valakut, the Molten Pinnacle's "if you control at
     /// least five other Mountains" — here "other" means "other than the newly-
     /// entered Mountain," not "other than Valakut." Resolves against
-    /// `FilterContext::triggering_object_id`, populated at trigger-condition
+    /// `FilterContext::triggering_object`, populated at trigger-condition
     /// evaluation from the current `GameEvent`.
+    ///
+    /// CR 400.7: the exclusion is keyed on the triggering object's exact IDENTITY
+    /// (id + incarnation), not on its storage id — an object that left and
+    /// returned is a new object and belongs back in the population.
     OtherThanTriggerObject,
     /// Matches objects with a specific color (for "white creature", "red spell", etc.).
     HasColor {
@@ -7116,14 +7531,29 @@ pub enum TargetFilter {
     /// the newly created token, or an existing Army — never re-derived by
     /// rescanning the battlefield for "an Army you control".
     AmassedArmy,
-    /// CR 613.1f + CR 611.2c + CR 400.7: Resolves to the single card most recently
-    /// recorded on the FILTER's source object via `ChosenAttribute::Card` (written
-    /// by `Effect::RememberCard`). Models "the last chosen card" — Koh, the Face
-    /// Stealer's Layer-6 grant source. Live, not snapshotted: re-evaluated each
-    /// layer pass, so re-choosing replaces the grant and the chosen card leaving
-    /// its zone (CR 400.7 — a new object) drops the grant. The object matcher
-    /// reads `chosen_attributes` from the source (not the resolving ability), so
-    /// the static grant resolves it against the permanent that HAS the static.
+    /// CR 607.2d + CR 608.2c + CR 613.1f: The zone-agnostic remembered-object
+    /// reader — matches the object most recently recorded on the FILTER's source
+    /// object via `ChosenAttribute::Card` (written by `Effect::RememberCard`).
+    /// Models "the chosen ‹object›" links of the object axis, including "the last
+    /// chosen card" (Koh, the Face Stealer's Layer-6 grant source).
+    ///
+    /// Identity only: the reader compares the candidate occurrence against the
+    /// source's stored [`ChosenAttribute::Card`] pin on BOTH object paths — the
+    /// live matcher (`filter_inner_for_object`, CR 607.2d) and the
+    /// leaves-the-battlefield look-back path (`zone_change_filter_inner`,
+    /// CR 603.10a). CR 400.7: the pin carries the remembered object's
+    /// incarnation, so an object that left and returned at the same storage id
+    /// is a new object and does not re-match (a legacy bare-id pin deserializes
+    /// to `LEGACY_INCARNATION` and matches nothing). A reader whose linked
+    /// ability requires a zone (e.g. Koh's CR 607.2a "exiled with" pin) composes
+    /// `FilterProp::InZone` at its emission site instead of hardcoding a zone
+    /// here; that is what lets one reader serve both a live Layer-6 grant and a
+    /// departure trigger.
+    ///
+    /// Live, not snapshotted: re-evaluated each layer pass, so re-choosing
+    /// replaces the grant. The object matcher reads `chosen_attributes` from the
+    /// source (not the resolving ability), so a static grant resolves it against
+    /// the permanent that HAS the static.
     ChosenCard,
     /// Matches exactly the objects in a tracked set.
     /// CR 603.7: Delayed triggers act on specific objects from the originating effect.
@@ -9494,6 +9924,108 @@ impl CostPaidObjectSnapshot {
     /// read `self.lki` and never call this.
     pub fn live_object_id(&self, state: &crate::types::game_state::GameState) -> Option<ObjectId> {
         self.is_current(state).then_some(self.object_id)
+    }
+}
+
+/// CR 400.7 + CR 601.2h + CR 602.2b: One entry of
+/// [`ResolvedAbility::cost_paid_objects`] — the record of a single object this
+/// ability's own cost consumed.
+///
+/// Two variants because the record carries two DIFFERENT amounts of authority
+/// depending on when it was written, and the engine must never pretend the
+/// weaker one is the stronger:
+///
+/// * [`Self::Snapshot`] — written by a live payment seam
+///   ([`CostPaidObjectSnapshot::capture`]). Carries storage identity, the
+///   pre-move characteristics (CR 608.2h) and the incarnation epoch (CR 400.7),
+///   so it is valid both as a membership record and as a live-object referent.
+/// * [`Self::LegacyMembership`] — a historical save whose wire form was a bare
+///   `ObjectId` (`cost_paid_object_ids`), written before this collection
+///   recorded anything but storage identity. It proves only "this ability's cost
+///   consumed the object that was at this id"; it CANNOT prove which
+///   incarnation, and no `lki` or epoch is invented for it.
+///
+/// The variant split is what lets the two consumers of the collection diverge
+/// correctly on a restored historical game:
+///
+/// * `exclude_cost_paid_object_that_left_battlefield` (`game/ability_utils.rs`)
+///   needs storage identity ONLY, so it reads [`Self::object_id`] from both
+///   variants and a migrated save keeps its full pre-migration exclusion.
+/// * `ZoneChoiceCandidateSource::CostPaidObjects`
+///   (`game/effects/choose_from_zone.rs`) resolves the record to a LIVE object,
+///   so it matches [`Self::Snapshot`] alone: a legacy record has no incarnation
+///   authority and must fail closed rather than name a possibly-new object at a
+///   reused id.
+///
+/// Production code has exactly one construction seam — `From<CostPaidObjectSnapshot>`
+/// via [`ResolvedAbility::add_cost_paid_objects_recursive`] — so
+/// [`Self::LegacyMembership`] can only ever come off the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Untagged so the two historical wire forms of one array both decode, and so a
+// `Snapshot` keeps serializing in exactly its current shape. The forms are
+// structurally disjoint and cannot be confused: `ObjectId` is
+// `#[serde(transparent)]` over `u64`, so a legacy element is a bare JSON number
+// and can never deserialize as `CostPaidObjectSnapshot` (a map whose `lki` has
+// no default), while a snapshot element is a map and can never deserialize as a
+// bare id.
+#[serde(untagged)]
+// clippy::large_enum_variant: `Snapshot` is ~392 bytes (it carries an
+// `LKISnapshot`) against `LegacyMembership`'s 8. Boxing the large arm is the
+// wrong trade here: `Snapshot` is the ONLY variant production ever constructs
+// (`From<CostPaidObjectSnapshot>` is the single seam), so boxing would add a
+// heap allocation to every cost payment in live play purely to shrink a variant
+// that can only arrive by deserializing a pre-migration save. The collection is
+// also short — one entry per object a single ability's cost consumed.
+#[allow(clippy::large_enum_variant)]
+pub enum CostPaidObjectRecord {
+    /// Current schema: captured at payment time with full CR 400.7 identity.
+    Snapshot(CostPaidObjectSnapshot),
+    /// CR 400.7: a pre-migration record that carried ONLY storage identity.
+    /// Membership-only — valid for target exclusion, NEVER an
+    /// incarnation-authoritative referent, because no epoch was ever recorded.
+    LegacyMembership(ObjectId),
+}
+
+impl CostPaidObjectRecord {
+    /// Storage identity of the recorded payment. Valid for MEMBERSHIP tests
+    /// ("did this ability's own cost consume the object at this id?") on both
+    /// variants; never sufficient on its own to name a live object, because the
+    /// engine reuses `ObjectId` across zone changes (CR 400.7).
+    pub fn object_id(&self) -> ObjectId {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.object_id,
+            Self::LegacyMembership(object_id) => *object_id,
+        }
+    }
+
+    /// CR 400.7: The full payment snapshot, or `None` for a legacy
+    /// membership-only record. Consumers that resolve the record to a LIVE
+    /// object go through here and then through
+    /// [`CostPaidObjectSnapshot::is_current`], so a record with no recorded
+    /// incarnation fails closed instead of naming a new object at a reused id.
+    pub fn snapshot(&self) -> Option<&CostPaidObjectSnapshot> {
+        match self {
+            Self::Snapshot(snapshot) => Some(snapshot),
+            Self::LegacyMembership(_) => None,
+        }
+    }
+
+    /// CR 400.7 + CR 400.7j: Re-pin a captured snapshot past the cost's OWN
+    /// object moves (see [`CostPaidObjectSnapshot::repin_to_current_incarnation`]).
+    /// A legacy membership record is deliberately left alone: re-pinning it
+    /// would INVENT the incarnation authority it never had and promote it to a
+    /// live referent.
+    fn repin_to_current_incarnation(&mut self, state: &crate::types::game_state::GameState) {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.repin_to_current_incarnation(state),
+            Self::LegacyMembership(_) => {}
+        }
+    }
+}
+
+impl From<CostPaidObjectSnapshot> for CostPaidObjectRecord {
+    fn from(snapshot: CostPaidObjectSnapshot) -> Self {
+        Self::Snapshot(snapshot)
     }
 }
 
@@ -12683,6 +13215,77 @@ impl AbilityCost {
             | AbilityCost::GetPlayerCounters { .. }
             | AbilityCost::Unimplemented { .. } => {}
         }
+    }
+
+    /// Visit every node of this cost tree in pre-order, recursing the container
+    /// arms (`Composite`, `OneOf`, `PerCounter`). The exhaustive match keeps
+    /// the traversal shape in lockstep with the enum — a new container variant
+    /// is a compile error here rather than a silently missed subtree — so every
+    /// cost-tree consumer (containment, coverage's parsed-item and gap
+    /// collectors) traverses the same complete shape.
+    pub(crate) fn for_each_cost_node<'a>(&'a self, visit: &mut impl FnMut(&'a AbilityCost)) {
+        visit(self);
+        match self {
+            AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => {
+                for cost in costs {
+                    cost.for_each_cost_node(visit);
+                }
+            }
+            AbilityCost::PerCounter { base, .. } => base.for_each_cost_node(visit),
+            AbilityCost::Mana { .. }
+            | AbilityCost::ManaDynamic { .. }
+            | AbilityCost::Tap
+            | AbilityCost::Untap
+            | AbilityCost::Loyalty { .. }
+            | AbilityCost::Sacrifice(_)
+            | AbilityCost::PayLife { .. }
+            | AbilityCost::Discard { .. }
+            | AbilityCost::Exile { .. }
+            | AbilityCost::ExileMaterials { .. }
+            | AbilityCost::CollectEvidence { .. }
+            | AbilityCost::ExileWithAggregate { .. }
+            | AbilityCost::TapCreatures { .. }
+            | AbilityCost::RemoveCounter { .. }
+            | AbilityCost::PayEnergy { .. }
+            | AbilityCost::PaySpeed { .. }
+            | AbilityCost::ReturnToHand { .. }
+            | AbilityCost::Unattach
+            | AbilityCost::UnattachFrom { .. }
+            | AbilityCost::Mill { .. }
+            | AbilityCost::Exert
+            | AbilityCost::Blight { .. }
+            | AbilityCost::Reveal { .. }
+            | AbilityCost::Behold { .. }
+            | AbilityCost::Waterbend { .. }
+            | AbilityCost::NinjutsuFamily { .. }
+            | AbilityCost::EffectCost { .. }
+            | AbilityCost::KeywordCostOfCastSpell { .. }
+            | AbilityCost::GetPlayerCounters { .. }
+            | AbilityCost::Unimplemented { .. } => {}
+        }
+    }
+
+    /// True when this cost tree contains an [`AbilityCost::Unimplemented`] leaf
+    /// or an [`AbilityCost::EffectCost`] whose embedded payment effect is itself
+    /// [`Effect::Unimplemented`] — either means the cost cannot be paid.
+    ///
+    /// Traversal delegates to [`AbilityCost::for_each_cost_node`], the single
+    /// cost-tree shape authority, so this predicate and coverage's parsed-item
+    /// and gap collectors cannot disagree about which subtrees exist.
+    ///
+    /// Mirrors `StaticCondition::contains_unrecognized`.
+    pub(crate) fn contains_unimplemented(&self) -> bool {
+        let mut found = false;
+        self.for_each_cost_node(&mut |node| {
+            found |= match node {
+                AbilityCost::Unimplemented { .. } => true,
+                AbilityCost::EffectCost { effect } => {
+                    matches!(effect.as_ref(), Effect::Unimplemented { .. })
+                }
+                _ => false,
+            };
+        });
+        found
     }
 
     /// CR 601.2h + CR 602.2b: a disjunctive cost leg is resolved to the chosen
@@ -17027,6 +17630,25 @@ pub enum Effect {
         /// driver is not `DuringResolution`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         additional_cost: Option<crate::types::mana::ManaCost>,
+        /// CR 601.2f + CR 608.2c: the "Spells you cast this way cost {N} less to
+        /// cast." / "… costs {N} more to cast." rider printed after this grant
+        /// (Urianger Augurelt's Play Arcanum). "This way" binds the rider to
+        /// THIS instruction (CR 608.2c), so it is carried here and stamped by
+        /// `cast_from_zone::record_lingering_permissions` onto each cast
+        /// permission the grant creates — never onto the CR 305.1 land-play
+        /// companion, which authorizes a land play and not a spell cast.
+        ///
+        /// Only ever `Some` when `driver` is
+        /// `CastFromZoneDriver::LingeringPermission`: that is the sole route
+        /// reaching `record_lingering_permissions`. The `DuringResolution` and
+        /// `ResolutionWindow` routes cast through
+        /// `initiate_cast_during_resolution` / `open_resolution_cast_window`,
+        /// which carry no cost-modifier slot, so the parser refuses to attach
+        /// the rider to them (`attach_cast_cost_modifier_to_prior_cast_from_zone`)
+        /// rather than drop it silently — the same discipline
+        /// `additional_cost` applies in the opposite direction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cast_cost_modifier: Option<CastCostModifier>,
     },
     /// CR 608.2g + CR 601.2 + CR 118.9: Open an interactive "free-cast window"
     /// during this spell/ability's resolution: the controller may cast up to
@@ -17504,16 +18126,23 @@ pub enum Effect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         constraint: Option<ChooseFromZoneConstraint>,
     },
-    /// CR 608.2c + CR 613.1f: Record the card selected by a preceding selection
+    /// CR 608.2c + CR 607.2d: Record the card selected by a preceding selection
     /// effect (typically `ChooseFromZone`) onto the resolving ability's SOURCE as
     /// `ChosenAttribute::Card`, so a companion Layer-6 static ("[this] has all
     /// activated and triggered abilities of the last chosen card" — Koh, the Face
-    /// Stealer) can read it via `TargetFilter::ChosenCard`. Composable building
-    /// block: the choice UI/zone search stays in `ChooseFromZone`; this effect is
-    /// the persistent writer. `target` reads the chosen object(s) — Koh passes
+    /// Stealer) can read it via `TargetFilter::ChosenCard`, and so a companion
+    /// leaves-the-battlefield trigger can re-identify the same object through the
+    /// CR 603.10a look-back path. Composable building block: the choice UI/zone
+    /// search stays in `ChooseFromZone`; this effect is the persistent writer.
+    /// `target` reads the chosen object(s) — Koh passes
     /// `TrackedSet { id: TrackedSetId(0) }` (the resolution chain's published
     /// pick, resolved via `resolve_tracked_set_sentinel`); the single recorded
     /// card replaces any prior `ChosenAttribute::Card` (replace-on-rechoose).
+    /// CR 400.7: the stored value is the chosen object's
+    /// `ObjectIncarnationRef` pin (id + incarnation at choice time), so an
+    /// object that left and returned at the same storage id is a new object and
+    /// no longer matches; a reader that needs the object in a specific zone
+    /// composes `FilterProp::InZone` at its emission site.
     RememberCard {
         target: TargetFilter,
     },
@@ -17601,6 +18230,14 @@ pub enum Effect {
         /// total-power modes on the wire.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         keeper_constraint: Option<KeeperConstraint>,
+        /// CR 608.2c + CR 122.1: when `Some`, each keeper receives this mark BEFORE the
+        /// unchosen permanents are sacrificed — the printed order. CR 614.1: replacement
+        /// effects "apply continuously as events happen", so a would-be multiplier that
+        /// is itself about to be sacrificed must still be on the battlefield when the
+        /// mark is placed. Only valid together with `KeeperConstraint::ExactCount`;
+        /// `choose_and_sacrifice_rest::resolve` refuses any other mode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keeper_counter: Option<KeeperCounterMark>,
     },
     /// CR 101.4 + CR 707.2 + CR 122.1: Each player, in APNAP order, chooses an
     /// ordered `min..=max` selection of objects they control matching
@@ -21261,8 +21898,8 @@ impl Effect {
     /// (`ChangeZoneAll`/`PutAtLibraryPosition`/`Conjure`/`Counter`'s
     /// countered-spell destination), `UntilCondition::CumulativeThreshold`
     /// (`ExileFromTopUntil`), `GuessSubject::Proposition` (`OpponentGuess`),
-    /// `KeeperConstraint::ExactCount` (`ChooseAndSacrificeRest`), and each
-    /// `ConjureCard::count`.
+    /// `KeeperConstraint::ExactCount` and `KeeperCounterMark::count`
+    /// (`ChooseAndSacrificeRest`), and each `ConjureCard::count`.
     ///
     /// Deliberately NOT walked: quantities inside deferred definition
     /// payloads (`AbilityDefinition` — including `RollDie::results` branch
@@ -21617,6 +22254,7 @@ impl Effect {
             Effect::ChooseAndSacrificeRest {
                 total_power_cap,
                 keeper_constraint,
+                keeper_counter,
                 ..
             } => {
                 if let Some(q) = total_power_cap {
@@ -21628,6 +22266,10 @@ impl Effect {
                     match constraint {
                         KeeperConstraint::ExactCount { count } => f(count),
                     }
+                }
+                // CR 608.2c + CR 122.1: the printed keeper mark's count.
+                if let Some(mark) = keeper_counter {
+                    f(&mark.count);
                 }
             }
             Effect::GainEnergy { amount, .. } => {
@@ -28156,6 +28798,9 @@ pub struct BoardWideCostModifier<'a> {
     /// (CR 601.2f "as long as" / "during your turn" clauses). `None` is
     /// unconditional.
     pub condition: Option<&'a StaticCondition>,
+    /// CR 118.7b/c/d: whether an unmatched colored/colorless reduction unit
+    /// spills into generic mana. Only meaningful when `mode` is `Reduce`.
+    pub reach: crate::types::statics::CostReductionReach,
 }
 
 impl StaticDefinition {
@@ -28170,6 +28815,7 @@ impl StaticDefinition {
             amount,
             spell_filter,
             dynamic_count,
+            reach,
         } = &self.mode
         else {
             return None;
@@ -28187,6 +28833,7 @@ impl StaticDefinition {
             dynamic_count: dynamic_count.as_ref(),
             caster_scope: cost_modifier_caster_scope(self.affected.as_ref()),
             condition: self.condition.as_ref(),
+            reach: *reach,
         })
     }
 
@@ -30607,7 +31254,7 @@ pub struct ResolvedAbility {
     /// with no memory of this activation's payment).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub noted_mana_payment: Option<NotedManaPayment>,
-    /// CR 601.2h + CR 602.2b (issue #4948): EVERY object paid as
+    /// CR 601.2h + CR 602.2b + CR 400.7 (issue #4948): EVERY object paid as
     /// part of this resolving ability's own cost — unlike `cost_paid_object`
     /// above, not just the first. This engine pays non-self
     /// Sacrifice/Discard/Exile costs BEFORE choosing this SAME ability's own
@@ -30615,13 +31262,46 @@ pub struct ResolvedAbility {
     /// see issue #1301's `exclude_cost_paid_object_that_left_battlefield`),
     /// so any object that already left its zone to pay that cost was never
     /// actually a legal target under the real target-before-cost order — no
-    /// matter how many objects the cost consumed. Read only by
-    /// `exclude_cost_paid_object_that_left_battlefield`
-    /// (`game/ability_utils.rs`) to strip those ids from this ability's own
-    /// candidate lists; never a resolution-time referent (use
-    /// `cost_paid_object` for that).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cost_paid_object_ids: Vec<ObjectId>,
+    /// matter how many objects the cost consumed.
+    ///
+    /// Stored as [`CostPaidObjectRecord`]s rather than bare [`ObjectId`]s
+    /// because this collection serves BOTH consumers of the payment record and
+    /// one of them is identity-sensitive:
+    ///
+    /// * `exclude_cost_paid_object_that_left_battlefield`
+    ///   (`game/ability_utils.rs`) reads STORAGE identity only — an object
+    ///   that left the battlefield to pay this cost was never a legal target
+    ///   regardless of which incarnation now sits at that id — so it reads
+    ///   [`CostPaidObjectRecord::object_id`] from every variant.
+    /// * `ZoneChoiceCandidateSource::CostPaidObjects`
+    ///   (`game/effects/choose_from_zone.rs`) reads the LIVE object, so it
+    ///   takes [`CostPaidObjectRecord::snapshot`] and gates on
+    ///   [`CostPaidObjectSnapshot::is_current`]: CR 400.7 makes a
+    ///   cost-exiled card that left exile and came back a NEW object this
+    ///   reference must no longer name, and the engine reuses `ObjectId`
+    ///   across zone changes so the id alone cannot tell the two apart.
+    ///
+    /// ONE correctly-typed field rather than a second parallel `Vec<ObjectId>`
+    /// — two collections recording the same fact would be two sources of truth
+    /// that drift. The incarnation pins are kept honest across the cost's OWN
+    /// moves by `repin_cost_paid_object_recursive` (CR 400.7j), so only a
+    /// LATER zone change reads as stale.
+    ///
+    /// WIRE KEY: `cost_paid_object_ids`, the historical name, deliberately
+    /// kept. Every save ever written used it, and an element of that array was
+    /// a bare id; those elements decode as
+    /// [`CostPaidObjectRecord::LegacyMembership`], which preserves the
+    /// membership fact this filter needs WITHOUT inventing characteristics or
+    /// an incarnation epoch the record never carried. Dropping them instead
+    /// (the field simply defaulting empty) would silently un-exclude every
+    /// object a historical multi-object cost paid but one, because the singular
+    /// `cost_paid_object` fallback can name at most one.
+    #[serde(
+        default,
+        rename = "cost_paid_object_ids",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub cost_paid_objects: Vec<CostPaidObjectRecord>,
     /// Public characteristics of an object chosen or moved by an earlier
     /// effect in the same resolving ability. This is distinct from
     /// `cost_paid_object`: the object was not paid as a cost, but later
@@ -30803,7 +31483,7 @@ impl ResolvedAbility {
             chosen_x: None,
             cost_paid_object: None,
             noted_mana_payment: None,
-            cost_paid_object_ids: Vec::new(),
+            cost_paid_objects: Vec::new(),
             effect_context_object: None,
             amassed_army_object: None,
             ability_index: None,
@@ -31610,8 +32290,10 @@ impl ResolvedAbility {
     }
 
     /// CR 400.7 + CR 608.2k: Re-pin this ability's (and every sub/else branch's)
-    /// cost-paid referent to its current incarnation, once the cost's own object
-    /// moves are complete. Mirrors `set_cost_paid_object_recursive`'s traversal.
+    /// cost-paid referents to their current incarnation, once the cost's own
+    /// object moves are complete. Covers BOTH the singular `cost_paid_object`
+    /// referent and every entry of the plural `cost_paid_objects` collection.
+    /// Mirrors `set_cost_paid_object_recursive`'s traversal.
     ///
     /// See `CostPaidObjectSnapshot::repin_to_current_incarnation`: the cost's own
     /// move must not make the reference stale, only a later one.
@@ -31621,6 +32303,9 @@ impl ResolvedAbility {
     ) {
         if let Some(snapshot) = self.cost_paid_object.as_mut() {
             snapshot.repin_to_current_incarnation(state);
+        }
+        for record in self.cost_paid_objects.iter_mut() {
+            record.repin_to_current_incarnation(state);
         }
         if let Some(sub) = self.sub_ability.as_mut() {
             sub.repin_cost_paid_object_recursive(state);
@@ -31668,23 +32353,35 @@ impl ResolvedAbility {
         }
     }
 
-    /// CR 601.2h + CR 602.2b (issue #4948): Record EVERY object
+    /// CR 601.2h + CR 602.2b + CR 400.7 (issue #4948): Record EVERY object
     /// paid as part of this ability's own cost (mirrors
     /// `set_cost_paid_object_recursive`'s recursion into `sub_ability` /
-    /// `else_ability`, but accumulates every id instead of overwriting a
-    /// single referent). Call this alongside — not instead of —
+    /// `else_ability`, but accumulates every referent instead of overwriting a
+    /// single one). Call this alongside — not instead of —
     /// `set_cost_paid_object_recursive` at every non-self
     /// Sacrifice/Discard/Exile cost-payment site; the singular field keeps
-    /// its own resolution-time referent semantics and this one only feeds
+    /// its own referent-wording semantics while this collection feeds both
     /// `exclude_cost_paid_object_that_left_battlefield`'s target-candidate
-    /// filter.
-    pub fn add_cost_paid_object_ids_recursive(&mut self, ids: &[ObjectId]) {
-        self.cost_paid_object_ids.extend_from_slice(ids);
+    /// filter and `ZoneChoiceCandidateSource::CostPaidObjects`'s candidate
+    /// pool.
+    ///
+    /// Snapshots must be captured BEFORE the cost moves the objects (CR
+    /// 608.2h: the `lki` records their pre-move characteristics); the
+    /// subsequent `repin_cost_paid_object_recursive` fixes the incarnation
+    /// epoch so the cost's own move does not read as stale (CR 400.7j).
+    ///
+    /// Takes `CostPaidObjectSnapshot`s, not [`CostPaidObjectRecord`]s: this is
+    /// the only production seam that appends to the collection, so every record
+    /// the engine itself writes is a full snapshot and
+    /// [`CostPaidObjectRecord::LegacyMembership`] can only arrive off the wire.
+    pub fn add_cost_paid_objects_recursive(&mut self, snapshots: &[CostPaidObjectSnapshot]) {
+        self.cost_paid_objects
+            .extend(snapshots.iter().cloned().map(CostPaidObjectRecord::from));
         if let Some(sub) = self.sub_ability.as_mut() {
-            sub.add_cost_paid_object_ids_recursive(ids);
+            sub.add_cost_paid_objects_recursive(snapshots);
         }
         if let Some(else_branch) = self.else_ability.as_mut() {
-            else_branch.add_cost_paid_object_ids_recursive(ids);
+            else_branch.add_cost_paid_objects_recursive(snapshots);
         }
     }
 
@@ -31782,6 +32479,47 @@ impl ResolvedAbility {
         }
         if let Some(else_branch) = self.else_ability.as_mut() {
             else_branch.set_replacement_applied_recursive(applied);
+        }
+    }
+
+    /// CR 608.2c: A parsed ability chain is ONE printed ability — every link is
+    /// a later instruction of the same text, not an ability of its own. The
+    /// parser records the printed text only on the chain head, so any prompt a
+    /// chained link opens has nothing to show the player.
+    ///
+    /// That is not cosmetic. A `WaitingFor::OptionalEffectChoice` raised by a
+    /// chained link ("If you do, you may cast the copy without paying its mana
+    /// cost" — Isochron Scepter) rendered as a bare Yes/No with no question, so
+    /// declining it looked identical to dismissing a stray dialog. The player
+    /// had already paid the activation cost, and the decline silently discarded
+    /// the copy. 152 optional chain links in the 4k-card test fixture alone open
+    /// a prompt this way.
+    ///
+    /// Fill every link that carries no text of its own with the head's printed
+    /// text. A link that DOES carry its own text — a modal branch label such as
+    /// "tap" / "untap" — keeps it, while the head's text still reaches that
+    /// link's own children: one value propagated down the chain, mirroring
+    /// [`Self::set_scoped_player_recursive`]. Idempotent, so a chain built once
+    /// and re-backfilled after a later head assignment is unchanged.
+    pub fn backfill_chain_description(&mut self) {
+        let Some(description) = self.description.clone() else {
+            return;
+        };
+        self.fill_missing_link_descriptions(&description);
+    }
+
+    /// Recursive half of [`Self::backfill_chain_description`], kept separate so
+    /// the public entry always sources the text from the chain head rather than
+    /// from whichever link the recursion currently sits on.
+    fn fill_missing_link_descriptions(&mut self, description: &str) {
+        for link in [self.sub_ability.as_mut(), self.else_ability.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            if link.description.is_none() {
+                link.description = Some(description.to_string());
+            }
+            link.fill_missing_link_descriptions(description);
         }
     }
 
@@ -33110,6 +33848,54 @@ mod tests {
         let mut visited = Vec::new();
         effect.for_each_quantity_expr(&mut |quantity| visited.push(quantity.clone()));
         assert_eq!(visited, vec![count, rhs]);
+    }
+
+    /// V-QE: `ChooseAndSacrificeRest`'s TWO secondary quantity slots —
+    /// `keeper_constraint`'s `ExactCount { count }` and `keeper_counter`'s
+    /// `KeeperCounterMark::count` — are both visited, and in that order. No
+    /// pre-existing completeness test enumerated the CSR arm's slots (grepped
+    /// this module for a `for_each_quantity_expr` walk keyed to
+    /// `ChooseAndSacrificeRest`: none existed before this row), so this is a
+    /// direct row rather than an extension of one.
+    #[test]
+    fn keeper_counter_quantity_visitor_includes_the_mark() {
+        let keeper_count = QuantityExpr::Fixed { value: 1 };
+        let mark_count = QuantityExpr::Fixed { value: 2 };
+        let effect = Effect::ChooseAndSacrificeRest {
+            categories: Vec::new(),
+            chooser_scope: CategoryChooserScope::EachPlayerSelf,
+            choose_filter: TargetFilter::Typed(TypedFilter::creature()),
+            sacrifice_filter: TargetFilter::Typed(TypedFilter::creature()),
+            total_power_cap: None,
+            keeper_constraint: Some(KeeperConstraint::ExactCount {
+                count: keeper_count.clone(),
+            }),
+            keeper_counter: Some(KeeperCounterMark {
+                counter_type: crate::types::counter::CounterType::Generic("vow".to_string()),
+                count: mark_count.clone(),
+            }),
+        };
+        let mut visited = Vec::new();
+        effect.for_each_quantity_expr(&mut |quantity| visited.push(quantity.clone()));
+        assert_eq!(visited, vec![keeper_count, mark_count]);
+
+        // A `keeper_counter: None` construction yields only the `ExactCount` expr.
+        let Effect::ChooseAndSacrificeRest {
+            keeper_counter: mark_slot,
+            ..
+        } = &effect
+        else {
+            unreachable!()
+        };
+        assert!(mark_slot.is_some());
+        let mut none_effect = effect.clone();
+        let Effect::ChooseAndSacrificeRest { keeper_counter, .. } = &mut none_effect else {
+            unreachable!()
+        };
+        *keeper_counter = None;
+        let mut visited_none = Vec::new();
+        none_effect.for_each_quantity_expr(&mut |quantity| visited_none.push(quantity.clone()));
+        assert_eq!(visited_none, vec![QuantityExpr::Fixed { value: 1 }]);
     }
 
     /// CR 109.1: `with_own_cast_exclusion` injects the `Another` marker and
@@ -35265,6 +36051,7 @@ mod tests {
             enters_with_counter: None,
             enters_with_modifications: Vec::new(),
             mana_spend_permission: None,
+            cast_cost_modifier: None,
         };
         let json = serde_json::to_string(&with_host).unwrap();
         assert!(
@@ -35323,6 +36110,7 @@ mod tests {
             granted_to: Some(PlayerId(0)),
             duration: Some(Duration::WhileControllingHost),
             source_id: Some(ObjectId(11)),
+            cast_cost_modifier: None,
         };
         let json = serde_json::to_string(&with_lifetime).unwrap();
         assert!(
@@ -35562,6 +36350,7 @@ mod tests {
             enters_with_counter: None,
             enters_with_modifications: Vec::new(),
             mana_spend_permission: None,
+            cast_cost_modifier: None,
         };
         let mut v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&modern).unwrap()).unwrap();
@@ -36586,6 +37375,66 @@ mod tests {
                 ],
             })
         );
+    }
+
+    /// `AbilityCost::contains_unimplemented` is the single containment
+    /// authority: it recurses `Composite`/`OneOf`/`PerCounter`, answers `true`
+    /// for a bare `Unimplemented`, and classifies an `EffectCost` by its
+    /// embedded payment effect.
+    #[test]
+    fn contains_unimplemented_recurses_composition_and_classifies_effect_cost() {
+        assert!(AbilityCost::Unimplemented {
+            description: "frobnicate".to_string(),
+        }
+        .contains_unimplemented());
+        assert!(AbilityCost::Composite {
+            costs: vec![
+                pay_life_cost(2),
+                AbilityCost::Unimplemented {
+                    description: "sacrifice a thing".to_string(),
+                },
+            ],
+        }
+        .contains_unimplemented());
+        assert!(AbilityCost::OneOf {
+            costs: vec![
+                generic_mana_cost(2),
+                AbilityCost::Composite {
+                    costs: vec![AbilityCost::Unimplemented {
+                        description: "frobnicate".to_string(),
+                    }],
+                },
+            ],
+        }
+        .contains_unimplemented());
+        assert!(AbilityCost::PerCounter {
+            counter: CounterType::Age,
+            target: TargetFilter::SelfRef,
+            base: Box::new(AbilityCost::Unimplemented {
+                description: "frobnicate".to_string(),
+            }),
+        }
+        .contains_unimplemented());
+        assert!(!AbilityCost::Composite {
+            costs: vec![pay_life_cost(2), generic_mana_cost(1)],
+        }
+        .contains_unimplemented());
+        // An `EffectCost` is classified by its embedded payment effect: an
+        // unimplemented payload is unpayable, a modeled one is not.
+        assert!(AbilityCost::EffectCost {
+            effect: Box::new(Effect::Unimplemented {
+                name: "static_structure".to_string(),
+                description: None,
+            }),
+        }
+        .contains_unimplemented());
+        assert!(!AbilityCost::EffectCost {
+            effect: Box::new(Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Any,
+            }),
+        }
+        .contains_unimplemented());
     }
 }
 
@@ -37723,6 +38572,321 @@ mod damage_redirect_target_serde_tests {
             serde_json::to_string(&DamageRedirectTarget::ChosenTarget)
                 .expect("chosen target serializes"),
             r#"{"type":"ChosenTarget"}"#
+        );
+    }
+}
+#[cfg(test)]
+mod cast_cost_modifier_serde_tests {
+    use super::*;
+
+    /// A `PlayFromExile` grant JSON body with `extra` spliced in as its only
+    /// rider key, so each matrix row differs in exactly one thing.
+    fn play_from_exile_json(extra: &str) -> String {
+        format!(r#"{{"type":"PlayFromExile","duration":"Permanent","granted_to":0,{extra}}}"#)
+    }
+
+    fn modifier_of(json: &str) -> Option<CastCostModifier> {
+        serde_json::from_str::<CastingPermission>(json)
+            .unwrap_or_else(|err| panic!("{json} must load: {err}"))
+            .cast_cost_modifier()
+            .cloned()
+    }
+
+    const MODERN_REDUCE: &str = r#""cast_cost_modifier":{"mode":"Reduce","amount":{"type":"Cost","shards":[],"generic":2}}"#;
+    const MODERN_KEY_LEGACY_PAYLOAD: &str =
+        r#""cast_cost_modifier":{"type":"Cost","shards":[],"generic":2}"#;
+    const LEGACY_KEY_MODERN_PAYLOAD: &str =
+        r#""cast_cost_raise":{"mode":"Raise","amount":{"type":"Cost","shards":[],"generic":2}}"#;
+    const LEGACY_KEY_LEGACY_PAYLOAD: &str =
+        r#""cast_cost_raise":{"type":"Cost","shards":[],"generic":2}"#;
+
+    /// CR 601.2f: all four key x payload combinations load, and each lands on
+    /// the direction its shape means. The legacy key/payload predates the
+    /// direction axis, when the only printed rider was an increase.
+    #[test]
+    fn all_four_key_by_payload_combinations_load() {
+        assert_eq!(
+            modifier_of(&play_from_exile_json(MODERN_REDUCE)),
+            Some(CastCostModifier::reduce(ManaCost::generic(2))),
+            "modern key + modern payload"
+        );
+        assert_eq!(
+            modifier_of(&play_from_exile_json(MODERN_KEY_LEGACY_PAYLOAD)),
+            Some(CastCostModifier::raise(ManaCost::generic(2))),
+            "modern key + legacy bare ManaCost payload reads as the increase it was"
+        );
+        assert_eq!(
+            modifier_of(&play_from_exile_json(LEGACY_KEY_MODERN_PAYLOAD)),
+            Some(CastCostModifier::raise(ManaCost::generic(2))),
+            "legacy key + modern payload"
+        );
+        assert_eq!(
+            modifier_of(&play_from_exile_json(LEGACY_KEY_LEGACY_PAYLOAD)),
+            Some(CastCostModifier::raise(ManaCost::generic(2))),
+            "legacy key + legacy bare payload"
+        );
+    }
+
+    /// An absent rider is `None`, not a zero-amount modifier.
+    #[test]
+    fn absent_rider_is_none() {
+        assert_eq!(
+            modifier_of(r#"{"type":"PlayFromExile","duration":"Permanent","granted_to":0}"#),
+            None
+        );
+    }
+
+    /// Serialization always emits the modern key; the legacy name survives as
+    /// a read-side alias only.
+    #[test]
+    fn serialization_emits_only_the_modern_key() {
+        let permission = serde_json::from_str::<CastingPermission>(&play_from_exile_json(
+            LEGACY_KEY_LEGACY_PAYLOAD,
+        ))
+        .expect("legacy grant loads");
+        let json = serde_json::to_string(&permission).expect("grant serializes");
+        assert!(
+            json.contains("cast_cost_modifier"),
+            "modern key must be written: {json}"
+        );
+        assert!(
+            !json.contains("cast_cost_raise"),
+            "the legacy key must never be written back out: {json}"
+        );
+    }
+
+    /// Both spellings name ONE field, so carrying both is a duplicate, not a
+    /// silent last-one-wins.
+    #[test]
+    fn both_keys_at_once_is_a_duplicate_field_error() {
+        let json = play_from_exile_json(&format!("{LEGACY_KEY_LEGACY_PAYLOAD},{MODERN_REDUCE}"));
+        let err = serde_json::from_str::<CastingPermission>(&json)
+            .expect_err("a grant carrying both spellings must be rejected");
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "expected a duplicate-field error, got {err}"
+        );
+    }
+
+    /// CR 601.2f: the cost floor is a separate, board-wide last step with no
+    /// per-grant form, so `Minimum` is refused at both entry points.
+    #[test]
+    fn minimum_mode_is_rejected_by_constructor_and_by_serde() {
+        assert_eq!(
+            CastCostModifier::new(CostModifyMode::Minimum, ManaCost::generic(3)),
+            Err(CastCostModifierError::MinimumUnsupported)
+        );
+        let json = play_from_exile_json(
+            r#""cast_cost_modifier":{"mode":"Minimum","amount":{"type":"Cost","shards":[],"generic":3}}"#,
+        );
+        let err = serde_json::from_str::<CastingPermission>(&json)
+            .expect_err("a Minimum payload must be rejected");
+        assert!(
+            err.to_string().contains("Minimum"),
+            "the rejection must name the unsupported mode, got {err}"
+        );
+    }
+
+    /// `new` accepts exactly the two directions the runtime has a step for.
+    #[test]
+    fn new_accepts_raise_and_reduce() {
+        assert_eq!(
+            CastCostModifier::new(CostModifyMode::Raise, ManaCost::generic(1)),
+            Ok(CastCostModifier::raise(ManaCost::generic(1)))
+        );
+        assert_eq!(
+            CastCostModifier::new(CostModifyMode::Reduce, ManaCost::generic(1)),
+            Ok(CastCostModifier::reduce(ManaCost::generic(1)))
+        );
+    }
+
+    /// CR 601.2f + CR 118.9d: the accessor is the single read authority, and it
+    /// answers for every carrying form. The card-native exile casting methods
+    /// have no rider slot and answer `None`.
+    #[test]
+    fn accessor_reads_every_carrying_variant() {
+        let modifier = CastCostModifier::reduce(ManaCost::generic(2));
+        let alt_cost = CastingPermission::ExileWithAltCost {
+            cost: ManaCost::generic(3),
+            cost_provenance: ExileGrantCostProvenance::Alternative,
+            cast_transformed: false,
+            constraint: None,
+            granted_to: None,
+            resolution_cleanup: None,
+            duration: None,
+            source_id: None,
+            graveyard_replacement: None,
+            enters_with_counter: None,
+            enters_with_modifications: Vec::new(),
+            mana_spend_permission: None,
+            cast_cost_modifier: Some(modifier.clone()),
+        };
+        assert_eq!(alt_cost.cast_cost_modifier(), Some(&modifier));
+        assert_eq!(
+            CastingPermission::AdventureCreature.cast_cost_modifier(),
+            None
+        );
+        assert_eq!(
+            CastingPermission::Foretold {
+                cost: ManaCost::generic(1),
+                turn_foretold: 1,
+            }
+            .cast_cost_modifier(),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod chain_description_backfill_tests {
+    use super::*;
+
+    /// Build a three-deep chain: a head with printed text, a middle link with
+    /// none (the shape Isochron Scepter's "If you do, you may cast the copy"
+    /// sub-ability has), and a leaf that carries its own modal branch label.
+    fn three_deep_chain() -> ResolvedAbility {
+        let leaf = ResolvedAbility {
+            description: Some("tap".to_string()),
+            ..ResolvedAbility::new(
+                Effect::Surveil {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                Vec::new(),
+                ObjectId(1),
+                PlayerId(0),
+            )
+        };
+        let middle = ResolvedAbility {
+            sub_ability: Some(Box::new(leaf)),
+            ..ResolvedAbility::new(
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                Vec::new(),
+                ObjectId(1),
+                PlayerId(0),
+            )
+        };
+        ResolvedAbility {
+            description: Some("printed ability text".to_string()),
+            sub_ability: Some(Box::new(middle)),
+            ..ResolvedAbility::new(
+                Effect::Scry {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                Vec::new(),
+                ObjectId(1),
+                PlayerId(0),
+            )
+        }
+    }
+
+    #[test]
+    fn backfill_fills_textless_links_and_preserves_their_own_text() {
+        let mut chain = three_deep_chain();
+        chain.backfill_chain_description();
+
+        let middle = chain.sub_ability.as_deref().expect("middle link");
+        assert_eq!(
+            middle.description.as_deref(),
+            Some("printed ability text"),
+            "a link with no text of its own inherits the head's printed text"
+        );
+
+        let leaf = middle.sub_ability.as_deref().expect("leaf link");
+        assert_eq!(
+            leaf.description.as_deref(),
+            Some("tap"),
+            "a link that carries its own label keeps it"
+        );
+    }
+
+    /// The head's text must reach links BELOW one that carries its own label —
+    /// a recursion that sourced the text from the current link would stamp
+    /// "tap" here instead.
+    #[test]
+    fn backfill_reaches_links_below_a_labelled_link() {
+        let mut chain = three_deep_chain();
+        let deepest = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            Vec::new(),
+            ObjectId(1),
+            PlayerId(0),
+        );
+        chain
+            .sub_ability
+            .as_mut()
+            .and_then(|middle| middle.sub_ability.as_mut())
+            .expect("leaf link")
+            .sub_ability = Some(Box::new(deepest));
+
+        chain.backfill_chain_description();
+
+        let below_label = chain
+            .sub_ability
+            .as_deref()
+            .and_then(|middle| middle.sub_ability.as_deref())
+            .and_then(|leaf| leaf.sub_ability.as_deref())
+            .expect("link below the labelled one");
+        assert_eq!(
+            below_label.description.as_deref(),
+            Some("printed ability text"),
+            "the head's text propagates past a labelled link, not the label"
+        );
+    }
+
+    /// `else_ability` is the branch sibling of `sub_ability` and raises its own
+    /// prompts, so it takes the same backfill.
+    #[test]
+    fn backfill_covers_the_else_branch() {
+        let mut chain = three_deep_chain();
+        chain.else_ability = Some(Box::new(ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            Vec::new(),
+            ObjectId(1),
+            PlayerId(0),
+        )));
+
+        chain.backfill_chain_description();
+
+        assert_eq!(
+            chain
+                .else_ability
+                .as_deref()
+                .expect("else branch")
+                .description
+                .as_deref(),
+            Some("printed ability text"),
+        );
+    }
+
+    /// A head with no text of its own leaves the chain untouched rather than
+    /// stamping `None` over a link that has one.
+    #[test]
+    fn backfill_with_no_head_text_is_a_no_op() {
+        let mut chain = three_deep_chain();
+        chain.description = None;
+        chain.backfill_chain_description();
+
+        let middle = chain.sub_ability.as_deref().expect("middle link");
+        assert_eq!(middle.description, None);
+        assert_eq!(
+            middle
+                .sub_ability
+                .as_deref()
+                .expect("leaf link")
+                .description
+                .as_deref(),
+            Some("tap"),
         );
     }
 }

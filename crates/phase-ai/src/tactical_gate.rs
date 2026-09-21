@@ -2772,6 +2772,7 @@ mod tests {
                     granted_to: Some(P0),
                     duration: None,
                     source_id: None,
+                    cast_cost_modifier: None,
                 },
             );
         }
@@ -3656,7 +3657,7 @@ mod tests {
                     })),
                     single_use_group: None,
                     single_use: false,
-                    cast_cost_raise: None,
+                    cast_cost_modifier: None,
                     alt_ability_cost: Some(AbilityCost::Mana {
                         cost: ManaCost::NoCost,
                     }),
@@ -5130,6 +5131,7 @@ mod tests {
                     ],
                 }),
             }),
+            reach: engine::types::statics::CostReductionReach::SpillsToGeneric,
         })
         .affected(TargetFilter::SelfRef);
         modifier.active_zones = engine::types::zones::self_spell_cost_mod_active_zones();

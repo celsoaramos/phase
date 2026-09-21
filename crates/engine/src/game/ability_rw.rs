@@ -103,8 +103,8 @@
 use crate::types::ability::FilterProp;
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, CardTypeSetSource, ContinuousModification, ControllerRef,
-    Duration, Effect, GuessSubject, ModalChoice, MultiTargetSpec, ObjectProperty, ObjectScope,
-    PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole,
+    Duration, Effect, GuessSubject, KeeperConstraint, ModalChoice, MultiTargetSpec, ObjectProperty,
+    ObjectScope, PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole,
     RepeatContinuation, ReplacementDefinition, ResolvedAbility, StaticCondition, StaticDefinition,
     TargetFilter, TriggerCondition, TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter,
     ZoneChoiceCandidateSource, ZoneRef,
@@ -3324,15 +3324,28 @@ fn legacy_effect(x: &Effect) -> bool {
             target_player,
             ..
         } => legacy_target_filter(filter) || legacy_quantity_expr(count) || otf(target_player),
+        // `keeper_constraint`'s `ExactCount { count }` and
+        // `keeper_counter`'s `KeeperCounterMark::count` are both unread
+        // `QuantityExpr` positions closed together here — the pre-existing
+        // `keeper_constraint` omission is the same fail-open shape the new
+        // `keeper_counter` field would otherwise introduce.
         Effect::ChooseAndSacrificeRest {
             choose_filter,
             sacrifice_filter,
             total_power_cap,
+            keeper_constraint,
+            keeper_counter,
             ..
         } => {
             legacy_target_filter(choose_filter)
                 || legacy_target_filter(sacrifice_filter)
                 || oqe(total_power_cap)
+                || keeper_constraint.as_ref().is_some_and(
+                    |KeeperConstraint::ExactCount { count }| legacy_quantity_expr(count),
+                )
+                || keeper_counter
+                    .as_ref()
+                    .is_some_and(|mark| legacy_quantity_expr(&mark.count))
         }
         Effect::EachPlayerCopyChosen {
             choose_filter,
@@ -3784,10 +3797,15 @@ fn member_bound_read() -> RwProfile {
 /// this resolution, while `Legacy` may take either that chain set or its
 /// direct-zone fallback; both are member-bound and include the conservative
 /// zone-membership read for their fallback/producer population.
+/// `CostPaidObjects` (CR 400.7j + CR 601.2h) reads the ids this SAME ability's
+/// cost recorded — a member-bound read — and live zone membership to keep only
+/// the ones still in the declared zone(s), so it carries both channels too.
 fn zone_choice_candidate_source_read(source: ZoneChoiceCandidateSource) -> RwProfile {
     match source {
         ZoneChoiceCandidateSource::Direct => reads_zone_membership(),
-        ZoneChoiceCandidateSource::Tracked | ZoneChoiceCandidateSource::Legacy => {
+        ZoneChoiceCandidateSource::Tracked
+        | ZoneChoiceCandidateSource::Legacy
+        | ZoneChoiceCandidateSource::CostPaidObjects => {
             let mut p = reads_zone_membership();
             p.merge(member_bound_read());
             p
@@ -4160,7 +4178,7 @@ fn walk_ability(
         chosen_x: _,
         cost_paid_object: _,
         noted_mana_payment: _, // concrete captured payment snapshot, no read/write effect
-        cost_paid_object_ids: _,
+        cost_paid_objects: _,
         effect_context_object: _,
         amassed_army_object: _,
         ability_index: _,
@@ -5680,6 +5698,7 @@ fn rw_effect(
             driver: _,
             mana_spend_permission: _,
             additional_cost: _,
+            cast_cost_modifier: _,
         } => {
             let mut p = ext_write(StateKind::HandLibrary);
             p.writes_external.set(StateKind::StackShape);
@@ -7543,6 +7562,14 @@ mod tests {
             (
                 "legacy tracked fallback",
                 zone_choice_for_rw(ZoneChoiceCandidateSource::Legacy, None),
+            ),
+            (
+                // CR 400.7j + CR 601.2h: the cost-payment record is a per-source
+                // binding this ability carries, so it belongs in this
+                // enumeration explicitly rather than riding along with the
+                // tracked sources in the profile's match arm.
+                "cost-paid provenance",
+                zone_choice_for_rw(ZoneChoiceCandidateSource::CostPaidObjects, None),
             ),
             (
                 "reciprocal consumer",

@@ -2,7 +2,7 @@ use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_until};
 use nom::character::complete::multispace0;
-use nom::combinator::{all_consuming, map, opt, peek, rest, value, verify};
+use nom::combinator::{all_consuming, eof, map, opt, peek, rest, value, verify};
 use nom::multi::separated_list1;
 use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::Parser;
@@ -32,13 +32,16 @@ use super::super::oracle_nom::duration::parse_duration;
 use super::super::oracle_nom::error::OracleResult;
 use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_nom::quantity as nom_quantity;
-use super::super::oracle_nom::target::{parse_event_context_ref, parse_supertype_word};
+use super::super::oracle_nom::target::{
+    parse_event_context_ref, parse_object_exclusion_list, parse_supertype_word, ObjectExclusion,
+};
 use super::super::oracle_quantity;
 use super::super::oracle_static::{
     classify_block_exception, parse_additive_type_clause_modifications,
-    parse_cant_be_activated_exemption_in_text, parse_chosen_qualifier_subject,
-    parse_continuous_modifications, parse_continuous_subject_filter, parse_static_line,
-    parse_static_line_multi, peel_compound_all_quantified_conjuncts,
+    parse_cant_attack_defended_scope_nom, parse_cant_be_activated_exemption_in_text,
+    parse_chosen_qualifier_subject, parse_continuous_modifications,
+    parse_continuous_subject_filter, parse_static_line, parse_static_line_multi,
+    peel_compound_all_quantified_conjuncts,
 };
 use super::super::oracle_target::{
     parse_target, parse_target_with_ctx, parse_target_with_syntax, parse_type_phrase_folding,
@@ -2885,6 +2888,17 @@ fn parse_subject_application_for(
         return subject_filter_application(TargetFilter::ParentTarget, false);
     }
 
+    // CR 608.2c + CR 607.2d: "creatures other than ~ and the chosen creature" —
+    // a bare-plural population subject carrying a multi-item exclusion list.
+    // Must precede the bare-plural arm below (which would consume "creatures"
+    // and silently drop the exclusions) while declining every form that arm or
+    // `parse_other_than_exclusion` already consumes: the list must parse whole
+    // (all_consuming) and contain at least one chosen-object item, and the base
+    // must be an unquantified bare plural.
+    if let Some(application) = try_parse_exclusion_list_subject(lower.as_str(), ctx) {
+        return Some(application);
+    }
+
     // Bare plural noun phrase subjects ("creatures you control", "other creatures you control")
     // are implicit "all X" forms — strip any "other " prefix and route through parse_target.
     let (had_other, noun_subject) =
@@ -4071,6 +4085,82 @@ fn resolve_they_pronoun(ctx: &mut ParseContext) -> TargetFilter {
             .unwrap_or(TargetFilter::TriggeringSource),
         // No trigger context — anaphoric reference to previously mentioned objects
         _ => TargetFilter::ParentTarget,
+    }
+}
+
+/// CR 608.2c + CR 607.2d: Subject form "‹bare plural base› other than ‹ref›
+/// [and ‹ref›]" — a population subject whose exclusion list names the ability
+/// source ("~") and/or the remembered chosen object ("the chosen creature").
+///
+/// Recognition only; composition is [`apply_object_exclusions`]. Deliberately
+/// declines every form the existing single-referent `parse_other_than_exclusion`
+/// path already consumes (P1–P7: "other than ~", "other than enchanted
+/// creature") and the target/all/each bases with their own grammar (Loki's
+/// "each creature you control other than the chosen creature" keeps its
+/// existing path), because the list `all_consuming` parse refuses any item that
+/// is not a self-reference or a chosen-object reader.
+fn try_parse_exclusion_list_subject(
+    lower: &str,
+    ctx: &mut ParseContext,
+) -> Option<SubjectApplication> {
+    let (_, (base, list)) = nom_primitives::split_once_on(lower, " other than ").ok()?;
+    let base = base.trim_end();
+    if base.is_empty() || list.trim().is_empty() {
+        return None;
+    }
+    // Scope gate mirroring the bare-plural arm below: "target "/"all "/"each "
+    // subjects are handled by their own grammar, never silently re-scoped here.
+    if alt((
+        tag::<_, _, OracleError<'_>>("target "),
+        tag("all "),
+        tag("each "),
+    ))
+    .parse(base)
+    .is_ok()
+    {
+        return None;
+    }
+    let (_, exclusions) = parse_object_exclusion_list(list.trim()).ok()?;
+    if !exclusions.contains(&ObjectExclusion::ChosenObject) {
+        return None;
+    }
+    // The base is a bare plural ("creatures") — normalize to its implicit
+    // "all ‹base›" form, exactly as the bare-plural arm below does, and thread
+    // `ctx` for the same controller-suffix reason (a "that player controls"
+    // relative suffix must bind the enclosing scope, not default to `You`).
+    let normalized = format!("all {base}");
+    let (filter, rest) = parse_target_with_ctx(&normalized, ctx);
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    subject_filter_application(apply_object_exclusions(filter, &exclusions), false)
+}
+
+/// CR 608.2c + CR 607.2d: Compose an "other than ‹ref› [and ‹ref›]" exclusion
+/// list onto the base population filter. The source item reuses the shared
+/// `FilterProp::Another` composition — the recursion-aware
+/// `imperative::add_another_to_filter_recursive`, so every typed leg of a
+/// composite base ("creatures and planeswalkers") excludes the source; the
+/// chosen object is `Not { ChosenCard }` — the shared CR 607.2d
+/// remembered-object reader.
+fn apply_object_exclusions(
+    mut filter: TargetFilter,
+    exclusions: &[ObjectExclusion],
+) -> TargetFilter {
+    if exclusions.contains(&ObjectExclusion::Source) {
+        imperative::add_another_to_filter_recursive(&mut filter);
+    }
+    if exclusions.contains(&ObjectExclusion::ChosenObject) {
+        TargetFilter::And {
+            filters: vec![
+                filter,
+                TargetFilter::Not {
+                    filter: Box::new(TargetFilter::ChosenCard),
+                },
+            ],
+        }
+    } else {
+        filter
     }
 }
 
@@ -5987,6 +6077,212 @@ fn build_restriction_clause(
         });
     }
 
+    // CR 508.1c + CR 109.5 + CR 611.2 + CR 608.2c: "<subject> can't attack you[
+    // or planeswalkers you control]" — a recipient-local, CONTROLLER-RELATIVE
+    // attack prohibition. `parse_restriction_modes` declines it, because its
+    // `all_consuming` mode list has no production for the defended-scope tail,
+    // so without this branch the whole clause becomes `Effect::Unimplemented`.
+    //
+    // Which half of CR 109.5 authorizes the latch: its FIRST sentence ("you"
+    // refers to the object's controller) is the operative one. Its "For a
+    // static ability, this is the current controller of the object it's on"
+    // sentence is INAPPLICABLE here, because the continuous effect this clause
+    // becomes is generated by the resolution of a spell (CR 611.2) rather than
+    // by a static ability printed on the recipient. That distinction is the
+    // whole reason "you" latches to the player who resolved the spell instead
+    // of tracking each recipient's current controller; the stamp site that
+    // performs the latch is `game/effects/effect.rs::resolve`, annotated there
+    // as CR 109.5 + CR 508.1c + CR 611.2c. The row that discriminates the two
+    // readings is
+    // `promise_of_loyalty.rs::keeper_still_cannot_attack_original_caster_after_control_change`:
+    // forcing that stamp's guard false makes it fail.
+    //
+    // The general rule this encodes, not the card: a recipient-local
+    // prohibition whose defended scope is controller-relative must be emitted
+    // as a nested `GrantStaticAbility { affected: SelfRef }`, because that is
+    // the only shape with a per-recipient slot for CR 109.5's "you". The
+    // resolution-time stamp in `game/effects/effect.rs` latches "you" to the
+    // installing player, and its six conjuncts (`source_controller.is_none()`,
+    // `affected == Some(SelfRef)`, `condition.is_none()`,
+    // `modifications.is_empty()`, `attack_defended` satisfying
+    // `defended_scope_uses_source_controller_anchor`, and `mode` in
+    // {`CantAttack`, `CantAttackOrBlock`}) are satisfied only by this shape.
+    // `ContinuousModification::AddStaticMode` manufactures a `SelfRef` static
+    // against the recipient with no slot to carry a per-recipient "you".
+    //
+    // The mandatory `eof` is load-bearing twice: refusing a `None` defended
+    // scope leaves the bare "can't attack" to `parse_restriction_modes`, and
+    // refusing trailing text this grant shape cannot express declines the
+    // "… unless their controller pays" rider (Sivitri, Dragon Master). A
+    // trailing "… this turn" / "… this combat" duration is NOT one of the
+    // riders `eof` rejects — `strip_trailing_duration` above already peels it
+    // before this branch runs, so `eof` never sees it and the grant claims
+    // the duration-scoped form too (CR 611.2a: the effect lasts as long as
+    // the spell states). See
+    // `tests.rs::keeper_dispose_sentence_two_requires_a_bare_defended_scope`'s
+    // `DURATION_SCOPED` probe, which measures this directly.
+    if let Ok((_, Some(defended))) = terminated(
+        preceded(
+            tag::<_, _, OracleError<'_>>("can't attack"),
+            parse_cant_attack_defended_scope_nom,
+        ),
+        eof,
+    )
+    .parse(lower.as_str())
+    {
+        let affected = static_affected_for_application(&application);
+        // Exhaustive on the subject filter's kind, with NO wildcard, so a new
+        // `TargetFilter` variant forces an explicit fixed-vs-live adjudication
+        // here rather than silently joining whichever side it was listed under.
+        let subject_set_is_fixed = match &affected {
+            // CR 608.2c: an anaphorically- or specifically-fixed subject names
+            // a set the preceding instruction determined; CR 611.2c's FIRST
+            // sentence then applies, because an ability grant IS a
+            // characteristic modification (CR 613.1f, layer 6). Freezing the
+            // set is correct here, and is what delivers Promise of Loyalty's
+            // "a vow counter moved to another creature does not bind it".
+            //
+            // `ParentTarget` is listed first because it is what this seam
+            // receives: `static_affected_for_application` returns
+            // `TargetFilter::ParentTarget` only when
+            // `application.target.is_some() || application.inherits_parent`,
+            // and for an "Each of those <type>" subject both are false, so it
+            // returns `application.affected` — which the subject parser has
+            // already set to `ParentTarget`. The `TrackedSet` form appears only
+            // when a prior clause satisfied
+            // `oracle_effect::publishes_tracked_set_from_resolution` and the
+            // chain assembler rewrote the anaphor. Both install identically at
+            // runtime: `register_transient_effect`'s
+            // `Some(ParentTarget) if ability.targets.is_empty()` arm reads
+            // `state.chain_tracked_set_id` directly, and the `TrackedSet` form
+            // reaches the same members through `resolve_tracked_set_sentinel`.
+            TargetFilter::ParentTarget
+            | TargetFilter::TrackedSet { .. }
+            | TargetFilter::SelfRef
+            | TargetFilter::SpecificObject { .. } => true,
+
+            // DEFERRED — broadcast subject, whose affected set must stay LIVE.
+            // CR 611.2c's SECOND sentence: an effect that grants no ability
+            // "modifies the rules of the game, so it can affect objects that
+            // weren't affected when that continuous effect began", which is
+            // exactly what Chronomantic Escape's printed ruling says. The grant
+            // shape above would FREEZE the set and ship a rules-incorrect fix.
+            // The engine's mechanism for this axis exists — the
+            // `MustAttackAwayFromSource` branch of `register_transient_effect`
+            // keeps the filter intact on ONE transient effect — but extending
+            // it to `CantAttack` is `game/effects/effect.rs` work for a
+            // different issue. Cards: Chronomantic Escape, Web of Inertia; both
+            // keep their `Effect::Unimplemented` and stay honestly uncovered.
+            TargetFilter::Typed(_) => false,
+
+            // DEFERRED — player-scoped subject. "…they can't attack you this
+            // combat" restricts a PLAYER (CR 508.1c), not objects, and an
+            // object-local `StaticMode::CantAttack` cannot express it. Card:
+            // Champions of Minas Tirith. Most of the remaining variants are
+            // player references or event/replacement references with no
+            // fixed object set at parse time, but not all — `AttachedTo`,
+            // `AmassedArmy`, `ChosenCard`, `ExiledBySource`, `LastCreated`, and
+            // `TrackedSetFiltered` are fixed object references whose
+            // fixed-vs-live adjudication for THIS branch has not been made
+            // (`TrackedSetFiltered`'s sibling `TrackedSet` sits in the fixed
+            // arm above and `additive_type_subject_application` treats the two
+            // identically as an anaphoric subject kind, but that does not by
+            // itself settle whether this branch's freeze-vs-broadcast choice
+            // is correct for `TrackedSetFiltered` too). Fail-closed keeps this
+            // honest: every one of these declines to `Effect::Unimplemented`
+            // rather than silently landing on the wrong side.
+            TargetFilter::None
+            | TargetFilter::Any
+            | TargetFilter::Player
+            | TargetFilter::Controller
+            | TargetFilter::SourceController
+            | TargetFilter::ControllerAndControlledPermanents { .. }
+            | TargetFilter::Opponent
+            | TargetFilter::GrantingObject
+            | TargetFilter::SourceOrPaired
+            | TargetFilter::Not { .. }
+            | TargetFilter::Or { .. }
+            | TargetFilter::And { .. }
+            | TargetFilter::StackAbility { .. }
+            | TargetFilter::StackSpell
+            | TargetFilter::SpecificPlayer { .. }
+            | TargetFilter::PlayerWhoChoseLabel { .. }
+            | TargetFilter::PlayerMatching { .. }
+            | TargetFilter::Neighbor { .. }
+            | TargetFilter::ScopedPlayer
+            | TargetFilter::AttachedTo
+            | TargetFilter::LastCreated
+            | TargetFilter::LastRevealed
+            | TargetFilter::LastZoneChanged
+            | TargetFilter::CostPaidObject
+            | TargetFilter::AmassedArmy
+            | TargetFilter::ChosenCard
+            | TargetFilter::TrackedSetFiltered { .. }
+            | TargetFilter::ExiledBySource
+            | TargetFilter::ExiledCardByIndex { .. }
+            | TargetFilter::TriggeringSpellController
+            | TargetFilter::TriggeringSpellOwner
+            | TargetFilter::TriggeringPlayer
+            | TargetFilter::TriggeringSource
+            | TargetFilter::EventTarget
+            | TargetFilter::TriggeringSourceController
+            | TargetFilter::EventTargetController
+            | TargetFilter::ParentTargetSlot { .. }
+            | TargetFilter::ParentTargetController
+            | TargetFilter::ParentTargetOwner
+            | TargetFilter::SourceChosenPlayer
+            | TargetFilter::OriginalController
+            | TargetFilter::OriginalSource
+            | TargetFilter::PostReplacementSourceController
+            | TargetFilter::PostReplacementDamageSource
+            | TargetFilter::PostReplacementDamageTarget
+            | TargetFilter::PostReplacementDamageTargetOwner
+            | TargetFilter::DefendingPlayer
+            | TargetFilter::HasChosenName
+            | TargetFilter::ChosenDamageSource { .. }
+            | TargetFilter::Named { .. }
+            | TargetFilter::Owner
+            | TargetFilter::AllPlayers => false,
+        };
+        if subject_set_is_fixed {
+            // CR 613.1f: the grant is an ability-adding effect, applied in
+            // layer 6. CR 611.2a/611.2b: the outer definition carries the
+            // peeled duration, so a "for as long as it has a vow counter on it"
+            // phrase keeps being re-evaluated per counter edit.
+            let granted = StaticDefinition::new(StaticMode::CantAttack)
+                .affected(TargetFilter::SelfRef)
+                .attack_defended(Some(defended));
+            let installer = StaticDefinition::continuous()
+                .affected(affected)
+                .modifications(vec![ContinuousModification::GrantStaticAbility {
+                    definition: Box::new(granted),
+                }])
+                .description(predicate.to_string());
+            return Some(ParsedEffectClause {
+                unlowered_guard: None,
+                effect: Effect::GenericEffect {
+                    static_abilities: vec![installer],
+                    duration: duration.clone(),
+                    // Passed through, not re-decided: both sibling emissions in
+                    // this function do the same. For an "Each of those <type>"
+                    // subject it is measured `None`; for an inherited or
+                    // targeted subject — which reaches the `ParentTarget` arm
+                    // above through `static_affected_for_application` — it is
+                    // the declaration `transient_bound_filters` binds against.
+                    target: application.target,
+                    end_cost: None,
+                },
+                duration,
+                sub_ability: None,
+                distribute: None,
+                multi_target: None,
+                condition: None,
+                optional: false,
+                unless_pay: None,
+            });
+        }
+    }
+
     // CR 508.1d / CR 509.1a: Restriction predicates for attack/block/target.
     // Compound restrictions ("can't attack or block") produce multiple StaticDefinition entries.
     let modes = parse_restriction_modes(&lower)?;
@@ -7480,7 +7776,12 @@ pub(super) fn find_predicate_start(text: &str) -> Option<usize> {
     None
 }
 
-/// Add `FilterProp::Another` to a target filter, ensuring the source is excluded.
+/// Add `FilterProp::Another` to a lone `Typed` target filter, ensuring the
+/// source is excluded.
+///
+/// Composite (`Or`/`And`) classes use the recursion-aware
+/// `imperative::add_another_to_filter_recursive` instead — this helper is the
+/// single-`Typed` form consumed by the subject-composition paths below.
 fn add_another_property(filter: TargetFilter) -> TargetFilter {
     match filter {
         TargetFilter::Typed(mut tf) => {

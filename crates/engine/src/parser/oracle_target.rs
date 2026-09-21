@@ -8208,12 +8208,33 @@ fn parse_shared_quality_reference<'a>(
         }
     }
 
-    let (filter, rest) = parse_target(input);
+    let (filter, rest) = parse_target_disjunction(input);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
             nom::error::ErrorKind::Fail,
         )));
+    }
+    Ok((rest, filter))
+}
+
+/// CR 109.2 + CR 109.2a: parse a reference noun phrase that may be a two-leg
+/// disjunction — "a creature you control **or** a creature card in your
+/// graveyard" (Guardian Project, Volo) — into `TargetFilter::Or`.
+///
+/// Each leg is parsed by `parse_target`, so the per-leg zone semantics are the
+/// ordinary ones: a zone-less type description means a permanent on the
+/// battlefield (CR 109.2) while a leg naming a zone keeps it (CR 109.2a). The
+/// single-leg path returns exactly what `parse_target` returned, so callers that
+/// never see a disjunction are unaffected.
+///
+/// Extracted from `parse_shared_quality_reference` so the name-relation
+/// combinator in `oracle_effect::search` shares one authority for the reference
+/// axis instead of duplicating the disjunction handling.
+pub(crate) fn parse_target_disjunction(input: &str) -> (TargetFilter, &str) {
+    let (filter, rest) = parse_target(input);
+    if matches!(filter, TargetFilter::Any) {
+        return (filter, rest);
     }
     let rest_trimmed = rest.trim_start();
     if let Ok((after_or, sep)) =
@@ -8221,17 +8242,17 @@ fn parse_shared_quality_reference<'a>(
     {
         let (filter2, rest2) = parse_target(after_or);
         if !matches!(filter2, TargetFilter::Any) {
-            return Ok((
-                rest2,
+            return (
                 TargetFilter::Or {
                     filters: vec![filter, filter2],
                 },
-            ));
+                rest2,
+            );
         }
         // Fall through: only accept the first leg if the disjunction tail didn't parse.
         let _ = sep;
     }
-    Ok((rest, filter))
+    (filter, rest)
 }
 
 /// CR 608.2k: "the sacrificed/exiled <noun>" — an untargeted reference to the
@@ -10272,6 +10293,9 @@ fn parse_zone_qual(i: &str) -> super::oracle_nom::error::OracleResult<'_, ZoneQu
                 tag("that player's "),
                 tag("defending player's "),
                 tag("each player's "),
+                // CR 404.1: "a player's graveyard" names a zone without binding an
+                // owner (Lodestone Bauble), so it contributes `InZone` alone.
+                tag("a player's "),
             )),
         ),
         // CR 400.7: Adjective- and quantity-qualified zone references — "all
@@ -20350,6 +20374,26 @@ mod tests {
         // The OtherPoss split must not regress non-"their" possessives:
         // "that player's graveyard" emits InZone with no Owned prop.
         let (f, _) = parse_target("a card from that player's graveyard");
+        let tf = typed_leg(&f).expect("typed filter");
+        assert_eq!(tf.controller, None);
+        assert!(has_prop(
+            tf,
+            FilterProp::InZone {
+                zone: Zone::Graveyard,
+            }
+        ));
+        assert!(!tf
+            .properties
+            .iter()
+            .any(|p| matches!(p, FilterProp::Owned { .. })));
+    }
+
+    #[test]
+    fn parse_target_a_players_graveyard_binds_the_zone() {
+        // "a player's graveyard" must reach the OtherPoss arm, not the bare "a "
+        // article, so the zone is extracted with no owner binding.
+        let (f, rest) = parse_target("basic land cards from a player's graveyard");
+        assert_eq!(rest, "");
         let tf = typed_leg(&f).expect("typed filter");
         assert_eq!(tf.controller, None);
         assert!(has_prop(
