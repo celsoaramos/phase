@@ -2,7 +2,7 @@ use crate::database::card_db::CardDbHandle;
 use crate::database::synthesis::KeywordTriggerInstaller;
 use crate::database::CardDatabase;
 use crate::types::ability::{
-    AbilityDefinition, ConjureSource, CopiableValues, Effect, PtValue, QuantityExpr,
+    AbilityDefinition, ChoiceType, ConjureSource, CopiableValues, Effect, PtValue, QuantityExpr,
     ReplacementCondition, ReplacementDefinition, ReplacementMode, RestrictionExpiry,
     StaticDefinition, TargetFilter, TriggerDefinition, TriggerDefinitionOccurrenceRef,
 };
@@ -1115,6 +1115,25 @@ fn collect_conjure_names(effect: &Effect, out: &mut Vec<String>) {
                 }
             }
         }
+        // CR 707.12: the literal form of "create a copy of a card named X" has a
+        // static name to seed, exactly like a named conjure. The chosen-name form
+        // (`name: None`) has none HERE — its candidate names live on the choice,
+        // seeded by the `Choose` arm below.
+        Effect::CreateCardCopyByName {
+            name: Some(name), ..
+        } => out.push(name.clone()),
+        // CR 201.2a + CR 707.12: a CLOSED card-name domain is an Oracle-printed
+        // list of cards the ability can materialize (Garth One-Eye's six), so
+        // every one of them has to be in the registry before the copy is created —
+        // otherwise the resolver looks up a name that was never preloaded and
+        // creates nothing. Scoped to the closed domain on purpose: the OPEN
+        // "choose a card name" prompt ranges over every card in Magic, which is
+        // the reason `card_face_registry` is a scoped preload and not the whole
+        // database.
+        Effect::Choose {
+            choice_type: ChoiceType::CardName { options, .. },
+            ..
+        } => out.extend(options.iter().cloned()),
         // CR 701.42 / CR 712.4b: the melded permanent presents the `result`
         // card's characteristics, but `result` is an outside-the-game third card.
         // Seed its name so `build_conjure_registry` preloads its `CardFace` into

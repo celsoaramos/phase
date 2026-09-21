@@ -306,7 +306,7 @@ fn attached_replacement_between_bound_attachments_preserves_remaining_attachment
                     .expect("attachment spell must keep resolving");
             }
             WaitingFor::NamedChoice {
-                choice_type: ChoiceType::CardName,
+                choice_type: ChoiceType::CardName { .. },
                 ..
             } => {
                 runner
@@ -429,7 +429,7 @@ fn bound_attachments_with_a_synchronous_prefix_do_not_replay_the_final_attachmen
                     .expect("attachment spell must keep resolving");
             }
             WaitingFor::NamedChoice {
-                choice_type: ChoiceType::CardName,
+                choice_type: ChoiceType::CardName { .. },
                 ..
             } => {
                 runner
@@ -540,7 +540,7 @@ fn singleton_bound_attachment_replacement_preserves_trailing_effect_once() {
                     .expect("singleton attachment spell must keep resolving");
             }
             WaitingFor::NamedChoice {
-                choice_type: ChoiceType::CardName,
+                choice_type: ChoiceType::CardName { .. },
                 ..
             } => {
                 runner
@@ -917,7 +917,7 @@ fn gilgamesh_host_choice_then_singleton_equipment_completes_to_priority() {
                 );
             }
             WaitingFor::NamedChoice {
-                choice_type: ChoiceType::CardName,
+                choice_type: ChoiceType::CardName { .. },
                 ..
             } => {
                 runner

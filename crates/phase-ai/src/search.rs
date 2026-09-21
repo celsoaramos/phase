@@ -11235,7 +11235,7 @@ mod tests {
         state.waiting_for = WaitingFor::NamedChoice {
             free_entry: None,
             player: PlayerId(0),
-            choice_type: ChoiceType::CardName,
+            choice_type: ChoiceType::card_name(),
             options: Vec::new(),
             source: None,
             persist_player: None,
@@ -11255,7 +11255,7 @@ mod tests {
         state.waiting_for = WaitingFor::NamedChoice {
             free_entry: None,
             player: P0,
-            choice_type: ChoiceType::CardName,
+            choice_type: ChoiceType::card_name(),
             options: Vec::new(),
             source: None,
             persist_player: None,
@@ -11288,7 +11288,7 @@ mod tests {
         state.waiting_for = WaitingFor::NamedChoice {
             free_entry: None,
             player: PlayerId(0),
-            choice_type: ChoiceType::CardName,
+            choice_type: ChoiceType::card_name(),
             options: Vec::new(),
             source: None,
             persist_player: None,

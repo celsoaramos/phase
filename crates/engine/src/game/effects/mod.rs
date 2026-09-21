@@ -80,6 +80,7 @@ pub mod cleanup;
 pub mod collect_evidence;
 pub mod complete_player_action;
 pub mod conjure;
+pub mod create_card_copy_by_name;
 pub mod connive;
 pub mod control_next_turn;
 pub(crate) mod copy_exception;
@@ -6129,6 +6130,9 @@ pub fn resolve_effect(
         }
         Effect::ProcessRadCounters => rad_counters::resolve(state, ability, events),
         Effect::Conjure { .. } => conjure::resolve(state, ability, events),
+        Effect::CreateCardCopyByName { .. } => {
+            create_card_copy_by_name::resolve(state, ability, events)
+        }
         Effect::Intensify { .. } => intensify::resolve(state, ability, events),
         Effect::ApplyPerpetual { .. } => perpetual::resolve(state, ability, events),
         Effect::DraftFromSpellbook { .. } => spellbook::resolve(state, ability, events),
