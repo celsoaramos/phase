@@ -7243,6 +7243,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         | Effect::GiveControl { .. }
         | Effect::RemoveFromCombat { .. }
         | Effect::Conjure { .. }
+        | Effect::CreateCardCopyByName { .. }
         | Effect::CombineHost { .. }
         | Effect::ChooseAugmentAndCombineWithHost { .. }
         | Effect::Intensify { .. }
