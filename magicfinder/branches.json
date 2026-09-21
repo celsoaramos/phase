@@ -57,5 +57,8 @@
   },
   {
     "branch": "card/alt-cost-cast-from-exile"
+  },
+  {
+    "branch": "ai/mana-waste-floor"
   }
 ]
