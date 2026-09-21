@@ -63,5 +63,11 @@
   },
   {
     "branch": "ai/mana-waste-floor"
+  },
+  {
+    "branch": "card/dragons-fire"
+  },
+  {
+    "branch": "card/arlinn-packs-hope"
   }
 ]
