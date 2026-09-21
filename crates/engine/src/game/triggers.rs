@@ -3102,7 +3102,11 @@ fn trigger_source_ids_for_zone(state: &GameState, zone: Zone) -> Vec<ObjectId> {
                 // (including KeywordAction) are abilities, not objects.
                 StackEntryKind::ActivatedAbility { .. }
                 | StackEntryKind::TriggeredAbility { .. }
-                | StackEntryKind::KeywordAction { .. } => None,
+                | StackEntryKind::KeywordAction { .. }
+                // Historically combat damage on the stack *was* an object, but
+                // this collection feeds source-has-trigger scanning over objects
+                // with a `GameObject` row, and a combat-damage entry has none.
+                | StackEntryKind::CombatDamage { .. } => None,
             })
             .collect(),
         // CR 114.4 + CR 113.6b: Abilities of emblems function in the command
@@ -6255,7 +6259,10 @@ fn collect_pending_triggers_with_collection(
         // CR 702.179d: The player with speed has an inherent no-source trigger that
         // increases their speed once each turn when one or more opponents lose life
         // during that player's turn, if their speed is less than 4.
-        if let GameEvent::LifeChanged { player_id, amount } = event {
+        if let GameEvent::LifeChanged {
+            player_id, amount, ..
+        } = event
+        {
             let trigger_controller = state.active_player;
             if *amount < 0
                 && *player_id != trigger_controller
@@ -16030,6 +16037,10 @@ pub(super) fn build_triggered_ability_from_context(
         // Carry the trigger's description if the execute doesn't have its own.
         if resolved.description.is_none() {
             resolved.description = trig_def.description.clone();
+            // CR 608.2c: the head only just acquired its text, so the chain
+            // built above still needs it pushed down to the links that raise
+            // their own prompts.
+            resolved.backfill_chain_description();
         }
         // Propagate cast_from_zone from the source object so sub_ability
         // conditions like "if you cast it from your hand" can evaluate.
@@ -16184,6 +16195,9 @@ pub(super) fn build_triggered_ability(
     let mut resolved = build_resolved_from_def(execute, source_id, controller);
     if resolved.description.is_none() {
         resolved.description = trig_def.description.clone();
+        // CR 608.2c: see the sibling site above — a head that acquires its text
+        // after construction must re-push it down the chain.
+        resolved.backfill_chain_description();
     }
     resolved.unless_pay.clone_from(&trig_def.unless_pay);
     if matches!(trig_def.mode, TriggerMode::Phase) {
@@ -25996,6 +26010,7 @@ pub mod tests {
         let event = GameEvent::LifeChanged {
             player_id: opponent,
             amount: -1,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         let mut ability = ResolvedAbility::new(
             Effect::Draw {
@@ -30612,6 +30627,7 @@ pub mod tests {
         let life_changed = |player_id: PlayerId| GameEvent::LifeChanged {
             player_id,
             amount: -1,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
 
         // Reach-guard: with an event that NAMES a player, the arm resolves and
@@ -31274,6 +31290,7 @@ pub mod tests {
             &GameEvent::LifeChanged {
                 player_id: PlayerId(1),
                 amount: -1,
+                new_total: crate::types::events::LifeTotalReading::default(),
             },
         );
         assert!(
@@ -32095,6 +32112,7 @@ pub mod tests {
             driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
             mana_spend_permission: None,
             additional_cost: None,
+            cast_cost_modifier: None,
         };
         assert!(
             extract_target_filter_from_effect(&effect).is_none(),
@@ -32128,6 +32146,7 @@ pub mod tests {
             driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
             mana_spend_permission: None,
             additional_cost: None,
+            cast_cost_modifier: None,
         };
         assert!(
             extract_target_filter_from_effect(&effect).is_some(),
@@ -33501,6 +33520,7 @@ pub mod tests {
         let opponent_life_loss = GameEvent::LifeChanged {
             player_id: opponent,
             amount: -3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         state.active_player = controller;
         assert!(!check_trigger_constraint(
@@ -33540,6 +33560,7 @@ pub mod tests {
         let controller_life_loss = GameEvent::LifeChanged {
             player_id: controller,
             amount: -3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         state.active_player = controller;
         assert!(!check_trigger_constraint(
@@ -39802,6 +39823,7 @@ pub mod tests {
         let event = Some(GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 1,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
         for mode in [LoopDetectionMode::Off, LoopDetectionMode::On] {
             for ability in [pr625_sound_ability(), pr625_sibling_mutable_ability()] {
@@ -39846,10 +39868,12 @@ pub mod tests {
         let ev_a = Some(GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -1,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
         let ev_b = Some(GameEvent::LifeChanged {
             player_id: PlayerId(1),
             amount: -1,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
 
         // OFF arm — must PROMPT.
@@ -40064,10 +40088,12 @@ pub mod tests {
         let ev_a = Some(GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -1,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
         let ev_b = Some(GameEvent::LifeChanged {
             player_id: PlayerId(1),
             amount: -1,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
         let mut on = setup();
         on.loop_detection = LoopDetectionMode::On;
@@ -41974,6 +42000,7 @@ pub mod tests {
             | Keyword::Gift(_)
             | Keyword::Discover(_)
             | Keyword::Spree
+            | Keyword::Tiered
             | Keyword::Ravenous
             | Keyword::Daybound
             | Keyword::Nightbound
@@ -45553,7 +45580,8 @@ pub mod tests {
                                 StackEntryKind::TriggeredAbility { .. }
                                 | StackEntryKind::Spell { .. }
                                 | StackEntryKind::ActivatedAbility { .. }
-                                | StackEntryKind::KeywordAction { .. } => None,
+                                | StackEntryKind::KeywordAction { .. }
+                                | StackEntryKind::CombatDamage { .. } => None,
                             })
                             .collect::<Vec<_>>();
                         actual_subjects.sort_unstable();
@@ -46940,7 +46968,8 @@ pub mod tests {
                     }
                     StackEntryKind::Spell { .. }
                     | StackEntryKind::ActivatedAbility { .. }
-                    | StackEntryKind::KeywordAction { .. } => None,
+                    | StackEntryKind::KeywordAction { .. }
+                    | StackEntryKind::CombatDamage { .. } => None,
                 })
                 .collect::<Vec<_>>();
             placed_refs.sort_unstable();
@@ -47716,7 +47745,8 @@ pub mod tests {
                     StackEntryKind::TriggeredAbility { .. }
                     | StackEntryKind::Spell { .. }
                     | StackEntryKind::ActivatedAbility { .. }
-                    | StackEntryKind::KeywordAction { .. } => None,
+                    | StackEntryKind::KeywordAction { .. }
+                    | StackEntryKind::CombatDamage { .. } => None,
                 })
                 .collect::<Vec<_>>();
             observed_subjects.sort_unstable();
