@@ -1101,30 +1101,82 @@ fn special_action_rank(value: SpecialAction) -> u8 {
 }
 
 impl ManaRestriction {
+    /// The `and/or` connective exactly as Oracle text prints it, e.g. Codsworth,
+    /// Handy Helper's "Aura and/or Equipment spells".
+    const AND_OR: &'static str = "and/or";
+
+    /// Byte offset of the next `and/or`, ignoring ASCII case. Stored phrases
+    /// arrive title-cased ("Aura And/or Equipment"), so a case-sensitive `find`
+    /// would miss them. The match always starts on an ASCII byte, so the offset
+    /// is a valid char boundary.
+    fn find_and_or(haystack: &str) -> Option<usize> {
+        haystack
+            .as_bytes()
+            .windows(Self::AND_OR.len())
+            .position(|window| window.eq_ignore_ascii_case(Self::AND_OR.as_bytes()))
+    }
+
+    /// Splits a phrase on every `and/or`, which the plain `split` connectives
+    /// cannot reach: it is one printed token, not a spaced conjunction.
+    fn split_and_or(required: &str) -> impl Iterator<Item = &str> {
+        let mut rest = Some(required);
+        std::iter::from_fn(move || {
+            let current = rest?;
+            match Self::find_and_or(current) {
+                Some(at) => {
+                    rest = Some(&current[at + Self::AND_OR.len()..]);
+                    Some(&current[..at])
+                }
+                None => {
+                    rest = None;
+                    Some(current)
+                }
+            }
+        })
+    }
+
+    /// The alternatives a restricted-spend type phrase enumerates.
+    ///
+    /// CR 106.6: the phrase names the *set* of objects the mana may be spent on,
+    /// and Oracle text enumerates that set with four connectives, not two:
+    /// `" or "`, `" and "`, the serial comma of a list of three or more
+    /// (Fíli and Kíli, Joyous — "Dwarf, Equipment, and Saga spells") and the
+    /// `and/or` token (Codsworth, Handy Helper — "Aura and/or Equipment
+    /// spells"). Each is an alternative the object need only satisfy one of: per
+    /// the Melek, Izzet Paragon example (CR 601.3e), "instant and sorcery
+    /// spells" (Tablet of Discovery, issue #1975) lets a spell that is an
+    /// instant *or* a sorcery qualify; a single object is never required to
+    /// carry every listed type — and for Fíli and Kíli no object *could*, since
+    /// no card is at once a Dwarf, an Equipment and a Saga.
+    ///
+    /// Whitespace within an alternative still ANDs, so a compound single quality
+    /// ("Colorless Eldrazi", Eldrazi Temple) must match every word.
+    fn type_phrase_alternatives(required: &str) -> impl Iterator<Item = &str> {
+        Self::split_and_or(required)
+            .flat_map(|clause| clause.split(" or "))
+            .flat_map(|clause| clause.split(" and "))
+            .flat_map(|clause| clause.split(','))
+    }
+
     fn matches_required_quality<'a>(
         required: &str,
         qualities: impl IntoIterator<Item = &'a String>,
     ) -> bool {
         let qualities = qualities.into_iter().collect::<Vec<_>>();
-        // CR 106.6: A restricted-spend type phrase names the *set* of objects the
-        // mana may be spent on. Both connectives — " or " and " and " — enumerate
-        // distinct acceptable types, so each is an alternative the object need
-        // only satisfy one of. Per the Melek, Izzet Paragon example (CR 601.3e),
-        // "instant and sorcery spells" (Tablet of Discovery, issue #1975) lets a
-        // spell that is an instant *or* a sorcery qualify; a single object is
-        // never required to carry both types. Whitespace within an alternative
-        // still ANDs (a compound single quality like "Colorless Eldrazi" must
-        // match every word).
-        required
-            .split(" or ")
-            .flat_map(|clause| clause.split(" and "))
-            .any(|alternative| {
-                alternative.split_whitespace().all(|part| {
+        Self::type_phrase_alternatives(required).any(|alternative| {
+            let mut words = alternative.split_whitespace().peekable();
+            // An alternative with no words authorizes nothing. Splitting a serial
+            // list leaves an empty piece ("Cleric, Rogue, Warrior, or Wizard"
+            // yields one between the last comma and " or "), and `all` over an
+            // empty iterator is vacuously true — which would let that mana pay
+            // for every spell in the game.
+            words.peek().is_some()
+                && words.all(|part| {
                     qualities
                         .iter()
                         .any(|quality| quality.eq_ignore_ascii_case(part))
                 })
-            })
+        })
     }
 
     /// Returns `true` if this restriction permits spending mana on the given spell.
@@ -3270,6 +3322,76 @@ mod tests {
         assert!(!legendary_restriction.allows_spell(&creature_spell));
     }
 
+    // CR 106.6: Oracle enumerates a restricted-spend type set with four
+    // connectives, not two. Before this, a phrase joined by the serial comma or
+    // by `and/or` collapsed into a single alternative that no object could ever
+    // satisfy — the mana entered the pool and paid for NOTHING.
+    //
+    // Fíli and Kíli, Joyous: "{T}: Add {R}{R}. Spend this mana only to cast
+    // Dwarf, Equipment, and Saga spells." (Oracle verified on Scryfall.)
+    // Reported from play: four red in the pool and Torbran, Thane of Red Fell
+    // (a Dwarf Noble) still uncastable.
+    #[test]
+    fn restriction_type_phrase_reads_serial_commas_and_and_or() {
+        let spell_of = |types: &[&str], subtypes: &[&str]| SpellMeta {
+            types: types.iter().map(|t| t.to_string()).collect(),
+            subtypes: subtypes.iter().map(|t| t.to_string()).collect(),
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            colors: vec![],
+            has_x_in_cost: false,
+            is_face_down: false,
+            cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
+        };
+
+        // Fíli and Kíli, Joyous — serial comma plus a closing "and".
+        let dwarf_gear_saga =
+            ManaRestriction::OnlyForSpellType("Dwarf, Equipment, and Saga".to_string());
+        let torbran = spell_of(&["Legendary", "Creature"], &["Dwarf", "Noble"]);
+        assert!(dwarf_gear_saga.allows_spell(&torbran));
+        assert!(dwarf_gear_saga.allows_spell(&spell_of(&["Artifact"], &["Equipment"])));
+        assert!(dwarf_gear_saga.allows_spell(&spell_of(&["Enchantment"], &["Saga"])));
+        // No card is a Dwarf AND an Equipment AND a Saga: reading the phrase as a
+        // conjunction is what made the mana dead. An unlisted type is still out.
+        assert!(!dwarf_gear_saga.allows_spell(&spell_of(&["Instant"], &[])));
+
+        // Codsworth, Handy Helper — "Aura and/or Equipment", stored title-cased.
+        let aura_or_gear = ManaRestriction::OnlyForSpellType("Aura And/or Equipment".to_string());
+        assert!(aura_or_gear.allows_spell(&spell_of(&["Enchantment"], &["Aura"])));
+        assert!(aura_or_gear.allows_spell(&spell_of(&["Artifact"], &["Equipment"])));
+        assert!(!aura_or_gear.allows_spell(&spell_of(&["Creature"], &["Goblin"])));
+
+        // Base Camp — serial comma closing with "or"; the empty piece between the
+        // last comma and " or " must authorize nothing.
+        let party =
+            ManaRestriction::OnlyForSpellType("Cleric, Rogue, Warrior, or Wizard".to_string());
+        assert!(party.allows_spell(&spell_of(&["Creature"], &["Cleric"])));
+        assert!(party.allows_spell(&spell_of(&["Creature"], &["Wizard"])));
+        assert!(!party.allows_spell(&spell_of(&["Creature"], &["Goblin"])));
+        assert!(!party.allows_spell(&spell_of(&["Sorcery"], &[])));
+
+        // Already-working shapes keep working: single type, " or ", " and ", and
+        // the compound quality whose words still AND.
+        let artifact_or_creature =
+            ManaRestriction::OnlyForSpellType("Artifact or Creature".to_string());
+        assert!(artifact_or_creature.allows_spell(&spell_of(&["Artifact"], &[])));
+        assert!(!artifact_or_creature.allows_spell(&spell_of(&["Instant"], &[])));
+
+        let instant_and_sorcery =
+            ManaRestriction::OnlyForSpellType("Instant and Sorcery".to_string());
+        assert!(instant_and_sorcery.allows_spell(&spell_of(&["Sorcery"], &[])));
+        assert!(!instant_and_sorcery.allows_spell(&spell_of(&["Creature"], &[])));
+
+        // Eldrazi Temple: "Colorless Eldrazi" is ONE quality — both words required.
+        let colorless_eldrazi = ManaRestriction::OnlyForSpellType("Colorless Eldrazi".to_string());
+        assert!(colorless_eldrazi.allows_spell(&spell_of(&["Colorless", "Creature"], &["Eldrazi"])));
+        assert!(!colorless_eldrazi.allows_spell(&spell_of(&["Creature"], &["Eldrazi"])));
+    }
+
     // CR 106.6: A disjunctive restriction allows a spell if it satisfies ANY
     // inner branch (Maelstrom of the Spirit Dragon: Dragon spell OR Omen spell).
     #[test]
@@ -3553,6 +3675,67 @@ mod tests {
         assert!(pool
             .spend_for(ManaType::Green, &PaymentContext::Spell(&elf_spell))
             .is_some());
+    }
+
+    // The reported symptom, at the layer where it hurt: the mana sits in the pool
+    // and the pool refuses to pay with it. Fíli and Kíli, Joyous makes {R}{R}
+    // "only to cast Dwarf, Equipment, and Saga spells"; Torbran, Thane of Red
+    // Fell is a Dwarf Noble, so the pool must hand the red over.
+    #[test]
+    fn spend_for_pays_a_dwarf_with_serial_list_restricted_mana() {
+        let mut pool = ManaPool::default();
+        pool.add(make_restricted_unit(
+            ManaType::Red,
+            ObjectId(1),
+            vec![ManaRestriction::OnlyForSpellType(
+                "Dwarf, Equipment, and Saga".to_string(),
+            )],
+        ));
+
+        let torbran = SpellMeta {
+            types: vec!["Legendary".to_string(), "Creature".to_string()],
+            subtypes: vec!["Dwarf".to_string(), "Noble".to_string()],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            colors: vec![],
+            has_x_in_cost: false,
+            is_face_down: false,
+            cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
+        };
+        assert!(pool
+            .spend_for(ManaType::Red, &PaymentContext::Spell(&torbran))
+            .is_some());
+
+        // And it stays restricted: an unlisted type still cannot touch it.
+        let mut pool = ManaPool::default();
+        pool.add(make_restricted_unit(
+            ManaType::Red,
+            ObjectId(1),
+            vec![ManaRestriction::OnlyForSpellType(
+                "Dwarf, Equipment, and Saga".to_string(),
+            )],
+        ));
+        let bolt = SpellMeta {
+            types: vec!["Instant".to_string()],
+            subtypes: vec![],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            colors: vec![],
+            has_x_in_cost: false,
+            is_face_down: false,
+            cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
+        };
+        assert!(pool
+            .spend_for(ManaType::Red, &PaymentContext::Spell(&bolt))
+            .is_none());
     }
 
     #[test]
