@@ -25,7 +25,7 @@ use crate::types::game_state::{
     AttackDeclarationRecord, CounterAddedRecord, DamageRecord, GameState, LKISnapshot,
     SpellCastRecord, StackEntryKind, TriggerSourceContext, ZoneChangeRecord,
 };
-use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef};
+use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef, TriggeringObjectRef};
 use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaColor, ManaCost};
 use crate::types::player::PlayerId;
@@ -1184,7 +1184,10 @@ pub fn normalize_contextual_filter_with_liveness(
 /// `ResolvedAbility::targets`.
 ///
 /// Construct via one of the three associated functions — don't build the struct
-/// literal directly; the constructors encode the correct defaults.
+/// literal directly; the constructors encode the correct defaults. (`Copy` is
+/// derived so `with_triggering_object` can rebind one field from a `&self`
+/// receiver; it is NOT a licence to build the literal or `..*ctx` by hand.)
+#[derive(Clone, Copy)]
 pub struct FilterContext<'a> {
     pub source_id: ObjectId,
     pub source_controller: Option<PlayerId>,
@@ -1202,6 +1205,37 @@ pub struct FilterContext<'a> {
     /// resolution. Distinct from `source_controller`, which remains the
     /// ability's controller for `ControllerRef::You` ("creatures you control").
     pub scoped_iteration_player: Option<PlayerId>,
+    /// CR 400.7 + CR 603.4 + CR 603.6a: The object whose zone change fired the
+    /// trigger whose intervening-`if` is being evaluated — the referent of
+    /// "another" in a trigger-anaphoric filter ("another creature you control",
+    /// where "another" means "other than the creature that just entered", not
+    /// "other than the ability source"). Bound only inside
+    /// `matches_zone_change_event_object_filter`, which is the one place holding
+    /// the `GameEvent::ZoneChanged` both CR 603.4 legs are handed; `None`
+    /// everywhere else, where `FilterProp::OtherThanTriggerObject` keeps its
+    /// transparent pass-through and the `ObjectCount` / `PropertyAggregate`
+    /// resolvers apply the exclusion at the set level instead.
+    ///
+    /// CR 400.7: carried as a `TriggeringObjectRef` (id + the incarnation the
+    /// event proves) rather than a bare `ObjectId`, so a leave-and-re-enter at
+    /// the same storage id is recognized as the DIFFERENT object it is and is
+    /// admitted to the "another" population.
+    pub triggering_object: Option<TriggeringObjectRef>,
+}
+
+impl<'a> FilterContext<'a> {
+    /// CR 603.4 + CR 603.6a: Rebind the triggering-object referent for the
+    /// duration of one intervening-`if` evaluation. Takes `&self` and returns a
+    /// fresh value (the struct is `Copy`), so the caller's borrowed context is
+    /// left untouched — CR 603.4 re-answers the condition at both the fire-time
+    /// and resolution-time legs, and each leg binds from the event it was handed
+    /// rather than from anything latched earlier.
+    pub fn with_triggering_object(&self, object: TriggeringObjectRef) -> FilterContext<'a> {
+        FilterContext {
+            triggering_object: Some(object),
+            ..*self
+        }
+    }
 }
 
 /// CR 608.2h + CR 111.7: The controller of a filter context's SOURCE, from live
@@ -1245,6 +1279,7 @@ impl<'a> FilterContext<'a> {
             trigger_source: None,
             recipient_id: None,
             scoped_iteration_player: None,
+            triggering_object: None,
         }
     }
 
@@ -1263,6 +1298,7 @@ impl<'a> FilterContext<'a> {
             trigger_source: None,
             recipient_id: None,
             scoped_iteration_player: None,
+            triggering_object: None,
         }
     }
 
@@ -1277,6 +1313,7 @@ impl<'a> FilterContext<'a> {
             trigger_source: None,
             recipient_id: None,
             scoped_iteration_player: None,
+            triggering_object: None,
         }
     }
 
@@ -1291,6 +1328,7 @@ impl<'a> FilterContext<'a> {
             trigger_source: Some(source),
             recipient_id: None,
             scoped_iteration_player: None,
+            triggering_object: None,
         }
     }
 
@@ -1308,6 +1346,7 @@ impl<'a> FilterContext<'a> {
             trigger_source: Some(source),
             recipient_id: None,
             scoped_iteration_player: None,
+            triggering_object: None,
         }
     }
 
@@ -1327,6 +1366,7 @@ impl<'a> FilterContext<'a> {
             trigger_source: None,
             recipient_id: Some(recipient_id),
             scoped_iteration_player: None,
+            triggering_object: None,
         }
     }
 
@@ -1341,6 +1381,7 @@ impl<'a> FilterContext<'a> {
             trigger_source: ability.trigger_source.as_ref(),
             recipient_id: None,
             scoped_iteration_player: None,
+            triggering_object: None,
         }
     }
 
@@ -1357,6 +1398,7 @@ impl<'a> FilterContext<'a> {
             trigger_source: ability.trigger_source.as_ref(),
             recipient_id: Some(recipient_id),
             scoped_iteration_player: None,
+            triggering_object: None,
         }
     }
 
@@ -1376,6 +1418,7 @@ impl<'a> FilterContext<'a> {
             trigger_source: ability.trigger_source.as_ref(),
             recipient_id: None,
             scoped_iteration_player: None,
+            triggering_object: None,
         }
     }
 }
@@ -3072,6 +3115,7 @@ fn stack_entry_controller_matches(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.triggering_object,
     );
     match controller {
         None => true,
@@ -3152,6 +3196,7 @@ pub fn matches_target_filter_including_phased_out(
         ctx.trigger_source,
         ctx.recipient_id,
         ctx.scoped_iteration_player,
+        ctx.triggering_object,
         ControllerLookup::LiveOnly,
     )
 }
@@ -3488,6 +3533,7 @@ pub fn matches_target_filter_in_owner_zone(
             ctx.trigger_source,
             ctx.recipient_id,
             ctx.scoped_iteration_player,
+            ctx.triggering_object,
             ControllerLookup::LiveOnly,
         );
     }
@@ -3505,6 +3551,7 @@ pub fn matches_target_filter_in_owner_zone(
         ctx.trigger_source,
         ctx.recipient_id,
         ctx.scoped_iteration_player,
+        ctx.triggering_object,
         ControllerLookup::LiveOnly,
     )
 }
@@ -3611,6 +3658,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                     ctx.trigger_source,
                     ctx.recipient_id,
                     ctx.scoped_iteration_player,
+                    ctx.triggering_object,
                     ControllerLookup::LiveOrLki,
                 );
             }
@@ -3636,6 +3684,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                     ctx.trigger_source,
                     ctx.recipient_id,
                     ctx.scoped_iteration_player,
+                    ctx.triggering_object,
                     ControllerLookup::LiveOrLki,
                 )
             } else if let Some(entry) = state.liminal_entries.get(object_id) {
@@ -3650,6 +3699,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                     ctx.trigger_source,
                     ctx.recipient_id,
                     ctx.scoped_iteration_player,
+                    ctx.triggering_object,
                     ControllerLookup::LiveOrLki,
                 )
             } else {
@@ -3669,6 +3719,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                     ctx.trigger_source,
                     ctx.recipient_id,
                     ctx.scoped_iteration_player,
+                    ctx.triggering_object,
                     ControllerLookup::LiveOrLki,
                 )
             })
@@ -3691,6 +3742,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                 ctx.trigger_source,
                 ctx.recipient_id,
                 ctx.scoped_iteration_player,
+                ctx.triggering_object,
                 ControllerLookup::LiveOrLki,
             )
         }
@@ -3711,15 +3763,7 @@ pub fn matches_target_filter_on_zone_change_record(
     filter: &TargetFilter,
     ctx: &FilterContext<'_>,
 ) -> bool {
-    zone_change_filter_inner(
-        state,
-        record,
-        filter,
-        ctx.source_id,
-        ctx.source_controller,
-        ctx.ability,
-        ctx.trigger_source,
-    )
+    zone_change_filter_inner(state, record, filter, ctx)
 }
 
 /// CR 122.1 + CR 122.6: Check whether a per-turn counter-placement snapshot
@@ -3759,6 +3803,7 @@ pub fn matches_target_filter_on_counter_added_record(
         ctx.trigger_source,
         ctx.recipient_id,
         ctx.scoped_iteration_player,
+        ctx.triggering_object,
         ControllerLookup::LiveOrLki,
     )
 }
@@ -3804,6 +3849,7 @@ pub fn matches_target_filter_on_attack_declaration_record(
         ctx.trigger_source,
         ctx.recipient_id,
         ctx.scoped_iteration_player,
+        ctx.triggering_object,
         ControllerLookup::LiveOrLki,
     )
 }
@@ -3853,6 +3899,7 @@ pub fn matches_target_filter_on_damage_record_source(
         ctx.trigger_source,
         ctx.recipient_id,
         ctx.scoped_iteration_player,
+        ctx.triggering_object,
         ControllerLookup::LiveOrLki,
     )
 }
@@ -3868,6 +3915,21 @@ pub fn matches_target_filter_on_lki_snapshot(
     lki: &LKISnapshot,
     filter: &TargetFilter,
     ctx: &FilterContext<'_>,
+) -> bool {
+    matches_target_filter_on_lki_snapshot_with_incarnation(state, object_id, lki, filter, ctx, None)
+}
+
+/// CR 400.7 + CR 608.2h: Evaluate a target filter against LKI for a known
+/// incarnation. The synthesized record preserves the proven incarnation so
+/// record-side identity predicates such as `OtherThanTriggerObject` do not
+/// collapse a later object at the same storage id into the original object.
+fn matches_target_filter_on_lki_snapshot_with_incarnation(
+    state: &GameState,
+    object_id: ObjectId,
+    lki: &LKISnapshot,
+    filter: &TargetFilter,
+    ctx: &FilterContext<'_>,
+    entered_incarnation: Option<u64>,
 ) -> bool {
     let record = ZoneChangeRecord {
         object_id,
@@ -3906,7 +3968,7 @@ pub fn matches_target_filter_on_lki_snapshot(
         combat_status: Default::default(),
         co_departed: Vec::new(),
         attached_to: None,
-        entered_incarnation: None,
+        entered_incarnation,
         turn_zone_change_index: 0,
         recorded_turn_number: 0,
         // CR 701.60b: Carry suspected status from the LKI snapshot so
@@ -3997,6 +4059,7 @@ pub(crate) fn matches_target_filter_on_event_snapshot(
         snapshot.zone,
     );
     object.controller = snapshot.controller;
+    object.incarnation = snapshot.identity.incarnation;
     object.power = snapshot.power;
     object.toughness = snapshot.toughness;
     object.base_power = snapshot.base_power;
@@ -4045,6 +4108,7 @@ pub(crate) fn matches_target_filter_on_event_snapshot(
         ctx.trigger_source,
         ctx.recipient_id,
         ctx.scoped_iteration_player,
+        ctx.triggering_object,
         ControllerLookup::LiveOnly,
     )
 }
@@ -4077,6 +4141,27 @@ pub fn matches_zone_change_event_object_filter(
         return false;
     }
 
+    // CR 603.4 + CR 603.6a + CR 201.2a: bind the zone-change subject as the
+    // triggering object for the whole of this evaluation, so a trigger-anaphoric
+    // "another <type>" in the filter (or nested in a `SharesQuality` reference)
+    // excludes the object that fired the trigger rather than the ability source.
+    // Bound here because this is the one place that holds the `ZoneChanged`
+    // event, and BOTH CR 603.4 legs arrive here with it: the fire-time leg via
+    // `check_trigger_condition_with_source`'s explicit `trigger_event`
+    // parameter, and the resolution-time recheck via `state.current_trigger_event`.
+    // Neither leg latches the id — each re-derives it from the event it was
+    // handed, which is what keeps the two legs answering the same question.
+    // CR 400.7: the record's `entered_incarnation` is captured after the entry
+    // bump, so the binding names the exact incarnation that fired this trigger —
+    // a later re-entry at the same storage id is a different object and must not
+    // be excluded from an "another" population at the CR 603.4 resolution
+    // recheck. `None` (non-battlefield destinations, legacy records) degrades to
+    // storage identity, which is the pre-existing behavior.
+    let ctx = &ctx.with_triggering_object(TriggeringObjectRef::from_zone_change(
+        *object_id,
+        record.entered_incarnation,
+    ));
+
     if destination == Zone::Battlefield {
         // CR 603.4: the intervening-if is rechecked when the ability resolves.
         // CR 608.2h: a filter that reads the entrant's characteristics uses its
@@ -4106,11 +4191,37 @@ pub fn matches_zone_change_event_object_filter(
         });
         if still_on_battlefield {
             matches_target_filter(state, *object_id, filter, ctx)
-        } else if let Some(lki) = state.lki_cache.get(object_id) {
+        } else if let Some(lki) = record
+            .entered_incarnation
+            .and_then(|incarnation| {
+                state
+                    .lki_by_incarnation
+                    .get(object_id)
+                    .and_then(|history| history.get(&incarnation))
+            })
+            .or_else(|| {
+                // CR 400.7: an event without an incarnation cannot select an
+                // exact history entry, so it retains the legacy cache behavior.
+                // A proven incarnation never falls back to this slot because it
+                // might describe a later incarnation at the same storage id.
+                record
+                    .entered_incarnation
+                    .is_none()
+                    .then(|| state.lki_cache.get(object_id))
+                    .flatten()
+            })
+        {
             // CR 608.2h: the entrant has left the battlefield — evaluate against
             // its exit-time LKI (the most-recently-existed battlefield
             // characteristics, snapshotted before the base revert).
-            matches_target_filter_on_lki_snapshot(state, *object_id, lki, filter, ctx)
+            matches_target_filter_on_lki_snapshot_with_incarnation(
+                state,
+                *object_id,
+                lki,
+                filter,
+                ctx,
+                record.entered_incarnation,
+            )
         } else {
             // No exit LKI cached (defensive — a battlefield exit always caches
             // one). Use the zone-change record rather than the reverted live
@@ -4150,6 +4261,7 @@ fn filter_inner(
         ctx.trigger_source,
         ctx.recipient_id,
         ctx.scoped_iteration_player,
+        ctx.triggering_object,
         ControllerLookup::LiveOrLki,
     )
 }
@@ -4166,6 +4278,7 @@ fn filter_inner_for_object(
     trigger_source: Option<&TriggerSourceContext>,
     recipient_id: Option<ObjectId>,
     scoped_iteration_player: Option<PlayerId>,
+    triggering_object: Option<TriggeringObjectRef>,
     controller_lookup: ControllerLookup,
 ) -> bool {
     match filter {
@@ -4329,6 +4442,7 @@ fn filter_inner_for_object(
                             ability,
                             trigger_source,
                             recipient_id,
+                            triggering_object,
                         );
                         match source_defending_player(state, &source_ctx) {
                             Some(pid) if pid == obj_ctrl => {}
@@ -4345,6 +4459,7 @@ fn filter_inner_for_object(
                             ability,
                             trigger_source,
                             recipient_id,
+                            triggering_object,
                         );
                         match source_chosen_player(&source_ctx) {
                             Some(pid) if pid == obj_ctrl => {}
@@ -4416,6 +4531,7 @@ fn filter_inner_for_object(
                 ability,
                 trigger_source,
                 recipient_id,
+                triggering_object,
             );
             properties
                 .iter()
@@ -4432,6 +4548,7 @@ fn filter_inner_for_object(
             trigger_source,
             recipient_id,
             scoped_iteration_player,
+            triggering_object,
             controller_lookup,
         ),
         TargetFilter::Or { filters } => filters.iter().any(|f| {
@@ -4446,6 +4563,7 @@ fn filter_inner_for_object(
                 trigger_source,
                 recipient_id,
                 scoped_iteration_player,
+                triggering_object,
                 controller_lookup,
             )
         }),
@@ -4461,6 +4579,7 @@ fn filter_inner_for_object(
                 trigger_source,
                 recipient_id,
                 scoped_iteration_player,
+                triggering_object,
                 controller_lookup,
             )
         }),
@@ -4478,6 +4597,7 @@ fn filter_inner_for_object(
                     trigger_source,
                     recipient_id,
                     scoped_iteration_player,
+                    triggering_object,
                 },
             )
         }
@@ -4577,6 +4697,7 @@ fn filter_inner_for_object(
             ability,
             trigger_source,
             recipient_id,
+            triggering_object,
         )
         .chosen_attributes
         .iter()
@@ -4677,6 +4798,7 @@ fn filter_inner_for_object(
                     trigger_source,
                     recipient_id,
                     scoped_iteration_player,
+                    triggering_object,
                     controller_lookup,
                 )
         }
@@ -4691,6 +4813,7 @@ fn filter_inner_for_object(
                 ability,
                 trigger_source,
                 recipient_id,
+                triggering_object,
             );
             let linked = if trigger_source.is_some() {
                 source_ctx.linked_exile_snapshot
@@ -4802,6 +4925,7 @@ fn filter_inner_for_object(
                 ability,
                 trigger_source,
                 recipient_id,
+                triggering_object,
             );
             let chosen_name = source_ctx.chosen_attributes.iter().find_map(|a| match a {
                 ChosenAttribute::CardName(n) => Some(n.as_str()),
@@ -4819,6 +4943,7 @@ fn filter_inner_for_object(
                 trigger_source,
                 recipient_id,
                 scoped_iteration_player,
+                triggering_object,
             };
             state
                 .last_chosen_damage_source
@@ -4892,11 +5017,13 @@ fn zone_change_filter_inner(
     state: &GameState,
     record: &ZoneChangeRecord,
     filter: &TargetFilter,
-    source_id: ObjectId,
-    source_controller: Option<PlayerId>,
-    ability: Option<&ResolvedAbility>,
-    trigger_source: Option<&TriggerSourceContext>,
+    ctx: &FilterContext<'_>,
 ) -> bool {
+    let source_id = ctx.source_id;
+    let source_controller = ctx.source_controller;
+    let ability = ctx.ability;
+    let trigger_source = ctx.trigger_source;
+    let triggering_object = ctx.triggering_object;
     match filter {
         TargetFilter::None => false,
         TargetFilter::Any => true,
@@ -4960,6 +5087,7 @@ fn zone_change_filter_inner(
                 ability,
                 trigger_source,
                 None,
+                triggering_object,
             );
 
             if let Some(ctrl) = controller {
@@ -5027,39 +5155,13 @@ fn zone_change_filter_inner(
                 .iter()
                 .all(|prop| zone_change_record_matches_property(prop, state, record, &source_ctx))
         }
-        TargetFilter::Not { filter: inner } => {
-            !zone_change_filter_inner(
-                state,
-                record,
-                inner,
-                source_id,
-                source_controller,
-                ability,
-                trigger_source,
-            )
-        }
-        TargetFilter::Or { filters } => filters.iter().any(|inner| {
-            zone_change_filter_inner(
-                state,
-                record,
-                inner,
-                source_id,
-                source_controller,
-                ability,
-                trigger_source,
-            )
-        }),
-        TargetFilter::And { filters } => filters.iter().all(|inner| {
-            zone_change_filter_inner(
-                state,
-                record,
-                inner,
-                source_id,
-                source_controller,
-                ability,
-                trigger_source,
-            )
-        }),
+        TargetFilter::Not { filter: inner } => !zone_change_filter_inner(state, record, inner, ctx),
+        TargetFilter::Or { filters } => filters
+            .iter()
+            .any(|inner| zone_change_filter_inner(state, record, inner, ctx)),
+        TargetFilter::And { filters } => filters
+            .iter()
+            .all(|inner| zone_change_filter_inner(state, record, inner, ctx)),
         TargetFilter::SpecificObject { id } => record.object_id == *id,
         // SpecificPlayer scopes to players, not objects — a zone-change record
         // is always an object transition.
@@ -5083,6 +5185,7 @@ fn zone_change_filter_inner(
                 ability,
                 trigger_source,
                 None,
+                triggering_object,
             );
             let chosen_name = source_ctx.chosen_attributes.iter().find_map(|a| match a {
                     ChosenAttribute::CardName(n) => Some(n.as_str()),
@@ -5116,6 +5219,7 @@ fn zone_change_filter_inner(
                     ability,
                     trigger_source,
                     None,
+                    triggering_object,
                 )
                 .chosen_attributes
                 .iter()
@@ -6220,6 +6324,12 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
 struct SourceContext<'a> {
     id: ObjectId,
     controller: Option<PlayerId>,
+    /// CR 400.7 + CR 603.4 + CR 603.6a: mirror of
+    /// `FilterContext::triggering_object` — the identity of the object whose zone
+    /// change fired the trigger being evaluated. Read by the
+    /// `FilterProp::OtherThanTriggerObject` arm; `None` outside a zone-change
+    /// intervening-`if`.
+    triggering_object: Option<TriggeringObjectRef>,
     /// Public source characteristics obtained through `TriggerSourceContext`
     /// when this filter belongs to a triggered ability. Kept as an owned
     /// projection so nested filter evaluation cannot rebind a recycled id.
@@ -6287,7 +6397,8 @@ pub(crate) fn source_defending_player_for_test(
     source_id: ObjectId,
     trigger_source: Option<&TriggerSourceContext>,
 ) -> Option<PlayerId> {
-    let context = source_context_from_filter(state, source_id, None, None, trigger_source, None);
+    let context =
+        source_context_from_filter(state, source_id, None, None, trigger_source, None, None);
     source_defending_player(state, &context)
 }
 
@@ -6363,6 +6474,7 @@ fn source_context_from_filter<'a>(
     ability: Option<&'a ResolvedAbility>,
     trigger_source: Option<&'a TriggerSourceContext>,
     recipient_id: Option<ObjectId>,
+    triggering_object: Option<TriggeringObjectRef>,
 ) -> SourceContext<'a> {
     let (lki, attached_to, saddled_by, convoked_creatures, linked_exile_snapshot) =
         if let Some(source) = trigger_source {
@@ -6466,6 +6578,7 @@ fn source_context_from_filter<'a>(
         chosen_attributes: lki.chosen_attributes,
         ability,
         recipient_id,
+        triggering_object,
     }
 }
 
@@ -6513,28 +6626,84 @@ fn combat_relation_subject_id(
     }
 }
 
+/// CR 400.7 + CR 608.2h: The exact incarnation `subject` names. A triggered
+/// source is named by the identity its trigger captured — for a
+/// leaves-the-battlefield trigger, the incarnation that left (CR 603.10a). An
+/// activated ability carries no trigger identity, so it falls to the
+/// incarnation stamped onto it when it reached the stack
+/// (CR 113.7a's "last known information" for a source that has since left the
+/// zone it was expected to be in). Only when neither is available does this
+/// fall to the live object at the referenced id; an object that left and
+/// returned is a new object (CR 400.7) and finds nothing its predecessor
+/// recorded. `ParentTarget` prefers the incarnation pinned when it was chosen.
+fn combat_relation_subject_ref(
+    state: &GameState,
+    subject: CombatRelationSubject,
+    source: &SourceContext<'_>,
+) -> Option<ObjectIncarnationRef> {
+    let live = |id: ObjectId| {
+        state
+            .objects
+            .get(&id)
+            .map(ObjectIncarnationRef::from_object)
+    };
+    match subject {
+        CombatRelationSubject::Source => source
+            .trigger_source
+            .map(|context| context.identity.reference)
+            .or_else(|| {
+                source
+                    .ability
+                    .and_then(|ability| ability.source_incarnation)
+                    .map(|incarnation| ObjectIncarnationRef::of(source.id, incarnation))
+            })
+            .or_else(|| live(source.id)),
+        CombatRelationSubject::ParentTarget => {
+            let ability = source.ability?;
+            let id = first_object_target(ability)?;
+            ability
+                .target_incarnations
+                .iter()
+                .chain(&ability.selected_target_incarnations)
+                .find(|pin| pin.object_id == id)
+                .copied()
+                .or_else(|| live(id))
+        }
+    }
+}
+
 fn matches_combat_relation(
     state: &GameState,
     object_id: ObjectId,
+    candidate: ObjectIncarnationRef,
     relation: CombatRelation,
     subject: CombatRelationSubject,
     source: &SourceContext<'_>,
 ) -> bool {
-    let Some(subject_id) = combat_relation_subject_id(subject, source) else {
-        return false;
-    };
     match relation {
-        CombatRelation::BlockingOrBlockedBy => state.combat.as_ref().is_some_and(|combat| {
-            let candidate_blocks_subject = combat
-                .blocker_to_attacker
-                .get(&object_id)
-                .is_some_and(|attackers| attackers.contains(&subject_id));
-            let subject_blocks_candidate = combat
-                .blocker_to_attacker
-                .get(&subject_id)
-                .is_some_and(|attackers| attackers.contains(&object_id));
-            candidate_blocks_subject || subject_blocks_candidate
-        }),
+        CombatRelation::BlockingOrBlockedBy => {
+            let Some(subject_id) = combat_relation_subject_id(subject, source) else {
+                return false;
+            };
+            state.combat.as_ref().is_some_and(|combat| {
+                let candidate_blocks_subject = combat
+                    .blocker_to_attacker
+                    .get(&object_id)
+                    .is_some_and(|attackers| attackers.contains(&subject_id));
+                let subject_blocks_candidate = combat
+                    .blocker_to_attacker
+                    .get(&subject_id)
+                    .is_some_and(|attackers| attackers.contains(&object_id));
+                candidate_blocks_subject || subject_blocks_candidate
+            })
+        }
+        // CR 509.1g + CR 400.7: answered from the block-history ledgers, which
+        // CR 506.4 does not prune, by the exact subject and candidate
+        // incarnations.
+        CombatRelation::BlockedBySubject { scope } => {
+            combat_relation_subject_ref(state, subject, source)
+                .is_some_and(|blocker| state.creature_blocked_attacker(blocker, candidate, scope))
+        }
     }
 }
 
@@ -6585,6 +6754,7 @@ fn aura_can_enchant_referenced_target(
                 trigger_source: source.trigger_source,
                 recipient_id: source.recipient_id,
                 scoped_iteration_player: None,
+                triggering_object: source.triggering_object,
             };
             filter_inner(state, *target_id, enchant_filter, &ctx)
         }
@@ -6818,9 +6988,14 @@ fn matches_filter_prop(
                 .get(&object_id)
                 .is_some_and(|attackers| attackers.contains(&source.id))
         }),
-        FilterProp::CombatRelation { relation, subject } => {
-            matches_combat_relation(state, object_id, *relation, *subject, source)
-        }
+        FilterProp::CombatRelation { relation, subject } => matches_combat_relation(
+            state,
+            object_id,
+            ObjectIncarnationRef::from_object(obj),
+            *relation,
+            *subject,
+            source,
+        ),
         // CR 509.1h: Unblocked = attacking creature that was never assigned blockers.
         // unblocked_attackers checks the permanent `blocked` flag, not the current blocker list.
         FilterProp::Unblocked => combat::unblocked_attackers(state).contains(&object_id),
@@ -7268,14 +7443,26 @@ fn matches_filter_prop(
         ),
         // CR 702.95b: An unpaired creature is one that is not paired.
         FilterProp::Unpaired => obj.paired_with.is_none(),
-        // CR 603.4 + CR 109.3: `OtherThanTriggerObject` is a typed marker that
-        // signals "exclude the triggering object" for count semantics. The
-        // exclusion is applied at the `QuantityRef::ObjectCount` resolver level
-        // (see `game::quantity`) using the current trigger event, not here —
-        // this variant acts as a transparent pass-through for per-object
-        // filter evaluation so that the marker does not spuriously exclude
-        // every object from individual match checks.
-        FilterProp::OtherThanTriggerObject => true,
+        // CR 603.4 + CR 603.6a + CR 201.2a: exclude the object whose zone change
+        // fired this trigger. CR 603.6a makes the entering permanent the subject
+        // of an enters-the-battlefield ability, and CR 201.2a makes every object
+        // share a name with itself — so "another creature you control" in such a
+        // trigger's intervening-`if` must exclude the entrant, or the comparison
+        // is trivially self-satisfied (Guardian Project). Distinct from
+        // `FilterProp::Another` above, which excludes the ability SOURCE.
+        //
+        // Unbound (`None`) keeps the historical transparent pass-through: every
+        // non-trigger context, and the `QuantityRef::ObjectCount` /
+        // `PropertyAggregate` resolvers, which strip this marker
+        // (`game::quantity`) and apply the exclusion at the set level instead.
+        // Expressing the default via `is_none_or` makes that a property of the
+        // code rather than of the current corpus.
+        // CR 400.7: compared as (id, incarnation), never as a raw storage id — a
+        // re-entered object at the same id is a NEW object with no relation to
+        // the entrant, so it belongs in the "another" population.
+        FilterProp::OtherThanTriggerObject => source
+            .triggering_object
+            .is_none_or(|trigger_object| !trigger_object.is_object(obj)),
         // CR 608.2c: Membership in the active resolution-chain tracked set.
         // Resolve the `TrackedSetId(0)` sentinel chain-first (the set the
         // preceding `ChooseObjectsIntoTrackedSet` head published within THIS
@@ -7845,10 +8032,19 @@ fn zone_change_record_matches_property(
         // read of a current object. It identifies the historical object this
         // zone-change record describes.
         FilterProp::Another => record.object_id != source.id,
-        // CR 603.4 + CR 109.3: Record-variant of OtherThanTriggerObject. See the
-        // comment in `matches_property_typed` — the exclusion is applied at the
-        // quantity-resolver layer; here the prop is a transparent pass-through.
-        FilterProp::OtherThanTriggerObject => true,
+        // CR 603.4 + CR 603.6a: Record-variant of OtherThanTriggerObject, keyed
+        // on the record's own event attribution rather than a live object read.
+        // `record.object_id` IS the zone-change subject, so when a triggering
+        // object is bound this record matches only if it describes some OTHER
+        // object. CR 400.7: "other" is identity, not storage — the record's own
+        // `entered_incarnation` is the same authority the binding was taken from,
+        // so the two agree exactly when the record describes THIS event and a
+        // re-entry at the same id does not. Unbound keeps the historical
+        // pass-through — see the live arm in `matches_filter_prop` for the full
+        // contract.
+        FilterProp::OtherThanTriggerObject => source
+            .triggering_object
+            .is_none_or(|trigger_object| !trigger_object.describes_record(record)),
         // CR 400.1: "from [zone]" — the record's origin zone.
         // CR 111.1 + CR 603.6a: Token creation produces `from_zone = None`,
         // which cannot match any specific origin zone — correct for triggers
@@ -7956,8 +8152,28 @@ fn zone_change_record_matches_property(
         }
         FilterProp::Blocking => record.combat_status.blocking,
         // `ZoneChangeCombatStatus` snapshots role, not the blocker-to-attacker
-        // relation. Source-relative blocker checks require live combat state.
-        FilterProp::BlockingSource | FilterProp::CombatRelation { .. } => false,
+        // relation, and this predicate reads live `combat.blocker_to_attacker`.
+        FilterProp::BlockingSource => false,
+        FilterProp::CombatRelation { relation, subject } => match relation {
+            // CR 506.4: the live map is pruned when either creature leaves
+            // combat, so there is nothing for a departed record to match.
+            CombatRelation::BlockingOrBlockedBy => false,
+            // CR 509.1g + CR 608.2i: answered from the same block-history
+            // ledgers as the live leg, through GameState::creature_blocked_attacker.
+            // CR 400.7: the record's exact departing incarnation is its own
+            // pre-change authority; a record without one fails closed.
+            CombatRelation::BlockedBySubject { scope } => {
+                let Some(candidate) = record
+                    .trigger_source_context()
+                    .map(|context| context.identity.reference)
+                else {
+                    return false;
+                };
+                combat_relation_subject_ref(state, *subject, source).is_some_and(|blocker| {
+                    state.creature_blocked_attacker(blocker, candidate, *scope)
+                })
+            }
+        },
         FilterProp::Unblocked => {
             record.combat_status.attacking && !record.combat_status.blocked
         }
@@ -8573,6 +8789,9 @@ fn source_context_from_spell_filter(context: SpellFilterContext<'_>) -> SourceCo
         id: context.source_id,
         controller: Some(context.source_controller),
         lki: lki.clone(),
+        // CR 603.4: a spell-cast cost-modifier evaluation is not a zone-change
+        // intervening-`if`, so there is no triggering object to exclude.
+        triggering_object: None,
         trigger_source: None,
         attached_to: source_obj.and_then(|o| o.attached_to),
         source_is_aura: source_obj
@@ -8758,7 +8977,12 @@ fn object_shares_quality_with_reference_filter(
         ability: source.ability,
         trigger_source: source.trigger_source,
         recipient_id: source.recipient_id,
+        // CR 603.4 + CR 603.6a: carry the triggering-object binding into the
+        // reference-population scan. Without this the nested
+        // `OtherThanTriggerObject` in a `SharesQuality` reference never sees the
+        // entrant and the exclusion is silently inert.
         scoped_iteration_player: None,
+        triggering_object: source.triggering_object,
     };
     // CR 109.2 + CR 205.3m: resolve a bare descriptive reference such as "a
     // creature you control" or "a creature card in your graveyard" to the zone
@@ -9185,10 +9409,10 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, AggregateFunction, AttachmentKind, ChosenAttribute,
-        Comparator, ControllerRef, DamageKindFilter, Effect, FilterProp, ManaContribution,
-        ManaProduction, PlayerScope, QuantityExpr, QuantityRef, ReplacementDefinition,
-        ResolvedAbility, StaticDefinition, TargetFilter, TargetRef, TriggerDefinition, TypeFilter,
-        TypedFilter,
+        CombatHistoryScope, Comparator, ControllerRef, DamageKindFilter, Effect, FilterProp,
+        ManaContribution, ManaProduction, PlayerScope, QuantityExpr, QuantityRef,
+        ReplacementDefinition, ResolvedAbility, StaticDefinition, TargetFilter, TargetRef,
+        TriggerDefinition, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::events::GameEvent;
@@ -9486,23 +9710,19 @@ mod tests {
             &state,
             &record,
             &TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::TargetOpponent)),
-            source,
-            Some(PlayerId(0)),
-            Some(&child),
-            None,
+            &ctx,
         ));
-        assert!(zone_change_filter_inner(
-            &state,
-            &record,
-            &owned,
-            source,
-            Some(PlayerId(0)),
-            Some(&child),
-            None,
-        ));
+        assert!(zone_change_filter_inner(&state, &record, &owned, &ctx));
 
-        let source_ctx =
-            source_context_from_filter(&state, source, Some(PlayerId(0)), Some(&child), None, None);
+        let source_ctx = source_context_from_filter(
+            &state,
+            source,
+            Some(PlayerId(0)),
+            Some(&child),
+            None,
+            None,
+            None,
+        );
         assert!(attachment_controller_matches(
             Some(&ControllerRef::TargetOpponent),
             PlayerId(1),
@@ -12274,6 +12494,161 @@ mod tests {
             &filter,
             &ctx
         ));
+    }
+
+    /// U1: `combat_relation_subject_ref`'s `ParentTarget` arm prefers a pinned
+    /// incarnation over the live object, and `target_incarnations` (the
+    /// delayed-trigger referent pin) over `selected_target_incarnations` when
+    /// both are populated. This path is production-unreachable today — no
+    /// parser emits `BlockedBySubject { subject: ParentTarget, .. }` — so it is
+    /// exercised only here.
+    #[test]
+    fn parent_target_subject_prefers_the_selected_pin_over_the_live_object() {
+        let mut state = setup();
+        let source = add_creature(&mut state, PlayerId(0), "Source");
+        let blocker = add_creature(&mut state, PlayerId(1), "Blocker");
+        let attacker = add_creature(&mut state, PlayerId(0), "Attacker");
+
+        let blocked_at = ObjectIncarnationRef::from_object(&state.objects[&blocker]);
+        let attacker_ref = ObjectIncarnationRef::from_object(&state.objects[&attacker]);
+        state
+            .creature_blocked_attackers_this_turn
+            .insert(crate::game::combat::BlockHistoryPair {
+                blocker: blocked_at,
+                attacker: attacker_ref,
+            });
+
+        // Bump the blocker past the recorded incarnation.
+        state.objects.get_mut(&blocker).unwrap().bump_incarnation();
+        assert_ne!(
+            ObjectIncarnationRef::from_object(&state.objects[&blocker]),
+            blocked_at,
+            "reach guard: the live object must have moved past the recorded incarnation"
+        );
+
+        let filter = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+            FilterProp::CombatRelation {
+                relation: CombatRelation::BlockedBySubject {
+                    scope: CombatHistoryScope::ThisTurn,
+                },
+                subject: CombatRelationSubject::ParentTarget,
+            },
+        ]));
+        let ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 0 },
+                target: TargetFilter::Controller,
+            },
+            vec![TargetRef::Object(blocker)],
+            source,
+            PlayerId(0),
+        );
+
+        // With the selected-target pin, the parent target's recorded
+        // incarnation is used and the block is found.
+        let mut pinned = ability.clone();
+        pinned.selected_target_incarnations = vec![blocked_at];
+        let ctx = FilterContext::from_ability(&pinned);
+        assert!(
+            crate::game::filter::matches_target_filter(&state, attacker, &filter, &ctx),
+            "with the selected-target pin, the parent target's recorded incarnation must be found"
+        );
+
+        // Without any pin, the live (bumped) incarnation is used and nothing matches.
+        let unpinned = ability.clone();
+        let ctx = FilterContext::from_ability(&unpinned);
+        assert!(
+            !crate::game::filter::matches_target_filter(&state, attacker, &filter, &ctx),
+            "without a pin, the live (bumped) blocker incarnation must not match its predecessor's block"
+        );
+
+        // (a) When both pin lists are populated with DIFFERENT incarnations,
+        // `target_incarnations` (the delayed-trigger referent) must be
+        // preferred over `selected_target_incarnations`.
+        let live_incarnation = ObjectIncarnationRef::from_object(&state.objects[&blocker]);
+        let mut both_pinned = ability.clone();
+        both_pinned.target_incarnations = vec![blocked_at];
+        both_pinned.selected_target_incarnations = vec![live_incarnation];
+        let ctx = FilterContext::from_ability(&both_pinned);
+        assert!(
+            crate::game::filter::matches_target_filter(&state, attacker, &filter, &ctx),
+            "target_incarnations must be preferred over selected_target_incarnations"
+        );
+
+        // (b) With no pins at all and the live object left at the recorded
+        // incarnation, the fallback to the live object finds the block.
+        state.objects.get_mut(&blocker).unwrap().incarnation = blocked_at.incarnation;
+        let ctx = FilterContext::from_ability(&unpinned);
+        assert!(
+            crate::game::filter::matches_target_filter(&state, attacker, &filter, &ctx),
+            "with no pin, the live object at its recorded incarnation must be found via fallback"
+        );
+    }
+
+    /// T12c (E15): `matches_target_filter_on_event_snapshot` must answer
+    /// `BlockedBySubject` from the SNAPSHOT's own captured incarnation, not the
+    /// live object's — otherwise a live object bumped past the snapshot (blink,
+    /// re-entry) would silently override the event-time fact the snapshot exists
+    /// to freeze. The snapshot's incarnation is pinned NON-zero, because
+    /// `GameObject::new` defaults `incarnation: 0` and a zero-incarnation
+    /// snapshot would make a dropped `E15` assignment invisible.
+    #[test]
+    fn event_snapshot_answers_from_its_captured_identity_not_the_live_object() {
+        let mut state = setup();
+        let blocker = add_creature(&mut state, PlayerId(1), "Blocker");
+        let attacker = add_creature(&mut state, PlayerId(0), "Attacker");
+
+        // Bump the attacker to a non-zero incarnation, then capture the snapshot
+        // at that incarnation.
+        state
+            .objects
+            .get_mut(&attacker)
+            .expect("attacker is live")
+            .bump_incarnation();
+        let snapshot = state
+            .capture_connive_subject(attacker)
+            .expect("a live object must capture a snapshot")
+            .snapshot;
+        assert_ne!(
+            snapshot.identity.incarnation, 0,
+            "reach guard: the snapshot's own incarnation must be non-zero"
+        );
+
+        // The ledger records the SNAPSHOT's incarnation.
+        state
+            .creature_blocked_attackers_this_turn
+            .insert(combat::BlockHistoryPair {
+                blocker: ObjectIncarnationRef::from_object(&state.objects[&blocker]),
+                attacker: snapshot.identity,
+            });
+
+        // The LIVE object then moves further — a real re-entry would land here
+        // too — so the live incarnation now disagrees with the snapshot's.
+        state
+            .objects
+            .get_mut(&attacker)
+            .expect("attacker is live")
+            .bump_incarnation();
+        assert_ne!(
+            state.objects[&attacker].incarnation, snapshot.identity.incarnation,
+            "reach guard: the live object must have moved past the snapshot's incarnation"
+        );
+
+        let ctx = FilterContext::from_source_with_controller(blocker, PlayerId(1));
+        let filter = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+            FilterProp::CombatRelation {
+                relation: CombatRelation::BlockedBySubject {
+                    scope: CombatHistoryScope::ThisTurn,
+                },
+                subject: CombatRelationSubject::Source,
+            },
+        ]));
+
+        assert!(
+            matches_target_filter_on_event_snapshot(&state, &snapshot, &filter, &ctx),
+            "the snapshot's own captured incarnation must match the ledger, \
+             regardless of where the live object has since moved"
+        );
     }
 
     #[test]
@@ -15891,6 +16266,144 @@ mod tests {
         ));
     }
 
+    /// CR 400.7 + CR 603.4: a known triggering incarnation must remain visible
+    /// to record-side `OtherThanTriggerObject` checks while evaluating its LKI.
+    #[test]
+    fn lki_snapshot_preserves_triggering_incarnation_for_other_than_filter() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Source".into(),
+            Zone::Battlefield,
+        );
+        let lki = crate::types::game_state::LKISnapshot {
+            name: "Original Entrant".into(),
+            token_image_ref: None,
+            power: Some(2),
+            toughness: Some(2),
+            base_power: Some(2),
+            base_toughness: Some(2),
+            mana_value: 2,
+            controller: PlayerId(0),
+            owner: PlayerId(0),
+            card_types: vec![CoreType::Creature],
+            subtypes: vec![],
+            supertypes: vec![],
+            keywords: vec![],
+            colors: vec![],
+            chosen_attributes: Vec::new(),
+            counters: Default::default(),
+            tapped: false,
+            is_suspected: false,
+            attachments: Vec::new(),
+        };
+        let entrant = ObjectId(700);
+        let filter = TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::OtherThanTriggerObject]),
+        );
+        let ctx = FilterContext::from_source(&state, source)
+            .with_triggering_object(TriggeringObjectRef::from_zone_change(entrant, Some(3)));
+
+        assert!(
+            !matches_target_filter_on_lki_snapshot_with_incarnation(
+                &state,
+                entrant,
+                &lki,
+                &filter,
+                &ctx,
+                Some(3),
+            ),
+            "the original triggering incarnation is not another object"
+        );
+        assert!(
+            matches_target_filter_on_lki_snapshot_with_incarnation(
+                &state,
+                entrant,
+                &lki,
+                &filter,
+                &ctx,
+                Some(4),
+            ),
+            "a later incarnation at the same storage id is another object"
+        );
+
+        let departed = create_object(
+            &mut state,
+            CardId(101),
+            PlayerId(0),
+            "Later object".into(),
+            Zone::Graveyard,
+        );
+        let mut original_lki = lki.clone();
+        original_lki.name = "Original Entrant".into();
+        let mut later_lki = lki.clone();
+        later_lki.name = "Later Entrant".into();
+        state
+            .lki_by_incarnation
+            .entry(departed)
+            .or_default()
+            .insert(3, original_lki);
+        state.lki_cache.insert(departed, later_lki);
+
+        let event = GameEvent::ZoneChanged {
+            object_id: departed,
+            from: Some(Zone::Hand),
+            to: Zone::Battlefield,
+            record: Box::new(ZoneChangeRecord {
+                entered_incarnation: Some(3),
+                name: "Original Entrant".into(),
+                ..ZoneChangeRecord::test_minimal(departed, Some(Zone::Hand), Zone::Battlefield)
+            }),
+        };
+        let named_original =
+            TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Named {
+                name: "Original Entrant".into(),
+            }]));
+        assert!(
+            matches_zone_change_event_object_filter(
+                &state,
+                &event,
+                None,
+                Zone::Battlefield,
+                &named_original,
+                &FilterContext::from_source(&state, source),
+            ),
+            "an original trigger must select its own LKI, not a later cache entry"
+        );
+
+        let legacy_departed = create_object(
+            &mut state,
+            CardId(102),
+            PlayerId(0),
+            "Legacy object".into(),
+            Zone::Graveyard,
+        );
+        state.lki_cache.insert(legacy_departed, lki);
+        let legacy_event = GameEvent::ZoneChanged {
+            object_id: legacy_departed,
+            from: Some(Zone::Hand),
+            to: Zone::Battlefield,
+            record: Box::new(ZoneChangeRecord::test_minimal(
+                legacy_departed,
+                Some(Zone::Hand),
+                Zone::Battlefield,
+            )),
+        };
+        assert!(
+            matches_zone_change_event_object_filter(
+                &state,
+                &legacy_event,
+                None,
+                Zone::Battlefield,
+                &named_original,
+                &FilterContext::from_source(&state, source),
+            ),
+            "legacy records without an incarnation retain their existing LKI fallback"
+        );
+    }
+
     #[test]
     fn lki_snapshot_filter_matches_nonbasic_land_property() {
         let mut state = GameState::new_two_player(42);
@@ -15957,8 +16470,15 @@ mod tests {
         use crate::types::game_state::ZoneChangeRecord;
 
         let state = GameState::default();
-        let source_ctx =
-            source_context_from_filter(&state, ObjectId(1), Some(PlayerId(0)), None, None, None);
+        let source_ctx = source_context_from_filter(
+            &state,
+            ObjectId(1),
+            Some(PlayerId(0)),
+            None,
+            None,
+            None,
+            None,
+        );
 
         // Leg 1: legendary creature (Arbaaz Mir, In Garruk's Wake-style ETB).
         let legendary_record = ZoneChangeRecord {
@@ -16028,8 +16548,15 @@ mod tests {
         use crate::types::game_state::{LKISnapshot, ZoneChangeRecord};
 
         let mut state = GameState::default();
-        let source_ctx =
-            source_context_from_filter(&state, ObjectId(1), Some(PlayerId(0)), None, None, None);
+        let source_ctx = source_context_from_filter(
+            &state,
+            ObjectId(1),
+            Some(PlayerId(0)),
+            None,
+            None,
+            None,
+            None,
+        );
 
         let lki = |tapped: bool| LKISnapshot {
             name: "Tap Probe".to_string(),
@@ -16123,8 +16650,15 @@ mod tests {
         use crate::types::game_state::ZoneChangeRecord;
 
         let state = GameState::default();
-        let source_ctx =
-            source_context_from_filter(&state, ObjectId(1), Some(PlayerId(0)), None, None, None);
+        let source_ctx = source_context_from_filter(
+            &state,
+            ObjectId(1),
+            Some(PlayerId(0)),
+            None,
+            None,
+            None,
+            None,
+        );
 
         // base 1/1, current 2/2 (had a +1/+1 counter when it left the battlefield).
         let record = ZoneChangeRecord {
@@ -16255,7 +16789,7 @@ mod tests {
         assert_eq!(record.toughness, Some(2));
 
         let source_ctx =
-            source_context_from_filter(&state, id, Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(&state, id, Some(PlayerId(0)), None, None, None, None);
         let pt_filter = |scope| FilterProp::PtComparison {
             stat: PtStat::Power,
             scope,
@@ -16389,8 +16923,15 @@ mod tests {
     #[test]
     fn zone_change_record_token_property_matches_snapshot() {
         let state = GameState::default();
-        let source_ctx =
-            source_context_from_filter(&state, ObjectId(1), Some(PlayerId(0)), None, None, None);
+        let source_ctx = source_context_from_filter(
+            &state,
+            ObjectId(1),
+            Some(PlayerId(0)),
+            None,
+            None,
+            None,
+            None,
+        );
 
         let token_record = ZoneChangeRecord {
             core_types: vec![CoreType::Creature],
@@ -16465,8 +17006,15 @@ mod tests {
         use crate::types::game_state::{ZoneChangeCombatStatus, ZoneChangeRecord};
 
         let state = GameState::default();
-        let source_ctx =
-            source_context_from_filter(&state, ObjectId(1), Some(PlayerId(0)), None, None, None);
+        let source_ctx = source_context_from_filter(
+            &state,
+            ObjectId(1),
+            Some(PlayerId(0)),
+            None,
+            None,
+            None,
+            None,
+        );
         let attacking_record = ZoneChangeRecord {
             combat_status: ZoneChangeCombatStatus {
                 attacking: true,
@@ -16595,7 +17143,7 @@ mod tests {
             .push(ChosenAttribute::Player(PlayerId(1)));
 
         let source_ctx =
-            source_context_from_filter(&state, src, Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(&state, src, Some(PlayerId(0)), None, None, None, None);
 
         assert!(
             attacking_defender_matches(

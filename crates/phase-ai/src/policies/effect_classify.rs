@@ -363,6 +363,7 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         | Effect::EachDealsDamageEqualToPower { .. }
         | Effect::EachPlayerCopyChosen { .. }
         | Effect::EachSourceDealsDamage { .. }
+        | Effect::EmpowerJace { .. }
         | Effect::Encore
         | Effect::EndCombatPhase
         | Effect::EndTheTurn
