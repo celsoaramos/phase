@@ -1214,6 +1214,8 @@ pub(crate) fn is_blocked_by_cant_play_lands(
                         trigger_source: None,
                         recipient_id: None,
                         scoped_iteration_player: None,
+                        // CR 603.4: not a zone-change intervening-`if`.
+                        triggering_object: None,
                     },
                 ),
                 None => true,
@@ -1560,7 +1562,16 @@ fn graveyard_object_castable_by_permission_sources(
         frequency_slot_available(state, source.source_id, obj_id, source.frequency) && {
             let ctx =
                 super::filter::FilterContext::from_source_with_controller(source.source_id, player);
-            super::filter::matches_target_filter(state, obj_id, source.filter, &ctx)
+            // CR 109.4 + CR 108.4a + CR 109.5: a card in a graveyard has NO
+            // controller, so "your graveyard" resolves to its OWNER. See the
+            // note on the sibling consumer in `graveyard_permission_source`.
+            super::filter::matches_target_filter_for_zone(
+                state,
+                obj_id,
+                Zone::Graveyard,
+                source.filter,
+                &ctx,
+            )
         }
     })
 }
@@ -5348,9 +5359,18 @@ fn graveyard_permission_source(
             if !frequency_slot_available(state, source.source_id, object_id, source.frequency) {
                 return false;
             }
-            super::filter::matches_target_filter(
+            // CR 109.4 + CR 108.4a + CR 109.5: a card in a graveyard has NO controller
+            // ("objects that are neither on the stack nor on the battlefield aren't
+            // controlled by any player"), so "your graveyard" resolves to its OWNER.
+            // `matches_target_filter` reads the LKI controller for an off-battlefield
+            // object, which for a permanent that died under an opponent's control is
+            // the THIEF -- excluding the card from its own owner's permission.
+            // `matches_target_filter_for_zone` is the single authority for that
+            // substitution.
+            super::filter::matches_target_filter_for_zone(
                 state,
                 object_id,
+                Zone::Graveyard,
                 source.filter,
                 &super::filter::FilterContext::from_source_with_controller(
                     source.source_id,
@@ -5397,9 +5417,12 @@ fn has_graveyard_cast_permission_without_keyword_constraint(
         .any(|source| {
             !filter_has_keyword_kind_constraint(source.filter, kind)
                 && frequency_slot_available(state, source.source_id, object_id, source.frequency)
-                && super::filter::matches_target_filter(
+                // CR 109.4 + CR 108.4a: owner-scoped, as in the sibling
+                // consumers -- see `graveyard_permission_source`.
+                && super::filter::matches_target_filter_for_zone(
                     state,
                     object_id,
+                    Zone::Graveyard,
                     source.filter,
                     &super::filter::FilterContext::from_source_with_controller(
                         source.source_id,
@@ -5750,7 +5773,15 @@ pub fn graveyard_lands_playable_by_permission(
                 if !frequency_slot_available(state, source.source_id, gy_obj_id, source.frequency) {
                     continue;
                 }
-                if super::filter::matches_target_filter(state, gy_obj_id, source.filter, &ctx) {
+                // CR 109.4 + CR 108.4a: owner-scoped, as in the sibling
+                // consumers -- see `graveyard_permission_source`.
+                if super::filter::matches_target_filter_for_zone(
+                    state,
+                    gy_obj_id,
+                    Zone::Graveyard,
+                    source.filter,
+                    &ctx,
+                ) {
                     results.push((gy_obj_id, source.source_id));
                 }
             }
@@ -19876,6 +19907,22 @@ pub fn can_pay_ability_mana_cost_after_auto_tap_excluding(
     )
 }
 
+/// CR 605.3b + CR 616.1: how an affordability probe treats an auto-tapped mana
+/// ability whose own cost pauses for a replacement choice mid-payment.
+///
+/// Whether that pause is "still payable" depends on the live payment the probe
+/// previews, not on the mana: a payment made with a resumable root surfaces the
+/// choice and continues, while one made without a root cannot suspend at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PausedManaPayment {
+    /// The live payment carries a resumable root and will surface the choice.
+    Resumable,
+    /// The live payment cannot suspend (`pay_unless_cost`, which combat taxes
+    /// and resolution-time "pay {X}" amounts pay through), so a pause means the
+    /// payment cannot complete.
+    Unresumable,
+}
+
 /// Returns true if the player can pay a resolution-time mana cost after
 /// auto-tapping mana sources. This is distinct from spell-casting and
 /// activated-ability payments: CR 106.6 restrictions that name those categories
@@ -19886,6 +19933,7 @@ pub(super) fn can_pay_effect_mana_cost_after_auto_tap(
     player: PlayerId,
     source_id: ObjectId,
     cost: &crate::types::mana::ManaCost,
+    paused: PausedManaPayment,
 ) -> bool {
     let mut simulated = state.clone();
     super::layers::flush_layers(&mut simulated);
@@ -19901,10 +19949,14 @@ pub(super) fn can_pay_effect_mana_cost_after_auto_tap(
         Some(&effect_ctx),
     );
     // CR 118.12 + CR 605.3b + CR 616.1: A replacement choice during an
-    // auto-tapped mana ability is an in-progress payment, not an affordability
-    // failure. The live payment will surface that exact choice before spending.
+    // auto-tapped mana ability is an in-progress payment when the live payment
+    // can surface that exact choice before spending, and a dead end when it
+    // cannot suspend.
     if mana_ability_cost_payment_is_paused(&simulated) {
-        return true;
+        return match paused {
+            PausedManaPayment::Resumable => true,
+            PausedManaPayment::Unresumable => false,
+        };
     }
     // CR 605.4a: Resolve coupled `TapsForMana` triggered mana abilities inline
     // so the bonus mana is in the simulated pool — same authority the real
@@ -21213,6 +21265,8 @@ fn apply_mana_spell_grants(
                 trigger_source: None,
                 recipient_id: None,
                 scoped_iteration_player: None,
+                // CR 603.4: not a zone-change intervening-`if`.
+                triggering_object: None,
             };
             if !crate::game::filter::matches_target_filter(state, spell_id, filter, &filter_ctx) {
                 continue;
