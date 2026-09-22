@@ -1132,6 +1132,7 @@ mod random_discard_cost_replacement_resume;
 mod raubahn_bull_of_ala_mhigo;
 mod raw_resolution_stack_restore;
 mod refurbished_familiar;
+mod regenerate_all_is_not_a_target;
 mod relic_of_progenitus_6446;
 mod render_silent_cant_cast;
 mod replacement_choice_trigger_gating;

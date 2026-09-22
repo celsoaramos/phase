@@ -2999,7 +2999,7 @@ fn legacy_effect(x: &Effect) -> bool {
         Effect::Pump { target, .. }
         | Effect::PairWith { target }
         | Effect::Destroy { target, .. }
-        | Effect::Regenerate { target }
+        | Effect::Regenerate { target, .. }
         | Effect::RemoveAllDamage { target }
         | Effect::Counter { target, .. }
         | Effect::CounterAll { target }

@@ -82,6 +82,9 @@ expression: "&ir"
                     "type": "Regenerate",
                     "target": {
                       "type": "ParentTarget"
+                    },
+                    "scope": {
+                      "type": "Single"
                     }
                   },
                   "duration": null,

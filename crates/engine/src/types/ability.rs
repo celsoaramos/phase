@@ -15470,9 +15470,18 @@ pub enum Effect {
         cant_regenerate: bool,
     },
     /// CR 701.19a: Create a regeneration shield on the target permanent.
+    ///
+    /// `scope` is the single-vs-mass axis, exactly as on [`Effect::Transform`]
+    /// and [`Effect::SetTapState`]: `Single` is the printed "regenerate target
+    /// creature" / "regenerate ~"; `All` is the mass form ("Regenerate all
+    /// Werewolf creatures you control" — Full Moon's Rise), where `target` is a
+    /// non-targeting population filter enumerated at resolution (CR 115.1:
+    /// "all" does not target, so no slot and no prompt).
     Regenerate {
         #[serde(default = "default_target_filter_any")]
         target: TargetFilter,
+        #[serde(default = "default_effect_scope_single")]
+        scope: EffectScope,
     },
     /// CR 120.6 + CR 120.3: Remove all damage marked on the target creature(s)
     /// ("all damage already dealt to him is healed"). Unlike `Regenerate`, this
@@ -20497,7 +20506,6 @@ impl Effect {
             | Effect::RememberCard { target }
             | Effect::PairWith { target }
             | Effect::Destroy { target, .. }
-            | Effect::Regenerate { target, .. }
             | Effect::RemoveAllDamage { target, .. }
             | Effect::Counter { target, .. }
             | Effect::RemoveCounter { target, .. }
@@ -20768,6 +20776,24 @@ impl Effect {
                 ..
             } => Some(target),
             Effect::Transform {
+                scope: EffectScope::All,
+                ..
+            } => None,
+
+            // CR 701.19a + CR 115.1: `Regenerate` exposes its target only for the
+            // single-permanent scope ("regenerate target creature", "{cost}:
+            // Regenerate ~"). The `All` scope ("Regenerate all Werewolf creatures
+            // you control" — Full Moon's Rise) prints no "target": it is a
+            // population filter enumerated at resolution, so — like `Transform`
+            // above — its `target_filter()` is `None` and no target slot or
+            // prompt is built. Claiming a target there made the mass form ask the
+            // controller to pick ONE of their Werewolves and shield only that one.
+            Effect::Regenerate {
+                scope: EffectScope::Single,
+                target,
+                ..
+            } => Some(target),
+            Effect::Regenerate {
                 scope: EffectScope::All,
                 ..
             } => None,

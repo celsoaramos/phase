@@ -2735,7 +2735,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         | Effect::FlipPermanent { target }
         | Effect::Shuffle { target }
         | Effect::Reveal { target }
-        | Effect::Regenerate { target }
+        | Effect::Regenerate { target, .. }
         | Effect::RemoveAllDamage { target } => {
             d.push(("target".into(), fmt_target(target)));
         }

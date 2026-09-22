@@ -7061,8 +7061,25 @@ pub(super) fn lower_utility_imperative_ast(ast: UtilityImperativeAst) -> Effect 
                 .parse(&*lower)
                 .map(|(r, _)| r)
                 .unwrap_or(&lower);
+            // CR 115.1 + CR 701.19a: "regenerate all/each <filter>" (Full Moon's
+            // Rise: "Regenerate all Werewolf creatures you control") prints no
+            // "target" — it shields every matching permanent. Mirrors the
+            // `destroy all/each` head in `parse_destroy_ast`. Without the scope
+            // the mass form declared a target slot and the table asked the
+            // controller to pick ONE of their Werewolves.
+            let scope = if alt((
+                tag::<_, _, OracleError<'_>>("all "),
+                tag::<_, _, OracleError<'_>>("each "),
+            ))
+            .parse(rest)
+            .is_ok()
+            {
+                EffectScope::All
+            } else {
+                EffectScope::Single
+            };
             let (target, _) = parse_target(rest);
-            Effect::Regenerate { target }
+            Effect::Regenerate { target, scope }
         }
         UtilityImperativeAst::Copy {
             target,

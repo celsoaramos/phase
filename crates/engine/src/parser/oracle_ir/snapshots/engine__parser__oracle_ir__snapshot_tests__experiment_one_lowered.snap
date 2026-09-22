@@ -28,6 +28,9 @@ expression: "&lowered"
         "type": "Regenerate",
         "target": {
           "type": "ParentTarget"
+        },
+        "scope": {
+          "type": "Single"
         }
       },
       "cost": {

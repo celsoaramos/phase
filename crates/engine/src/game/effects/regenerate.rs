@@ -1,7 +1,7 @@
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::types::ability::{
-    Effect, EffectError, EffectKind, ReplacementDefinition, ResolvedAbility, TargetFilter,
-    TargetRef,
+    Effect, EffectError, EffectKind, EffectScope, ReplacementDefinition, ResolvedAbility,
+    TargetFilter, TargetRef,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
@@ -17,7 +17,27 @@ pub fn resolve(
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
     let targets: Vec<_> = match &ability.effect {
-        Effect::Regenerate { target } => {
+        // CR 115.1 + CR 701.19a: the mass form ("Regenerate all Werewolf
+        // creatures you control" — Full Moon's Rise) does not target: every
+        // permanent matching the filter is shielded, enumerated here at
+        // resolution time. Mirrors `Effect::Transform`'s `EffectScope::All`.
+        Effect::Regenerate {
+            target,
+            scope: EffectScope::All,
+        } => {
+            let ctx = FilterContext::from_ability(ability);
+            let candidates: Vec<_> = state
+                .objects
+                .iter()
+                .filter(|(_, object)| object.zone == Zone::Battlefield)
+                .map(|(id, _)| *id)
+                .collect();
+            candidates
+                .into_iter()
+                .filter(|id| matches_target_filter(state, *id, target, &ctx))
+                .collect()
+        }
+        Effect::Regenerate { target, .. } => {
             let use_self = matches!(target, TargetFilter::None | TargetFilter::SelfRef)
                 || (matches!(target, TargetFilter::Any) && ability.targets.is_empty());
 
@@ -148,6 +168,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::Regenerate {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
             },
             vec![],
             bear,
@@ -225,6 +246,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::Regenerate {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
             },
             vec![],
             obj_id,
@@ -258,6 +280,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::Regenerate {
                 target: TargetFilter::Any,
+                scope: EffectScope::Single,
             },
             vec![TargetRef::Object(target_id)],
             ObjectId(100),
@@ -286,6 +309,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::Regenerate {
                 target: TargetFilter::Any,
+                scope: EffectScope::Single,
             },
             vec![TargetRef::Object(obj_id)],
             ObjectId(100),
@@ -314,6 +338,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::Regenerate {
                 target: TargetFilter::Any,
+                scope: EffectScope::Single,
             },
             vec![], // no explicit targets
             obj_id,
@@ -347,8 +372,15 @@ mod tests {
             Zone::Battlefield,
         );
 
-        let ability =
-            ResolvedAbility::new(Effect::Regenerate { target }, vec![], obj_id, PlayerId(0));
+        let ability = ResolvedAbility::new(
+            Effect::Regenerate {
+                target,
+                scope: EffectScope::Single,
+            },
+            vec![],
+            obj_id,
+            PlayerId(0),
+        );
         let mut events = Vec::new();
 
         resolve(&mut state, &ability, &mut events).unwrap();
@@ -389,6 +421,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::Regenerate {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
             },
             vec![],
             obj_id,
@@ -427,6 +460,7 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::Regenerate {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
             },
             vec![],
             obj_id,
@@ -814,6 +848,7 @@ mod tests {
             &ResolvedAbility::new(
                 Effect::Regenerate {
                     target: TargetFilter::SelfRef,
+                    scope: EffectScope::Single,
                 },
                 vec![],
                 id_a,
@@ -845,6 +880,7 @@ mod tests {
             &ResolvedAbility::new(
                 Effect::Regenerate {
                     target: TargetFilter::Any,
+                    scope: EffectScope::Single,
                 },
                 vec![],
                 id_b,
