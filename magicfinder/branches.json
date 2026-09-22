@@ -78,5 +78,8 @@
   },
   {
     "branch": "card/regenerate-all-mass"
+  },
+  {
+    "branch": "card/dtk-reveal-or-control"
   }
 ]
