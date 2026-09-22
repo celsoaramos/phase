@@ -8,16 +8,17 @@ use crate::parser::oracle_ir::doc::PrintedTriggerIndex;
 use crate::parser::oracle_ir::effect_chain::PlayerScopeRewrite;
 use crate::parser::test_support::assert_no_unimplemented;
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction, AttackScope,
+    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
     AttackSubject, BounceSelection, CardSelectionMode, CardTypeSetSource, CastingPermission,
-    ChosenAttribute, Comparator, ContinuousModification, ControllerRef, CopyChooseScope,
-    CopyRetargetPermission, CountScope, DamageAmountScope, DamageAmountThreshold, DamageChannel,
-    DamageModification, DamageSource, DelayedTriggerCondition, DiscardSelfScope, Duration, Effect,
-    EffectScope, FilterProp, ManaContribution, ManaProduction, ManaSpendPermission, ModalChoice,
-    ObjectProperty, ObjectScope, PerpetualModification, PlayerFilter, PlayerScope,
-    PropertyAggregate, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef, SeatDirection,
-    SharedQuality, SiblingCondition, SubAbilityLink, TapStateChange, TargetFilter,
-    TriggerCondition, TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
+    ChosenAttribute, CombatHistoryScope, Comparator, ContinuousModification, ControllerRef,
+    CopyChooseScope, CopyRetargetPermission, CountScope, DamageAmountScope, DamageAmountThreshold,
+    DamageChannel, DamageModification, DamageSource, DelayedTriggerCondition, DiscardSelfScope,
+    Duration, Effect, EffectScope, FilterProp, ManaContribution, ManaProduction,
+    ManaSpendPermission, ModalChoice, ObjectProperty, ObjectScope, PerpetualModification,
+    PlayerFilter, PlayerScope, PropertyAggregate, PtStat, PtValue, PtValueScope, QuantityExpr,
+    QuantityRef, SeatDirection, SharedQuality, SiblingCondition, SubAbilityLink, TapStateChange,
+    TargetFilter, TriggerCondition, TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter,
+    ZoneRef,
 };
 use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
@@ -7641,7 +7642,7 @@ fn parse_angel_of_destiny_end_step_loss_issue_1599() {
         execute.player_scope,
         Some(PlayerFilter::OpponentAttacked {
             subject: AttackSubject::Source,
-            scope: AttackScope::ThisTurn,
+            scope: CombatHistoryScope::ThisTurn,
         }),
         "LoseTheGame must scope to players the source attacked this turn (issue #1599), got {:?}",
         execute.player_scope,
@@ -7661,7 +7662,10 @@ fn parse_cloud_ex_soldier_etb_attach_targets_self() {
     );
 
     let execute = def.execute.as_deref().expect("execute must be Some");
-    let Effect::Attach { attachment, target } = &*execute.effect else {
+    let Effect::Attach {
+        attachment, target, ..
+    } = &*execute.effect
+    else {
         panic!("expected Attach, got {:?}", execute.effect);
     };
     assert_eq!(
@@ -11120,6 +11124,7 @@ fn goblin_plate_mail_amass_then_attach_to_amassed_army() {
         Effect::Attach {
             ref attachment,
             ref target,
+            ..
         } => {
             assert_eq!(
                 *attachment,
@@ -11413,6 +11418,7 @@ fn subtype_intervening_if_dispatches_by_trigger_kind() {
         "",
         None,
         Some((Zone::Battlefield, Zone::Graveyard)),
+        false,
     );
     let Some(TriggerCondition::Not { condition }) = zone_change else {
         panic!("expected negated condition, got {zone_change:?}");
@@ -11683,25 +11689,51 @@ fn trigger_intervening_if_you_were_dealt_damage_threshold_this_turn() {
             "At the beginning of each end step, if you were dealt 4 or more damage this turn, exile this artifact.",
             "Boarded Window",
         );
-    assert!(matches!(
-        def.condition,
-        Some(TriggerCondition::QuantityComparison {
-            lhs: QuantityExpr::Ref {
-                qty: QuantityRef::DamageDealtThisTurn {
-                    source,
-                    target,
-                    ..
-                },
+    let Some(TriggerCondition::QuantityComparison {
+        lhs:
+            QuantityExpr::Ref {
+                qty:
+                    QuantityRef::DamageDealtThisTurn {
+                        source,
+                        target,
+                        aggregate,
+                        group_by,
+                        ..
+                    },
             },
-            comparator: Comparator::GE,
-            rhs: QuantityExpr::Fixed { value: 4 },
-        }) if *source == TargetFilter::Any
-            && matches!(
-                &*target,
-                TargetFilter::Typed(ref typed)
-                    if typed.controller == Some(ControllerRef::You)
-            )
-    ));
+        comparator: Comparator::GE,
+        rhs: QuantityExpr::Fixed { value: 4 },
+    }) = def.condition
+    else {
+        panic!(
+            "expected QuantityComparison(DamageDealtThisTurn) GE 4, got: {:?}",
+            def.condition
+        );
+    };
+    // "you" is the singleton subject: any source, one recipient, so `Sum` with
+    // no grouping.
+    assert_eq!(*source, TargetFilter::Any, "any source");
+    assert_eq!(aggregate, AggregateFunction::Sum);
+    assert!(
+        group_by.is_none(),
+        "the singleton subject carries no grouping"
+    );
+    // CR 120.1 + CR 120.3 + CR 120.9: the recipient is the player-only shape
+    // `And[Player, Typed{controller: You}]` — the `Player` child refuses object
+    // recipients, so damage to a permanent you control can never satisfy it.
+    let TargetFilter::And { filters } = target.as_ref() else {
+        panic!("expected the player-only And recipient filter, got {target:?}");
+    };
+    assert_eq!(
+        filters.len(),
+        2,
+        "expected [Player, Typed], got {filters:?}"
+    );
+    assert_eq!(filters[0], TargetFilter::Player);
+    let TargetFilter::Typed(tf) = &filters[1] else {
+        panic!("expected the typed controller leg, got {:?}", filters[1]);
+    };
+    assert_eq!(tf.controller, Some(ControllerRef::You));
 }
 
 #[test]
@@ -15195,6 +15227,107 @@ fn trigger_unless_you_return_from_graveyard() {
                 _ => false,
             };
             assert!(has_land, "filter should include Land, got {:?}", filter);
+            // CR 118.12: "your graveyard" is a possessive zone qualifier —
+            // `parse_zone_suffix` folds it into `tf.controller = Some(You)`,
+            // the same battlefield CONTROL predicate "you control" produces.
+            // No additional scoping is (or should be) layered on top of this.
+            match filter {
+                TargetFilter::Typed(tf) => assert_eq!(
+                    tf.controller,
+                    Some(ControllerRef::You),
+                    "'your graveyard' should scope the filter to the payer, got {:?}",
+                    tf.controller
+                ),
+                other => panic!("expected a bare Typed filter, got {:?}", other),
+            }
+        }
+        other => panic!("cost should be ReturnToHand, got {:?}", other),
+    }
+}
+
+#[test]
+fn trigger_unless_you_return_from_unqualified_graveyard_has_no_ownership_restriction() {
+    // CR 118.12: an UNQUALIFIED source zone ("a graveyard", no possessive)
+    // names no owner — unlike Harvest Wurm's "your graveyard" above, this
+    // must carry NEITHER `tf.controller` NOR a `FilterProp::Owned` restriction,
+    // per `parse_zone_suffix`'s bare/indefinite-zone arm (`oracle_target.rs`).
+    // A synthetic building-block shape (no printed card omits the possessive
+    // here), added alongside the Harvest Wurm case as the discriminating
+    // control for the zone-ownership fix.
+    let def = parse_trigger_line(
+        "When ~ enters, sacrifice it unless you return a basic land card from a graveyard to your hand.",
+        "Unqualified Graveyard Test",
+    );
+    let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
+    match &unless_pay.cost {
+        AbilityCost::ReturnToHand {
+            filter: Some(filter),
+            ..
+        } => match filter {
+            TargetFilter::Typed(tf) => {
+                assert_eq!(
+                    tf.controller, None,
+                    "an unqualified zone must not be scoped by controller, got {:?}",
+                    tf.controller
+                );
+                assert!(
+                    !tf.properties
+                        .iter()
+                        .any(|p| matches!(p, FilterProp::Owned { .. })),
+                    "an unqualified zone must not be scoped by ownership, got {:?}",
+                    tf.properties
+                );
+            }
+            other => panic!("expected a bare Typed filter, got {:?}", other),
+        },
+        other => panic!("cost should be ReturnToHand, got {:?}", other),
+    }
+}
+
+#[test]
+fn trigger_unless_you_return_any_enchantment_to_hand() {
+    // CR 118.12: Drake Familiar — "sacrifice it unless you return an
+    // enchantment to its owner's hand." Unlike the "you control" family
+    // above, this clause has NO controller restriction — any enchantment on
+    // the battlefield (yours or an opponent's) may be returned.
+    let def = parse_trigger_line(
+        "When ~ enters, sacrifice it unless you return an enchantment to its owner's hand.",
+        "Drake Familiar",
+    );
+    let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
+    assert_eq!(unless_pay.payer, TargetFilter::Controller);
+    match &unless_pay.cost {
+        AbilityCost::ReturnToHand {
+            count,
+            filter: Some(filter),
+            from_zone,
+        } => {
+            assert_eq!(*count, 1);
+            assert!(
+                from_zone.is_none(),
+                "battlefield source should have no from_zone"
+            );
+            match filter {
+                TargetFilter::Typed(tf) => {
+                    assert!(
+                        tf.type_filters.contains(&TypeFilter::Enchantment),
+                        "filter should include Enchantment, got {:?}",
+                        tf.type_filters
+                    );
+                    assert!(
+                        tf.controller.is_none(),
+                        "filter must not be controller-scoped — Drake Familiar's \
+                         Oracle text has no \"you control\" restriction, so any \
+                         enchantment on the battlefield is eligible, got {:?}",
+                        tf.controller
+                    );
+                }
+                other => panic!(
+                    "filter should be a bare Typed(Enchantment) with no \
+                     controller scoping, got {:?}",
+                    other
+                ),
+            }
         }
         other => panic!("cost should be ReturnToHand, got {:?}", other),
     }
@@ -29901,7 +30034,10 @@ fn assert_reanimator_chain(oracle: &str, card_name: &str, expect_tapped: bool) {
         .sub_ability
         .as_deref()
         .unwrap_or_else(|| panic!("{card_name}: GenericEffect has no Attach sub"));
-    let Effect::Attach { attachment, target } = attach.effect.as_ref() else {
+    let Effect::Attach {
+        attachment, target, ..
+    } = attach.effect.as_ref()
+    else {
         panic!("{card_name}: expected Attach, got {:?}", attach.effect);
     };
     assert_eq!(
@@ -30117,7 +30253,10 @@ fn necromancy_etb_lowers_to_reanimator_grant_chain_640() {
         .sub_ability
         .as_deref()
         .expect("Necromancy: GenericEffect has no Attach sub");
-    let Effect::Attach { attachment, target } = attach.effect.as_ref() else {
+    let Effect::Attach {
+        attachment, target, ..
+    } = attach.effect.as_ref()
+    else {
         panic!("Necromancy: expected Attach, got {:?}", attach.effect);
     };
     assert_eq!(
@@ -33431,4 +33570,177 @@ fn non_dies_trigger_head_establishes_no_zone_change_provenance() {
         renders_zone_change_object_gate(&ordinary),
         "reach control: the dies head still binds: {ordinary:#?}"
     );
+}
+/// CR 201.2a + CR 603.4 + CR 603.6a: shared assertion for the entering-object
+/// same-name intervening-`if`. Returns the parsed reference so each caller can
+/// make its own claim about the reference pool.
+///
+/// Asserts the two invariants that are the POINT of this grammar rather than
+/// incidental shape: the condition is an entering-object (`destination:
+/// Battlefield`) event-object filter, and its subject filter is TYPE-OPEN.
+/// CR 201.2a defines name sharing without reference to card type ("two or more
+/// objects have the same name if they have at least one name in common"), so a
+/// type constraint here would make the grammar fail closed for every
+/// noncreature ETB head — the trigger's own head is what restricts which
+/// entrants fire the ability.
+fn assert_entering_object_same_name_condition(condition: &TriggerCondition) -> TargetFilter {
+    use crate::types::ability::SharedQualityRelation;
+
+    let TriggerCondition::ZoneChangeObjectMatchesFilter {
+        origin: None,
+        destination: Zone::Battlefield,
+        filter: TargetFilter::Typed(typed),
+    } = condition
+    else {
+        panic!("expected an entering-object event filter, got {condition:?}");
+    };
+    assert!(
+        typed.type_filters.is_empty(),
+        "CR 201.2a: name sharing is type-independent, so the entering-object \
+         subject filter must carry no type constraint — got {:?}",
+        typed.type_filters
+    );
+    assert_eq!(typed.controller, None, "the subject is the entrant itself");
+    match typed.properties.as_slice() {
+        [FilterProp::SharesQuality {
+            quality: SharedQuality::Name,
+            reference: Some(reference),
+            relation: SharedQualityRelation::DoesNotShare,
+        }] => (**reference).clone(),
+        other => panic!("expected a negated same-name predicate, got {other:?}"),
+    }
+}
+
+/// CR 603.6a: Guardian Project's printed (current-templating) head spells the
+/// event as the bare "enters".
+#[test]
+fn guardian_project_bare_enters_head_binds_same_name_intervening_if() {
+    let def = parse_trigger_line(
+        "Whenever a nontoken creature you control enters, if it doesn't have the same name as another creature you control or a creature card in your graveyard, draw a card.",
+        "Guardian Project",
+    );
+    let reference = assert_entering_object_same_name_condition(
+        def.condition
+            .as_ref()
+            .expect("Guardian Project intervening-if"),
+    );
+    // CR 109.2 / CR 109.2a: a two-leg reference pool — the zone-less leg is a
+    // battlefield permanent, the second leg names the graveyard explicitly.
+    let TargetFilter::Or { filters } = &reference else {
+        panic!("expected a two-leg reference disjunction, got {reference:?}");
+    };
+    assert_eq!(filters.len(), 2, "battlefield leg + graveyard leg");
+    assert_no_unimplemented(def.execute.as_deref().expect("draw effect"));
+}
+
+/// CR 603.6a: the SAME grammar must reach the pre-2024 spelling of the same
+/// event. `parse_event_word` terminates on a `peek` boundary, so before the
+/// optional destination arm was composed into `parse_enters_verb_phrase` the
+/// head prover saw a non-empty " the battlefield" tail and declined, making this
+/// whole arm unreachable for every card-data row that has not been re-Oracled.
+#[test]
+fn spelled_out_enters_the_battlefield_head_binds_same_name_intervening_if() {
+    let def = parse_trigger_line(
+        "Whenever a nontoken creature you control enters the battlefield, if it doesn't have the same name as another creature you control or a creature card in your graveyard, draw a card.",
+        "Guardian Project",
+    );
+    assert_entering_object_same_name_condition(
+        def.condition
+            .as_ref()
+            .expect("spelled-out ETB head must bind the same intervening-if"),
+    );
+}
+
+/// CR 201.2a: name sharing does not depend on card type, so the grammar must
+/// also bind for a NONCREATURE entering-object head. Guardian Project's own
+/// creature-restricted head hides a type constraint in the condition; this row
+/// is what makes the reusable claim honest.
+#[test]
+fn noncreature_entering_object_binds_type_open_same_name_intervening_if() {
+    let def = parse_trigger_line(
+        "Whenever a permanent you control enters, if it doesn't have the same name as another permanent you control, draw a card.",
+        "Test Permanent Watcher",
+    );
+    let reference = assert_entering_object_same_name_condition(
+        def.condition
+            .as_ref()
+            .expect("noncreature entering-object intervening-if"),
+    );
+    let TargetFilter::Typed(typed) = &reference else {
+        panic!("expected a typed reference pool, got {reference:?}");
+    };
+    assert_eq!(typed.type_filters, vec![TypeFilter::Permanent]);
+    assert!(
+        typed
+            .properties
+            .contains(&FilterProp::OtherThanTriggerObject),
+        "CR 603.6a: \"another\" in an entering-object reference excludes the \
+         ENTRANT, not the ability source — got {:?}",
+        typed.properties
+    );
+}
+
+/// The bare-verb head must keep declining a disjunctive head: proving ETB there
+/// would be false (the event may have been the death), and the existing dies
+/// proof for such heads must stay bit-identical.
+#[test]
+fn disjunctive_enters_or_dies_head_does_not_prove_enters_battlefield() {
+    assert!(
+        !trigger_head_enters_battlefield("whenever this creature enters or dies"),
+        "a disjunctive head does not prove the event was an ETB"
+    );
+    assert!(
+        !trigger_head_enters_battlefield("whenever this creature enters from your hand"),
+        "a qualified head stays conservatively unproven"
+    );
+    assert!(trigger_head_enters_battlefield(
+        "whenever a nontoken creature you control enters"
+    ));
+    assert!(trigger_head_enters_battlefield(
+        "whenever a nontoken creature you control enters the battlefield"
+    ));
+}
+
+/// SHAPE: the split form keeps each origin owner independent of the caster.
+#[test]
+fn split_graveyard_origin_owner_axes() {
+    for (entered_phrase, cast_phrase, entered_owner, cast_owner) in [
+        ("a", "a", None, None),
+        (
+            "your",
+            "your",
+            Some(ControllerRef::You),
+            Some(ControllerRef::You),
+        ),
+        ("a", "your", None, Some(ControllerRef::You)),
+        ("your", "a", Some(ControllerRef::You), None),
+    ] {
+        let text = format!(
+            "if that creature entered from {entered_phrase} graveyard or you cast it from {cast_phrase} graveyard"
+        );
+        let (rest, condition) = parse_graveyard_origin_intervening_if(&text).unwrap();
+        assert!(rest.is_empty());
+        let TriggerCondition::Or { conditions } = condition else {
+            panic!("expected the entry/cast disjunction");
+        };
+        let expected_filter = entered_owner.map_or(TargetFilter::Any, |owner| {
+            with_owner_scope(TargetFilter::Any, owner)
+        });
+        assert_eq!(
+            conditions[0],
+            TriggerCondition::ZoneChangeObjectMatchesFilter {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                filter: expected_filter,
+            }
+        );
+        assert_eq!(
+            conditions[1],
+            TriggerCondition::WasCast {
+                zone: Some(Zone::Graveyard),
+                controller: Some(ControllerRef::You),
+                owner: cast_owner,
+            }
+        );
+    }
 }
