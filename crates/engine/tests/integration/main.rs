@@ -271,6 +271,7 @@ mod dreadhorde_arcanist_ceiling_4943;
 mod dream_salvage_target_opponent_discards;
 mod dredgers_insight_mill_from_among;
 mod druid_of_purification_destroy_chosen_4780;
+mod dtk_reveal_or_control_rider;
 mod duskmantle_seer_each_player_reveal;
 mod dyadrine_counter_selection;
 mod electrostatic_bolt;

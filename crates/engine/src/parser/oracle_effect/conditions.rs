@@ -4265,6 +4265,14 @@ pub(super) fn parse_condition_text(text: &str) -> Option<AbilityCondition> {
         return Some(condition);
     }
 
+    // CR 601.2b/f: the two-legged DTK rider comes FIRST — its own left leg
+    // ("you revealed a Dragon card") is not a shape the single-leg
+    // controlled-as-cast parser below can read, so putting it after would only
+    // hide it behind a decline. Adjacent by family, not by precedence.
+    if let Some(condition) = parse_revealed_or_controlled_as_cast_condition_text(text) {
+        return Some(condition);
+    }
+
     if let Some(condition) = parse_controller_controlled_as_cast_condition_text(text) {
         return Some(condition);
     }
@@ -4495,6 +4503,81 @@ fn parse_controller_controlled_as_cast_condition(
         rest,
         AbilityCondition::ControllerControlledMatchingAsCast {
             filter: inject_controller_you(filter),
+        },
+    ))
+}
+
+/// CR 601.2b/f + CR 608.2c: the Dragons of Tarkir "reveal a Dragon" rider —
+/// "you revealed a/an \<T\> card or controlled a/an \<T\> as you cast this spell"
+/// (Draconic Roar, Foul-Tongue Invocation, Orator of Ojutai, Scaleguard
+/// Sentinels, Dragonlord's Prerogative, Silumgar's Scorn).
+///
+/// Two genuinely alternative ways to satisfy ONE printed rider, under a trailing
+/// casting-time snapshot they share:
+///   * "you revealed a \<T\> card" — the spell's OPTIONAL additional cost
+///     (`AdditionalCost::Optional(Reveal)`) was paid, which is exactly what
+///     `additional_cost_paid_any` tests.
+///   * "you controlled a \<T\> as you cast this spell" — the existing
+///     `ControllerControlledMatchingAsCast` board snapshot.
+///
+/// A player who already controls a Dragon reveals nothing, so the pair is an
+/// `Or`, never an `And`.
+///
+/// `parse_and_conjunction_condition`'s generic splitter cannot reach this shape,
+/// and no "or" sibling of it could: the trailing "as you cast this spell" is
+/// shared, so a split hands the left leg no snapshot and the right leg no "you".
+/// Both legs must name the same type — a mismatch is not this rider.
+///
+/// Whole family, measured before the fix (v0.89.0): the condition was dropped,
+/// and only four of the six even raised a `SwallowedClause` warning. Draconic
+/// Roar's extra 3 damage, Foul-Tongue's 4 life and Orator's draw fired
+/// unconditionally; Scaleguard Sentinels parsed no ability at all.
+fn parse_revealed_or_controlled_as_cast_condition_text(text: &str) -> Option<AbilityCondition> {
+    let lower = text.to_ascii_lowercase();
+    nom_parse_lower(&lower, |input| {
+        all_consuming(parse_revealed_or_controlled_as_cast_condition).parse(input)
+    })
+}
+
+fn parse_revealed_or_controlled_as_cast_condition(
+    input: &str,
+) -> OracleResult<'_, AbilityCondition> {
+    let (rest, _) = tag("you revealed ").parse(input)?;
+    let (rest, _) = alt((tag("a "), tag("an "))).parse(rest)?;
+    let (rest, revealed_type) = terminated(
+        take_until(" card or controlled "),
+        tag(" card or controlled "),
+    )
+    .parse(rest)?;
+    let (rest, _) = alt((tag("a "), tag("an "))).parse(rest)?;
+    let (rest, controlled_type) = terminated(
+        take_until(" as you cast this spell"),
+        tag(" as you cast this spell"),
+    )
+    .parse(rest)?;
+
+    let (revealed_filter, revealed_rem) = parse_type_phrase_folding(revealed_type.trim());
+    let (controlled_filter, controlled_rem) = parse_type_phrase_folding(controlled_type.trim());
+    if !revealed_rem.trim().is_empty()
+        || !controlled_rem.trim().is_empty()
+        || matches!(controlled_filter, TargetFilter::Any)
+        || revealed_filter != controlled_filter
+    {
+        return Err(nom::Err::Error(OracleError::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    }
+
+    Ok((
+        rest,
+        AbilityCondition::Or {
+            conditions: vec![
+                AbilityCondition::additional_cost_paid_any(),
+                AbilityCondition::ControllerControlledMatchingAsCast {
+                    filter: inject_controller_you(controlled_filter),
+                },
+            ],
         },
     ))
 }
