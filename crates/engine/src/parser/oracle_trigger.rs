@@ -7738,8 +7738,18 @@ fn entering_pt_vs_source_prop(stats: &[PtStat]) -> FilterProp {
 /// CR 603.10a look-back trigger, so `PtValueScope::Current` reads the post-layer
 /// P/T of both objects. Disjunction composes via `entering_pt_vs_source_prop`'s
 /// `FilterProp::AnyOf`; the single-stat form emits one `PtComparison`.
+///
+/// The subject may also be the demonstrative "that creature's" and the source
+/// side may elide the repeated stat ("if that creature's power is greater than
+/// ~'s", Pelt Collector) — the elided stat is the subject's own (CR 208.1).
+/// When the trigger head is a PROVEN dies head (`trigger_zone_change` is
+/// battlefield→graveyard, the split "or dies" half of Pelt Collector), the
+/// event object is gone, so the comparison is a CR 603.10a look-back on the
+/// dying creature's last battlefield P/T against the source's current P/T;
+/// every other head keeps the enters-the-battlefield shape above.
 fn parse_entering_pt_vs_source_possessive_condition(
     input: &str,
+    trigger_zone_change: Option<(Zone, Zone)>,
 ) -> OracleResult<'_, TriggerCondition> {
     // Consume the leading "if " so the whole intervening-if clause (including the
     // keyword) is stripped from the effect text — the disjunct combinator below
@@ -7758,6 +7768,9 @@ fn parse_entering_pt_vs_source_possessive_condition(
         rest = next;
     }
     let prop = entering_pt_vs_source_prop(&stats);
+    if trigger_zone_change == Some((Zone::Battlefield, Zone::Graveyard)) {
+        return Ok((rest, dies_lookback_condition(vec![prop], false)));
+    }
     Ok((
         rest,
         TriggerCondition::ZoneChangeObjectMatchesFilter {
@@ -7768,17 +7781,33 @@ fn parse_entering_pt_vs_source_possessive_condition(
     ))
 }
 
-/// CR 208.1: One possessive disjunct "its <stat> is greater than ~'s <stat>".
-/// Both apostrophe forms (`'s`, `\u{2019}s`) are accepted; the source-side stat
-/// word must equal the subject-side stat, rejecting cross-stat comparisons (which
-/// no card prints and which would otherwise read the wrong source stat).
+/// CR 208.1: One possessive disjunct "(its | that creature's) <stat> is greater
+/// than ~'s [<stat>]". Both apostrophe forms (`'s`, `\u{2019}s`) are accepted; a
+/// source-side stat word, when printed, must equal the subject-side stat,
+/// rejecting cross-stat comparisons (which no card prints and which would
+/// otherwise read the wrong source stat). An elided source stat ("greater than
+/// ~'s", Pelt Collector) is the subject's stat and must end at a word boundary.
 fn parse_entering_pt_vs_source_possessive_disjunct(input: &str) -> OracleResult<'_, PtStat> {
-    let (rest, _) = tag("its ").parse(input)?;
+    let (rest, _) = alt((
+        tag("its "),
+        tag("that creature's "),
+        tag("that creature\u{2019}s "),
+    ))
+    .parse(input)?;
     let (rest, stat) = parse_pt_stat_word(rest)?;
     let (rest, _) = tag(" is greater than ~").parse(rest)?;
-    let (rest, _) = alt((tag("'s "), tag("\u{2019}s "))).parse(rest)?;
-    let (rest, source_stat) = parse_pt_stat_word(rest)?;
-    if source_stat != stat {
+    let (rest, _) = alt((tag("'s"), tag("\u{2019}s"))).parse(rest)?;
+    if let Ok((after_stat, source_stat)) = preceded(tag(" "), parse_pt_stat_word).parse(rest) {
+        if source_stat != stat {
+            return Err(oracle_err(input));
+        }
+        return Ok((after_stat, stat));
+    }
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
         return Err(oracle_err(input));
     }
     Ok((rest, stat))
@@ -7966,7 +7995,9 @@ fn parse_zone_change_object_filter_condition<'a>(
     // greater than ~'s power ...", Sharp-Eyed Rookie). Both new "if its ..."
     // surfaces are disjoint from the existing "if it has greater"/"if it '..."
     // arms (the trailing "s" of "its" excludes the "if it " predicate arm).
-    if let Ok((rest, condition)) = parse_entering_pt_vs_source_possessive_condition(input) {
+    if let Ok((rest, condition)) =
+        parse_entering_pt_vs_source_possessive_condition(input, trigger_zone_change)
+    {
         return Ok((rest, condition));
     }
     // CR 603.10a: dying-object P/T-vs-fixed ("if its toughness was less than 1",
