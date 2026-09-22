@@ -94,11 +94,10 @@ fn garth_parses_a_closed_distinct_name_domain_and_a_card_copy() {
     // names here would mean the parser read them off its own lowercased copy of
     // the text — and the prompt would then offer "black lotus".
     let Effect::Choose {
-        choice_type:
-            ChoiceType::CardName {
-                options,
-                distinctness,
-            },
+        choice_type: ChoiceType::CardName {
+            options,
+            distinctness,
+        },
         persist,
         ..
     } = &*ability.effect
@@ -165,6 +164,133 @@ fn garth_parses_a_closed_distinct_name_domain_and_a_card_copy() {
     // outlive the copy — CR 704.5e removes it at the next SBA check.
     assert_eq!(*driver, CastFromZoneDriver::DuringResolution);
     assert!(cast.optional, "\"you MAY cast the copy\"");
+}
+
+/// The rest of the class, measured rather than assumed — these are every other
+/// card in the corpus whose text carries one of the two phrases this PR teaches
+/// the parser, and they are the whole of its claimed parse impact.
+///
+/// Ersta is Garth without the distinctness cue and with a free recast. The
+/// Interrogation Robot prints the SAME closed domain one word shorter ("chosen
+/// among", no "from"); accepting only the longer wording would parse its copy
+/// clause while leaving its domain open, which is a worse shape than either
+/// whole answer.
+#[test]
+fn the_rest_of_the_closed_domain_class_parses_the_same_way() {
+    let ersta = parse_oracle_text(
+        "[-3]: Choose a card name from among Enlightened Tutor, Mystical Tutor, Booster Tutor, \
+         Imperial Recruiter, and Worldly Tutor. Create a copy of the card with the chosen name. \
+         You may cast the copy without paying its mana cost.",
+        "Ersta, Friend to All",
+        &[],
+        &["Planeswalker".to_string()],
+        &[],
+    );
+    let ability = ersta.abilities.first().expect("the minus ability parsed");
+    let Effect::Choose {
+        choice_type: ChoiceType::CardName {
+            options,
+            distinctness,
+        },
+        ..
+    } = &*ability.effect
+    else {
+        panic!("expected a card-name Choose, got {:?}", ability.effect);
+    };
+    assert_eq!(options.len(), 5, "the five printed names: {options:?}");
+    assert_eq!(
+        options[0], "Enlightened Tutor",
+        "printed order and case: {options:?}"
+    );
+    // CR 609.3: Ersta prints no "that hasn't been chosen" cue, so repeats are legal.
+    assert_eq!(*distinctness, NameDistinctness::Repeatable);
+    assert!(
+        matches!(
+            ability.sub_ability.as_deref().map(|d| &*d.effect),
+            Some(Effect::CreateCardCopyByName { .. })
+        ),
+        "the copy clause: {:?}",
+        ability.sub_ability.as_deref().map(|d| &*d.effect)
+    );
+
+    let robot = parse_oracle_text(
+        "{T}, Discard a card: Choose a card name that hasn't been chosen among Who, What, When, \
+         Where, and Why. Create a copy of the card with the chosen name. You may cast the copy.",
+        "Interrogation Robot",
+        &[],
+        &["Artifact".to_string(), "Creature".to_string()],
+        &[],
+    );
+    let ability = robot.abilities.first().expect("the tap ability parsed");
+    let Effect::Choose {
+        choice_type: ChoiceType::CardName {
+            options,
+            distinctness,
+        },
+        ..
+    } = &*ability.effect
+    else {
+        panic!("expected a card-name Choose, got {:?}", ability.effect);
+    };
+    assert_eq!(
+        options,
+        &[
+            "Who".to_string(),
+            "What".to_string(),
+            "When".to_string(),
+            "Where".to_string(),
+            "Why".to_string(),
+        ],
+        "\"chosen among\" is the same closed domain as \"chosen from among\""
+    );
+    assert_eq!(*distinctness, NameDistinctness::DistinctFromSourceHistory);
+}
+
+/// Svega names its domain by planeswalker type ("Choose an Elspeth, Teferi,
+/// Liliana, Chandra, or Garruk planeswalker card name with mana value X"), which
+/// no card-name phrase-table arm claims. Its copy clause must therefore stay
+/// `Unimplemented`: a `CreateCardCopyByName` with no name to read would resolve
+/// as a silent no-op AND remove the gap that keeps `cargo coverage` honest about
+/// this card. Coverage honesty is the reason this is a test and not a comment.
+#[test]
+fn a_copy_clause_without_a_card_name_choice_stays_unimplemented() {
+    let svega = parse_oracle_text(
+        "[-X]: Choose an Elspeth, Teferi, Liliana, Chandra, or Garruk planeswalker card name with \
+         mana value X. Create a copy of the card with the chosen name. You may cast the copy \
+         without paying its mana cost.",
+        "Svega, the Unconventional",
+        &[],
+        &["Planeswalker".to_string()],
+        &[],
+    );
+    let mut saw_copy = false;
+    let mut saw_gap = false;
+    for a in &svega.abilities {
+        let mut node = Some(a);
+        while let Some(d) = node {
+            match &*d.effect {
+                Effect::CreateCardCopyByName { .. } => saw_copy = true,
+                Effect::Unimplemented { name, .. } if name == "unparsed_verb_arguments" => {
+                    saw_gap = true
+                }
+                _ => {}
+            }
+            node = d.sub_ability.as_deref();
+        }
+    }
+    assert!(
+        !saw_copy,
+        "no card-name choice reaches this copy clause, so it must not claim to \
+         create one: {:?}",
+        svega.abilities
+    );
+    // Reach-guard for the negative above: the clause was parsed and classified,
+    // not simply absent from the tree.
+    assert!(
+        saw_gap,
+        "the copy clause is still recorded as an honest gap: {:?}",
+        svega.abilities
+    );
 }
 
 /// The open "choose a card name" prompt (Pithing Needle, Meddling Mage) must be
@@ -310,7 +436,8 @@ fn accepting_the_cast_puts_the_copy_on_the_stack() {
         other => panic!("expected a during-resolution cast offer, got {other:?}"),
     };
     assert_eq!(
-        runner.state().objects[&hit].name, "Grizzly Bears",
+        runner.state().objects[&hit].name,
+        "Grizzly Bears",
         "the offer is over the copy — before the LastCreated bind it was over nothing"
     );
 
@@ -351,6 +478,18 @@ fn a_copy_nobody_casts_ceases_to_exist() {
             choice: "Grizzly Bears".to_string(),
         })
         .expect("a printed name is a legal answer");
+
+    // Reach-guard for the negative assertion below: the copy must EXIST first,
+    // or "it is gone" would pass on a card that never created one — which is
+    // precisely how the unfixed Garth behaved.
+    assert!(
+        runner
+            .state()
+            .objects
+            .values()
+            .any(|o| o.name == "Grizzly Bears"),
+        "the copy was created before anyone declined to cast it"
+    );
 
     // Decline the cast, then let the game reach a point where state-based actions
     // are checked (CR 704.3).

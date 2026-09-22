@@ -149,7 +149,10 @@ fn chosen_opponent_binds_private_look_and_card_name_in_three_player() {
         );
     };
     assert!(
-        matches!(choice_type, engine::types::ability::ChoiceType::CardName { .. }),
+        matches!(
+            choice_type,
+            engine::types::ability::ChoiceType::CardName { .. }
+        ),
         "the second choice must be Choose(CardName), got {:?}",
         choice_type
     );

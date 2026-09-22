@@ -6945,7 +6945,10 @@ pub(super) fn handle_resolution_choice(
             // seventh name and a name already used — the option list is the
             // authority here, and this is the seam that enforces it (the client's
             // `allow_arbitrary` projection is a hint, not a check).
-            if let ChoiceType::CardName { options: domain, .. } = &choice_type {
+            if let ChoiceType::CardName {
+                options: domain, ..
+            } = &choice_type
+            {
                 if domain.is_empty() {
                     let lower = choice.to_lowercase();
                     if !state

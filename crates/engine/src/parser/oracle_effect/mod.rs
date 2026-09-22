@@ -12252,9 +12252,13 @@ fn try_parse_create_card_copy_by_name(tp: TextPair) -> Option<Effect> {
         .parse(tp.lower)
         .ok()?;
     let rest = rest.trim_end().trim_end_matches('.').trim_end();
-    if rest != "the card with the chosen name" {
-        return None;
-    }
+    // The copy object is the chosen-name referent and nothing else; `all_consuming`
+    // is what makes that exact rather than a prefix match.
+    all_consuming(tag::<_, _, OracleError<'_>>(
+        "the card with the chosen name",
+    ))
+    .parse(rest)
+    .ok()?;
     Some(Effect::CreateCardCopyByName {
         name: None,
         // CR 707.12: the copy has to be somewhere a card can be cast FROM for the
@@ -29850,41 +29854,71 @@ fn parse_card_name_enumeration(
     rest: &str,
     original: Option<&str>,
 ) -> Option<(Vec<String>, NameDistinctness)> {
+    type E<'a> = OracleError<'a>;
+
+    /// One printed name: everything up to the comma that separates it from the
+    /// next. `is_not` rather than a hand-rolled scan so the separator stays the
+    /// only structure this grammar knows about.
+    fn name_item(input: &str) -> nom::IResult<&str, &str, OracleError<'_>> {
+        nom::bytes::complete::is_not(",").parse(input)
+    }
+
     let original = original?;
     if original.len() != rest.len() {
         return None;
     }
 
-    let (tail, _) = tag::<_, _, OracleError<'_>>("a card name ").parse(rest).ok()?;
-    // Both apostrophes: the corpus is not normalized on this character (see the
-    // straight/typographic pairs in `oracle.rs`'s "can't" handling).
-    let (tail, distinctness) = match tail
-        .strip_prefix("that hasn't been chosen ")
-        .or_else(|| tail.strip_prefix("that hasn\u{2019}t been chosen "))
-    {
-        Some(tail) => (tail, NameDistinctness::DistinctFromSourceHistory),
-        None => (tail, NameDistinctness::Repeatable),
-    };
-    let list = tail.strip_prefix("from among ")?;
+    let (tail, _) = tag::<_, _, E>("a card name ").parse(rest).ok()?;
+    // CR 609.3. Both apostrophes: the corpus is not normalized on this character
+    // (see the straight/typographic pairs in `oracle.rs`'s "can't" handling).
+    let (tail, distinctness) = opt(alt((
+        value(
+            NameDistinctness::DistinctFromSourceHistory,
+            tag::<_, _, E>("that hasn't been chosen "),
+        ),
+        value(
+            NameDistinctness::DistinctFromSourceHistory,
+            tag("that hasn\u{2019}t been chosen "),
+        ),
+    )))
+    .parse(tail)
+    .ok()
+    .map(|(tail, d)| (tail, d.unwrap_or(NameDistinctness::Repeatable)))?;
+    // "from among" (Garth One-Eye, Ersta) and the bare "among" (Interrogation
+    // Robot: "a card name that hasn't been chosen among Who, What, …"). Same
+    // construct, one word apart; accepting only the longer form would leave the
+    // shorter one on the open prompt while its sibling clause parsed.
+    let (list, _) = alt((tag::<_, _, E>("from among "), tag("among ")))
+        .parse(tail)
+        .ok()?;
 
-    // Same byte offset in both strings (equal lengths, checked above).
+    // The names are proper nouns, so they come off the ORIGINAL at the same byte
+    // offset (equal lengths, checked above) — the grammar above is what the
+    // lowercased copy is for.
     let list_original = &original[original.len() - list.len()..];
     let list_original = list_original.trim_end().trim_end_matches('.').trim_end();
-    if !list_original.contains(", ") {
+
+    let (_, items) = all_consuming(separated_list1(tag::<_, _, E>(", "), name_item))
+        .parse(list_original)
+        .ok()?;
+    // Two or more, and the comma is the only separator this accepts: " and " is a
+    // legal substring of a card name (Sword of Fire and Ice), so a two-name
+    // "from among A and B" declines here rather than risk splitting a name.
+    if items.len() < 2 {
         return None;
     }
 
-    let mut names = Vec::new();
-    for (index, piece) in list_original.split(", ").enumerate() {
+    let mut names = Vec::with_capacity(items.len());
+    let last = items.len() - 1;
+    for (index, piece) in items.into_iter().enumerate() {
         let piece = piece.trim();
-        // The final item carries the coordinating conjunction ("…, and Black
-        // Lotus"). Stripping it only on the LAST piece keeps a name that merely
-        // begins with "And" intact.
-        let is_last = index + 1 == list_original.split(", ").count();
-        let name = if is_last {
-            piece
-                .strip_prefix("and ")
-                .or_else(|| piece.strip_prefix("or "))
+        // Only the final item carries the coordinating conjunction ("…, and Black
+        // Lotus"), so stripping it there keeps a name that merely begins with
+        // "And" intact.
+        let name = if index == last {
+            opt(alt((tag::<_, _, E>("and "), tag("or "))))
+                .parse(piece)
+                .map(|(rest, _)| rest)
                 .unwrap_or(piece)
         } else {
             piece
@@ -29894,7 +29928,7 @@ fn parse_card_name_enumeration(
         }
         names.push(name.to_string());
     }
-    (names.len() >= 2).then_some((names, distinctness))
+    Some((names, distinctness))
 }
 
 /// Match "choose a creature type", "choose a color", "choose odd or even",

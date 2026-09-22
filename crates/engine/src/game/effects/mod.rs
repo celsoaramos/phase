@@ -82,7 +82,6 @@ pub mod cleanup;
 pub mod collect_evidence;
 pub mod complete_player_action;
 pub mod conjure;
-pub mod create_card_copy_by_name;
 pub mod connive;
 pub mod control_next_turn;
 pub(crate) mod copy_exception;
@@ -90,6 +89,7 @@ pub mod copy_spell;
 pub mod copy_token_blocking;
 pub mod counter;
 pub mod counters;
+pub mod create_card_copy_by_name;
 pub mod create_damage_replacement;
 pub mod create_draw_replacement;
 pub mod create_emblem;
@@ -4697,6 +4697,7 @@ fn audit_later_instruction(effect: &Effect) -> LaterInstructionAudit<'_> {
         | Effect::RemoveFromCombat { .. }
         | Effect::BecomeBlocked { .. }
         | Effect::Conjure { .. }
+        | Effect::CreateCardCopyByName { .. }
         | Effect::ApplyPerpetual { .. }
         | Effect::Intensify { .. }
         | Effect::DraftFromSpellbook { .. }
