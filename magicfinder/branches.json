@@ -81,5 +81,8 @@
   },
   {
     "branch": "card/dtk-reveal-or-control"
+  },
+  {
+    "branch": "card/mana-restriction-type-list"
   }
 ]
