@@ -1595,14 +1595,11 @@ mod tests {
     /// 25–5.
     #[test]
     fn no_preset_disables_the_wasted_mana_penalty() {
-        for difficulty in [
-            AiDifficulty::VeryEasy,
-            AiDifficulty::Easy,
-            AiDifficulty::Medium,
-            AiDifficulty::Hard,
-            AiDifficulty::VeryHard,
-            AiDifficulty::CEDH,
-        ] {
+        for difficulty in ACCEPTED_DIFFICULTY_LABELS
+            .iter()
+            .copied()
+            .map(AiDifficulty::from_label)
+        {
             let config = create_config(difficulty, Platform::Native);
             assert!(
                 config.profile.interaction_patience < 1.0,
