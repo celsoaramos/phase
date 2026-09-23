@@ -91,5 +91,8 @@
   },
   {
     "branch": "ai/combat-trick-and-prevent-timing"
+  },
+  {
+    "branch": "card/ring-cycle-upkeep-counter"
   }
 ]
