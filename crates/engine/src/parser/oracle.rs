@@ -82,7 +82,7 @@ use super::oracle_ir::doc::{
     stamp_printed_ability_slot, stamp_printed_trigger_slot, OracleDocBuilder, OracleDocIr,
     OracleItemId, OracleItemIr, OracleNodeIr, OracleSourceSpan, OracleUnitSource,
     PrintedAbilityIndex, PrintedTriggerIndex, RelationSynthesisIr, SpellPayloadIr,
-    UnsupportedAbilityIr,
+    UnsupportedAbilityCategory, UnsupportedAbilityIr,
 };
 use super::oracle_ir::effect_chain::{
     AbilityIr, AbilityRootTransform, AbilityShellIr, EffectChainIr, InjectedColorChoice,
@@ -123,12 +123,12 @@ use super::oracle_special::{
     parse_solve_condition, try_parse_die_roll_table,
 };
 use super::oracle_static::{
-    is_speed_unlock_sentence, lower_static_ir, parse_alternative_keyword_cost,
-    parse_cast_spells_alternative_cost_multi, parse_collect_evidence_alt_cost,
-    parse_flashback_trailing_self_spell_cost_reduction, parse_spells_alternative_cost,
-    parse_static_line, parse_static_line_multi, try_parse_graveyard_keyword_grant_clause,
-    try_parse_graveyard_keyword_grant_static, try_parse_top_of_library_cast_permission,
-    GrantedCastKeywordKind,
+    is_graveyard_cast_permission_lead, is_speed_unlock_sentence, lower_static_ir,
+    parse_alternative_keyword_cost, parse_cast_spells_alternative_cost_multi,
+    parse_collect_evidence_alt_cost, parse_flashback_trailing_self_spell_cost_reduction,
+    parse_spells_alternative_cost, parse_static_line, parse_static_line_multi,
+    try_parse_graveyard_keyword_grant_clause, try_parse_graveyard_keyword_grant_static,
+    try_parse_top_of_library_cast_permission, GrantedCastKeywordKind,
 };
 use super::oracle_trigger::{
     lower_trigger_ir, lower_trigger_node_ir, parse_trigger_lines_at_index,
@@ -4790,6 +4790,13 @@ fn parse_normalized_oracle_ir(
 
     let mut ctx = ParseContext {
         card_name: Some(card_name.to_string()),
+        // CR 109.1 + CR 205.2: publish the card's printed core types once, here,
+        // so a keyword action whose CR expansion is conditioned on them
+        // (`support N`, CR 701.41a) can read the answer instead of inferring it.
+        source_core_types: types
+            .iter()
+            .filter_map(|t| t.parse::<crate::types::card_type::CoreType>().ok())
+            .collect(),
         ..Default::default()
     };
 
@@ -6578,6 +6585,26 @@ fn parse_normalized_oracle_ir(
                     continue;
                 }
             }
+            // CR 601.2a + CR 113.6b: a line headed by a recognized
+            // cast-from-graveyard permission whose permission parser declined is
+            // a STRICT gap. Falling through to the replacement/effect fallbacks
+            // reclaims it as a partial parse (e.g. the "exile it instead"
+            // sentence becomes a Moved replacement) and silently drops the
+            // permission's unmodeled prefix, so emit the same typed
+            // `static_structure` residual the generic unsupported dispatch would.
+            if is_graveyard_cast_permission_lead(&lower) {
+                emitter.unsupported_ir_at(
+                    item_line,
+                    UnsupportedAbilityIr::new(
+                        UnsupportedAbilityCategory::StaticStructure,
+                        format!("Static pattern matched but line failed static parser: {line}"),
+                        line,
+                    ),
+                    min_x_value,
+                );
+                i += 1;
+                continue;
+            }
         }
 
         // CR 615 + CR 105.1: "Prevent all damage that sources of the color of your choice
@@ -7610,7 +7637,12 @@ fn parse_normalized_oracle_ir(
 
         // Priority 14a: the dispatcher parses once and retains successful spell IR.
         // Priority 15: its exact unsupported payload reaches final lowering unchanged.
-        match dispatch_line_nom(&line, card_name, ctx.host_self_reference.clone()) {
+        match dispatch_line_nom(
+            &line,
+            card_name,
+            ctx.host_self_reference.clone(),
+            ctx.source_core_types.clone(),
+        ) {
             NomDispatchIr::Spell(mut ir) => {
                 ir.shell.min_x_value = ir.shell.min_x_value.max(min_x_value);
                 emitter.ability_ir_at_route(item_line, ir, OuterRoute::NomDispatch);
@@ -8520,6 +8552,7 @@ fn resolve_guards_in_effect(effect: &mut Effect) {
         | Effect::RuntimeHandled { .. }
         | Effect::Incubate { .. }
         | Effect::Amass { .. }
+        | Effect::EmpowerJace { .. }
         | Effect::Monstrosity { .. }
         | Effect::Specialize
         | Effect::Renown { .. }
@@ -9301,6 +9334,7 @@ fn demote_lifetimes_in_effect(effect: &mut Effect) {
         | Effect::RuntimeHandled { .. }
         | Effect::Incubate { .. }
         | Effect::Amass { .. }
+        | Effect::EmpowerJace { .. }
         | Effect::Monstrosity { .. }
         | Effect::Specialize
         | Effect::Renown { .. }
@@ -10080,6 +10114,11 @@ pub(crate) fn try_parse_equip(line: &str) -> Option<AbilityIr> {
             parsed_clause(Effect::Attach {
                 attachment: crate::types::ability::TargetFilter::SelfRef,
                 target,
+                // CR 702.6a: the keyword's "target" names the HOST; the
+                // attachment ("this permanent") is determined.
+                selection: crate::types::ability::AttachSelection::AtResolution {
+                    count: crate::types::ability::AttachCardinality::One,
+                },
             }),
             None,
             None,
