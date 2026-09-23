@@ -88,5 +88,8 @@
   {
     "branch": "card/pelt-collector",
     "pr": 9240
+  },
+  {
+    "branch": "ai/combat-trick-and-prevent-timing"
   }
 ]
