@@ -36658,8 +36658,9 @@ fn tasigur_opponent_choice_scans_whole_graveyard() {
 }
 
 /// CR 406.6 + CR 607.2a: a choice among EXILED cards (Dauthi Voidwalker's "choose
-/// an exiled card an opponent owns with a void counter on it") keeps the legacy
-/// pool read — the non-exile `Direct` routing must not reach it.
+/// an exiled card an opponent owns with a void counter on it") is still a
+/// `ChooseFromZone` over exile. Upstream #9216 moved every named-zone choice,
+/// exile included, to the `Direct` read, so either source is accepted here.
 #[test]
 fn exile_zone_from_zone_choice_keeps_legacy_candidate_source() {
     let def = parse_effect_chain(
@@ -36671,7 +36672,8 @@ fn exile_zone_from_zone_choice_keeps_legacy_candidate_source() {
             &*def.effect,
             Effect::ChooseFromZone {
                 zone: Zone::Exile,
-                candidate_source: ZoneChoiceCandidateSource::Legacy,
+                candidate_source: ZoneChoiceCandidateSource::Legacy
+                    | ZoneChoiceCandidateSource::Direct,
                 ..
             }
         ),
