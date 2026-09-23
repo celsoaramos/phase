@@ -1357,8 +1357,10 @@ Trample";
         }
     }
 
-    /// CR 601.2b + CR 601.2f: an optional additional cost whose body the parser
-    /// cannot read stays optional instead of becoming a mandatory `Choice`.
+    /// CR 601.2b + CR 601.2f: an optional additional cost whose body is a
+    /// disjunction stays optional instead of becoming a mandatory `Choice`. The
+    /// body itself is not pinned: whether it reads as Unimplemented or as a typed
+    /// cost (Behold, Dragon's Fire) belongs to that cost's own grammar.
     #[test]
     fn parse_additional_cost_optional_disjunction_stays_optional_unimplemented() {
         let lower = "as an additional cost to cast this spell, you may reveal a dragon card from your hand or choose a dragon you control.";
@@ -1376,7 +1378,11 @@ Trample";
                 description,
                 "reveal a Dragon card from your hand or choose a Dragon you control"
             ),
-            other => panic!("Expected Optional(Unimplemented), got {other:?}"),
+            Some(AdditionalCost::Optional {
+                cost: AbilityCost::Behold { .. },
+                repeatability: AdditionalCostRepeatability::Once,
+            }) => {}
+            other => panic!("Expected Optional(Unimplemented | Behold), got {other:?}"),
         }
 
         // Reach guard: a readable optional reveal still returns the parsed cost.
