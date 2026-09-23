@@ -376,7 +376,7 @@ fn redundancy_delta(
         // CR 701.19a: a regeneration shield protects against the NEXT destruction
         // this turn; stacking a second one on a creature that already holds an
         // unconsumed shield buys only a second destruction in the same turn.
-        Effect::Regenerate { target } => regenerate_redundancy(state, source_id, target),
+        Effect::Regenerate { target, .. } => regenerate_redundancy(state, source_id, target),
         Effect::Animate {
             keywords, target, ..
         } => animate_keyword_redundancy(state, source_id, keywords, target),
@@ -2200,6 +2200,7 @@ mod tests {
             "Drudge Skeletons",
             Effect::Regenerate {
                 target: TargetFilter::SelfRef,
+                scope: engine::types::ability::EffectScope::Single,
             },
         )
     }
