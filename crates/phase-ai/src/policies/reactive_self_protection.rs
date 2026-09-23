@@ -18,6 +18,7 @@
 //! protection in hand for the moment a threat arrives is strictly better
 //! than burning it pre-emptively.
 
+use engine::types::ability::{AbilityDefinition, Effect};
 use engine::types::actions::GameAction;
 use engine::types::game_state::GameState;
 use engine::types::player::PlayerId;
@@ -26,7 +27,7 @@ use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use super::self_protection_classify::{
     any_immediate_threat, combat_step_allows_protection, is_self_protection_effect,
-    self_protection_activation_payoff,
+    prevention_has_incoming_damage, self_protection_activation_payoff,
 };
 use crate::cast_facts::collect_definition_effects;
 use crate::features::DeckFeatures;
@@ -97,6 +98,29 @@ impl TacticalPolicy for ReactiveSelfProtectionPolicy {
             .iter()
             .flat_map(|ability| collect_definition_effects(ability))
             .collect();
+        // CR 615.1a: a pure prevention spell — "prevent the next N damage", at
+        // most with a chained draw that only replaces itself (Swift Maneuver) —
+        // is only worth casting against damage that is actually coming. This is
+        // checked before the mixed-chain fail-open below, which would otherwise
+        // read the draw as a second line and let the AI cast it on turn 1. A
+        // modal spell never qualifies: a draw MODE is a real alternative.
+        if cast_facts
+            .primary_effects
+            .iter()
+            .all(|ability| ability.mode_abilities.is_empty() && is_pure_prevention(ability))
+            && !cast_facts.primary_effects.is_empty()
+        {
+            return if prevention_has_incoming_damage(ctx.state, ctx.ai_player) {
+                PolicyVerdict::neutral(PolicyReason::new(
+                    "reactive_self_protection_incoming_damage",
+                ))
+            } else {
+                PolicyVerdict::Reject {
+                    reason: PolicyReason::new("reactive_self_protection_no_incoming_damage"),
+                }
+            };
+        }
+
         // A mixed chain or modal spell may have a valuable non-protection line.
         // Reject the cast only when every reachable spell effect is itself a
         // self-protection effect; otherwise preserve the existing fail-open.
@@ -124,20 +148,47 @@ impl TacticalPolicy for ReactiveSelfProtectionPolicy {
     }
 }
 
+/// Every effect of the chain is `PreventDamage`, except draws that only
+/// replace the spent card — immediate, or delayed to the next upkeep (Swift
+/// Maneuver: "Prevent the next 2 damage that would be dealt to any target this
+/// turn. Draw a card at the beginning of the next turn's upkeep.").
+fn is_pure_prevention(ability: &AbilityDefinition) -> bool {
+    let effects = collect_definition_effects(ability);
+    effects
+        .iter()
+        .any(|e| matches!(e, Effect::PreventDamage { .. }))
+        && effects
+            .iter()
+            .all(|e| matches!(e, Effect::PreventDamage { .. }) || is_draw_rider(e))
+}
+
+fn is_draw_rider(effect: &Effect) -> bool {
+    match effect {
+        Effect::Draw { .. } => true,
+        Effect::CreateDelayedTrigger { effect, .. } => collect_definition_effects(effect)
+            .into_iter()
+            .all(|inner| matches!(inner, Effect::Draw { .. })),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::self_protection_classify::THREAT_FLOOR;
     use super::*;
     use engine::ai_support::{ActionMetadata, AiDecisionContext, CandidateAction, TacticalClass};
+    use engine::game::combat::{AttackerInfo, CombatState};
     use engine::game::zones::create_object;
     use engine::types::ability::{
         AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef, Effect,
         QuantityExpr, StaticDefinition, TargetFilter, TypedFilter,
     };
+    use engine::types::ability::{DelayedTriggerCondition, PreventionAmount, PreventionScope};
     use engine::types::card_type::CoreType;
     use engine::types::game_state::WaitingFor;
     use engine::types::identifiers::{CardId, ObjectId};
     use engine::types::keywords::Keyword;
+    use engine::types::phase::Phase;
     use engine::types::statics::StaticMode;
     use engine::types::zones::Zone;
     use std::sync::Arc;
@@ -1044,5 +1095,100 @@ mod tests {
             }
             PolicyVerdict::Score { .. } => panic!("begin-of-combat has no payoff; must reject"),
         }
+    }
+
+    /// Swift Maneuver: "Prevent the next 2 damage that would be dealt to any
+    /// target this turn. Draw a card at the beginning of the next turn's upkeep."
+    fn swift_maneuver(state: &mut GameState) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(31),
+            AI,
+            "Swift Maneuver".to_string(),
+            Zone::Hand,
+        );
+        let object = state.objects.get_mut(&id).unwrap();
+        object.card_types.core_types.push(CoreType::Instant);
+        let draw_later = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::CreateDelayedTrigger {
+                condition: DelayedTriggerCondition::AtNextPhase {
+                    phase: Phase::Upkeep,
+                },
+                effect: Box::new(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                )),
+                uses_tracked_set: false,
+            },
+        );
+        Arc::make_mut(&mut object.abilities).push(
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::PreventDamage {
+                    amount: PreventionAmount::Next(2),
+                    amount_dynamic: None,
+                    target: TargetFilter::Any,
+                    scope: PreventionScope::AllDamage,
+                    damage_source_filter: None,
+                    prevention_duration: None,
+                },
+            )
+            .sub_ability(draw_later),
+        );
+        id
+    }
+
+    fn rejected_for_no_incoming_damage(verdict: &PolicyVerdict) -> bool {
+        matches!(verdict, PolicyVerdict::Reject { reason }
+            if reason.kind == "reactive_self_protection_no_incoming_damage")
+    }
+
+    #[test]
+    fn prevention_with_a_draw_rider_is_held_without_incoming_damage() {
+        // Turn 1, empty board: the reported cast. Before the fix the delayed draw
+        // counted as a "valuable non-protection line" and the gate failed open.
+        let mut state = GameState::new_two_player(42);
+        let id = swift_maneuver(&mut state);
+        let verdict = cast_verdict(&state, id);
+        assert!(rejected_for_no_incoming_damage(&verdict), "got {verdict:?}");
+    }
+
+    #[test]
+    fn prevention_is_not_cast_in_a_combat_the_ai_is_not_in() {
+        let mut state = GameState::new_two_player(42);
+        let id = swift_maneuver(&mut state);
+        state.phase = Phase::DeclareBlockers;
+        state.combat = Some(CombatState::default());
+        let verdict = cast_verdict(&state, id);
+        assert!(rejected_for_no_incoming_damage(&verdict), "got {verdict:?}");
+    }
+
+    #[test]
+    fn prevention_is_cast_when_the_ai_is_being_attacked() {
+        let mut state = GameState::new_two_player(42);
+        let id = swift_maneuver(&mut state);
+        let attacker = create_object(
+            &mut state,
+            CardId(32),
+            PlayerId(1),
+            "Attacker".to_string(),
+            Zone::Battlefield,
+        );
+        state.active_player = PlayerId(1);
+        state.phase = Phase::DeclareAttackers;
+        state.combat = Some(CombatState {
+            attackers: vec![AttackerInfo::attacking_player(attacker, AI)],
+            ..Default::default()
+        });
+        let verdict = cast_verdict(&state, id);
+        assert!(
+            matches!(&verdict, PolicyVerdict::Score { reason, .. }
+                if reason.kind == "reactive_self_protection_incoming_damage"),
+            "got {verdict:?}"
+        );
     }
 }
