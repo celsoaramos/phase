@@ -86,6 +86,7 @@
     "branch": "card/mana-restriction-type-list"
   },
   {
-    "branch": "card/pelt-collector"
+    "branch": "card/pelt-collector",
+    "pr": 9240
   }
 ]
