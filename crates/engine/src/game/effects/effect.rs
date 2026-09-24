@@ -1184,6 +1184,43 @@ fn snapshot_transient_modifications(
                 // Symmetric with the Protection arm above: CR 609.3 + F1.
                 None => modification.clone(),
             },
+            // CR 608.2h + CR 205.1b: "target land becomes the basic land type of
+            // your choice" (Navigator's Compass) chains `Choose { persist: false }`
+            // into this apply-half. A non-persisting answer is never written onto
+            // the source's `chosen_attributes` — it lives only in
+            // `last_named_choice` for the rest of THIS resolution — so the live
+            // `AddChosenSubtype` read in `layers.rs` (which consults the source)
+            // found nothing and the land kept only its printed type. Latch the
+            // resolution's answer into a concrete `AddSubtype` here, the same way
+            // the chosen-colour grants above are latched.
+            //
+            // A source that DID persist its own subtype choice (an as-enters
+            // "choose a creature type") keeps the live read, byte-identical: that
+            // chain carries no `Choose` of its own, so `last_named_choice` there
+            // could be a stale answer from an unrelated earlier resolution.
+            ContinuousModification::AddChosenSubtype { kind }
+                if state
+                    .objects
+                    .get(&ability.source_id)
+                    .and_then(|src| src.chosen_subtype_str(kind))
+                    .is_none() =>
+            {
+                match (kind, &state.last_named_choice) {
+                    (
+                        crate::types::ability::ChosenSubtypeKind::BasicLandType,
+                        Some(crate::types::ability::ChoiceValue::BasicLandType(land_type)),
+                    ) => ContinuousModification::AddSubtype {
+                        subtype: land_type.as_subtype_str().to_string(),
+                    },
+                    (
+                        crate::types::ability::ChosenSubtypeKind::CreatureType,
+                        Some(crate::types::ability::ChoiceValue::CreatureType(creature_type)),
+                    ) => ContinuousModification::AddSubtype {
+                        subtype: creature_type.clone(),
+                    },
+                    _ => modification.clone(),
+                }
+            }
             _ => modification.clone(),
         })
         .collect()
