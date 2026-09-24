@@ -8742,6 +8742,7 @@ fn parse_oracle_pipeline(
     let mut parsed = lower_oracle_ir(&mut ir);
     let mut raw_lowered = capture_stages.then(|| parsed.clone());
     render_granting_self_descriptions(&mut parsed, card_name);
+    fold_delayed_token_riders(&mut parsed);
     demote_unbound_delayed_sweeps(&mut parsed);
     demote_unenforceable_replacement_lifetimes(&mut parsed);
     #[cfg(debug_assertions)]
@@ -9434,6 +9435,115 @@ fn demote_lifetimes_in_modification(modification: &mut ContinuousModification) {
         | ContinuousModification::AddCounterOnEnter { .. }
         | ContinuousModification::SetStartingLoyalty { .. }
         | ContinuousModification::RemoveManaCost => {}
+    }
+}
+
+/// CR 111.1 + CR 603.7a: fold a "Those tokens have \"<ability>\"" rider into the
+/// token a PRECEDING delayed trigger creates.
+///
+/// Glimpse the Impossible: "At the beginning of the next end step, …, then create
+/// a 0/1 colorless Eldrazi Spawn creature token for each card put into your
+/// graveyard this way. Those tokens have \"Sacrifice this token: Add {C}.\"" The
+/// rider is its own sentence, so it lowers as a spell-level sibling
+/// `GenericEffect { affected: TrackedSet }` that runs when the SPELL resolves —
+/// binding the ability to the cards exiled by the first instruction (the only
+/// published set at that moment) and never reaching the tokens, which do not exist
+/// until the delayed trigger resolves. A `GenericEffect` grant would also lapse at
+/// cleanup (`effects/effect.rs`'s `UntilEndOfTurn` fallback), while the printed
+/// "have" is a characteristic of the token for as long as it exists.
+///
+/// The fold is the same shape the parser already gives an inline
+/// `token with "<ability>"`: a `SelfRef` static on the token definition. Narrow by
+/// construction: the rider must be a target-less, duration-less `GenericEffect`
+/// whose every static reads the tracked set, grants only abilities/keywords, and
+/// reads as "have …"; and the node BEFORE it must be a delayed trigger whose chain
+/// creates a token.
+fn fold_delayed_token_riders(parsed: &mut ParsedAbilities) {
+    for def in &mut parsed.abilities {
+        fold_token_riders_in(def);
+    }
+    for trig in &mut parsed.triggers {
+        if let Some(exec) = trig.execute.as_deref_mut() {
+            fold_token_riders_in(exec);
+        }
+    }
+}
+
+fn fold_token_riders_in(def: &mut AbilityDefinition) {
+    if let Effect::CreateDelayedTrigger { effect: inner, .. } = &mut *def.effect {
+        if let Some(statics) = def.sub_ability.as_deref().and_then(token_rider_statics) {
+            if let Some(token_statics) = delayed_token_statics_mut(inner) {
+                token_statics.extend(statics);
+                let rest = def.sub_ability.take().and_then(|rider| rider.sub_ability);
+                def.sub_ability = rest;
+            }
+        }
+    }
+    if let Some(sub) = def.sub_ability.as_deref_mut() {
+        fold_token_riders_in(sub);
+    }
+    if let Some(els) = def.else_ability.as_deref_mut() {
+        fold_token_riders_in(els);
+    }
+}
+
+fn token_rider_statics(node: &AbilityDefinition) -> Option<Vec<StaticDefinition>> {
+    let Effect::GenericEffect {
+        static_abilities,
+        duration: None,
+        target: None,
+        end_cost: None,
+    } = &*node.effect
+    else {
+        return None;
+    };
+    if node.condition.is_some() || node.duration.is_some() || static_abilities.is_empty() {
+        return None;
+    }
+    let is_rider = static_abilities.iter().all(|st| {
+        matches!(
+            st.affected,
+            Some(TargetFilter::TrackedSet { .. } | TargetFilter::TrackedSetFiltered { .. })
+        ) && !st.modifications.is_empty()
+            && st.modifications.iter().all(|m| {
+                matches!(
+                    m,
+                    ContinuousModification::GrantAbility { .. }
+                        | ContinuousModification::GrantTrigger { .. }
+                        | ContinuousModification::AddKeyword { .. }
+                )
+            })
+            && st
+                .description
+                .as_deref()
+                .is_some_and(|d| d.trim_start().to_lowercase().starts_with("have "))
+    });
+    is_rider.then(|| {
+        static_abilities
+            .iter()
+            .cloned()
+            .map(|mut st| {
+                st.affected = Some(TargetFilter::SelfRef);
+                st
+            })
+            .collect()
+    })
+}
+
+/// The `static_abilities` of the LAST token created along a delayed trigger's chain.
+fn delayed_token_statics_mut(def: &mut AbilityDefinition) -> Option<&mut Vec<StaticDefinition>> {
+    fn creates_token(def: &AbilityDefinition) -> bool {
+        matches!(*def.effect, Effect::Token { .. })
+            || def.sub_ability.as_deref().is_some_and(creates_token)
+    }
+    if def.sub_ability.as_deref().is_some_and(creates_token) {
+        return delayed_token_statics_mut(def.sub_ability.as_deref_mut()?);
+    }
+    match &mut *def.effect {
+        Effect::Token {
+            static_abilities, ..
+        } => Some(static_abilities),
+        _ => None,
     }
 }
 

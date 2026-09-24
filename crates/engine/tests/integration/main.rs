@@ -380,6 +380,7 @@ mod gifts_ungiven_duplicate_candidates_8135;
 mod giggling_skitterspike_issue_890;
 mod gimbal_gremlin_prodigy;
 mod glen_elendras_answer_counter_all_conjunction;
+mod glimpse_the_impossible;
 mod gluntch_choose_player_chain;
 mod goad_badge_defender_gated_anchor;
 mod goaded_creature_under_pacifism_visible;

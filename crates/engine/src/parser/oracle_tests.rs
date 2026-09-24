@@ -27589,9 +27589,11 @@ fn parsed_effect_collectors_include_trigger_execution_trees() {
 /// Grinning Totem the targeted OPPONENT, not the exiled card) while the card
 /// would otherwise report as fully supported.
 ///
-/// Three cards share the shape, so this is a class guard, not a card special
-/// case. Reverting the pass drops every key here and silently re-promotes all
-/// three to "supported".
+/// Two cards share the shape, so this is a class guard, not a card special
+/// case. Reverting the pass drops every key here and silently re-promotes both
+/// to "supported". Glimpse the Impossible left the class when its plural
+/// "if any of those cards remain exiled" gate became a bound sweep
+/// (`strip_remaining_exiled_set_gate`; `tests/integration/glimpse_the_impossible.rs`).
 #[test]
 fn unbound_delayed_graveyard_sweep_stays_honestly_unimplemented() {
     let cases = [
@@ -27602,10 +27604,6 @@ fn unbound_delayed_graveyard_sweep_stays_honestly_unimplemented() {
         (
             "Bank Job",
             "At the beginning of your upkeep, exile the bottom creature card of your library. You may cast that card this turn. At the beginning of the next end step, if that card is still exiled, put it into your graveyard and create a Treasure token.",
-        ),
-        (
-            "Glimpse the Impossible",
-            "Exile the top three cards of your library. You may play those cards this turn. At the beginning of the next end step, if any of those cards remain exiled, put them into your graveyard, then create a 0/1 colorless Eldrazi Spawn creature token for each card put into your graveyard this way.",
         ),
     ];
     for (name, text) in cases {

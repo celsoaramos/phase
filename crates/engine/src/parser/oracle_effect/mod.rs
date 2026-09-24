@@ -31628,6 +31628,41 @@ fn is_broadcast_population_filter(filter: &TargetFilter) -> bool {
     )
 }
 
+/// CR 603.4 + CR 400.7: the intervening "if any of those cards remain exiled"
+/// gate of a delayed sweep over a previously exiled set — Glimpse the
+/// Impossible ("…, put them into your graveyard, then create a 0/1 … token for
+/// each card put into your graveyard this way").
+///
+/// The gate is REDUNDANT with the sweep that follows it: the instruction only
+/// reaches members still in exile (a member that left is a new object, CR
+/// 400.7), and when none remain it moves nothing — and every consequent in this
+/// class is counted by what was moved. So it is dropped, and the bare "them"
+/// that follows is rebound to "those cards", the plural anaphor the delayed-body
+/// parse already binds to the exiled set (`contains_explicit_tracked_set_pronoun`).
+/// Left in place, the gate made the whole body fall through to the
+/// play-from-exile route (it contains "remain exiled"), which swallowed the
+/// token clause and produced an unbound `ParentTarget` graveyard move.
+///
+/// Deliberately narrow: only the PLURAL set form, and only a graveyard sweep
+/// ("put them into …"). The singular "if that card is still exiled, put it into
+/// your graveyard and create a Treasure token" (Bank Job) is NOT redundant — its
+/// Treasure is gated by the condition, not counted. The two other printed
+/// plural-gate cards stay as they were: Mnemonic Betrayal's "return them to
+/// their owners' graveyards" lowers to a graveyard→graveyard move whose origin
+/// this rebinding does not fix, and Storybook Ride is an Attraction the engine
+/// does not parse.
+fn strip_remaining_exiled_set_gate(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let (rest_lower, _) = tag::<_, _, OracleError<'_>>("if any of those cards remain exiled, ")
+        .parse(lower.as_str())
+        .ok()?;
+    let rest = &text[text.len() - rest_lower.len()..];
+    let (after, _) = tag::<_, _, OracleError<'_>>("put them into ")
+        .parse(rest_lower)
+        .ok()?;
+    Some(format!("put those cards into {}", &rest[rest.len() - after.len()..]))
+}
+
 /// CR 603.7: Detect explicit cross-clause pronouns ("those cards", "the exiled card").
 /// `lower` must be the pre-lowered version of the text.
 fn contains_explicit_tracked_set_pronoun(lower: &str) -> bool {
@@ -39228,6 +39263,10 @@ pub(crate) fn parse_effect_chain_ir(
                 .and_then(|expr| expr.clone())
         });
         if let Some(prefix_condition) = prefix_delayed {
+            // CR 603.4 + CR 400.7: "…, if any of those cards remain exiled, <sweep
+            // them>" — see `strip_remaining_exiled_set_gate`.
+            let gated_body = strip_remaining_exiled_set_gate(text_after_prefix);
+            let text_after_prefix = gated_body.as_deref().unwrap_or(text_after_prefix);
             let (inner_text, inner_multi_target) = strip_any_number_quantifier(text_after_prefix);
             let inner_ir = parse_effect_chain_ir(&inner_text, kind, ctx);
             let mut inner_def = lower_effect_chain_ir(&inner_ir);
