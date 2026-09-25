@@ -39,7 +39,7 @@ use engine::types::ability::{
 use engine::types::ability_visit::visit_ability_def;
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
-use engine::types::game_state::{CastPaymentMode, DayNight, GameState, WaitingFor};
+use engine::types::game_state::{CastPaymentMode, DayNight, GameState, StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::{Keyword, KeywordKind};
 use engine::types::mana::{ManaSourcePenalty, ManaType};
@@ -1220,7 +1220,10 @@ fn cast_targets_are_all_futile(ctx: &PolicyContext<'_>) -> bool {
     let effects = ctx.effects();
     let mut proved_any = false;
     for effect in &effects {
-        if !matches!(effect, Effect::Destroy { .. } | Effect::DealDamage { .. }) {
+        if !matches!(
+            effect,
+            Effect::Destroy { .. } | Effect::DealDamage { .. } | Effect::Counter { .. }
+        ) {
             continue;
         }
         let Some(filter) = effect.target_filter() else {
@@ -1522,6 +1525,40 @@ fn target_is_provably_futile(
     let TargetRef::Object(object_id) = target else {
         return false;
     };
+
+    // CR 701.6a: countering a spell removes it from the stack. When the spell
+    // is the AI's own, a counter can only cost it two cards — its own spell and
+    // the counter — and hand the opponent whatever that spell was answering.
+    // Field report (2026-09-25): the AI cast Counterspell on the player's
+    // creature spell, then Spell Pierce ("counter target noncreature spell") —
+    // whose only legal target was that same Counterspell — and countered its
+    // own counter, letting the creature resolve.
+    //
+    // Proven only for a payload that is nothing but counters with no redirect
+    // (Remand/Memory Lapse send the spell back to be recast, and a rider such as
+    // Arcane Denial's draw is a consequence this proof does not weigh), and only
+    // for SPELLS: countering its own trigger (Stifle on an upkeep cost) is a
+    // real play.
+    let is_pure_counter = !effects.is_empty()
+        && effects.iter().all(|e| {
+            matches!(
+                e,
+                Effect::Counter {
+                    countered_spell_zone: None,
+                    ..
+                }
+            )
+        });
+    if is_pure_counter
+        && ctx.state.stack.iter().any(|entry| {
+            entry.id == *object_id
+                && entry.controller == ctx.ai_player
+                && matches!(entry.kind, StackEntryKind::Spell { .. })
+        })
+    {
+        return true;
+    }
+
     let Some(object) = ctx.state.objects.get(object_id) else {
         return false;
     };
@@ -7609,6 +7646,85 @@ mod tests {
         set_priority_window(state, Phase::PreCombatMain, P0);
 
         assert_ne!(gate_cast(state, spell), GateDecision::Reject);
+    }
+
+    // ---- CR 701.6a: a counter whose only target is the AI's own spell ----
+
+    const SPELL_PIERCE_ORACLE: &str =
+        "Counter target noncreature spell unless its controller pays {2}.";
+
+    /// Put a spell on the stack the way the engine does (stack entry id ==
+    /// object id) and return its id.
+    fn push_stack_spell(
+        state: &mut GameState,
+        controller: PlayerId,
+        name: &str,
+        core_type: CoreType,
+    ) -> ObjectId {
+        let id = engine::game::zones::create_object(
+            state,
+            engine::types::identifiers::CardId(state.next_object_id),
+            controller,
+            name.to_string(),
+            Zone::Stack,
+        );
+        let card_id = state.objects[&id].card_id;
+        state
+            .objects
+            .get_mut(&id)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(core_type);
+        state
+            .stack
+            .push_back(engine::types::game_state::StackEntry {
+                id,
+                source_id: id,
+                controller,
+                kind: StackEntryKind::Spell {
+                    card_id,
+                    ability: None,
+                    casting_variant: Default::default(),
+                    actual_mana_spent: 0,
+                },
+            });
+        id
+    }
+
+    /// Field report (2026-09-25): the AI countered the player's creature spell
+    /// with Counterspell, then cast Spell Pierce — "noncreature spell", so its
+    /// ONLY legal target was that Counterspell — and countered its own counter.
+    #[test]
+    fn rejects_counter_whose_only_legal_target_is_own_spell() {
+        let mut scenario = GameScenario::new();
+        let pierce = scenario
+            .add_spell_to_hand_from_oracle(P0, "Spell Pierce", true, SPELL_PIERCE_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        push_stack_spell(state, P1, "Makindi Sliderunner", CoreType::Creature);
+        push_stack_spell(state, P0, "Counterspell", CoreType::Instant);
+        set_priority_window(state, Phase::PreCombatMain, P0);
+
+        assert_eq!(gate_cast(state, pierce), GateDecision::Reject);
+    }
+
+    /// Non-vacuity: an opponent's noncreature spell in the target set makes it
+    /// a real counter again.
+    #[test]
+    fn allows_counter_when_an_opponent_spell_is_targetable() {
+        let mut scenario = GameScenario::new();
+        let pierce = scenario
+            .add_spell_to_hand_from_oracle(P0, "Spell Pierce", true, SPELL_PIERCE_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        push_stack_spell(state, P1, "Lightning Bolt", CoreType::Instant);
+        push_stack_spell(state, P0, "Counterspell", CoreType::Instant);
+        set_priority_window(state, Phase::PreCombatMain, P0);
+
+        assert_ne!(gate_cast(state, pierce), GateDecision::Reject);
     }
 
     // ---- CR 615.1a: burn into an active prevention shield ----
