@@ -105,7 +105,7 @@ fn garth_parses_a_closed_distinct_name_domain_and_a_card_copy() {
         panic!("expected a card-name Choose, got {:?}", ability.effect);
     };
     assert_eq!(
-        options,
+        &options[..],
         &[
             "Disenchant".to_string(),
             "Braingeyser".to_string(),
@@ -233,7 +233,7 @@ fn the_rest_of_the_closed_domain_class_parses_the_same_way() {
         panic!("expected a card-name Choose, got {:?}", ability.effect);
     };
     assert_eq!(
-        options,
+        &options[..],
         &[
             "Who".to_string(),
             "What".to_string(),

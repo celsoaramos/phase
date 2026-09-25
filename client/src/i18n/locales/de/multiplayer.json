@@ -79,6 +79,7 @@
     "draws_one": " ({{count}} Unentschieden)",
     "draws_other": " ({{count}} Unentschieden)",
     "main": "Haupt ({{count}}, min. {{min}})",
+    "mainNoMinimum": "Haupt ({{count}})",
     "sideboard": "Sideboard ({{count}})",
     "sideboardCapped": "Sideboard ({{count}}/{{max}})",
     "moveFromSideboard": "Karten aus dem Sideboard verschieben.",
@@ -95,6 +96,9 @@
     "title": "Lobby-Server nicht erreichbar",
     "message": "Dein Spiel wird nicht öffentlich gelistet. Du kannst trotzdem über P2P hosten — teile einfach den Raumcode direkt mit deinem Gegner.",
     "continueWithoutLobby": "Ohne Lobby fortfahren"
+  },
+  "lobbyCapability": {
+    "formatNeedsNewerServer": "Dieser Lobby-Server ist zu alt, um Spiele im gewählten Format aufzulisten (er benötigt Lobby-Protokoll {{needed}})."
   },
   "joinErrorDialog": {
     "dismiss": "Schließen"
@@ -131,6 +135,8 @@
     "sandboxConfirm": "Dies ist ein Sandbox-Spiel. Spieler mit Debug-Berechtigung können den Spielzustand direkt manipulieren. Fortfahren?",
     "draftBadgeTitle": "{{kind}} Draft — {{setCode}}",
     "draftBadge": "{{setCode}} Draft",
+    "cubeDraftBadgeTitle": "{{kind}} Draft — {{cubeName}}",
+    "cubeDraftBadge": "{{cubeName}} Draft",
     "p2pBadgeTitle": "Peer-to-Peer-Spiel (der Host führt die Engine aus)",
     "sandboxBadgeTitle": "Dieses Spiel erlaubt Debug-Aktionen. Zum Testen nutzen — keine kompetitive Partie.",
     "hintSlow": "LANGSAM",
@@ -314,6 +320,9 @@
     "anonymous": "Anonym",
     "joining": "Tritt bei",
     "joinNeedsServer": "Wähle einen Server, bevor du einem Spiel beitrittst.",
+    "serverDraftJoinUnsupported": "Serverseitig gehosteten Draft-Pods kannst du nicht aus der Lobby beitreten.",
+    "p2pDraftSpectateUnsupported": "Spielergehostete Draft-Pods können nicht beobachtet werden.",
+    "alreadyInDraftPod": "Du bist bereits in einem Draft-Pod. Verlasse ihn, bevor du einem anderen beitrittst.",
     "invalidGameLink": "Dieser Spiellink ist ungültig oder unvollständig.",
     "waitingForHostTitle": "Warte auf den Host…",
     "waitingForHostMessage": "Der Host hat dieses Spiel noch nicht geöffnet, oder es wurde geschlossen. Versuche es erneut, sobald der Host seinen Link geöffnet hat.",

@@ -39,6 +39,7 @@ import {
 } from "../services/multiplayerSession";
 import {
   BrokerRequestError,
+  LobbyCapabilityError,
   lookupJoinTargetOver,
   openBrokerClient,
   resolveGuestOver,
@@ -107,6 +108,7 @@ import type { DirectorySource } from "../services/serverDirectory";
 import { reportConnectOutcome } from "../services/serverMetrics";
 import {
   DEFAULT_MULTIPLAYER_SERVER_URL,
+  OFFICIAL_MULTIPLAYER_SERVER_URL,
   isOfficialMultiplayerServerUrl,
 } from "../config/multiplayerServer";
 import { saveActiveGame, useGameStore } from "./gameStore";
@@ -595,6 +597,17 @@ function closeChannel(set: MultiplayerSet, get: MultiplayerGet, url: string): vo
   subscriptionChannels.delete(url);
   const status = new Map(get().sourceStatus);
   if (status.delete(url)) set({ sourceStatus: status });
+}
+
+/** Show the shared toast for a `registerHost` refusal from
+ * {@link LobbyCapabilityError}. A no-op for any other rejection. */
+function toastLobbyCapabilityRefusal(get: MultiplayerGet, err: unknown): void {
+  if (!(err instanceof LobbyCapabilityError)) return;
+  get().showToast(
+    i18n.t("multiplayer:lobbyCapability.formatNeedsNewerServer", {
+      needed: err.neededLobbyVersion,
+    }),
+  );
 }
 
 function setSourceStatus(
@@ -1595,6 +1608,9 @@ interface MultiplayerState {
   /** Last host-setup form choices, persisted across sessions. `null` until the
    *  player has hosted at least once. See {@link RememberedHostConfig}. */
   lastHostConfig: RememberedHostConfig | null;
+  /** The last "List in lobby" choice submitted from pod setup; `null` until
+   *  one is made. */
+  lastPodListingPublic: boolean | null;
   /**
    * Tournament code → bearer credentials this browser holds. Persisted:
    * `organizer_token` and `player_token` are minted once in a point reply and
@@ -1679,6 +1695,7 @@ interface MultiplayerActions {
   setCompatibilityPlayerCount: (count: number | null) => void;
   rememberHostConfig: (config: RememberedHostConfig) => void;
   clearRememberedHostConfig: () => void;
+  rememberPodListingPublic: (isPublic: boolean) => void;
   setPlayerSlots: (slots: PlayerSlot[]) => void;
   setSpectators: (names: string[]) => void;
   setIsSpectator: (value: boolean) => void;
@@ -1724,6 +1741,12 @@ interface MultiplayerActions {
    * crash.
    */
   ensureSubscriptionSocket: (url: string) => Promise<PhaseSocket | null>;
+  /**
+   * Choose and probe the broker a P2P registration uses. Preserve a custom
+   * broker anchor; the official broker is the fallback. Unknown custom
+   * endpoints are probed before deciding.
+   */
+  resolveP2PBroker: (anchor: string | null) => Promise<{ url: string; socket: PhaseSocket | null }>;
   /** Close and discard every source's subscription socket. Called on store
    * teardown. */
   closeSubscriptionSocket: () => void;
@@ -2871,6 +2894,7 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
       toasts: new Map(),
       formatConfig: null,
       lastHostConfig: null,
+      lastPodListingPublic: null as boolean | null,
       tournamentCredentials: {},
       playerSlots: [],
       spectators: [],
@@ -3036,6 +3060,7 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
         lastHostConfig: normalizeRememberedHostConfig(config),
       }),
       clearRememberedHostConfig: () => set({ lastHostConfig: null }),
+      rememberPodListingPublic: (isPublic) => set({ lastPodListingPublic: isPublic }),
       setPlayerSlots: (slots) => set({ playerSlots: slots }),
       setSpectators: (names) => set({ spectators: names }),
       setIsSpectator: (value) => set({ isSpectator: value }),
@@ -3194,14 +3219,20 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
           console.error("[openBroker] no hosting server selected");
           return null;
         }
+        let broker: BrokerClient | null = null;
         try {
-          const broker = await openBrokerClient(url);
+          broker = await openBrokerClient(url);
           const registered = await broker.registerHost(req);
           activeBroker = broker;
           activeBrokerGameCode = registered.gameCode;
           return { broker, gameCode: registered.gameCode };
         } catch (err) {
+          // registerHost can reject after openBrokerClient already opened the
+          // socket; activeBroker is only assigned once both succeed, so
+          // closing here is what closeBroker() would otherwise never reach.
+          broker?.close();
           console.error("[openBroker] failed:", err);
+          toastLobbyCapabilityRefusal(get, err);
           return null;
         }
       },
@@ -3469,6 +3500,7 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
           ) {
             get().showToast(i18n.t("multiplayer:botLink.codeInUse"));
           }
+          toastLobbyCapabilityRefusal(get, err);
           resetFailedHosting();
           return false;
         }
@@ -3717,6 +3749,18 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
         });
 
         return channel.firstOpen;
+      },
+
+      resolveP2PBroker: async (anchor) => {
+        let url = anchor !== null && get().sourceStatus.get(anchor)?.serverInfo?.mode !== "Full"
+          ? anchor
+          : OFFICIAL_MULTIPLAYER_SERVER_URL;
+        let socket = await get().ensureSubscriptionSocket(url);
+        if (socket?.serverInfo.mode === "Full") {
+          url = OFFICIAL_MULTIPLAYER_SERVER_URL;
+          socket = await get().ensureSubscriptionSocket(url);
+        }
+        return { url, socket };
       },
 
       closeSubscriptionSocket: () => {
@@ -4067,6 +4111,10 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
             saved.connectionMode === "server" || saved.connectionMode === "p2p"
               ? saved.connectionMode
               : null,
+          lastPodListingPublic:
+            typeof saved.lastPodListingPublic === "boolean"
+              ? saved.lastPodListingPublic
+              : null,
         };
       },
       partialize: (state) => ({
@@ -4083,6 +4131,7 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
         // projection is rebuilt each session, never persisted.
         disabledDirectorySources: state.disabledDirectorySources,
         lastHostConfig: state.lastHostConfig,
+        lastPodListingPublic: state.lastPodListingPublic,
         // `tournamentCredentials` is deliberately ABSENT: these are bearer
         // secrets and must not be written to localStorage. They persist to
         // sessionStorage instead — see `hydrateSessionTournamentCredentials`

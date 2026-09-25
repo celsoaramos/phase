@@ -722,7 +722,7 @@ fn compute_options(
             options,
             distinctness,
         } => match distinctness {
-            crate::types::ability::NameDistinctness::Repeatable => options.clone(),
+            crate::types::ability::NameDistinctness::Repeatable => options.to_vec(),
             crate::types::ability::NameDistinctness::DistinctFromSourceHistory => {
                 let used: Vec<String> = state
                     .objects
