@@ -873,6 +873,15 @@ impl AbilityCost {
                 !super::keywords::returnable_creatures_for_variant(state, player, variant)
                     .is_empty()
             }
+            // CR 118.9 + CR 119.1: "have an opponent gain N life" is paid
+            // without a recipient choice only when there is exactly one
+            // opponent; with more, the choice isn't modeled, so the cost is
+            // not offered rather than guessing a recipient.
+            AbilityCost::EffectCost { effect }
+                if super::casting_costs::opponent_life_gain_amount(effect).is_some() =>
+            {
+                super::players::opponents(state, player).len() == 1
+            }
             // CR 118.3: Effect-as-cost is conservatively treated as payable.
             // Runtime resolution determines actual outcome.
             AbilityCost::EffectCost { .. } => true,

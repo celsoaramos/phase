@@ -9276,6 +9276,11 @@ pub enum AlternativeCastKeyword {
     /// — the spell resolves normally; the prowl provenance is recorded so "if
     /// its prowl cost was paid" intervening-ifs (Latchkey Faerie) can read it.
     Prowl,
+    /// CR 702.117a: Surge alternative cost paid from hand, available only if the
+    /// caster or a teammate has cast another spell this turn. A pure cost
+    /// substitution; the surge provenance is recorded so "if its surge cost was
+    /// paid" intervening-ifs (Reckless Bushwhacker) can read it.
+    Surge,
     /// CR 702.37c (Morph) / CR 702.168b (Disguise): Cast the card face down as a
     /// 2/2 face-down creature spell for a fixed {3} (CR 601.2b alternative cost)
     /// rather than its mana cost. Offered from hand for any card with Morph,

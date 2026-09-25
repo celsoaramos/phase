@@ -1686,6 +1686,21 @@ fn an_opponent_lost_life_this_turn(state: &GameState, caster: PlayerId) -> bool 
         .any(|p| p.id != caster && p.life_lost_this_turn > 0)
 }
 
+/// CR 702.117a: Surge's gate — the caster or a teammate has cast another spell
+/// this turn. The surge spell isn't recorded in `spells_cast_this_turn_by_player`
+/// until it is cast, so any prior entry satisfies "another spell". Single
+/// authority for the candidate path and the normal-vs-surge choice.
+fn surge_spell_ledger_satisfied(state: &GameState, player: PlayerId) -> bool {
+    std::iter::once(player)
+        .chain(super::players::teammates(state, player))
+        .any(|p| {
+            state
+                .spells_cast_this_turn_by_player
+                .get(&p)
+                .is_some_and(|spells| !spells.is_empty())
+        })
+}
+
 /// CR 702.76a: Prowl's gate — whether `player` controlled a creature that dealt
 /// combat damage to a player this turn while having one of `object_id`'s
 /// creature types. The per-turn creature-type ledger
@@ -7206,14 +7221,7 @@ fn casting_variant_candidates(
         && effective_spell_keywords(state, player, object_id)
             .iter()
             .any(|k| matches!(k, Keyword::Surge(_)))
-        && std::iter::once(player)
-            .chain(super::players::teammates(state, player))
-            .any(|p| {
-                state
-                    .spells_cast_this_turn_by_player
-                    .get(&p)
-                    .is_some_and(|spells| !spells.is_empty())
-            })
+        && surge_spell_ledger_satisfied(state, player)
     {
         candidates.push(CastingVariant::Surge);
     }
@@ -13852,6 +13860,34 @@ pub fn handle_prowl_cost_choice_with_payment_mode(
     continue_cast_from_prepared(state, player, object_id, payment_mode, events)
 }
 
+/// CR 702.117a: Resolve the player's Surge cost choice. Mirrors
+/// `handle_prowl_cost_choice_with_payment_mode` — `Alternative` opts into
+/// `CastingVariant::Surge` (which substitutes the surge mana cost), and `Normal`
+/// casts for the printed cost. The another-spell-this-turn gate is enforced at
+/// offer time, so reaching this handler means the option was legal.
+pub fn handle_surge_cost_choice_with_payment_mode(
+    state: &mut GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    _card_id: CardId,
+    decision: crate::types::actions::AlternativeCastDecision,
+    payment_mode: CastPaymentMode,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    use crate::types::actions::AlternativeCastDecision;
+    if matches!(decision, AlternativeCastDecision::Alternative) {
+        let mut prepared = prepare_spell_cast_with_variant_override(
+            state,
+            player,
+            object_id,
+            Some(CastingVariant::Surge),
+        )?;
+        prepared.payment_mode = payment_mode;
+        return continue_with_prepared(state, player, prepared, events);
+    }
+    continue_cast_from_prepared(state, player, object_id, payment_mode, events)
+}
+
 /// Shared continuation: call prepare_spell_cast and run the standard casting
 /// pipeline (modal → targeting → payment). Extracted so handle_warp_cost_choice
 /// and handle_cast_spell can share the same post-prepare logic.
@@ -15829,6 +15865,62 @@ pub fn handle_cast_spell_with_payment_mode(
                 }
                 if !normal_affordable && prowl_affordable {
                     return handle_prowl_cost_choice_with_payment_mode(
+                        state,
+                        player,
+                        object_id,
+                        card_id,
+                        crate::types::actions::AlternativeCastDecision::Alternative,
+                        payment_mode,
+                        events,
+                    );
+                }
+                // Otherwise (normal-only or neither): fall through to normal cast.
+            }
+        }
+    }
+
+    // CR 702.117a + CR 118.9: Surge — opt-in pure-mana alternative cost from
+    // hand, available only if the caster or a teammate has cast another spell
+    // this turn. Mirrors the Prowl flow: offer the choice when both costs are
+    // affordable, auto-route when only the surge cost is payable. Without this
+    // block the surge variant was a candidate that nothing elected, so a surge
+    // spell whose printed cost was out of reach could never be cast.
+    if let Some(obj) = state.objects.get(&object_id) {
+        if obj.zone == Zone::Hand && surge_spell_ledger_satisfied(state, player) {
+            if let Some(surge_cost) = effective_spell_keywords(state, player, object_id)
+                .into_iter()
+                .find_map(|k| match k {
+                    crate::types::keywords::Keyword::Surge(cost) => Some(cost),
+                    _ => None,
+                })
+            {
+                // CR 601.2f: affordability and displayed costs reflect active
+                // cost modifiers, applied to both the printed and surge costs.
+                let normal_cost =
+                    apply_cost_modifiers_to_base(state, player, object_id, obj.mana_cost.clone())
+                        .unwrap_or_else(|| obj.mana_cost.clone());
+                let surge_eff =
+                    apply_cost_modifiers_to_base(state, player, object_id, surge_cost.clone())
+                        .unwrap_or(surge_cost);
+                let normal_affordable =
+                    can_pay_cost_after_auto_tap(state, player, object_id, &normal_cost);
+                let surge_affordable =
+                    can_pay_cost_after_auto_tap(state, player, object_id, &surge_eff);
+                if normal_affordable && surge_affordable {
+                    return Ok(WaitingFor::AlternativeCastChoice {
+                        player,
+                        object_id,
+                        card_id,
+                        payment_mode,
+                        keyword: crate::types::game_state::AlternativeCastKeyword::Surge,
+                        normal_cost,
+                        alternative_cost: Some(surge_eff),
+                        alternative_additional_cost: None,
+                        alternative_additional_cost_description: None,
+                    });
+                }
+                if !normal_affordable && surge_affordable {
+                    return handle_surge_cost_choice_with_payment_mode(
                         state,
                         player,
                         object_id,

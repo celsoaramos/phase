@@ -1286,6 +1286,28 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
         }
     }
 
+    // CR 118.9 + CR 119.1: "have an opponent gain N life" — an alternative cost
+    // paid by making an opponent gain life (Invigorate). Modeled as an
+    // EffectCost wrapping `Effect::GainLife` for an opponent; the spell-cost
+    // payer (`casting_costs::pay_additional_cost_with_source`) performs it.
+    if let Some((amount, _)) = nom_on_lower(text, &lower, |i| {
+        let (i, _) = tag("have an opponent gain ").parse(i)?;
+        let (i, amount) = nom_primitives::parse_number(i)?;
+        let (i, _) = (tag(" life"), opt(tag(".")), eof).parse(i)?;
+        Ok((i, amount))
+    }) {
+        return AbilityCost::EffectCost {
+            effect: Box::new(crate::types::ability::Effect::GainLife {
+                amount: QuantityExpr::Fixed {
+                    value: amount as i32,
+                },
+                player: TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::Opponent),
+                ),
+            }),
+        };
+    }
+
     // "reveal your hand" — reveal the controller's entire hand.
     // CR 701.20a: Reveal means show to all players. Used as alternative cost
     // (Land Grant class). Modeled as EffectCost wrapping Effect::RevealHand.
@@ -2084,21 +2106,31 @@ fn try_parse_energy_cost(lower: &str) -> Option<QuantityExpr> {
 
 /// Parse "return a land you control to its owner's hand" style bounce costs.
 fn try_parse_return_to_hand_cost(rest_lower: &str) -> Option<AbilityCost> {
-    // Must end with "to its owner's hand" or "to your hand"
-    if !scan_contains(rest_lower, "to its owner's hand")
-        && !scan_contains(rest_lower, "to your hand")
-    {
-        return None;
-    }
-    // Strip the destination
-    let filter_text = split_once_on(rest_lower, " to its owner's hand")
-        .map(|(_, (before, _))| before)
-        .or_else(|_| split_once_on(rest_lower, " to your hand").map(|(_, (before, _))| before))
-        .ok()?;
-    // Strip article using nom
-    let filter_text = nom_on_lower(filter_text, filter_text, nom_primitives::parse_article)
-        .map(|((), rest)| rest)
-        .unwrap_or(filter_text);
+    // CR 118.3: the destination is the owner's hand — singular "to its owner's
+    // hand" (Daze) or plural "to their owner's hand" / "to their owners' hands"
+    // (Ensnare, Thwart: "return two/three Islands you control …").
+    const DESTINATIONS: [&str; 5] = [
+        " to its owner's hand",
+        " to their owner's hand",
+        " to their owners' hands",
+        " to their owners' hand",
+        " to your hand",
+    ];
+    let filter_text = DESTINATIONS
+        .iter()
+        .find_map(|destination| split_once_on(rest_lower, destination).ok())
+        .map(|(_, (before, _))| before)?;
+    // CR 107.1a: "return two Islands" — a count word above one is how many
+    // permanents the cost returns; otherwise strip the article ("an Island").
+    let (count, filter_text) = match parse_number(filter_text) {
+        Some((count, rest)) if count > 1 => (count, rest.trim()),
+        _ => (
+            1,
+            nom_on_lower(filter_text, filter_text, nom_primitives::parse_article)
+                .map(|((), rest)| rest)
+                .unwrap_or(filter_text),
+        ),
+    };
     // CR 201.5 / CR 201.5a: "~" / "this X" is the host self-reference; the
     // granter placeholder is a granted body's by-name reference to its granting
     // object. Preserve the explicit filter so the runtime does not treat an
@@ -2157,7 +2189,7 @@ fn try_parse_return_to_hand_cost(rest_lower: &str) -> Option<AbilityCost> {
         filter => filter,
     };
     Some(AbilityCost::ReturnToHand {
-        count: 1,
+        count,
         filter: Some(filter),
         from_zone: None,
     })
