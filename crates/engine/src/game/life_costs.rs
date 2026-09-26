@@ -225,6 +225,12 @@ pub fn pay_life_as_cast_or_activation_cost(
 /// The recipient is a CHOICE, not a target, so it uses the choice seam
 /// (`player_exists_for_choice`: alive and phased in) and is evaluated relative to
 /// the PAYER (team-aware, CR 102.3).
+///
+/// Only a "can't gain life" static excludes a player. A replacement that
+/// prevents or reduces the gain (e.g. to zero) deliberately does NOT: the gain
+/// event can still happen and is merely modified (CR 614.1a), so the cost stays
+/// payable. This intentionally differs from the counter-cost gate in `costs.rs`
+/// (`mandatory_prevention_applies`); do not unify the two without revisiting it.
 pub fn life_gain_cost_recipients(
     state: &GameState,
     payer: PlayerId,
