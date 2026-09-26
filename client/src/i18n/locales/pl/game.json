@@ -1951,6 +1951,10 @@
     "title": "Wybierz odbiorcę prezentu",
     "subtitle": "Wybierz przeciwnika, który otrzyma obiecany prezent."
   },
+  "costRecipient": {
+    "title": "Wybierz przeciwnika",
+    "subtitle": "Wybierz przeciwnika dla tego kosztu: {{cost}}."
+  },
   "entryController": {
     "title": "Wybierz kontrolującego przy wejściu",
     "subtitle": "Wybierz przeciwnika, który kontroluje ten permanent, gdy wchodzi na pole bitwy."

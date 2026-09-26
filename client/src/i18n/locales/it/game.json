@@ -1951,6 +1951,10 @@
     "title": "Scegli il destinatario del dono",
     "subtitle": "Scegli quale avversario riceve il dono promesso."
   },
+  "costRecipient": {
+    "title": "Scegli un avversario",
+    "subtitle": "Scegli l'avversario per questo costo: {{cost}}."
+  },
   "entryController": {
     "title": "Scegli il controllore all'entrata",
     "subtitle": "Scegli quale avversario controlla questo permanente mentre entra."
