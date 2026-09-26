@@ -103,5 +103,8 @@
   },
   {
     "branch": "card/mf-alt-cost-reports-0924"
+  },
+  {
+    "branch": "card/akiri-attack-player-with"
   }
 ]
