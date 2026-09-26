@@ -1064,9 +1064,9 @@ fn parse_referenced_player_phrase(input: &str) -> OracleResult<'_, ()> {
 ///
 /// `None` (a bare "you attack") keeps CR 508.3d: fires once per declaration,
 /// any defender. A trailing qualifier ("a player WITH one or more equipped
-/// creatures", Akiri) also declines: that clause narrows the trigger further
-/// and is not modelled on this arm, so claiming the CR 508.3e restriction
-/// while dropping the qualifier would be worse than leaving the shape alone.
+/// creatures", Akiri) also declines here: that form is owned by
+/// `try_parse_attack_with_n_creatures`, which runs first and keeps the
+/// attacker gate alongside the attacked-player object.
 fn parse_you_attack_player_object(rest: &str) -> Option<AttackTargetFilter> {
     let (remainder, filter) = alt((
         value(
@@ -16220,6 +16220,22 @@ fn try_parse_attack_with_n_creatures(lower: &str) -> Option<(TriggerMode, Trigge
         (after_actor, false)
     };
 
+    // CR 508.3e: "you attack a player with one or more <TYPE>" (Akiri, Fearless
+    // Voyager; Bitter Work) names the attacked player AND narrows the attackers.
+    // The attacked-player object restricts the trigger to player-directed attacks
+    // and binds one firing per attacked player (Akiri ruling 2020-09-25: "one card
+    // per player you attack with an equipped creature"); the `with` tail stays the
+    // attacker gate below. Only the scoped "you attack" actor takes this object.
+    let (after_target, attacks_a_player) = match (actor.clone(), attacks_you) {
+        (ControllerRef::You, false) => {
+            match value((), tag::<_, _, OracleError<'_>>(" a player")).parse(after_target) {
+                Ok((rest, ())) => (rest, true),
+                Err(_) => (after_target, false),
+            }
+        }
+        _ => (after_target, false),
+    };
+
     // Required " with " separator.
     let (after_with, ()) = value((), tag::<_, _, OracleError<'_>>(" with "))
         .parse(after_target)
@@ -16306,6 +16322,23 @@ fn try_parse_attack_with_n_creatures(lower: &str) -> Option<(TriggerMode, Trigge
     def.mode = mode.clone();
     if attacks_you {
         def.attack_target_filter = Some(AttackTargetFilter::Player);
+    }
+    if attacks_a_player {
+        // CR 508.3e: only the "one or more" gate is per-attacked-player safe — a
+        // count threshold would have to be evaluated against each attacked
+        // player's attackers, which `AttackersDeclaredCount` does not model.
+        // Decline rather than claim a count we would compute over the whole
+        // declaration.
+        if !(n == 1 && comparator == Comparator::GE) {
+            return None;
+        }
+        // Not batched: the per-attacked-player arm in `triggers.rs` splits the
+        // declaration by attacked player, and a batched trigger would bypass it
+        // and fire once per declaration.
+        def.batched = false;
+        def.attack_target_filter = Some(AttackTargetFilter::Player);
+        def.valid_card = Some(filter);
+        return Some((mode, def));
     }
     if n == 1 && comparator == Comparator::GE {
         // CR 508.1 + CR 603.2c: the matcher's "at least one attacker matching

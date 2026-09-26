@@ -28895,36 +28895,40 @@ fn you_attack_trigger_binds_its_attacked_player_object() {
          its firings per attacked player"
     );
 
-    // A trailing qualifier is a different, unmodelled grammar. Declining leaves
-    // the pre-existing shape rather than claiming the CR 508.3e restriction
-    // while dropping the qualifier's meaning.
-    let qualified = parse(
-        "Whenever you attack a player with one or more equipped creatures, draw a card.",
-        "Akiri, Fearless Voyager",
-        &[],
-        &["Creature"],
-        &[],
-    );
-    // Positive reach-guard: `.all()` over an empty iterator is vacuously true,
-    // so a parse regression that drops the trigger entirely would pass the
-    // assertion below for the wrong reason.
-    let qualified_you_attack: Vec<_> = qualified
-        .triggers
-        .iter()
-        .filter(|t| t.mode == TriggerMode::YouAttack)
-        .collect();
-    assert!(
-        !qualified_you_attack.is_empty(),
-        "the qualified phrase must still produce a YouAttack trigger — an empty \
-         set would make the next assertion vacuous: {qualified:#?}"
-    );
-    assert!(
-        qualified_you_attack
+    // CR 508.3e + CR 508.1: the qualified form "you attack a player with one or
+    // more <TYPE>" names the attacked player AND gates on the attackers. Before,
+    // the `with` tail was dropped and the trigger fired on ANY attack — Akiri
+    // drew with no equipped creature attacking.
+    for (name, text) in [
+        (
+            "Akiri, Fearless Voyager",
+            "Whenever you attack a player with one or more equipped creatures, draw a card.",
+        ),
+        (
+            "Bitter Work",
+            "Whenever you attack a player with one or more creatures with power 4 or greater, draw a card.",
+        ),
+    ] {
+        let qualified = parse(text, name, &[], &["Creature"], &[]);
+        let trigger = qualified
+            .triggers
             .iter()
-            .all(|t| t.attack_target_filter.is_none()),
-        "a qualified attacked-player phrase must not be read as the bare \
-         CR 508.3e object: {qualified:#?}"
-    );
+            .find(|t| t.mode == TriggerMode::YouAttack)
+            .unwrap_or_else(|| panic!("{name} keeps its YouAttack trigger: {qualified:#?}"));
+        assert_eq!(
+            trigger.attack_target_filter,
+            Some(AttackTargetFilter::Player),
+            "{name}: the attacked player is named (CR 508.3e)"
+        );
+        assert!(
+            trigger.valid_card.is_some(),
+            "{name}: the `with one or more` attacker gate must survive: {trigger:#?}"
+        );
+        assert!(
+            !trigger.batched,
+            "{name}: batched would bypass the per-attacked-player split"
+        );
+    }
 }
 
 /// CR 201.5a: `render_modification_descriptions`'s `GrantReplacement` arm must
