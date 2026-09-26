@@ -2,7 +2,9 @@ use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::{alpha1, one_of, space1};
-use nom::combinator::{all_consuming, consumed, eof, map, not, opt, peek, recognize, rest, value};
+use nom::combinator::{
+    all_consuming, consumed, eof, fail, map, not, opt, peek, recognize, rest, value,
+};
 use nom::multi::{many0, many1, separated_list1};
 use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::Parser;
@@ -7088,6 +7090,7 @@ fn extract_if_condition_with_card_name(
         text,
         dying_subject,
         trigger_zone_change,
+        head_enters_battlefield,
     ) {
         return result;
     }
@@ -7450,9 +7453,15 @@ fn try_extract_zone_change_object_filter_condition(
     text: &str,
     dying_subject: Option<&TargetFilter>,
     trigger_zone_change: Option<(Zone, Zone)>,
+    head_enters_battlefield: bool,
 ) -> Option<(String, Option<TriggerCondition>)> {
     let (before, condition, rest) = scan_preceded(lower, |i| {
-        parse_zone_change_object_filter_condition(i, dying_subject, trigger_zone_change)
+        parse_zone_change_object_filter_condition(
+            i,
+            dying_subject,
+            trigger_zone_change,
+            head_enters_battlefield,
+        )
     })?;
     let next_char_is_boundary = rest
         .chars()
@@ -7742,15 +7751,25 @@ fn entering_pt_vs_source_prop(stats: &[PtStat]) -> FilterProp {
 /// The subject may also be the demonstrative "that creature's" and the source
 /// side may elide the repeated stat ("if that creature's power is greater than
 /// ~'s", Pelt Collector) — the elided stat is the subject's own (CR 208.1).
-/// When the trigger head is a PROVEN dies head (`trigger_zone_change` is
-/// battlefield→graveyard, the split "or dies" half of Pelt Collector), the
-/// event object is gone, so the comparison is a CR 603.10a look-back on the
-/// dying creature's last battlefield P/T against the source's current P/T;
-/// every other head keeps the enters-the-battlefield shape above.
+/// The condition shape follows the PROVEN trigger head, never a default:
+/// a dies head (`trigger_zone_change` is battlefield→graveyard, the split
+/// "or dies" half of Pelt Collector) has lost its event object, so the
+/// comparison is a CR 603.10a look-back on the dying creature's last
+/// battlefield P/T against the source's current P/T; an enters head
+/// (`head_enters_battlefield`) keeps the enters-the-battlefield shape above.
+/// Any other head ("becomes tapped", "attacks") is declined: an entry-only
+/// `ZoneChangeObjectMatchesFilter` can never match its event, so hoisting the
+/// clause there would silently kill the trigger (CR 603.4 checks the condition
+/// on the trigger's OWN event). The clause stays honestly unsupported instead.
 fn parse_entering_pt_vs_source_possessive_condition(
     input: &str,
     trigger_zone_change: Option<(Zone, Zone)>,
+    head_enters_battlefield: bool,
 ) -> OracleResult<'_, TriggerCondition> {
+    let head_dies = trigger_zone_change == Some((Zone::Battlefield, Zone::Graveyard));
+    if !head_dies && !head_enters_battlefield {
+        return fail().parse(input);
+    }
     // Consume the leading "if " so the whole intervening-if clause (including the
     // keyword) is stripped from the effect text — the disjunct combinator below
     // starts at "its ".
@@ -7768,7 +7787,7 @@ fn parse_entering_pt_vs_source_possessive_condition(
         rest = next;
     }
     let prop = entering_pt_vs_source_prop(&stats);
-    if trigger_zone_change == Some((Zone::Battlefield, Zone::Graveyard)) {
+    if head_dies {
         return Ok((rest, dies_lookback_condition(vec![prop], false)));
     }
     Ok((
@@ -7990,14 +8009,17 @@ fn parse_zone_change_object_filter_condition<'a>(
     input: &'a str,
     dying_subject: Option<&TargetFilter>,
     trigger_zone_change: Option<(Zone, Zone)>,
+    head_enters_battlefield: bool,
 ) -> OracleResult<'a, TriggerCondition> {
     // CR 603.6a: possessive entering-object P/T-vs-source ("if its power is
     // greater than ~'s power ...", Sharp-Eyed Rookie). Both new "if its ..."
     // surfaces are disjoint from the existing "if it has greater"/"if it '..."
     // arms (the trailing "s" of "its" excludes the "if it " predicate arm).
-    if let Ok((rest, condition)) =
-        parse_entering_pt_vs_source_possessive_condition(input, trigger_zone_change)
-    {
+    if let Ok((rest, condition)) = parse_entering_pt_vs_source_possessive_condition(
+        input,
+        trigger_zone_change,
+        head_enters_battlefield,
+    ) {
         return Ok((rest, condition));
     }
     // CR 603.10a: dying-object P/T-vs-fixed ("if its toughness was less than 1",

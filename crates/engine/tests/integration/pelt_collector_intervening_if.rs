@@ -80,6 +80,36 @@ fn pelt_collector_both_halves_carry_the_power_condition() {
     );
 }
 
+/// Review of phase-rs#9240: the possessive comparison must follow the proven
+/// trigger head. On a non-zone head the entry-only condition could never match
+/// the tap event (it only accepts `ZoneChanged`), so the trigger would never
+/// fire; the clause stays unhoisted instead. Paired with the enters/dies
+/// positive shape above, so the negative is not vacuous.
+#[test]
+fn a_non_zone_head_does_not_get_an_entry_condition() {
+    let parsed = parse_oracle_text(
+        "Whenever a creature you control becomes tapped, if that creature's power is \
+         greater than this creature's, put a +1/+1 counter on this creature.",
+        "Tapped Probe",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    assert_eq!(
+        parsed.triggers.len(),
+        1,
+        "reach guard: the tap trigger parses"
+    );
+    assert!(
+        !matches!(
+            parsed.triggers[0].condition,
+            Some(TriggerCondition::ZoneChangeObjectMatchesFilter { .. })
+        ),
+        "a becomes-tapped head must not carry a zone-change condition, got {:?}",
+        parsed.triggers[0].condition
+    );
+}
+
 fn enters(power: i32) -> u32 {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
