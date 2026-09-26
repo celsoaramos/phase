@@ -5427,6 +5427,9 @@ pub(crate) fn finish_target_selected_activated_ability_at_payment_boundary(
 ) -> Result<WaitingFor, EngineError> {
     pending.activation_target_selection =
         crate::types::game_state::ActivationTargetSelection::Settled;
+    // CR 601.2c + CR 601.2f: targets are declared; a rider that counts the
+    // chosen target (Dragonfire Blade) is determined now, before payment.
+    super::casting::apply_target_dependent_activation_rider(state, &mut pending);
     finish_activated_ability_at_payment_boundary(state, player, pending, events)
 }
 

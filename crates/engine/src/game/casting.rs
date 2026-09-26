@@ -23869,10 +23869,18 @@ fn activate_with_cost_carrier(
     let activation_cost = preview_cost
         .clone()
         .map(|cost| activation_cost_for_affordability(cost, ability_def.ability_tag));
+    // CR 601.2c + CR 601.2f: a target-reading rider is not in the locked
+    // announcement fold; the gate judges it at its best legal target.
+    let gate_cost = match best_case_target_rider_reduction(state, &ability_def, player, source_id) {
+        Some(entry) => activation_cost
+            .as_ref()
+            .map(|cost| fold_activation_cost(cost, 0, std::slice::from_ref(&entry), None)),
+        None => activation_cost.clone(),
+    };
 
     // CR 601.2b: If the activation cost requires a choice of object and no
     // legal object exists, the ability can't be activated.
-    if let Some(ref cost) = activation_cost {
+    if let Some(ref cost) = gate_cost {
         if !activation_cost_passes_early_affordability_gate(
             state,
             player,
@@ -25331,12 +25339,167 @@ fn apply_cost_reduction(
     player: PlayerId,
     source_id: ObjectId,
 ) {
-    let modifiers = collect_activation_cost_modifiers(state, ability_def, player, source_id);
+    let mut modifiers = collect_activation_cost_modifiers(state, ability_def, player, source_id);
+    // CR 601.2c + CR 601.2f: the preview answers "can this be activated at all",
+    // so a target-dependent rider counts at its best legal target.
+    modifiers
+        .reductions
+        .extend(best_case_target_rider_reduction(
+            state,
+            ability_def,
+            player,
+            source_id,
+        ));
     if let Some(cost) = ability_def.cost.take() {
         let folded =
             fold_activation_cost(&cost, modifiers.raise_total, &modifiers.reductions, None);
         ability_def.cost = Some(finish_activation_fold(state, player, ability_def, folded));
     }
+}
+
+/// CR 601.2c + CR 601.2f + CR 602.2b: True when the ability's own "costs {N}
+/// less to activate for each …" rider counts something about the target the
+/// ability chooses (Dragonfire Blade: "for each color of the creature it
+/// targets"). Targets are chosen in 601.2c and the total cost is determined in
+/// 601.2f, so such a rider is left out of the announcement fold and applied by
+/// [`apply_target_dependent_activation_rider`] once the targets are declared.
+/// Only the Reduce form is deferred; a target-reading Raise keeps the
+/// announcement path (none is printed).
+pub(crate) fn activation_rider_reads_target(ability_def: &AbilityDefinition) -> bool {
+    ability_def.cost_reduction.as_ref().is_some_and(|rider| {
+        matches!(rider.mode, CostModifyMode::Reduce)
+            && super::quantity::quantity_expr_contains_scope(&rider.count, ObjectScope::Target)
+    })
+}
+
+/// CR 601.2f: the generic reduction a target-reading rider grants for the
+/// targets carried by `ability` (0 when its condition fails or it counts none).
+fn target_rider_reduction_amount(
+    state: &GameState,
+    ability_def: &AbilityDefinition,
+    player: PlayerId,
+    source_id: ObjectId,
+    ability: &ResolvedAbility,
+) -> u32 {
+    let Some(rider) = ability_def.cost_reduction.as_ref() else {
+        return 0;
+    };
+    let condition_met = rider.condition.as_ref().is_none_or(|cond| {
+        crate::game::restrictions::evaluate_condition(state, player, source_id, cond)
+    });
+    if !condition_met {
+        return 0;
+    }
+    let count = super::quantity::resolve_quantity_with_targets(state, &rider.count, ability);
+    (rider.amount_per as i32 * count).max(0) as u32
+}
+
+/// The reduction entry a target-reading rider contributes, `None` at zero.
+fn target_rider_entry(
+    state: &GameState,
+    source_id: ObjectId,
+    amount: u32,
+) -> Option<CostReductionEntry> {
+    (amount > 0).then(|| CostReductionEntry {
+        // CR 118.7a: activation reductions reduce generic mana only.
+        amount: ManaCost::generic(amount),
+        multiplier: 1,
+        reach: CostReductionReach::SpillsToGeneric,
+        provenance: ReductionProvenance::AbilityCostRider,
+        display_name: state
+            .objects
+            .get(&source_id)
+            .map(|obj| obj.name.clone())
+            .unwrap_or_default(),
+        minimum_mana: 0,
+    })
+}
+
+/// CR 601.2c + CR 601.2f + CR 118.3: before targets exist, a target-reading
+/// rider is judged at the legal target that reduces the most — the activation
+/// is legal when SOME target makes it payable. The chosen target's own amount
+/// is what gets paid ([`apply_target_dependent_activation_rider`]).
+fn best_case_target_rider_reduction(
+    state: &GameState,
+    ability_def: &AbilityDefinition,
+    player: PlayerId,
+    source_id: ObjectId,
+) -> Option<CostReductionEntry> {
+    if !activation_rider_reads_target(ability_def) {
+        return None;
+    }
+    let resolved = build_resolved_from_def(ability_def, source_id, player);
+    let slots = build_target_slots(state, &resolved).ok()?;
+    let best = slots
+        .first()?
+        .legal_targets
+        .iter()
+        .map(|target| {
+            let mut probe = resolved.clone();
+            probe.targets = vec![target.clone()];
+            target_rider_reduction_amount(state, ability_def, player, source_id, &probe)
+        })
+        .max()?;
+    target_rider_entry(state, source_id, best)
+}
+
+/// CR 601.2c + CR 601.2f + CR 602.2b: apply a target-reading rider to a pending
+/// activation whose targets were just declared, before any cost is paid. The
+/// applied entry is recorded on the cost snapshot, which also makes this
+/// idempotent. The mana leg lives in `activation_cost`, or in `cost` for a
+/// deferred mana-`{X}` activation.
+pub(crate) fn apply_target_dependent_activation_rider(
+    state: &GameState,
+    pending: &mut PendingCast,
+) {
+    let Some(ability_index) = pending.activation_ability_index else {
+        return;
+    };
+    let source_id = pending.object_id;
+    let Some(ability_def) = activation_ability_definition(state, source_id, ability_index) else {
+        return;
+    };
+    if !activation_rider_reads_target(&ability_def) {
+        return;
+    }
+    let Some(snapshot) = pending.activation_cost_snapshot.as_mut() else {
+        return;
+    };
+    if snapshot
+        .reductions
+        .iter()
+        .any(|entry| entry.provenance == ReductionProvenance::AbilityCostRider)
+    {
+        return;
+    }
+    let player = pending.ability.controller;
+    let amount =
+        target_rider_reduction_amount(state, &ability_def, player, source_id, &pending.ability);
+    let Some(entry) = target_rider_entry(state, source_id, amount) else {
+        return;
+    };
+    let entries = std::slice::from_ref(&entry);
+    let has_mana_leg = pending
+        .activation_cost
+        .as_ref()
+        .is_some_and(|cost| casting_costs::extract_mana_leg(cost).is_some());
+    if has_mana_leg {
+        let cost = pending.activation_cost.take().expect("checked above");
+        pending.activation_cost = Some(fold_activation_cost(&cost, 0, entries, None));
+    } else if pending.cost.mana_value() > 0 {
+        let folded = fold_activation_cost(
+            &AbilityCost::Mana {
+                cost: pending.cost.clone(),
+            },
+            0,
+            entries,
+            None,
+        );
+        if let AbilityCost::Mana { cost } = folded {
+            pending.cost = cost;
+        }
+    }
+    snapshot.reductions.push(entry);
 }
 
 /// CR 116.2k + CR 702.170: Plot is taken as a special action via a synthesized
@@ -25418,7 +25581,16 @@ pub(crate) fn collect_activation_cost_modifiers(
         .map(|obj| obj.name.as_str())
         .unwrap_or_default();
 
-    if let Some(ref rider) = ability_def.cost_reduction {
+    // CR 601.2c + CR 601.2f: a rider that counts something about the chosen
+    // target is determined after the targets are declared — see
+    // `apply_target_dependent_activation_rider`. Folding it here, before any
+    // target exists, counted nothing and locked the printed cost (Dragonfire
+    // Blade's equip stayed {4} on a two-color creature).
+    if let Some(rider) = ability_def
+        .cost_reduction
+        .as_ref()
+        .filter(|_| !activation_rider_reads_target(ability_def))
+    {
         // CR 602.2b + CR 601.2f: A conditional flat modification ("costs {N} less/more … if [cond]")
         // applies only when its gate holds at cost-determination time. `None` =
         // unconditional (the "for each" scaling form and all legacy reductions).
