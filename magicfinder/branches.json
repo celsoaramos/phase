@@ -106,5 +106,8 @@
   },
   {
     "branch": "card/akiri-attack-player-with"
+  },
+  {
+    "branch": "card/dragonfire-blade-equip-target-reduction"
   }
 ]
