@@ -541,7 +541,21 @@ pub fn resolve_unattach_all(
                 &live_targets
             };
         super::effect_object_targets(attachment_filter, pool)
+    })
+    // CR 608.2c + CR 701.3d: a tracked-set attachment ("unattach an Equipment
+    // from a creature you control" — Akiri, Fearless Voyager) consumes the
+    // resolution-time choice published by `ChooseObjectsIntoTrackedSet`. Like
+    // the parent-ref arm above, set membership is resolved here, not by
+    // `matches_target_filter` (which declines context refs).
+    .or_else(|| {
+        consumes_tracked_set(attachment_filter)
+            .then(|| resolved_object_ids_for_filter(state, ability, attachment_filter))
     });
+    // CR 608.2c: the creature each chosen attachment came off of — the referent
+    // of a following "that creature" (Akiri: "If you do, tap that creature and
+    // it gains indestructible"). Published below as the chain's fresh tracked
+    // set, which a target-less `ParentTarget` continuation reads.
+    let mut old_hosts: Vec<ObjectId> = Vec::new();
     for target_id in target_ids {
         let attachments = state
             .objects
@@ -557,12 +571,20 @@ pub fn resolve_unattach_all(
                 continue;
             }
             if let Some(old_target) = unattach(state, attachment_id) {
+                if let TargetRef::Object(host) = old_target {
+                    if !old_hosts.contains(&host) {
+                        old_hosts.push(host);
+                    }
+                }
                 events.push(GameEvent::Unattached {
                     attachment_id,
                     old_target,
                 });
             }
         }
+    }
+    if consumes_tracked_set(attachment_filter) {
+        super::publish_fresh_tracked_set(state, old_hosts);
     }
 
     events.push(GameEvent::EffectResolved {
@@ -572,6 +594,15 @@ pub fn resolve_unattach_all(
     });
 
     Ok(())
+}
+
+/// CR 608.2c: whether an `UnattachAll` attachment operand is a chain tracked
+/// set (a resolution-time choice), as opposed to a live filter or the source.
+fn consumes_tracked_set(filter: &TargetFilter) -> bool {
+    matches!(
+        filter,
+        TargetFilter::TrackedSet { .. } | TargetFilter::TrackedSetFiltered { .. }
+    )
 }
 
 pub(crate) fn target_ref_from_attach_target(target: AttachTarget) -> TargetRef {

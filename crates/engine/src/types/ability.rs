@@ -6543,6 +6543,14 @@ pub enum FilterProp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         controller: Option<ControllerRef>,
     },
+    /// CR 301.5 + CR 303.4: the inverse of `HasAttachment` — matches an
+    /// attachment (Aura/Equipment/Fortification) whose `attached_to` is an
+    /// OBJECT matching `host`. "an Equipment attached to a creature you
+    /// control" (Akiri, Fearless Voyager). A player-attached Aura never
+    /// matches (use `AttachedToPlayer`).
+    AttachedTo {
+        host: Box<TargetFilter>,
+    },
     /// Matches any object that is NOT the trigger source (for "another creature" triggers).
     Another,
     /// CR 702.95b: Matches objects that are not paired with another creature.

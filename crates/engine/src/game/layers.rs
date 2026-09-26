@@ -4209,7 +4209,8 @@ fn filter_prop_reads_life(prop: &FilterProp) -> bool {
         | FilterProp::DifferentNameFrom { filter: f }
         | FilterProp::DistinctFrom { reference: f }
         | FilterProp::TargetsOnly { filter: f }
-        | FilterProp::Targets { filter: f } => target_filter_reads_life_total(f),
+        | FilterProp::Targets { filter: f }
+        | FilterProp::AttachedTo { host: f } => target_filter_reads_life_total(f),
         // Multi-target group constraint carries an OPTIONAL reference filter.
         FilterProp::SharesQuality { reference, .. } => reference
             .as_deref()

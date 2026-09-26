@@ -710,6 +710,9 @@ impl EventObjectSnapshot {
             // Classify Unsupported so a future goaded event-subject filter fails the reach gate
             // LOUDLY rather than silently reading an ungoaded snapshot. Deferred follow-up
             // (option a): snapshot goaded onto EventObjectSnapshot + ZoneChangeRecord.
+            // CR 301.5: the host is a second live object read through a nested
+            // filter; the snapshot records attachments, not the host's state.
+            FilterProp::AttachedTo { .. } => Unsupported,
             FilterProp::Goaded
             | FilterProp::WasPlayed
             // CR 108.2 + CR 108.2b: event snapshots retain token status but not whether

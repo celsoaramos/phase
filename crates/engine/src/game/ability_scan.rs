@@ -4480,7 +4480,7 @@ fn scan_filter_prop(x: &FilterProp, mode: ScanMode) -> Axes {
                 .map_or(Axes::NONE, |r| scan_target_filter(r, FilterReadContext::LiveBoardCensus, mode))
         }
         FilterProp::TargetsOnly { filter } => scan_target_filter(filter, FilterReadContext::LiveBoardCensus, mode),
-        FilterProp::Targets { filter } => scan_target_filter(filter, FilterReadContext::LiveBoardCensus, mode),
+        FilterProp::Targets { filter } | FilterProp::AttachedTo { host: filter } => scan_target_filter(filter, FilterReadContext::LiveBoardCensus, mode),
 
         // --- Box<PlayerFilter>-bearing: recurse (OpponentLostLife/… is projected).
         FilterProp::ControllerMatches { player } => scan_player_filter(player, mode),

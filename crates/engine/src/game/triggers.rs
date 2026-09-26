@@ -12150,7 +12150,7 @@ fn filter_prop_binding_diverges(prop: &FilterProp) -> bool {
         FilterProp::CanEnchant { target } => filter_binding_diverges(target),
         FilterProp::DifferentNameFrom { filter }
         | FilterProp::TargetsOnly { filter }
-        | FilterProp::Targets { filter } => filter_binding_diverges(filter),
+        | FilterProp::Targets { filter } | FilterProp::AttachedTo { host: filter } => filter_binding_diverges(filter),
         // CR 608.2c: the Radiance-class reference. `DistinctFrom` takes its ids
         // from `ability.targets` for the `ParentTarget` shape, so the nested
         // filter is the whole question.

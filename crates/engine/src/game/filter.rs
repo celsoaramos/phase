@@ -272,6 +272,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::TargetsOnly { .. }
+        | FilterProp::AttachedTo { .. }
         | FilterProp::Targets { .. }
         | FilterProp::ColorCount { .. }
         | FilterProp::ManaSymbolCount { .. }
@@ -679,7 +680,7 @@ fn filter_prop_characteristic_reads_at(prop: &FilterProp, depth: u32) -> Charact
         // CR 608.2c: negation does not change WHICH state the inner prop reads.
         FilterProp::Not { prop } => filter_prop_characteristic_reads_at(prop, depth),
         // CR 115.9b/c: the stack entry's targets are matched by the inner filter.
-        FilterProp::TargetsOnly { filter } | FilterProp::Targets { filter } => {
+        FilterProp::TargetsOnly { filter } | FilterProp::Targets { filter } | FilterProp::AttachedTo { host: filter } => {
             target_filter_characteristic_reads_at(filter, depth)
         }
         // CR 603.4: the shared quality names exactly which characteristic is
@@ -946,6 +947,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::TargetsOnly { .. }
+        | FilterProp::AttachedTo { .. }
         | FilterProp::Targets { .. }
         | FilterProp::ColorCount { .. }
         | FilterProp::ManaSymbolCount { .. }
@@ -1788,7 +1790,9 @@ pub(crate) fn filter_prop_contains(
         FilterProp::DistinctFrom { reference } => recurse(reference),
         FilterProp::SharesQuality { reference, .. } => reference.as_deref().is_some_and(recurse),
         // CR 115.9b/9c: the stack entry's target-side filters.
-        FilterProp::Targets { filter } | FilterProp::TargetsOnly { filter } => recurse(filter),
+        FilterProp::Targets { filter }
+        | FilterProp::AttachedTo { host: filter }
+        | FilterProp::TargetsOnly { filter } => recurse(filter),
         // CR 608.2c: prop-level combinators.
         FilterProp::Not { prop } => filter_prop_contains(prop, leaf),
         FilterProp::AnyOf { props } => props.iter().any(|p| filter_prop_contains(p, leaf)),
@@ -2037,9 +2041,9 @@ fn filter_prop_contains_filter_prop(
             FilterProp::SharesQuality { reference, .. } => reference
                 .as_deref()
                 .is_some_and(|inner| filter_contains_filter_prop(inner, predicate)),
-            FilterProp::Targets { filter } | FilterProp::TargetsOnly { filter } => {
-                filter_contains_filter_prop(filter, predicate)
-            }
+            FilterProp::Targets { filter }
+            | FilterProp::AttachedTo { host: filter }
+            | FilterProp::TargetsOnly { filter } => filter_contains_filter_prop(filter, predicate),
             FilterProp::Not { prop } => filter_prop_contains_filter_prop(prop, predicate),
             FilterProp::AnyOf { props } => props
                 .iter()
@@ -2496,9 +2500,9 @@ fn rewrite_filter_prop(
             .as_deref_mut()
             .into_iter()
             .for_each(|inner| rewrite_filter_props(inner, rewrite, complete)),
-        FilterProp::Targets { filter } | FilterProp::TargetsOnly { filter } => {
-            rewrite_filter_props(filter, rewrite, complete)
-        }
+        FilterProp::Targets { filter }
+        | FilterProp::AttachedTo { host: filter }
+        | FilterProp::TargetsOnly { filter } => rewrite_filter_props(filter, rewrite, complete),
         FilterProp::Not { prop } => rewrite_filter_prop(prop, rewrite, complete),
         FilterProp::AnyOf { props } => props
             .iter_mut()
@@ -6295,6 +6299,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::CountersPutOnThisTurn { .. }
         | FilterProp::Transformed
         | FilterProp::TargetsOnly { .. }
+        | FilterProp::AttachedTo { .. }
         | FilterProp::Targets { .. }
         // CR 201.2: Source-/target-relative name predicates require
         // resolution context the spell-history scan doesn't currently plumb
@@ -7416,6 +7421,18 @@ fn matches_filter_prop(
         // object has at least one attachment whose subtype is in `kinds` and whose
         // controller satisfies the optional `ControllerRef`. Generalization of
         // `HasAttachment` to the "enchanted or equipped" compound-subject class.
+        // CR 301.5 + CR 303.4: the object is attached to a host matching the
+        // nested filter, read with the same context as the outer match.
+        FilterProp::AttachedTo { host } => match obj.attached_to {
+            Some(crate::game::game_object::AttachTarget::Object(host_id)) => {
+                // "a creature YOU control": the host's controller reads the
+                // outer match's controller (mirrors `DifferentNameFrom`).
+                let controller = source.controller.unwrap_or(PlayerId(0));
+                let nested_ctx = FilterContext::from_source_with_controller(source.id, controller);
+                matches_target_filter(state, host_id, host, &nested_ctx)
+            }
+            _ => false,
+        },
         FilterProp::HasAnyAttachmentOf { kinds, controller } => {
             obj.attachments.iter().any(|att_id| {
                 let Some(att) = state.objects.get(att_id) else {
@@ -8427,6 +8444,7 @@ fn zone_change_record_matches_property(
         // object id; a zone-change snapshot does not carry it. Fail closed.
         | FilterProp::CountersPutOnThisTurn { .. }
         | FilterProp::TargetsOnly { .. }
+        | FilterProp::AttachedTo { .. }
         | FilterProp::Targets { .. }
         // CR 107.3 + CR 202.1: X-in-cost is a spell-cast-time predicate; it has no
         // meaning for a zone-change record (the object has already left the stack
@@ -18455,6 +18473,7 @@ mod characteristic_read_classification_tests {
             | FilterProp::Owned { .. }
             | FilterProp::HasAttachment { .. }
             | FilterProp::HasAnyAttachmentOf { .. }
+            | FilterProp::AttachedTo { .. }
             | FilterProp::MostPrevalentCreatureTypeIn { .. }
             | FilterProp::AttackedThisTurn { .. }
             | FilterProp::NameMatchesAnyPermanent { .. }

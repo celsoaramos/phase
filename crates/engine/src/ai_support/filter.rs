@@ -963,6 +963,7 @@ fn filterprop_reads_only_candidate_fp(p: &FilterProp) -> bool {
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeywordKind { .. }
+        | FilterProp::AttachedTo { .. }
         | FilterProp::Targets { .. }
         | FilterProp::TargetsOnly { .. }
         | FilterProp::HasSingleTarget

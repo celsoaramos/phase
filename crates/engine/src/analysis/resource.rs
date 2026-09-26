@@ -5979,6 +5979,8 @@ fn prop_is_arrival_invariant(prop: &crate::types::ability::FilterProp) -> bool {
         // CR 303.4f: an arriving Aura attaches to a PRE-EXISTING permanent as it enters.
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
+        // CR 301.5: which object an attachment is attached to changes after entry.
+        | FilterProp::AttachedTo { .. }
         | FilterProp::ColorCount { .. }
         | FilterProp::ManaSymbolCount { .. }
         | FilterProp::ManaValueParity { .. }

@@ -8477,6 +8477,76 @@ fn parse_choose_object_selection_filter(
     Some(filter)
 }
 
+/// CR 701.3d + CR 608.2c: "unattach a[n] <attachment> from a[n] <host>" —
+/// Akiri, Fearless Voyager's "unattach an Equipment from a creature you
+/// control". Nothing is targeted: the player chooses ONE attachment matching
+/// both phrases as the ability resolves (Akiri ruling 2020-09-25), and it is
+/// unattached. Emitted as a 2-effect chain:
+///   head:        `ChooseObjectsIntoTrackedSet` over attachments whose host
+///                matches (`FilterProp::AttachedTo`), exactly one
+///   sub_ability: `UnattachAll { attachment: TrackedSet, target: host }`
+///
+/// `UnattachAll` publishes the creature each chosen attachment came off of as
+/// the chain's fresh tracked set, so a following "that creature" / "it"
+/// (`ParentTarget` with no inherited target) reads that creature — the
+/// referent CR 608.2c gives the anaphor.
+fn try_parse_unattach_chosen_attachment(
+    text: &str,
+    lower: &str,
+    ctx: &mut ParseContext,
+) -> Option<ParsedEffectClause> {
+    let ((), after_verb) = nom_on_lower(text, lower, |input| {
+        let (input, _) = tag("unattach ").parse(input)?;
+        let (input, _) = alt((tag("an "), tag("a "))).parse(input)?;
+        Ok((input, ()))
+    })?;
+    let after_verb_lower = &lower[lower.len() - after_verb.len()..];
+    let (_, (attachment_lower, host_lower)) =
+        nom_primitives::split_once_on(after_verb_lower, " from ").ok()?;
+    // A described host ("a creature you control"); "target creature" is a
+    // different, targeted grammar and declines here.
+    alt((tag::<_, _, OracleError<'_>>("an "), tag("a ")))
+        .parse(host_lower)
+        .ok()?;
+    let attachment_text = &after_verb[..attachment_lower.len()];
+    let host_text = &after_verb[after_verb.len() - host_lower.len()..];
+
+    let (attachment, attachment_rem) = parse_type_phrase_folding(attachment_text.trim());
+    if !attachment_rem.trim().is_empty() {
+        return None;
+    }
+    let TargetFilter::Typed(mut attachment_tf) = attachment else {
+        return None;
+    };
+    let (host, host_rem) = parse_target_with_ctx(host_text.trim_end_matches('.'), ctx);
+    if !host_rem.trim().is_empty() || !matches!(host, TargetFilter::Typed(_)) {
+        return None;
+    }
+    attachment_tf.properties.push(FilterProp::AttachedTo {
+        host: Box::new(host.clone()),
+    });
+
+    let unattach = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::UnattachAll {
+            attachment: TargetFilter::TrackedSet {
+                id: crate::types::identifiers::TrackedSetId(0),
+            },
+            target: host,
+        },
+    );
+    let mut clause = parsed_clause(Effect::ChooseObjectsIntoTrackedSet {
+        chooser: TargetFilter::Controller,
+        filter: TargetFilter::Typed(attachment_tf),
+        min: 1,
+        max: Some(1),
+        cardinality: Some(crate::types::ability::ObjectSelectionCardinality::Exactly { count: 1 }),
+        eligibility: None,
+    });
+    clause.sub_ability = Some(Box::new(unattach));
+    Some(clause)
+}
+
 /// CR 603.7e + CR 118.1: Detect the compound clause
 /// "choose any number of <filter> [they control] and pay <cost> for each
 /// <noun> chosen this way" (Magnetic Mountain, Dream Tides, Thelon's Curse).
@@ -10231,6 +10301,13 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     // parse only the trailing `pay <cost>` and silently drop the selection
     // step and the per-object multiplier.
     if let Some(clause) = try_parse_choose_and_pay_per_object(text, &lower, ctx) {
+        return clause;
+    }
+    // CR 701.3d + CR 608.2c: "unattach an Equipment from a creature you
+    // control" (Akiri, Fearless Voyager) — an untargeted choice made while the
+    // ability resolves, then the unattach. Checked before the generic dispatch,
+    // which has no single-attachment unattach verb.
+    if let Some(clause) = try_parse_unattach_chosen_attachment(text, &lower, ctx) {
         return clause;
     }
 
@@ -23712,6 +23789,57 @@ fn has_typed_target_widened(effect: &Effect) -> bool {
         _ => return false,
     };
     filter_introduces_typed_object(target)
+}
+
+/// CR 608.2c: whether a clause's chain ends in an `UnattachAll` that consumes a
+/// chosen tracked set — the producer `try_parse_unattach_chosen_attachment`
+/// emits. That unattach republishes the creature the attachment came off of as
+/// the chain's tracked set, which is what a following "that creature" names.
+fn clause_publishes_unattached_host(clause: &ParsedEffectClause) -> bool {
+    let mut node = clause.sub_ability.as_deref();
+    let mut last = &clause.effect;
+    while let Some(def) = node {
+        last = &def.effect;
+        node = def.sub_ability.as_deref();
+    }
+    matches!(
+        last,
+        Effect::UnattachAll {
+            attachment: TargetFilter::TrackedSet { .. },
+            ..
+        }
+    )
+}
+
+/// CR 608.2c: the nearest referent of a bare "it" / "that creature" is the
+/// creature an attachment was just unattached from — walking back past clauses
+/// that only carry that same referent (Akiri's "tap that creature and IT
+/// gains indestructible": the tap clause is itself bound to the host).
+fn chain_has_unattached_host_referent(clauses: &[ClauseIr]) -> bool {
+    for prev in clauses.iter().rev() {
+        if clause_publishes_unattached_host(&prev.parsed) {
+            return true;
+        }
+        let carries_host = matches!(
+            prev.parsed.effect.target_filter(),
+            Some(TargetFilter::TrackedSet {
+                id: crate::types::identifiers::TrackedSetId(0)
+            })
+        ) || matches!(
+            &prev.parsed.effect,
+            Effect::GenericEffect { static_abilities, .. }
+                if static_abilities.iter().any(|sd| matches!(
+                    sd.affected,
+                    Some(TargetFilter::TrackedSet {
+                        id: crate::types::identifiers::TrackedSetId(0)
+                    })
+                ))
+        );
+        if !carries_host {
+            return false;
+        }
+    }
+    false
 }
 
 /// CR 608.2c: Does an earlier clause in the chain establish a typed (chosen)
@@ -38510,6 +38638,7 @@ pub(crate) fn parse_effect_chain_ir(
                 (None, text)
             };
         let prior_typed_referent = chain_has_prior_typed_referent(builder.clauses(), false);
+        let prior_unattached_host = chain_has_unattached_host_referent(builder.clauses());
         if prior_typed_referent
             && has_bare_recipient_counter_gate
             && condition.as_ref().is_some_and(condition_refs_source_object)
@@ -39014,8 +39143,15 @@ pub(crate) fn parse_effect_chain_ir(
             // (CR 109.2b), not the ability's source (CR 113.7) — so Decree of
             // Silence and Charitable Levy stopped sacrificing themselves, and
             // Thing in the Ice and The Emperor of Palamecia stopped transforming.
-            object_pronoun_ref: prior_typed_referent
-                .then_some(TargetFilter::ParentTarget)
+            // CR 608.2c: after "unattach an Equipment from a creature you
+            // control" (Akiri), "it" / "that creature" name the creature the
+            // Equipment came off of, which that unattach publishes as the
+            // chain's tracked set — nearer than any chosen-object rung.
+            object_pronoun_ref: prior_unattached_host
+                .then_some(TargetFilter::TrackedSet {
+                    id: crate::types::identifiers::TrackedSetId(0),
+                })
+                .or_else(|| prior_typed_referent.then_some(TargetFilter::ParentTarget))
                 .or_else(|| {
                     (!binds_source_counter_pronoun)
                         .then(|| ctx.object_pronoun_ref.clone())
@@ -39032,8 +39168,11 @@ pub(crate) fn parse_effect_chain_ir(
             // The `binds_source_counter_pronoun` rung is deliberately absent:
             // that gate exists for the bare "it" pronoun's source-counter class
             // (#8549), which is not a demonstrative grammar.
-            demonstrative_object_ref: prior_typed_referent
-                .then_some(TargetFilter::ParentTarget)
+            demonstrative_object_ref: prior_unattached_host
+                .then_some(TargetFilter::TrackedSet {
+                    id: crate::types::identifiers::TrackedSetId(0),
+                })
+                .or_else(|| prior_typed_referent.then_some(TargetFilter::ParentTarget))
                 .or_else(|| ctx.demonstrative_object_ref.clone()),
             // CR 707.9a + CR 603.1: propagate the trigger index from the parent
             // ctx — `current_trigger_index` is a property of the whole trigger
@@ -39956,6 +40095,9 @@ pub(crate) fn parse_effect_chain_ir(
         // which is scoped to exactly the reported bug class.
         if condition.is_some()
             && !is_distributed_chunk
+            // CR 608.2c: an unattached-host anaphor (Akiri) is already bound to
+            // the tracked host set, which is nearer than any parent target.
+            && !prior_unattached_host
             // CR 608.2k: only a GENUINE source-counter gate (no prior chosen
             // target — see `binds_source_counter_pronoun`) keeps the SelfRef
             // binding; a mis-scoped bare "it" over a prior typed target
@@ -40051,6 +40193,7 @@ pub(crate) fn parse_effect_chain_ir(
         // (Nissa, Who Shakes the World).
         if condition.is_none()
             && !is_distributed_chunk
+            && !prior_unattached_host
             && chain_has_prior_typed_referent(builder.clauses(), false)
             && has_anaphoric_reference(&text_lower)
             && !typed_trigger_subject
