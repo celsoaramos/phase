@@ -458,21 +458,6 @@ fn extract_rather_than_pay_alt_cost<'a>(
     const PREFIX: &str = "you may ";
     const SUFFIX: &str = " rather than pay this spell's mana cost";
 
-    // CR 118.9: the same alternative cost with the clauses swapped — "[If
-    // <condition>, ]rather than pay this spell's mana cost, you may [cost]"
-    // (Invigorate). The leading `if` has already been split off by the caller,
-    // so the whole remainder after "you may " is the cost.
-    if let Ok((cost_lower, _)) = (
-        tag::<_, _, OracleError<'_>>("rather than pay this spell's mana cost"),
-        opt(tag(",")),
-        tag(" you may "),
-    )
-        .parse(body_lower)
-    {
-        let cost_text = body[body.len() - cost_lower.len()..].trim();
-        return (!cost_text.is_empty()).then_some((cost_text, None));
-    }
-
     let (after_prefix_lower, _) = tag::<_, _, OracleError<'_>>(PREFIX)
         .parse(body_lower)
         .ok()?;

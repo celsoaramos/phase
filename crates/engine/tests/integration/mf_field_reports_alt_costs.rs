@@ -4,9 +4,6 @@
 //! - Ensnare: "return two Islands you control to their owner's hand" parsed as
 //!   an effect-as-cost that the spell-cost payer never performs, so the spell
 //!   resolved for free and the Islands stayed on the battlefield.
-//! - Invigorate: the "If …, rather than pay this spell's mana cost, you may …"
-//!   clause order was not recognized as an alternative cost at all; the life
-//!   gain was parsed as part of the spell's effect instead.
 //! - Surge: cast for the surge cost after another spell this turn.
 
 use engine::game::scenario::{GameScenario, P0, P1};
@@ -19,7 +16,6 @@ use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
 const ENSNARE: &str = "You may return two Islands you control to their owner's hand rather than pay this spell's mana cost.\nTap all creatures.";
-const INVIGORATE: &str = "If you control a Forest, rather than pay this spell's mana cost, you may have an opponent gain 3 life.\nTarget creature gets +4/+4 until end of turn.";
 
 /// CR 118.3 + CR 107.1a: the count word and the plural destination both belong
 /// to a return-to-hand cost.
@@ -131,89 +127,6 @@ fn ensnare_alternative_cost_needs_two_islands() {
                 WaitingFor::OptionalCostChoice { .. }
             ),
         "one Island must not pay Ensnare's alternative cost"
-    );
-}
-
-/// CR 118.9: Invigorate's leading-if form is an alternative cost gated by
-/// controlling a Forest, not a life-gain effect of the spell.
-#[test]
-fn invigorate_parses_as_conditional_alternative_cost() {
-    let mut scenario = GameScenario::new();
-    let inv = scenario
-        .add_spell_to_hand_from_oracle(P0, "Invigorate", true, INVIGORATE)
-        .id();
-    let runner = scenario.build();
-    let obj = &runner.state().objects[&inv];
-    assert_eq!(obj.casting_options.len(), 1, "{:?}", obj.casting_options);
-    let SpellCastingOption {
-        cost, condition, ..
-    } = &obj.casting_options[0];
-    assert!(condition.is_some(), "the Forest gate must be kept");
-    assert!(
-        matches!(cost, Some(AbilityCost::EffectCost { .. })),
-        "expected the opponent life-gain cost, got {cost:?}"
-    );
-    let text = format!("{:?}", obj.abilities);
-    assert!(
-        !text.contains("GainLife"),
-        "life gain must not be part of the spell's effect: {text}"
-    );
-}
-
-/// CR 118.9 + CR 119.1: casting Invigorate for its alternative cost makes the
-/// opponent gain 3 life, spends no mana, and pumps the target.
-#[test]
-fn invigorate_alternative_cost_gives_opponent_three_life() {
-    let mut scenario = GameScenario::new();
-    scenario.at_phase(Phase::PreCombatMain);
-    let inv = scenario
-        .add_spell_to_hand_from_oracle(P0, "Invigorate", true, INVIGORATE)
-        .id();
-    let forest = scenario.add_basic_land(P0, ManaColor::Green);
-    let bear = scenario.add_creature(P0, "Bear", 2, 2).id();
-    let mut runner = scenario.build();
-    let opp_life = runner.life(P1);
-    let my_life = runner.life(P0);
-
-    runner
-        .cast(inv)
-        .target_object(bear)
-        .accept_optional()
-        .resolve();
-
-    assert_eq!(runner.life(P1), opp_life + 3, "the opponent gains 3 life");
-    assert_eq!(runner.life(P0), my_life, "the caster gains nothing");
-    assert!(!runner.state().objects[&forest].tapped, "no mana is spent");
-    let bear_obj = &runner.state().objects[&bear];
-    assert_eq!((bear_obj.power, bear_obj.toughness), (Some(6), Some(6)));
-}
-
-/// CR 118.9: without a Forest the alternative cost isn't available.
-#[test]
-fn invigorate_without_forest_offers_no_alternative_cost() {
-    let mut scenario = GameScenario::new();
-    scenario.at_phase(Phase::PreCombatMain);
-    let inv = scenario
-        .add_spell_to_hand_from_oracle(P0, "Invigorate", true, INVIGORATE)
-        .id();
-    scenario.add_basic_land(P0, ManaColor::Blue);
-    let bear = scenario.add_creature(P0, "Bear", 2, 2).id();
-    let mut runner = scenario.build();
-
-    let card_id = runner.state().objects[&inv].card_id;
-    let result = runner.act(GameAction::CastSpell {
-        object_id: inv,
-        card_id,
-        targets: vec![bear],
-        payment_mode: CastPaymentMode::Auto,
-    });
-    assert!(
-        result.is_err()
-            || !matches!(
-                runner.state().waiting_for,
-                WaitingFor::OptionalCostChoice { .. }
-            ),
-        "no Forest, no alternative cost"
     );
 }
 

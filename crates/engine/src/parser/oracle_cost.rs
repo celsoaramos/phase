@@ -1286,28 +1286,6 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
         }
     }
 
-    // CR 118.9 + CR 119.1: "have an opponent gain N life" — an alternative cost
-    // paid by making an opponent gain life (Invigorate). Modeled as an
-    // EffectCost wrapping `Effect::GainLife` for an opponent; the spell-cost
-    // payer (`casting_costs::pay_additional_cost_with_source`) performs it.
-    if let Some((amount, _)) = nom_on_lower(text, &lower, |i| {
-        let (i, _) = tag("have an opponent gain ").parse(i)?;
-        let (i, amount) = nom_primitives::parse_number(i)?;
-        let (i, _) = (tag(" life"), opt(tag(".")), eof).parse(i)?;
-        Ok((i, amount))
-    }) {
-        return AbilityCost::EffectCost {
-            effect: Box::new(crate::types::ability::Effect::GainLife {
-                amount: QuantityExpr::Fixed {
-                    value: amount as i32,
-                },
-                player: TargetFilter::Typed(
-                    TypedFilter::default().controller(ControllerRef::Opponent),
-                ),
-            }),
-        };
-    }
-
     // "reveal your hand" — reveal the controller's entire hand.
     // CR 701.20a: Reveal means show to all players. Used as alternative cost
     // (Land Grant class). Modeled as EffectCost wrapping Effect::RevealHand.

@@ -8376,32 +8376,6 @@ fn pay_additional_cost_with_source(
     }
 
     match cost {
-        // CR 118.9 + CR 119.1: "have an opponent gain N life" (Invigorate). The
-        // payability gate (`cost_payability`) only admits this cost when the
-        // caster has exactly one opponent, so "an opponent" names no choice.
-        AbilityCost::EffectCost { ref effect } if opponent_life_gain_amount(effect).is_some() => {
-            let amount = opponent_life_gain_amount(effect).unwrap_or(0);
-            let [opponent] = super::players::opponents(state, player)[..] else {
-                super::casting::handle_cancel_cast(state, &pending, events);
-                return Err(EngineError::ActionNotAllowed(
-                    "Opponent life-gain cost needs exactly one opponent".to_string(),
-                ));
-            };
-            let resume_at_resolution_depth = state.resolution_stack.len();
-            if super::effects::life::apply_life_gain(state, opponent, amount, events).is_err() {
-                // CR 616.1 + CR 614.6: a replacement on the life gain paused for
-                // a choice; resume the cast once it settles (same seam as a
-                // paused life payment).
-                state.pending_deferred_life_cost_resume =
-                    Some(crate::types::game_state::DeferredLifeCostResume::Cast {
-                        player,
-                        pending: Some(Box::new(pending)),
-                        remaining_life_payments: Vec::new(),
-                        resume_at_resolution_depth,
-                    });
-                return Ok(state.waiting_for.clone());
-            }
-        }
         AbilityCost::PayLife { amount } => {
             // CR 118.3 + CR 119.4 + CR 119.8: Pay life as an additional cost via
             // the single-authority helper. Unpayable = spell cannot be cast.
@@ -9122,24 +9096,6 @@ pub(crate) fn handle_reveal_for_cost(
 
     pending.mark_activation_cost_committed();
     finish_pending_cost_or_cast(state, player, pending, events)
-}
-
-/// CR 118.9 + CR 119.1: the fixed amount of an "have an opponent gain N life"
-/// effect-as-cost (`AbilityCost::EffectCost` wrapping `Effect::GainLife` for an
-/// unrestricted opponent), or `None` for any other effect.
-pub(crate) fn opponent_life_gain_amount(effect: &Effect) -> Option<u32> {
-    let Effect::GainLife {
-        amount: QuantityExpr::Fixed { value },
-        player: TargetFilter::Typed(filter),
-    } = effect
-    else {
-        return None;
-    };
-    (filter.controller == Some(crate::types::ability::ControllerRef::Opponent)
-        && filter.type_filters.is_empty()
-        && filter.properties.is_empty()
-        && *value > 0)
-        .then_some(*value as u32)
 }
 
 pub(crate) fn is_exile_any_number_effect_cost(cost: &AbilityCost) -> bool {
