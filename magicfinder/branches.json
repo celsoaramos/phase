@@ -112,5 +112,8 @@
   },
   {
     "branch": "card/akiri-unattach-equipment"
+  },
+  {
+    "branch": "card/invigorate-opponent-choice"
   }
 ]
