@@ -876,15 +876,12 @@ impl AbilityCost {
             // CR 118.3: Effect-as-cost is conservatively payable (runtime resolution
             // determines the actual outcome), except a recipient effect-cost
             // (CR 118.9 + CR 601.2b + CR 115.10a), offered only when the payer can
-            // choose a recipient. Phase 1 requires exactly one choosable recipient:
-            // the ≥2 choice surface is DEFERRED(phase 2) (a parameterized cast-time
-            // opponent prompt). Until then the option is not offered rather than
-            // guessing a recipient; the printed cost stays castable.
+            // choose at least one recipient; two or more are asked at payment
+            // (`ChooseGiftRecipient` with `CastOpponentChoicePurpose::EffectCost`).
             AbilityCost::EffectCost { .. } => match self.player_recipient_cost() {
                 Some(PlayerRecipientCost::GainLife { recipient, .. }) => {
-                    super::life_costs::life_gain_cost_recipients(state, player, source, recipient)
-                        .len()
-                        == 1
+                    !super::life_costs::life_gain_cost_recipients(state, player, source, recipient)
+                        .is_empty()
                 }
                 None => true,
             },

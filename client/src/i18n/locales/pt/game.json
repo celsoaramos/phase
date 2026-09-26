@@ -1951,6 +1951,10 @@
     "title": "Escolher destinatário do presente",
     "subtitle": "Escolha qual oponente recebe o presente prometido."
   },
+  "costRecipient": {
+    "title": "Escolha um oponente",
+    "subtitle": "Escolha o oponente para este custo: {{cost}}."
+  },
   "entryController": {
     "title": "Escolher controlador ao entrar",
     "subtitle": "Escolha qual oponente controla esta permanente ao entrar."
