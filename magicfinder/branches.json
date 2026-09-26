@@ -109,5 +109,8 @@
   },
   {
     "branch": "card/dragonfire-blade-equip-target-reduction"
+  },
+  {
+    "branch": "card/akiri-unattach-equipment"
   }
 ]
