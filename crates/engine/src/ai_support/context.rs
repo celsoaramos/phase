@@ -159,6 +159,32 @@ impl AiDecisionContract {
                 crate::game::combat::validate_blockers_for_player(state, *player, assignments)
                     .is_ok()
             }
+            // CR 608.2d: a dig's keep-selection is combinatorial like a combat
+            // declaration — Stargaze at X=7 keeps 7 of 14 (3,432 subsets), and
+            // the enumerator issues only the first `SELECTION_CANDIDATE_CAP`
+            // in lexicographic order. Exact membership there refused the AI's
+            // value-ranked pick and the seat stopped with no action. Bound it
+            // by the resolution handler's own validator instead.
+            (
+                WaitingFor::DigChoice {
+                    player,
+                    cards,
+                    keep_count,
+                    up_to,
+                    selectable_cards,
+                    ..
+                },
+                GameAction::SelectCards { cards: kept },
+            ) if *player == self.semantic_owner => {
+                crate::game::engine_resolution_choices::validate_dig_choice(
+                    kept,
+                    cards,
+                    selectable_cards,
+                    *keep_count,
+                    *up_to,
+                )
+                .is_ok()
+            }
             _ => self
                 .candidates
                 .iter()

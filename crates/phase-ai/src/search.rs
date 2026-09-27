@@ -14079,6 +14079,114 @@ mod tests {
         }
     }
 
+    /// Stargaze at X=7 (field report, 2026-09-27): "look at the top fourteen,
+    /// put seven into your hand". C(14,7) = 3,432 keep-sets; the enumerator
+    /// issues the first 64 in lexicographic order, so the value-ranked pick
+    /// (the seven 10/10s, the LAST ids) sat outside exact-membership gating and
+    /// the seat produced no action at all. The contract now bounds a dig by the
+    /// resolution handler's validator, so the best keep-set is proposed and the
+    /// engine applies it.
+    #[test]
+    fn dig_choice_best_keep_set_outside_the_issued_cap_is_proposed() {
+        let mut state = make_state();
+        let ai = PlayerId(0);
+        fn library_creature(state: &mut GameState, ai: PlayerId, power: i32) -> ObjectId {
+            let id = create_object(
+                state,
+                CardId(state.next_object_id),
+                ai,
+                "Creature".to_string(),
+                Zone::Library,
+            );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(power);
+            obj.toughness = Some(power);
+            obj.base_card_types = obj.card_types.clone();
+            obj.base_power = obj.power;
+            obj.base_toughness = obj.toughness;
+            id
+        }
+        let mut looked_at: Vec<_> = (0..7)
+            .map(|_| library_creature(&mut state, ai, 1))
+            .collect();
+        let best: Vec<_> = (0..7)
+            .map(|_| library_creature(&mut state, ai, 10))
+            .collect();
+        looked_at.extend(best.iter().copied());
+        for &id in &looked_at[..7] {
+            assert!(
+                crate::card_value::intrinsic_value(&state, id)
+                    < crate::card_value::intrinsic_value(&state, best[0]),
+                "fixture premise: the 1/1s must score below the 10/10s"
+            );
+        }
+        state.waiting_for = WaitingFor::DigChoice {
+            player: ai,
+            library_owner: ai,
+            cards: looked_at.clone(),
+            keep_count: 7,
+            up_to: false,
+            selectable_cards: looked_at.clone(),
+            kept_destination: Some(Zone::Hand),
+            rest_destination: Some(Zone::Graveyard),
+            rest_order: engine::types::ability::DigRestOrder::Preserve,
+            source_id: None,
+            enter_tapped: false,
+            enters_attacking: false,
+        };
+
+        let contract = AiDecisionContract::issue(&state, ai);
+        assert_eq!(
+            contract.candidates.len(),
+            64,
+            "fixture premise: the selection output cap must be reached"
+        );
+        let is_best = |action: &GameAction| match action {
+            GameAction::SelectCards { cards } => {
+                let mut chosen = cards.clone();
+                chosen.sort();
+                let mut want = best.clone();
+                want.sort();
+                chosen == want
+            }
+            _ => false,
+        };
+        assert!(
+            !contract.candidates.iter().any(|c| is_best(&c.action)),
+            "fixture premise: the best keep-set must be outside the issued combinations"
+        );
+
+        let config = create_config(AiDifficulty::Medium, Platform::Native);
+        let mut rng = SmallRng::seed_from_u64(27);
+        let action = choose_action(&state, ai, &config, &mut rng)
+            .expect("a dig the engine can resolve must have a proposal");
+        assert!(
+            contract.contains_action(&state, &action),
+            "the proposal must survive final contract gating"
+        );
+        assert!(
+            is_best(&action),
+            "the AI keeps the seven 10/10s, got {action:?}"
+        );
+
+        let wrong_size = GameAction::SelectCards {
+            cards: best[..6].to_vec(),
+        };
+        assert!(
+            !contract.contains_action(&state, &wrong_size),
+            "the contract still refuses a keep-set the handler would reject"
+        );
+
+        let mut applied = state.clone();
+        engine::game::engine::apply_as_current(&mut applied, action)
+            .expect("the engine must accept the kept cards");
+        assert!(
+            best.iter().all(|id| applied.players[0].hand.contains(id)),
+            "the kept cards must reach the hand"
+        );
+    }
+
     // ======================================================================
     // Issue #6942 — selection escapes must answer out of the issued contract.
     //
