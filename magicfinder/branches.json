@@ -121,5 +121,8 @@
   },
   {
     "branch": "ai/legal-actions-picker-dedup"
+  },
+  {
+    "branch": "card/restless-dreams-discard-x"
   }
 ]
