@@ -350,6 +350,7 @@ mod fin_sidequest_turn_history_conditions;
 mod finality_counter_death_to_exile;
 mod fire_lord_ozai_each_opponent_library_top;
 mod fireball_x_cost_surcharge_timing;
+mod firestorm_discard_x_additional_cost;
 mod first_family_union_color_count;
 mod fixture_deck_size_conformance;
 mod flamewar_mtmte_export;
