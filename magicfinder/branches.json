@@ -118,5 +118,8 @@
   },
   {
     "branch": "ai/dig-choice-contract"
+  },
+  {
+    "branch": "ai/legal-actions-picker-dedup"
   }
 ]
