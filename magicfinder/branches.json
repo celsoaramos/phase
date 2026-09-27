@@ -115,5 +115,8 @@
   },
   {
     "branch": "card/invigorate-opponent-choice"
+  },
+  {
+    "branch": "ai/dig-choice-contract"
   }
 ]
