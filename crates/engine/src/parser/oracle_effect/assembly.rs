@@ -37,7 +37,6 @@ use super::conditions::ability_condition_to_static_condition;
 use super::lower::{
     append_remember_card_to_standalone_exiled_choice, apply_where_x_ability_expression,
     apply_where_x_to_latest_def, attach_alt_ability_cost_to_previous_play_from_exile,
-    attach_any_color_mana_rider_to_previous_play_from_exile,
     attach_cast_cost_modifier_to_previous_play_from_exile,
     attach_cast_cost_modifier_to_prior_cast_from_zone,
     attach_graveyard_redirect_rider_to_prior_cast_from_zone,
@@ -53,8 +52,7 @@ use super::lower::{
     fold_exile_resolving_rider, fold_search_choose_type_conditional_destination,
     fold_token_it_has_grants_into_token_statics, gate_other_revealed_card_on_multiplayer_reveal,
     gate_reflexive_rider_on_declined_optional_target, is_exile_until_cast_bottom_cleanup,
-    is_land_enters_tapped_rider, is_linked_exile_cast_bottom_cleanup,
-    is_spend_mana_as_any_color_rider, is_stable_branch_amount,
+    is_land_enters_tapped_rider, is_linked_exile_cast_bottom_cleanup, is_stable_branch_amount,
     nest_whenever_this_turn_token_cleanup_delayed_trigger,
     normalize_exile_until_cast_bottom_cleanup, normalize_linked_exile_cast_bottom_cleanup,
     parse_controlled_by_different_players_target_constraint,
@@ -73,7 +71,8 @@ use super::sequence::{apply_clause_continuation, def_bears_retargetable_copy};
 use super::{
     append_to_deepest_sub_ability, apply_player_scope_rewrites,
     attach_alt_cost_to_prior_cast_from_zone, attach_mana_retention_to_prior_mana,
-    attach_perpetual_keyword_grants, attach_repeat_process_keywords, attach_same_is_true_keywords,
+    attach_mana_spend_permission_to_prior_cast_grant, attach_perpetual_keyword_grants,
+    attach_repeat_process_keywords, attach_same_is_true_keywords,
     bind_anaphoric_damage_subject_keep_recipient, collapse_ephemeral_color_choice_mana,
     contains_explicit_tracked_set_pronoun, contains_implicit_tracked_set_pronoun,
     def_is_damage_dealer, def_is_dig_look, def_is_dig_or_mill, def_is_generic_effect_head,
@@ -82,11 +81,12 @@ use super::{
     has_explicit_player_target, inject_chosen_color_choice_grant,
     inject_printed_color_choice_filter, mark_uses_tracked_set, nearest_publisher_is_self_move,
     parse_spell_graveyard_replacement_rider,
-    parse_spells_cast_this_way_graveyard_replacement_rider,
+    parse_spells_cast_this_way_graveyard_replacement_rider, plural_library_shuffle_recall,
     publishes_aggregate_set_from_resolution, publishes_exiled_cause_at_resolution,
     publishes_tracked_set_from_resolution, rebind_tracked_aggregate_to_chain_set,
     resolve_difference_anaphor_in_ability, retarget_counter_additional_cost_to_target,
-    rewrite_grant_parent_to_filter, rewrite_parent_targets_to_tracked_set, rewrite_rounding_mode,
+    rewrite_grant_parent_to_filter, rewrite_parent_targets_to_tracked_set,
+    rewrite_plural_library_recall_to_tracked_set, rewrite_rounding_mode,
     rewrite_singular_battlefield_recall_to_self, rewrite_that_type_mana_instead,
     singular_battlefield_recall, stamp_delayed_returns, try_fold_token_repeat_into_count,
     wire_optional_cast_decline_fallback, PrintedColorCarrier, PrintedColorCarrierScope,
@@ -1086,7 +1086,6 @@ impl AssemblyEnv {
                 &*def.effect,
                 Effect::ChangeZone {
                     origin: Some(Zone::Library),
-                    destination: Zone::Hand,
                     ..
                 }
             ) && provenance.role == NodeRole::ContinuationProduct
@@ -1921,6 +1920,18 @@ fn subject_anchored_optional_actor(
     }
 }
 
+/// CR 601.2c: a `Pump` whose target is its own declared target instance
+/// ("[up to one] [other] target creature gets +N/+M"), not an inherited anaphor.
+fn declares_pump_target(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::Pump {
+            target: TargetFilter::Typed(_),
+            ..
+        }
+    )
+}
+
 pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     let kind = ir.kind;
     let continuation_kind = ir.continuation_kind.unwrap_or(AbilityKind::Spell);
@@ -2210,6 +2221,22 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                     }
                     PriorModifier::ManaRetention(expiry) => {
                         attach_mana_retention_to_prior_mana(&mut defs, *expiry);
+                    }
+                    PriorModifier::ManaSpendPermission(permission) => {
+                        // CR 609.4b: the rider was admitted only because the
+                        // clause it follows grants a cast without a concession
+                        // (`prior_clause_grants_a_cast_without_mana_spend_permission`),
+                        // so the stamp lands on that grant — the last def.
+                        let stamped = attach_mana_spend_permission_to_prior_cast_grant(
+                            &mut defs,
+                            *permission,
+                        );
+                        debug_assert!(
+                            stamped,
+                            "CR 609.4b: a mana rider admitted for the prior cast grant found \
+                             no grant to stamp on the last def: {:?}",
+                            defs.last()
+                        );
                     }
                     PriorModifier::EntersTappedAttacking => {
                         // CR 508.4 / CR 614.1: Conditional enters-tapped-attacking modifier.
@@ -2574,18 +2601,6 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
             // Classify anything this handler detached; the mirror is asserted at the
             // next loop-top, or at the Phase-1/Phase-2 boundary for the last clause.
             env.arena.settle();
-            continue;
-        }
-
-        // CR 609.4b + CR 608.2c: Brainstealer/Daxos-class any-color mana
-        // riders may be split into their own sentence or comma sibling after a
-        // `PlayFromExile` grant. They scope the existing exile-play
-        // permission, so fold the rider into the prior grant instead of
-        // emitting a broad standalone `SpendManaAsAnyColor` effect.
-        if is_spend_mana_as_any_color_rider(clause_ir)
-            && attach_any_color_mana_rider_to_previous_play_from_exile(&mut defs)
-        {
-            prev_boundary = clause_ir.boundary;
             continue;
         }
 
@@ -3461,6 +3476,7 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                     // and mass-publisher recalls keep the chain tracked set.
                     let singular_self_recall = singular_battlefield_recall(&source_text_lower)
                         && nearest_publisher_is_self_move(&defs);
+                    let plural_library_recall = plural_library_shuffle_recall(&source_text_lower);
                     for current in &mut current_defs {
                         mark_uses_tracked_set(current);
                         // Per-def branch: only a battlefield-recall-shaped leg
@@ -3478,6 +3494,9 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                         {
                             rewrite_singular_battlefield_recall_to_self(&mut current.effect);
                         } else {
+                            if plural_library_recall {
+                                rewrite_plural_library_recall_to_tracked_set(&mut current.effect);
+                            }
                             rewrite_parent_targets_to_tracked_set(
                                 &mut current.effect,
                                 cast_anaphor_is_exiled,
@@ -3486,6 +3505,29 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                     }
                 }
             } else if contains_explicit_tracked_set_pronoun(&source_text_lower) {
+                // CR 608.2c + CR 601.2c + CR 115.6: a plural anaphor ("those
+                // creatures") after two or more targeted P/T instructions of this
+                // ability names every object those target instances declared, and a
+                // declined "up to one" instance contributes none. No single parent's
+                // targets carry that union, so the grant or pump binds the chain
+                // tracked set the targeted `Pump`s publish
+                // (`affected_objects_from_events`). A damage or fight consumer keeps
+                // its `ParentTarget` binding.
+                if defs
+                    .iter()
+                    .filter(|def| declares_pump_target(&def.effect))
+                    .count()
+                    >= 2
+                {
+                    for current in &mut current_defs {
+                        if matches!(
+                            &*current.effect,
+                            Effect::GenericEffect { .. } | Effect::Pump { .. }
+                        ) {
+                            rewrite_parent_targets_to_tracked_set(&mut current.effect, false);
+                        }
+                    }
+                }
                 // CR 603.7 + issue #6065: "those creatures gain <keyword>" after a
                 // "draw a card for each <creature filter>" clause (Inspiring Call).
                 // Draw publishes no tracked set (its target is the drawing player),
@@ -4114,6 +4156,15 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // check is robustly correct.
     gate_other_revealed_card_on_multiplayer_reveal(&mut result);
 
+    // CR 608.2c + CR 611.2f: a lingering cast grant's "If you do" rider is
+    // followed in printed order during the grant's own resolution (CR 608.2c),
+    // before any spell exists to receive it; an effect that modifies a spell cast
+    // LATER applies only once that spell is put on the stack (CR 611.2f), which
+    // this grant cannot carry. Applied on the FINAL tree for the
+    // same reason as the gate above: only here are the grant and its rider both
+    // linked. See `refuse_cast_rider_on_lingering_grant`.
+    super::lower::refuse_cast_rider_on_lingering_grant(&mut result);
+
     // CR 608.2c + CR 107.1c: A trailing "repeat this process" directive sets a
     // chain-level loop predicate; apply it to the assembled root ability so the
     // resolver re-follows the whole chain.
@@ -4401,6 +4452,87 @@ mod arena_tests {
                 target: TargetFilter::Controller,
             },
         )
+    }
+
+    /// The anaphoric grant of a two-targeted-`Pump` chain, as the stamp leaves it.
+    fn p6_anaphor_grant_affected(text: &str) -> Vec<Option<TargetFilter>> {
+        let parsed = crate::parser::parse_oracle_text(
+            text,
+            "P6 Anaphor Probe",
+            &[],
+            &["Sorcery".to_string()],
+            &[],
+        );
+        let root = parsed
+            .abilities
+            .first()
+            .unwrap_or_else(|| panic!("one spell chain expected: {text}"));
+        let mut node = Some(root);
+        let mut pumps = 0usize;
+        while let Some(def) = node {
+            match &*def.effect {
+                Effect::Pump {
+                    target: TargetFilter::Typed(_),
+                    ..
+                } => pumps += 1,
+                Effect::GenericEffect {
+                    static_abilities, ..
+                } => {
+                    assert_eq!(
+                        pumps, 2,
+                        "REACH GUARD: the chain must reach the grant with TWO declared \
+                         targeted pumps before it, or the stamp's gate is not the thing \
+                         under test: {text}"
+                    );
+                    return static_abilities
+                        .iter()
+                        .map(|static_def| static_def.affected.clone())
+                        .collect();
+                }
+                _ => {}
+            }
+            node = def.sub_ability.as_deref();
+        }
+        panic!("no anaphoric grant in the chain: {text}");
+    }
+
+    /// CR 608.2c + CR 601.2c + CR 115.6 — H-3b.1. U6b's DISCRIMINATING
+    /// building-block row, and the one no U6a row can supply: both conjuncts
+    /// already split at PHASE_BASE through the pre-existing verb-only arm, so
+    /// this row moves on the STAMP alone.
+    ///
+    /// A PLURAL anaphor after two or more targeted P/T instructions names every
+    /// object those instances declared. No single parent's targets carry that
+    /// union, so the grant binds the chain tracked set.
+    ///
+    /// PAIR: M-3 (revert the stamp).
+    #[test]
+    fn plural_anaphor_after_two_targeted_pumps_binds_tracked_set() {
+        assert_eq!(
+            p6_anaphor_grant_affected(
+                "Target creature you control gets +1/+1 and target creature an opponent controls gets +1/+1. Those creatures gain trample until end of turn."
+            ),
+            vec![Some(TargetFilter::TrackedSet {
+                id: crate::types::identifiers::TrackedSetId(0)
+            })],
+        );
+    }
+
+    /// CR 608.2c — H-3b.2, HOSTILE NEIGHBOUR. GREEN AT BASE. A SINGULAR
+    /// anaphor over the same two-pump chain names one object, so it keeps its
+    /// `ParentTarget` binding and must not be swept into the tracked set.
+    ///
+    /// PAIR: `plural_anaphor_after_two_targeted_pumps_binds_tracked_set`
+    /// (H-3b.1, red at base on the same stamp) + M-9 (hoist the stamp above
+    /// the pronoun branch so it also fires on the singular path).
+    #[test]
+    fn singular_anaphor_after_two_targeted_pumps_keeps_parent_target() {
+        assert_eq!(
+            p6_anaphor_grant_affected(
+                "Target creature you control gets +1/+1 and target creature an opponent controls gets +1/+1. It gains trample until end of turn."
+            ),
+            vec![Some(TargetFilter::ParentTarget)],
+        );
     }
 
     /// The mirror assert's IDENTITY check (`order[i]` names the def actually at
