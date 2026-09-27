@@ -1627,6 +1627,7 @@ mod reflexive_surveil_this_way;
 mod reflexive_this_way_delayed_s25;
 mod regenerate_card_shields_creature;
 mod remove_all_counters_transform;
+mod restless_dreams_discard_x_additional_cost;
 mod restricted_mana_face_down_and_face_up;
 mod restricted_mana_mv_or_x;
 mod restricted_mana_not_from_zone;
