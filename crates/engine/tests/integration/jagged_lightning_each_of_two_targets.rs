@@ -262,10 +262,10 @@ fn t5_fall_of_the_titans_declines_all_optional_target_slots() {
     );
 
     // Reach-guard: the same card, same fixture, with one declared target.
-    // CR 702.117a: the first cast makes Surge available for this one, and both
-    // costs are affordable, so the caster declares the printed cost.
     let targeted_outcome = runner
         .cast(targeted)
+        // CR 702.117a: the first cast enables Surge for this one and both costs
+        // are payable, so the caster declares the printed cost.
         .alternative_cast(AlternativeCastDecision::Normal)
         .x(3)
         .target_objects(&[victim])
