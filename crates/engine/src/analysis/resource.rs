@@ -32,7 +32,7 @@ use crate::types::counter::CounterType;
 use crate::types::game_state::{loop_states_equal, GameState, StackEntry, StackEntryKind};
 use crate::types::identifiers::{CardId, ObjectId, TriggerFiring};
 use crate::types::mana::ManaType;
-use crate::types::phase::Phase;
+use crate::types::phase::{Phase, PhaseGroup, TurnSegment};
 use crate::types::player::{Player, PlayerId};
 use crate::types::replacements::ReplacementEvent;
 use crate::types::zones::Zone;
@@ -1372,22 +1372,26 @@ impl ResourceVector {
 
         // CR 500.8 + CR 506.1 + CR 500.1: extra COMBAT phases created this turn.
         // A turn has exactly one natural combat phase, so
-        // `combat_phases_started_this_turn` (every begin-combat ENTERED this turn,
-        // natural + extra) minus that one yields extra combats already entered; the
-        // `Phase::BeginCombat` entries still queued in `state.extra_phases` (CR 500.8)
-        // add extra combats created but not yet entered. The two terms are disjoint —
+        // `steps_started_this_turn.count(Phase::BeginCombat)` (every begin-combat
+        // ENTERED this turn, natural + extra) minus that one yields extra combats
+        // already entered; the whole combat phases still queued in
+        // `state.extra_phases` (CR 500.8) add extra combats created but not yet
+        // entered. The two terms are disjoint —
         // `advance_phase` removes an extra phase from `state.extra_phases` before
         // entering it. This is "extra combats created", monotone within the turn and
         // independent of consumption timing, so a self-sustaining extra-combat loop
-        // does not net to zero. `combat_phases_started_this_turn` resets each turn (in
+        // does not net to zero. `steps_started_this_turn` resets each turn (in
         // `start_next_turn`), so across a turn boundary this axis can read negative
         // under `delta`; that is a benign false-NEGATIVE for a `Gained` axis
         // (CR 732.2a `is_net_progress` only vetoes on negative `Consumed` axes).
-        let entered_extra_combats = state.combat_phases_started_this_turn.saturating_sub(1) as i64;
+        let entered_extra_combats = state
+            .steps_started_this_turn
+            .count(Phase::BeginCombat)
+            .saturating_sub(1) as i64;
         let queued_extra_combats = state
             .extra_phases
             .iter()
-            .filter(|extra_phase| extra_phase.phase == Phase::BeginCombat)
+            .filter(|extra_phase| extra_phase.segment == TurnSegment::Phase(PhaseGroup::Combat))
             .count() as i64;
         v.combat_phases = entered_extra_combats + queued_extra_combats;
 
@@ -2280,9 +2284,10 @@ pub(crate) fn ring_delta_signature(state: &GameState) -> Option<(u32, ResourceVe
         // `active_player` and `phase`. This is NOT a claim that shortcuts may not cross
         // turns — CR 732.2a says a shortcut "may even cross multiple turns"; what is refused
         // is a cross-turn certification by the BOARD-BLIND basis. KNOWINGLY ACCEPTED FALSE
-        // NEGATIVE: `window_scope_from_cover_frames` requires `extra_phases.is_empty()` on
-        // BOTH frames (CR 500.8), so a legitimate WITHIN-turn loop running while an extra
-        // phase is queued mints no basis-B offer. Widen that authority, not a local test.
+        // NEGATIVE: `window_scope_from_cover_frames` requires `extra_phases` and
+        // `extra_phase_resume` empty on BOTH frames (CR 500.8 + CR 500.10), so a legitimate
+        // WITHIN-turn loop running while an extra phase is queued or an inserted unit is in
+        // progress mints no basis-B offer. Widen that authority, not a local test.
         let window: Vec<&GameState> = state
             .loop_detect_ring
             .iter()
@@ -2293,10 +2298,10 @@ pub(crate) fn ring_delta_signature(state: &GameState) -> Option<(u32, ResourceVe
             // `identity_unstable: None` — a CR 104.4b ring SIGNATURE is a resource-delta
             // fact about a period, not a window proof about any object's CR 400.7 identity.
             // This function reads exactly two things: `ResourceVector::snapshot` of each
-            // frame, and `.phase_invariant` (turn number + phase + `extra_phases.is_empty()`)
-            // off this call. The sampler gate also makes the frames homogeneous in
-            // `waiting_for`/`priority_player`, but nothing here looks at those — basis A does,
-            // via `loop_states_equal_modulo_resources`.
+            // frame, and `.phase_invariant` (turn number + phase + no queued extra phase + no
+            // inserted unit in progress) off this call. The sampler gate also makes the frames
+            // homogeneous in `waiting_for`/`priority_player`, but nothing here looks at those —
+            // basis A does, via `loop_states_equal_modulo_resources`.
             window_scope_from_cover_frames(w[0], w[1], None, None, None)
                 .phase_invariant
                 .is_some()
@@ -2802,14 +2807,16 @@ impl LoopWindowScope<'static> {
 /// frame pair that proves nothing gets the [`LoopWindowScope::unproven`] values.
 ///
 /// `phase_invariant`: `Some(phase)` only when the frames agree on turn number AND
-/// step-granular phase AND neither carries a pending extra phase (CR 500.8 can insert a
-/// duplicate of the SAME phase inside one turn). Derived LOCALLY, so it is independent of gate
-/// ORDER; `extra_turns` is not a conjunct because an extra TURN is taken after the current one
-/// and `turn_number` is monotone. `sole_driver`: `Some(p)` only when BOTH frames' driving
-/// sequences are non-empty and every entry in BOTH names controller `p` (CR 117.1b) — reading
-/// only `prior` would mint `Some(p)` for a window another player drove. `identity_unstable`
-/// (CR 400.7) is NOT derived here: [`identity_unstable_ids`] must be computed from the same
-/// PROJECTED pair the caller hands the firewall, so it is threaded in as `pinned` and `period`.
+/// step-granular phase AND neither carries a pending extra phase nor an inserted unit in
+/// progress (CR 500.8 + CR 500.10: an insert can repeat the SAME step label inside one turn,
+/// and once its entry is taken only the unit record shows it). Derived LOCALLY, so it is
+/// independent of gate ORDER; `extra_turns` is not a conjunct because an extra TURN is taken
+/// after the current one and `turn_number` is monotone. `sole_driver`: `Some(p)` only when
+/// BOTH frames' driving sequences are non-empty and every entry in BOTH names controller `p`
+/// (CR 117.1b) — reading only `prior` would mint `Some(p)` for a window another player
+/// drove. `identity_unstable` (CR 400.7) is NOT derived here: [`identity_unstable_ids`] must
+/// be computed from the same PROJECTED pair the caller hands the firewall, so it is threaded
+/// in as `pinned` and `period`.
 fn window_scope_from_cover_frames<'a>(
     pa: &GameState,
     pb: &GameState,
@@ -2817,12 +2824,14 @@ fn window_scope_from_cover_frames<'a>(
     period: Option<&'a PeriodTouch<'a>>,
     identity_unstable: Option<&'a HashSet<ObjectId>>,
 ) -> LoopWindowScope<'a> {
-    // (p1) same turn, (p2) same step-granular phase, (p3) no pending extra phase in
-    // either frame (CR 500.8).
+    // (p1) same turn, (p2) same step-granular phase, (p3) no pending extra phase and
+    // (p4) no inserted unit in progress in either frame (CR 500.8 + CR 500.10).
     let phase_invariant = (pa.turn_number == pb.turn_number
         && pa.phase == pb.phase
         && pa.extra_phases.is_empty()
-        && pb.extra_phases.is_empty())
+        && pb.extra_phases.is_empty()
+        && pa.extra_phase_resume.is_empty()
+        && pb.extra_phase_resume.is_empty())
     .then_some(pa.phase);
 
     // (s1) BOTH sequences non-empty; (s2) one controller across BOTH sequences. Both conjuncts
@@ -7024,6 +7033,14 @@ fn normalized_stack_entries(state: &GameState) -> Vec<(StackEntry, Option<Trigge
                 } => crate::game::triggers::normalize_ability_identity(ability),
                 StackEntryKind::Spell { ability: None, .. }
                 | StackEntryKind::KeywordAction { .. } => {}
+                // The payload keeps its `ObjectIncarnationRef`s: `norm.id` /
+                // `norm.source_id` zeroing does not reach inside it, so two
+                // otherwise-identical entries normalize unequal. That is
+                // fail-safe here — retained content differences only SUPPRESS a
+                // coverability match, never manufacture one (see this
+                // function's own contract). Re-audit when these entries carry
+                // live assignments.
+                StackEntryKind::CombatDamage { .. } => {}
             }
             (norm, firing)
         })
@@ -7244,7 +7261,11 @@ fn stack_entry_resolution_choice_freedom(
         }
         StackEntryKind::Spell { .. }
         | StackEntryKind::ActivatedAbility { .. }
-        | StackEntryKind::KeywordAction { .. } => ResolutionChoiceFreedom::MayPrompt,
+        | StackEntryKind::KeywordAction { .. }
+        // Fail-closed, per the classifier's contract: a choice-free verdict is
+        // a soundness claim requiring a resolver trace, and this kind has no
+        // resolver until combat-damage timing lands.
+        | StackEntryKind::CombatDamage { .. } => ResolutionChoiceFreedom::MayPrompt,
     }
 }
 
@@ -7585,7 +7606,13 @@ fn board_has_keyed_trigger(
 /// [`token_growth_is_observed`] asks a differently-FILTERED question of the same walk than
 /// [`board_has_event_observer`] does. The zone narrowing is this walk's whole contribution:
 /// `active_replacements` is all-zones, and dropping it would let a graveyard-resident
-/// replacement route loops.
+/// replacement route loops. The host-zone test is paired with the per-definition
+/// CR 113.6b authority (`replacement_functions_in_zone`): a host CAN sit on the battlefield
+/// while its definition declares `active_zones = [Graveyard]` and therefore cannot apply,
+/// and counting that as an observer is a false veto. Both halves are needed — the host test
+/// alone admits the declared-out-of-zone def, and the authority alone would admit a
+/// graveyard host carrying an undeclared def (whose default answer covers the command zone
+/// too).
 ///
 /// IT YIELDS THE HOST OBJECT, AND NARROWING THE ITEM BACK TO THE BARE DEF IS A CAPABILITY
 /// DELETION, NOT A TIDY-UP. Nothing else can supply what `obj` supplies: `ReplacementDefinition`
@@ -7623,7 +7650,21 @@ fn functioning_board_replacement_defs(
 > {
     crate::game::functioning_abilities::active_replacements(state)
         .filter(|(_, obj, def)| {
-            matches!(obj.zone, Zone::Battlefield | Zone::Command) && replacement_def_is_live(def)
+            matches!(obj.zone, Zone::Battlefield | Zone::Command)
+                // CR 113.6b: the HOST's zone is not the whole zone question — a
+                // definition that declares `active_zones` functions only from
+                // the zones it names, so a battlefield host carrying a
+                // `[Graveyard]`-declared definition cannot apply in the
+                // pipeline at all. Asking the same authority the pipeline asks
+                // (`object_replacement_candidate_applies` → this predicate)
+                // keeps the firewall from counting a definition that provably
+                // can never observe the loop, which would route an otherwise
+                // batchable loop to the safe O(N) discrete path for nothing.
+                // NARROWING, NOT LOOSENING: an undeclared definition answers
+                // `true` for both battlefield and command hosts, so every
+                // pre-existing observer is still counted.
+                && crate::game::functioning_abilities::replacement_functions_in_zone(obj, def)
+                && replacement_def_is_live(def)
         })
         .map(|(idx, obj, def)| (obj, idx, def))
 }
@@ -8169,9 +8210,8 @@ fn project_out_resources(state: &GameState) -> GameState {
     s.players_who_sacrificed_artifact_this_turn.clear();
     s.counter_added_this_turn.clear();
     s.player_actions_this_turn.clear();
-    // CR 506 / CR 500.8: combat/phase tallies an extra-combat loop pumps.
-    s.combat_phases_started_this_turn = 0;
-    s.end_steps_started_this_turn = 0;
+    // CR 500.1 + CR 500.8: the per-step tally an extra-phase loop pumps.
+    s.steps_started_this_turn.clear();
 
     // CR 104.4b / CR 732.2a — MODULO LAYER ONLY. The strict `loop_states_equal` /
     // `normalize_for_loop` are deliberately NOT changed; they never call this fn.
@@ -8563,7 +8603,7 @@ mod tests {
     use crate::game::game_object::GameObject;
     use crate::types::ability::TriggerDefinitionRef;
     use crate::types::identifiers::{
-        CardId, DelayedTriggerInstanceId, DelayedTriggerOrigin, DelayedTriggerToken,
+        CardId, DelayedTriggerInstanceId, DelayedTriggerOrigin, DelayedTriggerToken, ExtraPhaseId,
     };
     use crate::types::zones::Zone;
 
@@ -9333,10 +9373,9 @@ mod tests {
         );
     }
 
-    /// `snapshot` reads extra combat phases from `combat_phases_started_this_turn`
-    /// (entered, minus the one natural combat) plus the `BeginCombat` entries
-    /// queued in `state.extra_phases`. A queued `Upkeep` extra phase must not
-    /// change it.
+    /// `snapshot` reads extra combat phases from the step tally's `BeginCombat`
+    /// count (entered, minus the one natural combat) plus the whole combat phases
+    /// queued in `state.extra_phases`. A queued upkeep step must not change it.
     ///
     /// REVERT-PROBE: leaving `combat_phases` at its `Default` 0 flips the positive
     /// assertions.
@@ -9346,20 +9385,24 @@ mod tests {
 
         let mut state = GameState::new_two_player(7);
         // CR 506.1: one natural combat + two extra combats already ENTERED.
-        state.combat_phases_started_this_turn = 3;
+        for _ in 0..3 {
+            state.steps_started_this_turn.record(Phase::BeginCombat);
+        }
         // CR 500.8: one extra combat still QUEUED, plus a non-combat extra phase
         // that must be filtered out.
         state.extra_phases.push(ExtraPhase {
             anchor: Phase::EndCombat,
-            phase: Phase::BeginCombat,
+            segment: TurnSegment::Phase(PhaseGroup::Combat),
             attacker_restriction: None,
             attacker_restriction_source: None,
+            id: ExtraPhaseId::default(),
         });
         state.extra_phases.push(ExtraPhase {
             anchor: Phase::Upkeep,
-            phase: Phase::Upkeep,
+            segment: TurnSegment::Step(Phase::Upkeep),
             attacker_restriction: None,
             attacker_restriction_source: None,
+            id: ExtraPhaseId::default(),
         });
 
         let v = ResourceVector::snapshot(&state);
@@ -9371,11 +9414,82 @@ mod tests {
 
         // Removing the queued BeginCombat drops the axis to the entered term only.
         let mut consumed = GameState::new_two_player(7);
-        consumed.combat_phases_started_this_turn = 3;
+        for _ in 0..3 {
+            consumed.steps_started_this_turn.record(Phase::BeginCombat);
+        }
         let v2 = ResourceVector::snapshot(&consumed);
         assert_eq!(
             v2.combat_phases, 2,
             "with no queued extras, only the entered term (started - 1) remains"
+        );
+    }
+
+    /// `snapshot` counts only the whole combat phases queued in
+    /// `state.extra_phases`, not every queued whole phase: an added main phase
+    /// and an added beginning phase are not combats.
+    #[test]
+    fn snapshot_counts_queued_whole_combat_phases_only() {
+        let mut state = GameState::new_two_player(7);
+        // CR 506.1: the natural combat was entered, so no extra combat yet.
+        state.steps_started_this_turn.record(Phase::BeginCombat);
+        // CR 500.8: in the postcombat main phase, Relentless Assault queues its
+        // follow-up main phase and then its combat phase, and Temple of
+        // Atropos queues a whole beginning phase (CR 501.1).
+        for segment in [
+            TurnSegment::Phase(PhaseGroup::PostcombatMain),
+            TurnSegment::Phase(PhaseGroup::Combat),
+            TurnSegment::Phase(PhaseGroup::Beginning),
+        ] {
+            let id = state.mint_extra_phase_id();
+            state
+                .extra_phases
+                .push(crate::types::game_state::ExtraPhase {
+                    anchor: Phase::PostCombatMain,
+                    segment,
+                    attacker_restriction: None,
+                    attacker_restriction_source: None,
+                    id,
+                });
+        }
+
+        assert_eq!(
+            ResourceVector::snapshot(&state).combat_phases,
+            1,
+            "one queued whole combat phase is one extra combat; a queued whole main or beginning phase is none"
+        );
+    }
+
+    /// CR 732.2a: the modulo projection clears the step tally, so two positions
+    /// that differ only in steps begun this turn compare equal there (the strict
+    /// CR 104.4b comparator keeps them apart:
+    /// `types::game_state::tests::strict_loop_equality_compares_the_step_tally`).
+    /// The resource snapshot, taken on `normalize_for_loop` outputs, still reads
+    /// the extra-combat axis from the tally, so the tally is not normalized away.
+    #[test]
+    fn modulo_projection_clears_the_step_tally() {
+        let mut base = GameState::new_two_player(7);
+        base.steps_started_this_turn.record(Phase::Upkeep);
+        let same = base.clone();
+        let mut extra_upkeep = base.clone();
+        extra_upkeep.steps_started_this_turn.record(Phase::Upkeep);
+
+        assert!(
+            loop_states_equal_modulo_resources(&base, &same),
+            "reach guard: the unmodified clone is equal modulo resources"
+        );
+        assert!(
+            loop_states_equal_modulo_resources(&base, &extra_upkeep),
+            "the modulo projection clears the tally"
+        );
+
+        let mut combats = GameState::new_two_player(7);
+        for _ in 0..3 {
+            combats.steps_started_this_turn.record(Phase::BeginCombat);
+        }
+        assert_eq!(
+            ResourceVector::snapshot(&combats.normalize_for_loop()).combat_phases,
+            2,
+            "one natural combat and two extra combats entered"
         );
     }
 
@@ -9661,6 +9775,48 @@ mod tests {
         }
     }
 
+    /// CR 119.1 + CR 732.2a: two drain-cycle points whose stacks hold the same life-gain
+    /// trigger, differing only in the life TOTAL that trigger's firing event reports
+    /// (CR 603.7c), must compare modulo-EQUAL. The reported total is the projected
+    /// resource itself, so leaving it in compared content makes every drain cycle look
+    /// distinct and the loop is never certified. The control pair — a different life-change
+    /// AMOUNT — must still compare UNEQUAL: the projection drops the reading, never the
+    /// change.
+    ///
+    /// Revert proof: giving `LifeTotalReading` a derived `PartialEq` flips the first
+    /// assertion to `false`.
+    #[test]
+    fn modulo_equal_ignores_a_carried_life_total_reading() {
+        use crate::types::events::GameEvent;
+        use crate::types::game_state::StackEntryKind;
+
+        fn cycle_point(amount: i32, reported_total: i32) -> GameState {
+            let mut state = GameState::new_two_player(7);
+            state.players[1].life = reported_total;
+            let mut entry = trigger_entry(1, 500, 0);
+            if let StackEntryKind::TriggeredAbility { trigger_event, .. } = &mut entry.kind {
+                *trigger_event = Some(GameEvent::LifeChanged {
+                    player_id: PlayerId(1),
+                    amount,
+                    new_total: crate::types::events::LifeTotalReading(Some(reported_total)),
+                });
+            }
+            state.stack.push_back(entry);
+            state
+        }
+
+        assert!(
+            loop_states_equal_modulo_resources(&cycle_point(-1, 199), &cycle_point(-1, 198)),
+            "two drain cycles differing only in the life total their firing event reports \
+             must stay modulo-equal (CR 732.2a), or the loop is never certified"
+        );
+        assert!(
+            !loop_states_equal_modulo_resources(&cycle_point(-1, 199), &cycle_point(-2, 198)),
+            "a different life-change amount is a real difference in the period and must \
+             still compare UNEQUAL"
+        );
+    }
+
     /// The modulo comparator must treat two cascade cycle points whose stacks hold
     /// the SAME triggered ability from the SAME source but a DIFFERENT (fresh) entry
     /// id as equal — otherwise a mandatory trigger cascade is invisible to the modulo
@@ -9679,6 +9835,7 @@ mod tests {
                 token: DelayedTriggerToken(1),
                 instance: DelayedTriggerInstanceId(1),
                 source_id: ObjectId(500),
+                offer_id: None,
             }),
         );
         let mut b = a.clone();
@@ -9691,6 +9848,7 @@ mod tests {
                 token: DelayedTriggerToken(2),
                 instance: DelayedTriggerInstanceId(2),
                 source_id: ObjectId(500),
+                offer_id: None,
             }),
         );
         assert!(
@@ -13118,6 +13276,7 @@ mod tests {
             amount: ManaCost::default(),
             spell_filter: None,
             dynamic_count,
+            reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
         };
         assert!(
             !cover_with_static_on_stable(modify(Some(object_count_ref()))),
@@ -15658,6 +15817,7 @@ mod tests {
                 "OptionalEffectChoice (CR 603.5 + CR 608.2d)",
                 WaitingFor::OptionalEffectChoice {
                     player: PlayerId(0),
+                    decision_subject_id: None,
                     source_id: on_board[0],
                     description: None,
                     may_trigger_key: None,
@@ -17831,6 +17991,7 @@ mod tests {
             amount: ManaCost::NoCost,
             spell_filter: None,
             dynamic_count: None,
+            reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
         })
         .affected(TargetFilter::SelfRef)
         .condition(StaticCondition::QuantityComparison {
@@ -18034,6 +18195,7 @@ mod tests {
                 amount: ManaCost::NoCost,
                 spell_filter: None,
                 dynamic_count: None,
+                reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
             })
             .affected(TargetFilter::SelfRef)
             .condition(StaticCondition::QuantityComparison {
@@ -19928,6 +20090,78 @@ mod tests {
         );
     }
 
+    /// CR 113.6b: a definition that DECLARES `active_zones` functions only from the zones it
+    /// names, so a battlefield HOST carrying a `[Graveyard]`-declared definition cannot apply
+    /// in the replacement pipeline at all. Counting it as an observer is a false veto: it
+    /// routes an otherwise batchable loop to the safe O(N) discrete path for a definition that
+    /// provably can never observe the growing class.
+    ///
+    /// The host-zone test alone cannot see this — `obj.zone` is `Battlefield` in every arm
+    /// below. Only the per-definition authority
+    /// (`functioning_abilities::replacement_functions_in_zone`, the same one
+    /// `game::replacement`'s `object_replacement_candidate_applies` consults) separates them,
+    /// which is why the seam asks it.
+    ///
+    /// Three arms on the SAME fixture, one field apart, so the `false` is the DECLARATION's
+    /// verdict and not an empty board: undeclared ⇒ observed; declared `[Battlefield]` ⇒
+    /// observed; declared `[Graveyard]` ⇒ NOT observed.
+    ///
+    /// REVERT PROBE: drop the `replacement_functions_in_zone` term from
+    /// [`functioning_board_replacement_defs`] ⇒ the `[Graveyard]` arm flips to `true` ⇒ RED,
+    /// while the other two arms stay green (neither ever depended on the term).
+    #[test]
+    fn a_declared_out_of_zone_definition_does_not_observe_token_growth() {
+        use crate::types::ability::{
+            ControllerRef, QuantityModification, ReplacementDefinition, TargetFilter,
+        };
+
+        fn board_with_token_doubler(active_zones: Option<Vec<Zone>>) -> GameState {
+            let mut state = GameState::new_two_player(7);
+            let mut def = ReplacementDefinition::new(ReplacementEvent::CreateToken)
+                .token_owner_scope(ControllerRef::You)
+                .quantity_modification(QuantityModification::DOUBLE);
+            if let Some(zones) = active_zones {
+                def = def.active_zones(zones);
+            }
+            // Unfiltered on purpose: `board_has_active_replacement_among` excludes
+            // `valid_card: SelfRef` defs, so a self-scoped one would read `false` for a
+            // reason that has nothing to do with zones.
+            assert!(def.valid_card.is_none() || def.valid_card == Some(TargetFilter::SelfRef));
+            install_board_replacement(&mut state, 300, def);
+            state
+        }
+
+        let undeclared = board_with_token_doubler(None);
+        assert!(
+            token_growth_is_observed(&undeclared),
+            "BASELINE: an undeclared battlefield `CreateToken` doubler observes token growth —              the seam's new zone term must not touch the definitions that always counted"
+        );
+
+        let declared_battlefield = board_with_token_doubler(Some(vec![Zone::Battlefield]));
+        assert!(
+            token_growth_is_observed(&declared_battlefield),
+            "CR 113.6b: declaring the zone the host is actually IN keeps the definition an              observer — the term narrows by DECLARATION, not by the presence of one"
+        );
+
+        let declared_graveyard = board_with_token_doubler(Some(vec![Zone::Graveyard]));
+        // Reach-guard: the definition really is installed and functioning at the iterator
+        // level, so the `false` below is the zone authority's verdict and not an empty board.
+        assert_eq!(
+            crate::game::functioning_abilities::active_replacements(&declared_graveyard).count(),
+            1,
+            "reach-guard: the `[Graveyard]`-declared def IS installed on a battlefield host and              IS yielded by the all-zones iterator — the seam is what declines it"
+        );
+        assert_eq!(
+            functioning_board_replacement_defs(&declared_graveyard).count(),
+            0,
+            "CR 113.6b: a battlefield host whose definition declares only [Graveyard] cannot              apply in the pipeline, so the observer walk must not yield it"
+        );
+        assert!(
+            !token_growth_is_observed(&declared_graveyard),
+            "CR 113.6b: a definition that cannot apply must not veto batching — an              out-of-zone declaration does not observe the resource loop"
+        );
+    }
+
     /// Installs `def` as a FUNCTIONING battlefield replacement on a fresh permanent. The single
     /// fixture builder for every replacement row in this module, so the two-vector discipline
     /// below has exactly one definition site.
@@ -20637,6 +20871,9 @@ mod tests {
     ///   `sole_driver == None` assertion FAILS.
     /// * drop the `extra_phases` conjunct (CR 500.8) ⇒ the `phase_invariant == None`
     ///   assertion FAILS while the turn/phase ones still pass.
+    /// * drop either `extra_phase_resume` conjunct (CR 500.8 + CR 500.10) ⇒ the matching (p4)
+    ///   `phase_invariant == None` assertion FAILS while the paired `Some(BeginCombat)` still
+    ///   passes.
     /// * drop the turn-number conjunct ⇒ the differing-turn assertion FAILS.
     #[test]
     fn window_scope_is_fail_closed_on_a_heterogeneous_window() {
@@ -20715,14 +20952,69 @@ mod tests {
             .extra_phases
             .push(crate::types::game_state::ExtraPhase {
                 anchor: Phase::PreCombatMain,
-                phase: Phase::PreCombatMain,
+                segment: TurnSegment::Phase(PhaseGroup::PrecombatMain),
                 attacker_restriction: None,
                 attacker_restriction_source: None,
+                id: crate::types::identifiers::ExtraPhaseId::default(),
             });
         assert_eq!(
             window_scope_from_cover_frames(&pa, &pb_extra, None, None, None).phase_invariant,
             None,
             "(p3) CR 500.8: a pending extra phase breaks `equal phase ⇒ never left it`"
+        );
+
+        // (p4) CR 500.8 + CR 500.10: a combat added after the precombat main phase
+        // and the natural combat share the turn and the step label with no entry
+        // queued; only the frame inside the added combat has a unit in progress.
+        let at_begin_combat = || {
+            let mut s = base();
+            s.phase = Phase::BeginCombat;
+            s
+        };
+        let in_added_combat = || {
+            let mut s = at_begin_combat();
+            s.extra_phase_resume = vec![crate::types::game_state::InsertedPhaseResume {
+                anchor: Phase::PreCombatMain,
+                segment: TurnSegment::Phase(PhaseGroup::Combat),
+                entry: crate::types::identifiers::ExtraPhaseId::default(),
+            }];
+            s
+        };
+        assert_eq!(
+            window_scope_from_cover_frames(
+                &at_begin_combat(),
+                &at_begin_combat(),
+                None,
+                None,
+                None
+            )
+            .phase_invariant,
+            Some(Phase::BeginCombat),
+            "PAIRED POSITIVE: no unit in progress in either frame"
+        );
+        assert_eq!(
+            window_scope_from_cover_frames(
+                &in_added_combat(),
+                &at_begin_combat(),
+                None,
+                None,
+                None
+            )
+            .phase_invariant,
+            None,
+            "(p4) an inserted unit in progress in the first frame"
+        );
+        assert_eq!(
+            window_scope_from_cover_frames(
+                &at_begin_combat(),
+                &in_added_combat(),
+                None,
+                None,
+                None
+            )
+            .phase_invariant,
+            None,
+            "(p4) an inserted unit in progress in the second frame"
         );
 
         // (p1) different turns.
@@ -20931,7 +21223,7 @@ mod tests {
     ///   non-refusing value on drawgo's own data, so the `None`s above are a measured refusal
     ///   rather than an inert instrument.
     /// * ATTRIBUTION — `ResourceVector::snapshot` reads life / library / poison / energy /
-    ///   mana / battlefield counters / `combat_phases_started_this_turn` / `extra_phases`, and
+    ///   mana / battlefield counters / `steps_started_this_turn` / `extra_phases`, and
     ///   never `turn_number` or `phase`, so δ and the derived `k` are unchanged by the
     ///   flattening and the `None` → `Some` flip is attributable to the turn-position
     ///   conjunct alone.
