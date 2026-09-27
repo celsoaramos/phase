@@ -6633,6 +6633,21 @@ fn concretize_chosen_x_cost(cost: &AbilityCost, chosen_x: u32) -> AbilityCost {
                 value: chosen_x as i32,
             },
         },
+        // CR 107.3a + CR 601.2h: once X is announced, "discard X cards"
+        // (Restless Dreams) discards exactly that many cards.
+        AbilityCost::Discard {
+            count,
+            filter,
+            selection,
+            self_scope,
+        } if count.contains_x() => AbilityCost::Discard {
+            count: QuantityExpr::Fixed {
+                value: chosen_x as i32,
+            },
+            filter: filter.clone(),
+            selection: *selection,
+            self_scope: *self_scope,
+        },
         AbilityCost::Composite { costs } => AbilityCost::Composite {
             costs: costs
                 .iter()
@@ -9357,6 +9372,25 @@ fn additional_cost_x_max(
                 .map(|object| object.effective_mana_value())
                 .max()
                 .unwrap_or(0),
+        ),
+        // CR 107.3a + CR 601.2b: X in an additional "discard X cards" cost
+        // (Restless Dreams, Firestorm) is announced before later target
+        // choices, capped by the hand cards that can pay it.
+        AbilityCost::Discard {
+            count,
+            filter,
+            self_scope,
+            ..
+        } if count.contains_x() && !self_scope.is_source_card() => Some(
+            super::casting::find_eligible_discard_targets(
+                state,
+                player,
+                source_id,
+                filter.as_ref(),
+            )
+            .len()
+            .try_into()
+            .unwrap_or(u32::MAX),
         ),
         AbilityCost::Sacrifice(cost)
             if cost.requirement == SacrificeRequirement::Count { count: u32::MAX } =>
