@@ -1285,11 +1285,13 @@ pub fn candidate_actions_broad_with_probe(
             }
         }
         WaitingFor::ScryChoice { player, cards } => select_cards_variants(*player, cards, None),
-        // CR 702.60a: the Ripple bottom-order response is a full permutation of
-        // the uncast revealed pile. `select_cards_variants` yields the identity
-        // ordering (+ a couple of variants); `apply()` validates any permutation.
-        WaitingFor::RippleBottomOrder { player, cards, .. } => {
-            select_cards_variants(*player, cards, Some(cards.len()))
+        // CR 702.60a + CR 608.2d + CR 401.4: the bottom-order response is a full
+        // permutation of the revealed pile. The owner of those cards may arrange
+        // them in any order (CR 401.4). `bounded_select_card_permutations` yields
+        // bounded permutations (identity, reverse, and variants up to output cap).
+        WaitingFor::RippleBottomOrder { player, cards, .. }
+        | WaitingFor::RevealUntilBottomOrder { player, cards, .. } => {
+            bounded_select_card_permutations(*player, cards)
         }
         WaitingFor::ArrangePlanarDeckTopChoice {
             player,
@@ -1583,6 +1585,20 @@ pub fn candidate_actions_broad_with_probe(
         // rational agent prefers the battlefield leg. All picks are legal; policy
         // scoring orders them.
         WaitingFor::BeholdChoice { player, choices } => choices
+            .iter()
+            .map(|&id| {
+                candidate(
+                    GameAction::SelectCards { cards: vec![id] },
+                    TacticalClass::Selection,
+                    Some(*player),
+                )
+            })
+            .collect(),
+        // CR 701.71a + CR 608.2d: empower Jace chooses exactly one Jace token
+        // from the engine-provided candidates; every candidate is a legal pick.
+        WaitingFor::EmpowerJaceChoice {
+            player, choices, ..
+        } => choices
             .iter()
             .map(|&id| {
                 candidate(
@@ -2235,6 +2251,26 @@ pub fn candidate_actions_broad_with_probe(
                 Some(*player),
             ),
         ],
+        // CR 601.2f: one candidate per engine-authored representative order.
+        // The engine already proved that every distinct locked total cost is
+        // reachable by exactly one of these, so there is no size-based
+        // synthetic fallback to add here — enumerating more permutations would
+        // only hand the search duplicate outcomes to evaluate.
+        WaitingFor::OrderCostReductions {
+            player, outcomes, ..
+        } => outcomes
+            .iter()
+            .map(|outcome| {
+                candidate(
+                    GameAction::OrderCostReductions {
+                        order: outcome.order.clone(),
+                        hybrid_announcement: outcome.hybrid_announcement.clone(),
+                    },
+                    TacticalClass::Selection,
+                    Some(*player),
+                )
+            })
+            .collect(),
         // CR 118.3 + CR 601.2b + CR 605.3b: AI selects objects to pay a cost.
         // Single-object RemoveCounter chooses one source per candidate;
         // from-among RemoveCounter, Sacrifice, and optional zone-exile costs
@@ -2471,19 +2507,74 @@ pub fn candidate_actions_broad_with_probe(
                 )
             })
             .collect(),
-        // CR 712.12: Both MDFC land faces are playable — offer front or back
-        WaitingFor::ModalFaceChoice { player, .. } => vec![
-            candidate(
-                GameAction::ChooseModalFace { back_face: false },
-                TacticalClass::Selection,
-                Some(*player),
-            ),
-            candidate(
-                GameAction::ChooseModalFace { back_face: true },
-                TacticalClass::Selection,
-                Some(*player),
-            ),
-        ],
+        // CR 712.11b-c / CR 709.3-3a: a face election exposes only faces whose
+        // own characteristics can be cast. Ordinary MDFC land/spell prompts
+        // retain both actions. A resolution-owned prompt, however, exposes
+        // only faces the exact temporary permission can still cast; the handler
+        // independently enforces the same policy for forged direct submissions.
+        WaitingFor::ModalFaceChoice {
+            player,
+            object_id,
+            card_id,
+            ..
+        } => {
+            let resolution_permission =
+                crate::game::casting::current_resolution_cast_permission_index(
+                    state, *player, *object_id, *card_id,
+                );
+            let legal_faces = resolution_permission.and_then(|index| {
+                state
+                    .objects
+                    .get(object_id)
+                    .and_then(|object| object.casting_permissions.get(index.0))
+                    .and_then(|permission| match permission {
+                        crate::types::ability::CastingPermission::ExileWithAltCost {
+                            resolution_cleanup: Some(cleanup),
+                            ..
+                        } => Some(crate::game::casting::resolution_spell_face_legality_for_current_permission(
+                            state,
+                            *player,
+                            *object_id,
+                            &cleanup.face_policy,
+                            index,
+                        )),
+                        _ => None,
+                    })
+            });
+            let mut actions: Vec<_> = [false, true]
+                .into_iter()
+                .filter(|back_face| {
+                    legal_faces.is_none_or(
+                        |faces| {
+                            if *back_face {
+                                faces.back
+                            } else {
+                                faces.front
+                            }
+                        },
+                    )
+                })
+                .map(|back_face| {
+                    candidate(
+                        GameAction::ChooseModalFace { back_face },
+                        TacticalClass::Selection,
+                        Some(*player),
+                    )
+                })
+                .collect();
+            // A resolution-owned face election is pre-announcement, but it is
+            // still an elected cast transaction.  Surface its exact CancelCast
+            // authority; ordinary modal land/spell prompts intentionally have
+            // no such permission and remain uncancellable here.
+            if resolution_permission.is_some() {
+                actions.push(candidate(
+                    GameAction::CancelCast,
+                    TacticalClass::Pass,
+                    Some(*player),
+                ));
+            }
+            actions
+        }
         // CR 118.9: Alternative-cast prompt — surface both cost paths
         // uniformly across all keywords. The keyword discriminator lives on the
         // waiting state; the action shape is identical.
@@ -2779,16 +2870,16 @@ pub fn candidate_actions_broad_with_probe(
             })
             .collect(),
         // CR 903.9a: Commander owner may return it to the command zone.
-        // AI policy: always return to the command zone. Leaving a commander in
-        // the graveyard or exile forfeits a high-value reusable threat that the
-        // search has no reliable signal to value; declining is almost never
-        // correct and was misleading users into thinking the AI was throwing
-        // its commander away. Restrict the AI to the accept branch only.
-        WaitingFor::CommanderZoneChoice { player, .. } => vec![candidate(
-            GameAction::DecideOptionalEffect { accept: true },
-            TacticalClass::Selection,
-            Some(*player),
-        )],
+        WaitingFor::CommanderZoneChoice { player, .. } => [true, false]
+            .into_iter()
+            .map(|accept| {
+                candidate(
+                    GameAction::DecideOptionalEffect { accept },
+                    TacticalClass::Selection,
+                    Some(*player),
+                )
+            })
+            .collect(),
         // CR 310.11 + CR 704.5x: controller chooses a new protector.
         WaitingFor::BattleProtectorChoice {
             player, candidates, ..
@@ -5052,7 +5143,15 @@ fn attacker_actions(
     // assignment (completion collapses many illegal proposals to the same witness).
     let mut seen: HashSet<Vec<(ObjectId, AttackTarget)>> = HashSet::new();
     let mut actions = Vec::new();
-    for action in crate::game::combat::complete_attacker_proposals(state, &proposals) {
+    // CR 508.1d: the combat AI completes its own declaration with the tax
+    // posture it planned, at the root and in rollouts alike. These enumerated
+    // proposals carry no such plan, so they complete tax-free: no scorer here is
+    // positioned to commit to paying for an arbitrary proposal.
+    for action in crate::game::combat::complete_attacker_proposals(
+        state,
+        &proposals,
+        crate::game::combat::CombatTaxPosture::Refuse,
+    ) {
         if let GameAction::DeclareAttackers { attacks, .. } = &action {
             let mut key = attacks.clone();
             key.sort_unstable();
@@ -5129,18 +5228,23 @@ fn blocker_actions(
     }
 
     let mut seen = HashSet::new();
-    crate::game::combat::complete_blocker_proposals(state, player, &proposals)
-        .into_iter()
-        .filter_map(|action| {
-            let GameAction::DeclareBlockers { assignments } = &action else {
-                return None;
-            };
-            let mut key = assignments.clone();
-            key.sort_unstable();
-            seen.insert(key)
-                .then(|| candidate(action, TacticalClass::Block, Some(player)))
-        })
-        .collect()
+    crate::game::combat::complete_blocker_proposals(
+        state,
+        player,
+        &proposals,
+        crate::game::combat::CombatTaxPosture::Refuse,
+    )
+    .into_iter()
+    .filter_map(|action| {
+        let GameAction::DeclareBlockers { assignments } = &action else {
+            return None;
+        };
+        let mut key = assignments.clone();
+        key.sort_unstable();
+        seen.insert(key)
+            .then(|| candidate(action, TacticalClass::Block, Some(player)))
+    })
+    .collect()
 }
 
 fn select_cards_variants(
@@ -5187,6 +5291,26 @@ fn bounded_select_card_candidates(
         .map(|combo| {
             candidate(
                 GameAction::SelectCards { cards: combo },
+                TacticalClass::Selection,
+                Some(player),
+            )
+        })
+        .collect()
+}
+
+/// CR 401.4 + CR 608.2d + CR 702.60a: The bottom-order response is a full
+/// permutation of the revealed pile. The owner of those cards may arrange them
+/// in any order (CR 401.4). `bounded_select_card_permutations` yields bounded
+/// permutations (identity, alternate permutations, and reverse up to output cap).
+fn bounded_select_card_permutations(
+    player: PlayerId,
+    cards: &[crate::types::identifiers::ObjectId],
+) -> Vec<CandidateAction> {
+    bounded_permutations(cards, SELECTION_CANDIDATE_CAP)
+        .into_iter()
+        .map(|permutation| {
+            candidate(
+                GameAction::SelectCards { cards: permutation },
                 TacticalClass::Selection,
                 Some(player),
             )
@@ -5925,6 +6049,70 @@ fn push_object_combo(
     let key: Vec<u64> = combo.iter().map(|id| id.0).collect();
     if seen.insert(key) {
         output.push(combo);
+    }
+}
+
+/// CR 401.4: Generates permutations of `items` bounded by `output_cap`.
+///
+/// Identity order is always emitted first. For pools up to `SELECTION_POOL_CAP`,
+/// recursive backtracking yields up to `output_cap` permutations (all 24 at len 4,
+/// 64 of 120 at len 5), ensuring reverse is included. For larger pools, factorial
+/// blowup is avoided by providing the identity and reverse orders.
+fn bounded_permutations(
+    items: &[crate::types::identifiers::ObjectId],
+    output_cap: usize,
+) -> Vec<Vec<crate::types::identifiers::ObjectId>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    if items.len() == 1 {
+        return vec![items.to_vec()];
+    }
+    if items.len() > SELECTION_POOL_CAP {
+        let mut reverse = items.to_vec();
+        reverse.reverse();
+        return vec![items.to_vec(), reverse];
+    }
+    let mut output = Vec::new();
+    let mut current = Vec::with_capacity(items.len());
+    let mut used = vec![false; items.len()];
+    permute_objects_into(items, &mut current, &mut used, &mut output, output_cap);
+    let reverse: Vec<_> = items.iter().rev().copied().collect();
+    if !output.contains(&reverse) {
+        if output.len() >= output_cap {
+            output.pop();
+        }
+        output.push(reverse);
+    }
+    output
+}
+
+fn permute_objects_into(
+    items: &[crate::types::identifiers::ObjectId],
+    current: &mut Vec<crate::types::identifiers::ObjectId>,
+    used: &mut [bool],
+    out: &mut Vec<Vec<crate::types::identifiers::ObjectId>>,
+    cap: usize,
+) {
+    if out.len() >= cap {
+        return;
+    }
+    if current.len() == items.len() {
+        out.push(current.clone());
+        return;
+    }
+    for (i, &item) in items.iter().enumerate() {
+        if used[i] {
+            continue;
+        }
+        used[i] = true;
+        current.push(item);
+        permute_objects_into(items, current, used, out, cap);
+        current.pop();
+        used[i] = false;
+        if out.len() >= cap {
+            break;
+        }
     }
 }
 
@@ -7524,6 +7712,7 @@ mod tests {
             enters_attacking: false,
             owner_library: false,
             track_exiled_by_source: false,
+            face_down_in_exile: crate::types::ability::ExileConcealment::Public,
             face_down_profile: None,
             enter_with_counters: vec![],
             conditional_enter_with_counters: vec![],
@@ -9255,5 +9444,36 @@ mod tests {
             crate::ai_support::legal_actions(&declared).contains(&GameAction::DeclineShortcut),
             "the decline stays legal on both arms, which is what keeps the pair one axis apart"
         );
+    }
+
+    /// CR 401.4 + CR 608.2d: for RevealUntilBottomOrder and RippleBottomOrder, the owner
+    /// may arrange cards in any order. The AI must be able to offer alternate permutations
+    /// (e.g. [B, A] for [A, B]), not only the identity combination [A, B].
+    #[test]
+    fn reveal_until_bottom_order_ai_candidates_include_alternate_permutations() {
+        let mut state = GameState::new_two_player(42);
+        let a = ObjectId(10);
+        let b = ObjectId(20);
+        state.waiting_for = WaitingFor::RevealUntilBottomOrder {
+            player: PlayerId(0),
+            source_id: ObjectId(100),
+            cards: vec![a, b],
+            clear_markers: Vec::new(),
+            emit_reveal_until_resolved: None,
+            reveal_until_hit_snapshot: None,
+        };
+
+        let actions = candidate_actions_broad(&state);
+        let permutations: Vec<Vec<ObjectId>> = actions
+            .into_iter()
+            .filter_map(|cand| match cand.action {
+                GameAction::SelectCards { cards } => Some(cards),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(permutations.len(), 2);
+        assert_eq!(permutations[0], vec![a, b]);
+        assert_eq!(permutations[1], vec![b, a]);
     }
 }
