@@ -26337,6 +26337,57 @@ fn unadmitted_state_change_head_yields_an_honest_unknown_arm() {
     );
 }
 
+/// CR 102.1 + CR 508.1b: Preacher of the Schism — BOTH attack triggers keep their
+/// life-total gate. Before, each came out with no condition and no defender scope,
+/// so the token AND the card arrived on every attack.
+#[test]
+fn preacher_of_the_schism_keeps_both_life_gates() {
+    let triggers = parse_trigger_lines(
+        "Whenever this creature attacks the player with the most life or tied for most life, create a 1/1 white Vampire creature token with lifelink.",
+        "Preacher of the Schism",
+    );
+    assert_eq!(triggers.len(), 1);
+    assert_eq!(triggers[0].mode, TriggerMode::Attacks);
+    assert_eq!(
+        triggers[0].attack_target_filter,
+        Some(AttackTargetFilter::Player)
+    );
+    let vt = format!("{:?}", triggers[0].valid_target);
+    assert!(
+        vt.contains("PlayerAttribute") && vt.contains("LifeTotal") && vt.contains("GE"),
+        "defender must be scoped to the most-life player, got {vt}"
+    );
+
+    let triggers = parse_trigger_lines(
+        "Whenever this creature attacks while you have the most life or are tied for most life, you draw a card and you lose 1 life.",
+        "Preacher of the Schism",
+    );
+    assert_eq!(triggers.len(), 1);
+    assert_eq!(triggers[0].mode, TriggerMode::Attacks);
+    let cond = format!("{:?}", triggers[0].condition);
+    assert!(
+        cond.contains("LifeTotal { player: Controller }")
+            && cond.contains("GE")
+            && cond.contains("AllPlayers"),
+        "while-gate must be your life >= max life, got {cond}"
+    );
+}
+
+/// The "the player" arm only binds when the most-life qualifier follows.
+#[test]
+fn attacks_the_player_without_most_life_qualifier_does_not_bind_player_scope() {
+    let triggers = parse_trigger_lines(
+        "Whenever this creature attacks the player with the fewest cards in hand, draw a card.",
+        "Probe",
+    );
+    assert!(
+        triggers
+            .iter()
+            .all(|t| t.attack_target_filter.is_none() || t.valid_target.is_some()),
+        "an unmodelled 'the player' qualifier must not widen to every player: {triggers:?}"
+    );
+}
+
 /// CR 603.2 / CR 603.8 + CR 508.1m: an `or` inside a trigger's CONDITION is a
 /// condition disjunction, not an event list.
 #[test]
