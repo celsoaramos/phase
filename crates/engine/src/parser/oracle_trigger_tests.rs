@@ -26666,6 +26666,29 @@ fn unadmitted_state_change_head_yields_an_honest_unknown_arm() {
     );
 }
 
+/// CR 508.1m + CR 109.4: Pugnacious Hammerskull's while-gate must survive. The
+/// negated "you don't control another Dinosaur" used to fail to parse, the gate
+/// was dropped (`condition: None`) and the stun counter landed on EVERY attack.
+#[test]
+fn attacks_while_you_dont_control_another_type_keeps_the_gate() {
+    let triggers = parse_trigger_lines(
+        "Whenever this creature attacks while you don't control another Dinosaur, put a stun counter on it.",
+        "Pugnacious Hammerskull",
+    );
+    assert_eq!(triggers.len(), 1);
+    assert_eq!(triggers[0].mode, TriggerMode::Attacks);
+    // The gate lowers to "count of OTHER Dinosaurs you control == 0" (the same
+    // shape as Kari Zev's "you don't control a legendary Monkey").
+    let cond = format!("{:?}", triggers[0].condition);
+    assert!(
+        cond.contains("Another")
+            && cond.contains("Dinosaur")
+            && (cond.starts_with("Some(Not")
+                || (cond.contains("comparator: EQ") && cond.contains("Fixed { value: 0 }"))),
+        "expected the 'no other Dinosaur' gate, got {cond}"
+    );
+}
+
 /// CR 603.2 / CR 603.8 + CR 508.1m: an `or` inside a trigger's CONDITION is a
 /// condition disjunction, not an event list.
 #[test]
