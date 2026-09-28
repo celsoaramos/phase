@@ -1288,6 +1288,20 @@ pub(crate) fn finish_pending_cost_or_cast(
                 cost,
                 repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
             } => {
+                // CR 601.2f + CR 601.2h + CR 702.157a: one more payment of a
+                // repeatable additional cost (Squad, Replicate, …) is only a legal
+                // declaration while the total cost — the spell's cost plus every
+                // payment already declared plus this one — can still be paid. The
+                // `Once` arm above and repeatable Kicker (`next_offerable_kicker_option`)
+                // already preview this; without it the prompt kept offering "pay
+                // again" past what the player's mana covers, and the cast then died
+                // at payment (Roadkill Rodney: {2} + Squad {3} with five lands —
+                // accepting a second payment left only an unpayable "pay" and Cancel).
+                if !additional_cost_declaration_is_offerable(state, player, &pending, cost.clone())?
+                {
+                    pending.additional_cost_queue.remove(0);
+                    return finish_pending_cost_or_cast(state, player, pending, events);
+                }
                 let times_kicked = pending
                     .ability
                     .context
@@ -24410,7 +24424,7 @@ many tokens that are copies of it.)";
         let spell_id = builder.id();
         let card_id = scenario.state.objects[&spell_id].card_id;
         let mut runner = scenario.build();
-        fund_white(&mut runner, 4);
+        fund_white(&mut runner, 6); // Two payments, plus a payable third offer to decline.
 
         runner
             .act(GameAction::CastSpell {
@@ -24662,7 +24676,7 @@ its replicate cost was paid.)\nDraw a card.";
     fn replicate_paid_twice_creates_two_copies() {
         use crate::types::GameAction;
         let (mut runner, spell_id, card_id) = replicate_draw_scenario();
-        fund_colorless(&mut runner, 2); // {1} + {1} for two replicate payments
+        fund_colorless(&mut runner, 3); // {1} + {1} paid, plus a payable third offer to decline.
 
         runner
             .act(GameAction::CastSpell {
@@ -24728,7 +24742,7 @@ its replicate cost was paid.)\nDraw a card.";
     fn granted_replicate_paid_twice_creates_two_copies() {
         use crate::types::GameAction;
         let (mut runner, spell_id, card_id) = granted_replicate_draw_scenario();
-        fund_colorless(&mut runner, 2);
+        fund_colorless(&mut runner, 3); // Two payments, plus a payable third offer to decline.
 
         runner
             .act(GameAction::CastSpell {
@@ -24878,7 +24892,9 @@ its replicate cost was paid.)\nDraw a card.";
     fn replicate_paid_zero_times_creates_no_copies() {
         use crate::types::GameAction;
         let (mut runner, spell_id, card_id) = replicate_draw_scenario();
-        // {0} base cost — no mana needed when replicate is declined.
+        // {0} base cost; fund one {1} so the first replicate payment is offerable
+        // (CR 601.2f: an unpayable additional cost is never offered).
+        fund_colorless(&mut runner, 1);
 
         runner
             .act(GameAction::CastSpell {

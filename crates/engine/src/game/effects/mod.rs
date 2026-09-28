@@ -4070,6 +4070,20 @@ pub(crate) fn sub_outlives_false_parent_gate(sub: &ResolvedAbility) -> bool {
             && sub.sub_link == SubAbilityLink::SequentialSibling)
 }
 
+/// CR 608.2k: whether `condition` only reads the object paid as the ability's
+/// cost ("if the sacrificed creature was black"), possibly negated. Such a gate
+/// is independent of any sibling instruction's effect, so a sequential sibling
+/// carrying it is evaluated on its own even when the previous instruction's gate
+/// was false. Kept at the `resolve_ability_chain` call site (not in
+/// [`sub_outlives_false_parent_gate`]): delayed bodies carry no cost-paid object.
+fn condition_reads_only_cost_paid_object(condition: &AbilityCondition) -> bool {
+    match condition {
+        AbilityCondition::CostPaidObjectMatchesFilter { .. } => true,
+        AbilityCondition::Not { condition } => condition_reads_only_cost_paid_object(condition),
+        _ => false,
+    }
+}
+
 /// CR 608.2c: whether `node` is the next printed instruction of its chain
 /// rather than a resolution step of the node before it (see
 /// [`SubAbilityLink`]). The one instruction-unit authority for the walks that
@@ -14854,7 +14868,22 @@ fn resolve_chain_body(
                             ..
                         })
                     );
+                // CR 608.2c + CR 608.2k: a `SequentialSibling` gated on its OWN
+                // look-back at the cost-paid object ("…if the sacrificed creature
+                // was red. Draw a card if the sacrificed creature was black." —
+                // Lyzolda, the Blood Witch) is an independent instruction: its gate
+                // reads the object paid as the cost, not this node's effect, so a
+                // false gate here must not suppress it. Without this, sacrificing a
+                // mono-black creature skipped the draw because the damage clause's
+                // "was red" gate failed first.
+                let is_cost_paid_gated_sequential_sibling = sub.sub_link
+                    == SubAbilityLink::SequentialSibling
+                    && sub
+                        .condition
+                        .as_ref()
+                        .is_some_and(condition_reads_only_cost_paid_object);
                 if sub_outlives_false_parent_gate(sub)
+                    || is_cost_paid_gated_sequential_sibling
                     || (sub.sub_link == SubAbilityLink::SequentialSibling
                         && (sub.condition.is_none() || is_ordinal_sequential_sibling))
                 {
