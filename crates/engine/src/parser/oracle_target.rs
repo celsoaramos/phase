@@ -2469,6 +2469,42 @@ fn parse_named_filter_terminator(input: &str) -> Result<(&str, ()), nom::Err<Ora
                 )),
             ),
         ),
+        // CR 201.2 + CR 603.4: a comma followed by an imperative effect verb
+        // ends the name — it is the boundary between an intervening-if
+        // condition and its effect ("if you don't control another permanent
+        // named The Majestic Duo, create a token …"). Legendary epithets are
+        // noun phrases and never open with one of these verbs; "counter" is
+        // left out because it does open one ("Gimli, Counter of Kills"). The
+        // trailing space keeps a name-final verb ("Untap, Upkeep, Draw") whole.
+        value(
+            (),
+            (
+                tag(", "),
+                alt((
+                    alt((
+                        tag("create "),
+                        tag("draw "),
+                        tag("put "),
+                        tag("return "),
+                        tag("exile "),
+                        tag("destroy "),
+                        tag("sacrifice "),
+                        tag("search "),
+                        tag("gain "),
+                    )),
+                    alt((
+                        tag("lose "),
+                        tag("look "),
+                        tag("reveal "),
+                        tag("mill "),
+                        tag("scry "),
+                        tag("copy "),
+                        tag("shuffle "),
+                        tag("add "),
+                    )),
+                )),
+            ),
+        ),
     ))
     .parse(input)
 }
@@ -10498,6 +10534,33 @@ mod tests {
             TargetFilter::Typed(tf) => Some(tf),
             TargetFilter::And { filters } => filters.iter().find_map(typed_leg),
             _ => None,
+        }
+    }
+
+    /// CR 201.2 + CR 603.4: an imperative effect verb after a comma ends a
+    /// "named X" name (the intervening-if boundary), while an epithet that
+    /// opens with a verb-shaped word keeps the name whole.
+    #[test]
+    fn named_filter_stops_at_comma_before_an_effect_verb() {
+        for (text, name) in [
+            (
+                "permanent named the majestic duo, create a token that's a copy of it",
+                "the majestic duo",
+            ),
+            (
+                "creature named gimli, counter of kills you control",
+                "gimli, counter of kills",
+            ),
+        ] {
+            let (filter, _) = parse_type_phrase_folding(text);
+            let tf = typed_leg(&filter).expect("typed filter");
+            assert!(
+                tf.properties.contains(&FilterProp::Named {
+                    name: name.to_string()
+                }),
+                "{text}: {:?}",
+                tf.properties
+            );
         }
     }
 
