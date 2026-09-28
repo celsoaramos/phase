@@ -1911,6 +1911,15 @@ pub(crate) fn try_parse_max_hand_size(tp: &TextPair<'_>, text: &str) -> Option<S
     )
 }
 
+/// CR 118.9b: the casting methods a "using its <keyword> ability" graveyard
+/// permission can be honored with, because the engine casts them from the
+/// graveyard: Blitz (Sabin, Master Monk; Tenacious Underdog) and Bestow
+/// (Detective's Phoenix). Warp, Sneak and Mutate have no graveyard cast route,
+/// so a permission requiring them is declined rather than modeled.
+fn graveyard_cast_method_is_modeled(kind: KeywordKind) -> bool {
+    matches!(kind, KeywordKind::Blitz | KeywordKind::Bestow)
+}
+
 /// Handles three patterns, each with an optional alt-cost rider:
 /// 1. "Once during each of your turns, you may cast [filter] from your graveyard[ rider]." (Lurrus, Karador)
 /// 2. "You may play [filter] from your graveyard[ rider]." (Crucible of Worlds, Icetill Explorer)
@@ -1919,8 +1928,10 @@ pub(crate) fn try_parse_max_hand_size(tp: &TextPair<'_>, text: &str) -> Option<S
 /// Rider grammar (both possessive and number-insensitive):
 ///   " using " alt("its" | "their") " " <keyword_name> " " alt("ability" | "abilities")
 ///
-/// When present, the rider injects `FilterProp::HasKeywordKind { value: kind }` into the
-/// returned `affected: TargetFilter`, so eligibility is gated on that granted keyword.
+/// When present, the rider becomes the permission's typed
+/// `required_cast_keyword` (CR 118.9b); `affected` keeps only the card
+/// selection. A rider naming a method with no graveyard cast route in the
+/// engine, or an unrecognized " using ..." rider, declines the permission.
 /// CR 604.2 + CR 118.9: static continuous effect granting permission to cast via an
 /// alternative cost associated with the named keyword.
 pub(crate) fn try_parse_graveyard_cast_permission(
@@ -1970,6 +1981,7 @@ pub(crate) fn try_parse_graveyard_cast_permission(
                 graveyard_destination_replacement: None,
                 extra_cost: None,
                 enters_with_counter: None,
+                required_cast_keyword: None,
             })
             .affected(affected)
             .description(text.to_string()),
@@ -2125,8 +2137,26 @@ pub(crate) fn try_parse_graveyard_cast_permission(
     // Parse optional alt-cost rider from the text after "from your graveyard".
     // Thread its remainder so the final strict-consumption check below sees
     // exactly the text no modeled rider consumed.
-    let (trailing, rider_kind) = match parse_alt_cost_rider(trailing) {
-        Ok((rest, kind)) => (rest, Some(kind)),
+    //
+    // CR 118.9b: "An effect that allows you to cast a spell may require a
+    // certain alternative cost to be paid." The rider is the permission's
+    // required casting method, carried typed on the permission (not as a card
+    // selector in `affected`). A method the engine can't cast from the
+    // graveyard (warp: Timeline Culler; sneak: Ninja Teen; mutate: Brokkos,
+    // Apex of Forever) declines the whole permission, so it stays an honest
+    // gap rather than a permission whose only legal cast doesn't exist. A
+    // " using ..." rider that isn't recognized declines too, so an unknown
+    // method never becomes an unrestricted permission.
+    let (trailing, required_cast_keyword) = match parse_alt_cost_rider(trailing) {
+        Ok((rest, kind)) if graveyard_cast_method_is_modeled(kind) => (rest, Some(kind)),
+        Ok(_) => return None,
+        Err(_)
+            if tag::<_, _, OracleError<'_>>(" using ")
+                .parse(trailing)
+                .is_ok() =>
+        {
+            return None;
+        }
         Err(_) => (trailing, None),
     };
     // CR 614.1a + CR 607.1: peel the linked stack-exit destination sentence
@@ -2182,11 +2212,7 @@ pub(crate) fn try_parse_graveyard_cast_permission(
         return None;
     }
 
-    let affected = if let Some(kind) = rider_kind {
-        inject_keyword_kind_filter_prop(filter, kind)
-    } else {
-        filter
-    };
+    let affected = filter;
     // CR 400.7 + CR 604.2: the pool provenance the anchor stated ("cards in
     // your graveyard that were put there from … this turn") narrows WHICH
     // graveyard cards the permission offers. It rides `affected`, which
@@ -2201,6 +2227,7 @@ pub(crate) fn try_parse_graveyard_cast_permission(
         graveyard_destination_replacement,
         extra_cost,
         enters_with_counter,
+        required_cast_keyword,
     })
     .affected(affected)
     .description(text.to_string());
@@ -2340,9 +2367,8 @@ fn read_graveyard_pool_qualifier(after: &str) -> GraveyardPoolQualifier {
 }
 
 /// CR 604.2: AND-combine extra properties onto a permission's `affected`
-/// filter. Prop-vector generalization of [`inject_keyword_kind_filter_prop`],
-/// which folds exactly one property; both keep the same `Typed`-in-place /
-/// `And`-wrap shape so a `Typed` filter stays a `Typed` filter.
+/// filter, keeping the `Typed`-in-place / `And`-wrap shape so a `Typed` filter
+/// stays a `Typed` filter.
 fn inject_filter_props(filter: TargetFilter, props: Vec<FilterProp>) -> TargetFilter {
     if props.is_empty() {
         return filter;
@@ -2716,6 +2742,7 @@ fn try_parse_disjunctive_graveyard_cast_permission(
             graveyard_destination_replacement: None,
             extra_cost: None,
             enters_with_counter: None,
+            required_cast_keyword: None,
         })
         .affected(affected)
         .description(text.to_string()),
@@ -2757,6 +2784,7 @@ fn try_parse_unlimited_combined_graveyard_permission(
             graveyard_destination_replacement: None,
             extra_cost: None,
             enters_with_counter: None,
+            required_cast_keyword: None,
         })
         .affected(affected)
         .description(text.to_string()),
@@ -3411,6 +3439,7 @@ pub(crate) fn try_parse_spend_any_color_to_activate_abilities(
         StaticDefinition::new(StaticMode::SpendManaAsAnyColor {
             spell_filter: None,
             activation_source_filter: Some(activation_source_filter),
+            concession: crate::types::ability::ManaSpendPermission::AnyColor,
         })
         .affected(TargetFilter::Player)
         .description(text.to_string()),
@@ -3437,10 +3466,9 @@ pub(crate) fn try_parse_filtered_spend_any_type_to_cast(
     text: &str,
     lower: &str,
 ) -> Option<StaticDefinition> {
-    // CR 609.4b: "you may"/"you can" surface, then "spend mana of any type to
-    // cast ". The "mana of any type" wording (vs "any color") is the spell-cast
-    // any-type concession; the runtime treats both as `any_color` in
-    // mana_payment.rs (any mana satisfies a colored requirement).
+    // CR 609.4b + CR 118.14: "you may"/"you can" surface, then "spend mana of
+    // any type to cast ". The "mana of any type" wording (vs "any color") is the
+    // spell-cast any-type concession: at payment it also covers `{C}`.
     let rest = nom_tag_lower(text, lower, "you may spend mana of any type to cast ")
         .or_else(|| nom_tag_lower(text, lower, "you can spend mana of any type to cast "))?;
 
@@ -3485,11 +3513,13 @@ pub(crate) fn try_parse_filtered_spend_any_type_to_cast(
         StaticDefinition::new(StaticMode::SpendManaAsAnyColor {
             spell_filter: Some(filter),
             activation_source_filter: None,
+            // CR 118.14: "mana of any type" — colorless included.
+            concession: crate::types::ability::ManaSpendPermission::AnyTypeOrColor,
         })
         // For the filtered (`Some`) path `affected` is documentation-only:
         // controller-scoping is enforced at runtime by the explicit
         // `obj.controller != player_id` gate in
-        // `player_can_spend_as_any_color_for_spell_object`, which never reads
+        // `player_mana_spend_permission_for_spell_object`, which never reads
         // `def.affected`. Kept for intent + structural parity with the
         // board-wide (`None`) form, which DOES consult `affected`.
         .affected(TargetFilter::Controller)
@@ -4067,6 +4097,7 @@ mod spend_any_color_to_activate_abilities_tests {
             StaticMode::SpendManaAsAnyColor {
                 spell_filter: None,
                 activation_source_filter: Some(TargetFilter::Typed(typed)),
+                concession: crate::types::ability::ManaSpendPermission::AnyColor,
             } => {
                 assert!(typed.type_filters.contains(&TypeFilter::Creature));
                 assert_eq!(typed.controller, Some(ControllerRef::You));
@@ -4091,6 +4122,7 @@ mod spend_any_color_to_activate_abilities_tests {
             StaticMode::SpendManaAsAnyColor {
                 spell_filter: None,
                 activation_source_filter: Some(TargetFilter::SelfRef),
+                concession: crate::types::ability::ManaSpendPermission::AnyColor,
             }
         ));
     }
@@ -4311,6 +4343,7 @@ mod filtered_spend_any_type_tests {
             StaticMode::SpendManaAsAnyColor {
                 spell_filter: Some(TargetFilter::Typed(typed)),
                 activation_source_filter: None,
+                concession: crate::types::ability::ManaSpendPermission::AnyTypeOrColor,
             } => assert!(
                 typed.type_filters.contains(&TypeFilter::Creature),
                 "spell filter must scope to creature spells; got {typed:?}"

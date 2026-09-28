@@ -14,15 +14,42 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // duration (`Duration::UntilEvent` and the transient effect's
 // `duration_event_source`); v79 adds the CR 601.2f activated-ability
 // cost-reduction election (`ReductionProvenance::{AbilityCostRider,
-// TransientEffect}` and the `activation_cost_snapshot` carrier).
+// TransientEffect}` and the `activation_cost_snapshot` carrier); v80 reshapes
+// the face-down exile look link (`ExileLinkKind::HideawayLookable { grant,
+// lookers, source_incarnation }`); v81 adds the CR 702.117a Surge cast
+// election tag (`AlternativeCastKeyword::Surge`); v82 retypes
+// `AdditionalPhase.after` to `ExtraPhaseAnchor`, adds
+// `DelayedTriggerCondition::AtBeginningOfAddedPhase`, replaces
+// `ExtraPhase.phase` and the `extra_phase_resume` element with
+// `TurnSegment`-carrying records and minted ids, and replaces the two
+// per-turn step counters with the `steps_started_this_turn` tally; v83 adds
+// target-gated activation costs (`ReduceAbilityCost { targets, frequency }`,
+// the per-turn activation journal and the target-settlement carrier fields);
+// v84 adds required dungeon choice card and room previews.
+// v85 adds the tagged ignored-die display event; v86 adds the tagged
+// GameEvent::Melded event; v87 adds the Dig remainder split choice; v88 adds
+// `WaitingFor::DeclareBlockers.block_capacities` (CR 509.1a + CR 101.1); v89
+// adds the CR 118.9b required casting method on graveyard permissions
+// (`GraveyardCastPermission.required_cast_keyword`), the casting-menu
+// option's `additional_cost`, and the announced graveyard permission (the
+// option's `authority`, the slot prompt's `permission`, the latched terms).
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.
 const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
-// +8: upstream's v76 CR 601.2f caster-elected cost-reduction ordering, the
+// +10: upstream's v76 CR 601.2f caster-elected cost-reduction ordering, the
 // v77 pre-emptive bump ahead of new format names, the v78 CR 611.2a
-// event-deadline duration parse bump, and the v79 activated-ability
-// cost-reduction election.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 8;
+// event-deadline duration parse bump, the v79 activated-ability
+// cost-reduction election, the v80 exile look-link reshape, and the v81 Surge
+// cast election tag.
+// +11: the v82 CR 500.8–500.10 added-phase anchoring parse bump.
+// +12: the v83 target-gated activation costs.
+// +13: the v84 dungeon choice card and room previews.
+// +14: the v85 ignored-die display event.
+// +15: the v86 Melded event tag.
+// +16: the v87 Dig rest-split serialized choice and effect field.
+// +17: the v88 CR 509.1a + CR 101.1 block-capacities capability bump.
+// +18: the v89 graveyard cast-method requirement and permission announcement.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 18;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
@@ -52,7 +79,18 @@ const EXPECTED_MIN_LOBBY_PROTOCOL_FOR_DEFAULT_SCORING = 6;
 const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +6: wire 60 moves with full-game v78 for the event-deadline duration.
 // +7: wire 61 moves with full-game v79 for the activated-ability cost election.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 7;
+// +8: wire 62 moves with full-game v80 for the exile look-link reshape.
+// +9: wire 63 moves with full-game v81 for the Surge cast election tag.
+// +10: wire 64 moves with full-game v82 for added-phase anchoring.
+// +11: wire 65 moves with full-game v83 for target-gated activation costs.
+// +12: wire 66 moves with full-game v84 for dungeon choice previews.
+// +13: wire 67 moves with full-game v85 for ignored-die event batches.
+// +14: wire 68 moves with full-game v86 for the Melded event tag.
+// +15: wire 69 moves with full-game v87 for the Dig rest-split choice.
+// +16: wire 70 moves with full-game v88 for block-capacities.
+// +17: wire 71 moves with full-game v89 for the graveyard cast-method
+// requirement and permission announcement.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 17;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse
