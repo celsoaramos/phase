@@ -459,6 +459,23 @@ pub(crate) enum ContinuationAst {
         /// "put two of them into your hand and the rest on the bottom of your library".
         /// When None, a subsequent PutRest continuation handles rest_destination.
         rest_destination: Option<Zone>,
+        /// CR 401.2 + CR 701.20e + CR 608.2c: Set when the same clause names
+        /// BOTH library positions for the remainder instead of one destination
+        /// for all of it — "put one of those cards into your hand, one on top
+        /// of your library, and one on the bottom of your library" (Telling
+        /// Time). Carries how many of the remainder go on TOP; CR 401.2 leaves
+        /// the bottom as the only other position a library instruction can
+        /// name, so the bottom count is implied rather than stored twice.
+        /// Always accompanied by `rest_destination: Some(Zone::Library)`.
+        /// `None` for every uniform-remainder form, including the plain
+        /// "... and the rest on the bottom of your library".
+        ///
+        /// Boxed only to keep `clippy::large_enum_variant` satisfied:
+        /// `DigFromAmong` is already this enum's largest variant, and an
+        /// inline `QuantityExpr` here pushes it past the lint's ratio against
+        /// the second-largest variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rest_split_top_count: Option<Box<QuantityExpr>>,
         /// CR 400.5 + CR 608.2c: Only exact "in a random order" text sets
         /// `Random`; every other accepted form preserves existing behavior.
         #[serde(default)]
@@ -538,6 +555,11 @@ pub(crate) enum ContinuationAst {
         /// "put that card …" form (`KeepEach`).
         any_number: bool,
         rest_destination: Option<Zone>,
+        /// CR 400.5 + CR 608.2c + CR 701.20a: Rest-pile ordering. Defaults to
+        /// `Random` for library rest piles under CR 701.20a, or `PlayerChoice`
+        /// when "in any order" is specified.
+        #[serde(default)]
+        rest_order: crate::types::ability::DigRestOrder,
         /// CR 110.2a: "under your control" on the kept-card clause.
         enters_under: Option<ControllerRef>,
         /// CR 701.20a + CR 608.2c: `Some(decline_zone)` when the kept clause is
@@ -554,7 +576,14 @@ pub(crate) enum ContinuationAst {
     /// `rest_destination`. Used by cards like Balustrade Spy, Consuming Aberration,
     /// and Destroy the Evidence where "those cards" refers to all cards revealed
     /// during the RevealUntil resolution, not only the non-matching ones.
-    RevealUntilAllToZone { destination: Zone },
+    RevealUntilAllToZone {
+        destination: Zone,
+        #[serde(
+            default,
+            skip_serializing_if = "crate::types::ability::DigRestOrder::is_preserve"
+        )]
+        rest_order: crate::types::ability::DigRestOrder,
+    },
     /// CR 202.3 + CR 608.2c: "If its mana value is <comparator> <dynamic
     /// quantity>, put it onto <zone>[. Otherwise, put it into <zone>]." after
     /// RevealUntil — a card-property branch on the hit card's own mana value
