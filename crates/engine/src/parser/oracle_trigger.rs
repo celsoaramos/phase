@@ -1069,10 +1069,6 @@ fn parse_referenced_player_phrase(input: &str) -> OracleResult<'_, ()> {
 /// creatures", Akiri) also declines: that clause narrows the trigger further
 /// and is not modelled on this arm, so claiming the CR 508.3e restriction
 /// while dropping the qualifier would be worse than leaving the shape alone.
-/// CR 102.1: the defender qualifier shared by Dethrone's reminder text and the
-/// cards that print it as a plain attack trigger (leading space included).
-const MOST_LIFE_OR_TIED_DEFENDER: &str = " with the most life or tied for most life";
-
 fn parse_you_attack_player_object(rest: &str) -> Option<AttackTargetFilter> {
     let (remainder, filter) = alt((
         value(
@@ -13249,6 +13245,10 @@ fn strip_attack_alone_qualifier(after: &str) -> (bool, &str) {
         (false, after)
     }
 }
+
+/// CR 102.1: the defender qualifier shared by Dethrone's reminder text and the
+/// cards that print it as a plain attack trigger (leading space included).
+const MOST_LIFE_OR_TIED_DEFENDER: &str = " with the most life or tied for most life";
 
 /// Try to parse an event verb and build a TriggerDefinition from subject + event.
 fn try_parse_event(
