@@ -268,6 +268,7 @@ mod dihada_graveyard_treasure_count_8159;
 mod diligent_farmhand_counts_as_named;
 mod diluvian_primordial_6754;
 mod dina_noff_turn5_loader;
+mod discard_x_cost_class;
 mod disjunctive_state_change_head_coverage_honesty;
 mod disorder_in_the_court_5955;
 mod divine_gambit_metamorphose_prompt_8257;
