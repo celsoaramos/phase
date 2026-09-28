@@ -14226,6 +14226,7 @@ mod tests {
             kept_destination: Some(Zone::Hand),
             rest_destination: Some(Zone::Graveyard),
             rest_order: engine::types::ability::DigRestOrder::Preserve,
+            rest_split_top_count: None,
             source_id: None,
             enter_tapped: false,
             enters_attacking: false,
