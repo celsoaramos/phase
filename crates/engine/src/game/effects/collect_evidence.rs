@@ -260,6 +260,9 @@ fn complete_cost_payment(
         scry_bottom_count: None,
         scry_top_count: None,
     });
+    // CR 701.59a: this event is published after the choice, outside any chain
+    // window, so record it here.
+    super::record_player_action_this_turn(state, player, PlayerActionKind::CollectEvidence);
 
     match resume {
         CollectEvidenceResume::Casting {
@@ -279,6 +282,15 @@ fn complete_cost_payment(
             // have `None` and fall through to `pay_and_push`.
             if pending.activation_ability_index.is_some() {
                 return super::super::casting_costs::finish_activated_ability_at_payment_boundary(
+                    state, player, pending, events,
+                );
+            }
+            // CR 601.2f + CR 601.2h: collect evidence paid as a compound
+            // alternative cost's residual leaves the cast's other committed
+            // costs on the pending (an imposed tax for a spell targeting Terror
+            // of the Peaks); continue through the pending so they are paid.
+            if super::super::casting_costs::pending_carries_unpaid_committed_costs(&pending) {
+                return super::super::casting_costs::finish_pending_cost_or_cast(
                     state, player, pending, events,
                 );
             }
