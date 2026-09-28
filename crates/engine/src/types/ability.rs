@@ -33762,6 +33762,27 @@ impl ResolvedAbility {
         )
     }
 
+    /// CR 400.7 + CR 608.2b: True when a NON-triggered ability's source is no
+    /// longer the object that put it on the stack — sacrificed or exiled to pay
+    /// its own cost and brought back before resolution (Carrion Feeder under
+    /// Supernatural Stamina). "This creature" then names the departed object
+    /// and the instruction has no referent.
+    ///
+    /// Deliberately narrower than `!self_ref_is_current`: that authority fails
+    /// open for every non-triggered ability, and triggered sources keep their
+    /// own provenance rules there (a dies trigger's "it" is the card in the
+    /// graveyard; Bogardan Phoenix's counter goes on the returned card). A
+    /// self-move made by this ability's own resolution is still current via the
+    /// `resolution_source_relatch` read inside `source_is_current`.
+    pub fn self_ref_left_before_resolution(
+        &self,
+        state: &crate::types::game_state::GameState,
+    ) -> bool {
+        self.trigger_source.is_none()
+            && self.source_incarnation.is_some()
+            && !self.source_is_current(state)
+    }
+
     /// Returns whether a self-reference can resolve to the source's current
     /// object. A normal triggered source must still be its exact captured
     /// incarnation. The one exception is the immediate successor of the

@@ -57,6 +57,7 @@ fn resolve_object_targets(state: &GameState, ability: &ResolvedAbility) -> Vec<O
             // / "it" on a self-targeting ability) — it always resolves to the
             // source permanent, regardless of `ability.targets`. Mirrors the
             // `resolve_defined_or_targets` short-circuit.
+            TargetFilter::SelfRef if ability.self_ref_left_before_resolution(state) => Vec::new(),
             TargetFilter::SelfRef => vec![ability.source_id],
             _ => ability
                 .targets
