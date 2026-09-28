@@ -42,14 +42,26 @@ pub fn resolve(
             }
         })
         .unwrap_or(ability.source_id);
+    // CR 701.50b + CR 400.7: "~ connives" whose source left and returned before
+    // resolution. The returned permanent is a new object, so the connive uses the
+    // departed one's last known information: its controller still draws and
+    // discards, and `add_connive_counters` finds no current object for the
+    // captured identity and puts no counter.
+    let stale_source_incarnation = (conniver_id == ability.source_id
+        && ability.self_ref_binding(state).is_none())
+    .then_some(ability.source_incarnation)
+    .flatten();
 
     // CR 701.50a + CR 614.1a: Consult connive replacements (Leader,
     // Super-Genius — "If a creature you control would connive, instead you draw
     // a card, then that creature connives") before the draw/discard/counter
     // pipeline runs. The top-level resolve seeds an empty `applied` set.
-    let conniver = state
+    let mut conniver = state
         .capture_connive_subject(conniver_id)
         .ok_or(EffectError::ObjectNotFound(conniver_id))?;
+    if let Some(incarnation) = stale_source_incarnation {
+        conniver.snapshot.identity.incarnation = incarnation;
+    }
     propose_connive(state, conniver, count, HashSet::new(), events)
 }
 
