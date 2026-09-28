@@ -39051,7 +39051,7 @@ mod tests {
             outcomes: Vec::new(),
             pending_cast: dummy_pending(),
         }));
-        assert_eq!(variants.len(), 41);
+        assert_eq!(variants.len(), 42);
     }
 
     fn cast_opponent_prompt(purpose: CastOpponentChoicePurpose) -> WaitingFor {
