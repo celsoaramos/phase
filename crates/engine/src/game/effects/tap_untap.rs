@@ -40,7 +40,6 @@ pub(super) fn tap_untap_target_ids(
     effect_target: &TargetFilter,
 ) -> Vec<ObjectId> {
     match effect_target {
-        TargetFilter::SelfRef if ability.self_ref_left_before_resolution(state) => Vec::new(),
         TargetFilter::SelfRef => vec![ability.source_id],
         // CR 700.2 + CR 608.2c: "highest id" == "the set the currently-resolving
         // instruction published" — the ordering argument is written once, on

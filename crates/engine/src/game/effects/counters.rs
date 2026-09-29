@@ -2343,9 +2343,6 @@ pub(super) fn resolve_defined_or_targets(
     // `PutCounter { target: SelfRef }` sub-ability would inherit the parent's
     // targets via chain propagation in `effects::mod.rs::resolve_ability_chain`.
     if let Some(TargetFilter::SelfRef) = target_spec {
-        if ability.self_ref_left_before_resolution(state) {
-            return Vec::new();
-        }
         return vec![ability.source_id];
     }
 
