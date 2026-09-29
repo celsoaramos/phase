@@ -13,9 +13,10 @@
 //! prompt, not on `GameState`); only
 //! an auto-paid cast, which reaches the stack in the announcing action, fired.
 
-use engine::game::scenario::{GameScenario, GameRunner, P0, P1};
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::TargetRef;
 use engine::types::actions::GameAction;
+use engine::types::events::GameEvent;
 use engine::types::game_state::{CastPaymentMode, ShardChoice, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
@@ -59,7 +60,10 @@ fn announce(runner: &mut GameRunner, pump: ObjectId, priest: ObjectId, mode: Cas
             payment_mode: mode,
         })
         .expect("announce the pump spell");
-    if matches!(runner.state().waiting_for, WaitingFor::TargetSelection { .. }) {
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::TargetSelection { .. }
+    ) {
         runner
             .act(GameAction::SelectTargets {
                 targets: vec![TargetRef::Object(priest)],
@@ -75,7 +79,10 @@ fn resolve_all(runner: &mut GameRunner) {
         }
         runner.act(GameAction::PassPriority).expect("pass priority");
     }
-    assert!(runner.state().stack.is_empty(), "stack should have resolved");
+    assert!(
+        runner.state().stack.is_empty(),
+        "stack should have resolved"
+    );
 }
 
 fn poison(runner: &GameRunner) -> u32 {
@@ -97,7 +104,7 @@ fn phyrexian_life_payment_keeps_becomes_target_trigger() {
         runner.state().waiting_for,
         WaitingFor::PhyrexianPayment { .. }
     ));
-    runner
+    let finalized = runner
         .act(GameAction::SubmitPhyrexianChoices {
             choices: vec![ShardChoice::PayLife],
         })
@@ -106,6 +113,15 @@ fn phyrexian_life_payment_keeps_becomes_target_trigger() {
         runner.state().stack.len(),
         2,
         "the Rotpriest trigger goes on the stack above the spell"
+    );
+    // The announcing action already reported the targeting; the finalizing
+    // action must not report it again (the game log renders each one).
+    assert!(
+        !finalized
+            .events
+            .iter()
+            .any(|e| matches!(e, GameEvent::BecomesTarget { .. })),
+        "BecomesTarget reported twice"
     );
     resolve_all(&mut runner);
     assert_eq!(poison(&runner), 1);

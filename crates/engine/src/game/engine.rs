@@ -11059,19 +11059,27 @@ fn hold_cast_target_events(state: &mut GameState, waiting_for: &WaitingFor, even
     }
 }
 
-/// CR 601.2i + CR 603.3b: at a Priority boundary, hand the held events to the
-/// trigger scan when their spell is now on the stack. A cancelled cast (CR
-/// 601.2i rewinds it) never reaches the stack, so its events are dropped.
-fn release_held_cast_target_events(state: &mut GameState, events: &mut Vec<GameEvent>) {
+/// CR 601.2i + CR 603.3: at a Priority boundary, once the held events' spell is
+/// on the stack, append them to this action's events so the pipeline's trigger
+/// scan collects them. Returns where they start and a copy: the caller removes
+/// them after the scan (by value — the pipeline may reorder the buffer), because
+/// the announcing action already returned (and logged) them. A
+/// cancelled cast is reversed (CR 601.2 + CR 733.1), never reaches the stack,
+/// and its events are dropped.
+fn release_held_cast_target_events(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> Option<(usize, Vec<GameEvent>)> {
     if state.pending_cast.is_some() {
-        return;
+        return None;
     }
-    let Some((spell, held)) = state.held_cast_target_events.take() else {
-        return;
-    };
-    if state.stack.iter().any(|entry| entry.id == spell) {
-        events.extend(held);
+    let (spell, held) = state.held_cast_target_events.take()?;
+    if !state.stack.iter().any(|entry| entry.id == spell) {
+        return None;
     }
+    let start = events.len();
+    events.extend(held.iter().cloned());
+    Some((start, held))
 }
 
 fn apply_non_priority_pass_action(
@@ -15688,10 +15696,11 @@ fn apply_non_priority_pass_action(
         // the action's result, not the pre-action state (fixes stale TargetSelection
         // after CancelCast).
         state.waiting_for = waiting_for.clone();
-        // CR 601.2c + CR 603.3b: a spell whose cast paused after its targets
+        // CR 601.2c + CR 603.3: a spell whose cast paused after its targets
         // were announced reaches the stack in THIS action; its held
-        // `BecomesTarget` events join the scan below.
-        release_held_cast_target_events(state, &mut events);
+        // `BecomesTarget` events join the scan below, then leave the returned
+        // events — the announcing action already reported them.
+        let held_events = release_held_cast_target_events(state, &mut events);
         // CR 704.3 + CR 704.5f: a token battlefield entry postponed by an as-enters choice is
         // realized HERE, before the pipeline below, so the CR 400.7 row is written ahead of that
         // pipeline's SBA pass and survives a copy that enters with 0 toughness. It also puts the
@@ -15708,6 +15717,13 @@ fn apply_non_priority_pass_action(
             triggers_processed_inline,
             skip_deferred_trigger_drain,
         )?;
+        if let Some((start, held)) = held_events {
+            for event in held {
+                if let Some(at) = events[start..].iter().position(|e| *e == event) {
+                    events.remove(start + at);
+                }
+            }
+        }
         // CR 732.2a: the SECOND sampling site — a stack entry announced while a player
         // answers a FORCED pre-priority window.
         //
