@@ -396,6 +396,17 @@ fn copy_squad_with_payments(payments: u32) -> usize {
         })
         .expect("begin the Squad cast");
     for pay in std::iter::repeat_n(true, payments as usize).chain(std::iter::once(false)) {
+        // CR 601.2f: a further repeatable payment the pool can no longer afford
+        // is not offered, so the closing "stop paying" answer may never be
+        // asked (the pool here funds two Squad payments, not three).
+        if !pay
+            && !matches!(
+                runner.state().waiting_for,
+                WaitingFor::OptionalCostChoice { .. }
+            )
+        {
+            break;
+        }
         assert!(matches!(
             runner.state().waiting_for,
             WaitingFor::OptionalCostChoice { .. }
