@@ -133,5 +133,8 @@
   },
   {
     "branch": "card/sacrificed-source-self-counter"
+  },
+  {
+    "branch": "card/target-events-across-payment-pause"
   }
 ]
