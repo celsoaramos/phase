@@ -1906,14 +1906,21 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
     // printed-trigger effect context (`parse_trigger_line`), which likewise seeds
     // `subject`. Scoped to `DamageDone`; a `SelfRef`/`Any` subject ("he", Human
     // Torch) is left unset so its body keeps the source binding.
-    if matches!(trigger_def.mode, TriggerMode::DamageDone) {
-        if let Some(subject) = trigger_def
-            .valid_source
-            .clone()
-            .filter(|f| !matches!(f, TargetFilter::SelfRef | TargetFilter::Any))
-        {
-            inner_ctx.subject = Some(subject);
-        }
+    //
+    // CR 508.1 + CR 608.2k: the same for a non-batched `Attacks` trigger whose
+    // attacker is a set/other creature ("whenever a creature attacks this turn,
+    // it gets +1/+0" — Song of Blood): "it" is the attacking creature, carried
+    // in `valid_card`. Without the seed "it" fell back to `SelfRef` — the
+    // instant/sorcery itself, already in the graveyard — and nothing was pumped.
+    let subject = match trigger_def.mode {
+        TriggerMode::DamageDone => trigger_def.valid_source.clone(),
+        TriggerMode::Attacks if !trigger_def.batched => trigger_def.valid_card.clone(),
+        _ => None,
+    };
+    if let Some(subject) =
+        subject.filter(|f| !matches!(f, TargetFilter::SelfRef | TargetFilter::Any))
+    {
+        inner_ctx.subject = Some(subject);
     }
     let inner = parse_effect_chain_with_context(effect_text, AbilityKind::Spell, &mut inner_ctx);
 

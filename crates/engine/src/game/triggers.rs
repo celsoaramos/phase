@@ -11302,6 +11302,8 @@ pub(crate) fn filter_already_collected_trigger_events_from(
 /// event unchanged (paired with `matched_index`) for every other case
 /// (non-`WheneverEvent`, or no aggregate match — e.g. a `SelfRef` source already
 /// matching the per-source `DamageDealt` event directly, or a non-damage trigger).
+/// A non-batched `Attacks` trigger is split the same way, one occurrence per
+/// attacking creature (CR 508.1 + CR 603.2c).
 fn expand_multi_fire_damage_occurrences(
     condition: &crate::types::ability::DelayedTriggerCondition,
     events: &[GameEvent],
@@ -11339,11 +11341,38 @@ fn expand_multi_fire_damage_occurrences(
             .map(move |synth| (idx, synth))
         })
         .collect();
-    if expanded.is_empty() {
-        vec![(matched_index, matched_event.clone())]
-    } else {
-        expanded
+    if !expanded.is_empty() {
+        return expanded;
     }
+    // CR 603.2c + CR 508.1: the same holds for a declaration of attackers. A
+    // non-batched `Attacks` trigger ("whenever a creature attacks this turn, it
+    // gets …" — Song of Blood) triggers once PER ATTACKING CREATURE, exactly as
+    // the printed-trigger path does through `matching_attack_events`. Without the
+    // split the multi-fire delayed trigger fired ONCE on the aggregate
+    // `AttackersDeclared`, and with 2+ attackers `TriggeringSource` ("it")
+    // resolved to nothing, so no attacker got the bonus. Batched attack triggers
+    // ("whenever one or more creatures attack") keep the aggregate.
+    if matches!(trigger.mode, TriggerMode::Attacks) && !trigger.batched {
+        let attacks: Vec<(usize, GameEvent)> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, GameEvent::AttackersDeclared { .. }))
+            .flat_map(|(idx, event)| {
+                super::trigger_matchers::matching_attack_events(
+                    event,
+                    trigger,
+                    source_context,
+                    state,
+                )
+                .into_iter()
+                .map(move |synth| (idx, synth))
+            })
+            .collect();
+        if !attacks.is_empty() {
+            return attacks;
+        }
+    }
+    vec![(matched_index, matched_event.clone())]
 }
 
 /// CR 603.4 + CR 608.2c: does this delayed body still carry work that the
