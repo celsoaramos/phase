@@ -4154,6 +4154,10 @@ fn walk_ability(
         modal,
         mode_abilities,
         targets: _,
+        declares_chosen_group: _, // target identity, no additional state read/write
+        reads_chosen_group: _,    // selected objects are already in `targets`
+        declares_return_result: _, // producer effect accounts for publication
+        reads_return_result,      // instruction-local result is member-bound
         source_id: _,
         cast_occurrence: _,    // finalized-cast provenance, no read/write effect
         source_incarnation: _, // self-transform epoch latch, no read/write effect
@@ -4206,6 +4210,8 @@ fn walk_ability(
         sibling_condition: _, // replication marker, no read/write effect
         replacement_applied: _,
         parent_target_missing_reason: _,
+        activation_cost_reduction: _,
+        activation_record: _,
     } = a;
 
     // §4.3.2: a definition's own `player_scope` overrides the inherited scope for
@@ -4215,6 +4221,7 @@ fn walk_ability(
         .map_or(pscope_in, player_span_of_filter);
     let (eff, own_scope) = rw_effect(effect, chain_root, pscope, chain_move_owner);
     acc.merge(eff);
+    acc.reads_member_bound |= reads_return_result.is_some();
     let child_root = own_scope.or(chain_root);
     let child_move_owner = effect_move_owner(effect).or(chain_move_owner);
 
@@ -4311,6 +4318,10 @@ fn walk_definition(
         cost: _,
         description: _,
         target_prompt: _,
+        declares_chosen_group: _,  // definition-local target identity
+        reads_chosen_group: _,     // effect and target metadata are walked above
+        declares_return_result: _, // producer effect accounts for publication
+        reads_return_result,       // instruction-local result is member-bound
         activation_restrictions: _,
         // Payment-time only; it cannot create a resolution-time dependency.
         activation_mana_payment_restriction: _,
@@ -4349,6 +4360,7 @@ fn walk_definition(
         .map_or(pscope_in, player_span_of_filter);
     let (eff, own_scope) = rw_effect(effect, chain_root, pscope, chain_move_owner);
     acc.merge(eff);
+    acc.reads_member_bound |= reads_return_result.is_some();
     let child_root = own_scope.or(chain_root);
     let child_move_owner = effect_move_owner(effect).or(chain_move_owner);
 
@@ -5165,6 +5177,11 @@ fn rw_effect(
             // them", Stargaze) — a `QuantityExpr` resolved against game state, so it
             // is profiled like `count`. `None` = the fixed-count path (no read).
             keep_count_expr,
+            // CR 401.2 + CR 701.20e: the Telling Time-class remainder split
+            // size is a `QuantityExpr` resolved against game state exactly
+            // like `keep_count_expr`, so it is profiled the same way rather
+            // than ignored. `None` = no split (no read).
+            rest_split_top_count,
             destination: _,
             keep_count: _,
             up_to: _,
@@ -5182,6 +5199,9 @@ fn rw_effect(
             p.merge(rw_quantity_expr(count));
             if let Some(kc) = keep_count_expr {
                 p.merge(rw_quantity_expr(kc));
+            }
+            if let Some(split) = rest_split_top_count {
+                p.merge(rw_quantity_expr(split));
             }
             (p, None)
         }
