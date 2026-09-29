@@ -872,6 +872,67 @@ fn own_permanent_with_opponent_alternative(
         .then(|| PolicyReason::new("anti_self_harm_own_permanent_with_opponent_target"))
 }
 
+/// Mirror of [`own_permanent_with_opponent_alternative`]: refuse aiming a
+/// PURE creature-benefit spell (a non-negative pump, optionally with a Role
+/// attached to the same creature) at an opponent's permanent while the same
+/// slot still offers one the AI controls.
+///
+/// The soft target score already prefers the AI's creature, but the policy
+/// layer samples among candidates, so the opponent's creature still won a
+/// share of draws: Monstrous Rage (+2/+0 and a Monster Role attached) landed
+/// on the human's creature about 1 in 20 casts with the AI's own attacker
+/// available.
+///
+/// "Pure" is strict on purpose: every effect must be `Beneficial`, and at
+/// least one must be a `Pump`/`DoublePT` that targets creatures. Threaten
+/// effects (`GainControl` + pump + haste), where the opponent's creature IS
+/// the intended target, carry a non-`Beneficial` effect and stand down here.
+fn opponent_permanent_with_own_alternative(
+    ctx: &PolicyContext<'_>,
+    object_id: ObjectId,
+) -> Option<PolicyReason> {
+    if !matches!(
+        ctx.candidate.action,
+        GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(_))
+        }
+    ) {
+        return None;
+    }
+
+    let target = ctx.state.objects.get(&object_id)?;
+    if !players::is_opponent(ctx.state, ctx.ai_player, target.controller) {
+        return None;
+    }
+
+    let effects = ctx.effects();
+    let has_creature_pump = effects.iter().any(|effect| {
+        matches!(effect, Effect::Pump { .. } | Effect::DoublePT { .. })
+            && matches!(effect_polarity(effect), EffectPolarity::Beneficial)
+            && targets_creatures(effect)
+    });
+    let all_beneficial = effects
+        .iter()
+        .all(|effect| matches!(effect_polarity(effect), EffectPolarity::Beneficial));
+    if !has_creature_pump || !all_beneficial {
+        return None;
+    }
+
+    current_target_selection_targets(ctx.state)?
+        .iter()
+        .any(|target| match target {
+            TargetRef::Object(id) => ctx
+                .state
+                .objects
+                .get(id)
+                .is_some_and(|object| object.controller == ctx.ai_player),
+            TargetRef::Player(_) => false,
+        })
+        .then(|| {
+            PolicyReason::new("anti_self_harm_beneficial_opponent_target_with_own_alternative")
+        })
+}
+
 /// Refuse an ACTIVATION whose every legal target is a permanent the AI itself
 /// controls, and whose effect on that permanent is harmful.
 ///
@@ -1070,8 +1131,14 @@ fn untargeted_effect_confirms_ai_payoff(ctx: &PolicyContext<'_>, effect: &Effect
         // has no analogous SBA risk from gaining zero life), so ownership is
         // the whole question here.
         Effect::GainLife { player, .. } => resolves_to_ai(player),
-        // CR 111.7: the player who creates/owns the token(s).
-        Effect::Token { owner, .. } => resolves_to_ai(owner),
+        // CR 111.7: the player who creates/owns the token(s). A token created
+        // ATTACHED to something (CR 303.4f + CR 111.7 — Monstrous Rage's
+        // "create a Monster Role token attached to it") delivers its upside to
+        // whatever it enchants, not to its controller: owning a Role on the
+        // opponent's creature is that opponent's payoff, never the AI's.
+        Effect::Token {
+            owner, attach_to, ..
+        } => resolves_to_ai(owner) && attach_to.is_none(),
         // CR 605: the common, unmarked shape adds to the ACTIVATING player's
         // own pool (no explicit role at all). An explicit `ManaTargetRole`
         // (Jetfire-class "target player adds...") names some OTHER player's
@@ -1239,6 +1306,10 @@ fn target_reject_reason(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<P
             }
 
             if let Some(reason) = own_permanent_with_opponent_alternative(ctx, *object_id) {
+                return Some(reason);
+            }
+
+            if let Some(reason) = opponent_permanent_with_own_alternative(ctx, *object_id) {
                 return Some(reason);
             }
 
@@ -2863,9 +2934,12 @@ mod tests {
             "Pump +3/+3 should prefer own creature: own={score_own}, opp={score_opp}"
         );
         assert!(score_own > 0.0, "Own creature score should be positive");
+        // The opponent's creature is now a hard veto at the verdict level
+        // (`beneficial_pump_rejects_opponent_target_with_own_alternative`);
+        // a rejected target scores 0 here instead of a soft negative.
         assert!(
-            score_opp < 0.0,
-            "Opponent creature score should be negative"
+            score_opp <= 0.0,
+            "Opponent creature score should not be positive"
         );
     }
 
@@ -3416,6 +3490,135 @@ mod tests {
                 .find(|(id, _)| *id == PolicyId::AntiSelfHarm)
                 .map(|(_, verdict)| verdict),
             Some(PolicyVerdict::Score { .. })
+        ));
+    }
+
+    /// Monstrous Rage: "+2/+0 and create a Monster Role token attached to it".
+    /// The Role is the AI's token, but it enchants the TARGET — with no
+    /// friendly creature it was read as an AI payoff and the AI spent the
+    /// spell buffing the human's creature every time it could.
+    #[test]
+    fn monstrous_rage_rejected_without_a_friendly_creature_recipient() {
+        let mut state = make_state();
+        state.phase = Phase::PreCombatMain;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        add_creature(&mut state, PlayerId(1), "Opponent Creature", 2, 2);
+
+        let spell_id = create_object(
+            &mut state,
+            CardId(90_008),
+            PlayerId(0),
+            "Monstrous Rage".to_string(),
+            Zone::Hand,
+        );
+        let spell = state.objects.get_mut(&spell_id).unwrap();
+        spell.card_types.core_types.push(CoreType::Instant);
+        spell.mana_cost = ManaCost::zero();
+        *Arc::make_mut(&mut spell.abilities) = parsed_abilities(
+            "Monstrous Rage",
+            "Target creature gets +2/+0 until end of turn. Create a Monster Role token attached \
+             to it.",
+            &[],
+            &["Instant"],
+        );
+
+        let candidate = engine::ai_support::candidate_actions(&state)
+            .into_iter()
+            .find(|candidate| {
+                matches!(candidate.action, GameAction::CastSpell { object_id, .. } if object_id == spell_id)
+            })
+            .expect("the engine must offer the cast before the policy rejects it");
+        let verdict_kind = |state: &GameState| {
+            shared_registry_verdicts_for(state, &candidate)
+                .into_iter()
+                .find(|(id, _)| *id == PolicyId::AntiSelfHarm)
+                .map(|(_, verdict)| verdict)
+        };
+        assert!(matches!(
+            verdict_kind(&state),
+            Some(PolicyVerdict::Reject { reason })
+                if reason.kind == "anti_self_harm_beneficial_creature_spell_no_friendly_recipient"
+        ));
+
+        add_creature(&mut state, PlayerId(0), "Friendly Creature", 2, 2);
+        assert!(matches!(
+            verdict_kind(&state),
+            Some(PolicyVerdict::Score { .. })
+        ));
+    }
+
+    /// With a friendly creature available, a pure pump's target step must not
+    /// pick the opponent's creature: the soft score alone lost ~1 in 20
+    /// samples to the human's creature.
+    #[test]
+    fn beneficial_pump_rejects_opponent_target_with_own_alternative() {
+        let mut state = make_state();
+        let own_id = add_creature(&mut state, PlayerId(0), "Bear", 2, 2);
+        let opp_id = add_creature(&mut state, PlayerId(1), "Goblin", 2, 2);
+        let config = AiConfig::default();
+        let effect = Effect::Pump {
+            power: PtValue::Fixed(2),
+            toughness: PtValue::Fixed(0),
+            target: TargetFilter::Any,
+        };
+        let legal = vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)];
+
+        let verdict_for = |state: &mut GameState, pick: ObjectId| {
+            let (decision, candidate) = make_target_selection_ctx(
+                state,
+                effect.clone(),
+                legal.clone(),
+                Some(TargetRef::Object(pick)),
+            );
+            let ctx = PolicyContext {
+                state,
+                decision: &decision,
+                candidate: &candidate,
+                ai_player: PlayerId(0),
+                config: &config,
+                context: &crate::context::AiContext::empty(&config.weights),
+                cast_facts: None,
+                search_depth: crate::policies::context::SearchDepth::Root,
+            };
+            AntiSelfHarmPolicy.verdict(&ctx)
+        };
+
+        assert!(matches!(
+            verdict_for(&mut state, opp_id),
+            PolicyVerdict::Reject { reason }
+                if reason.kind == "anti_self_harm_beneficial_opponent_target_with_own_alternative"
+        ));
+        assert!(matches!(
+            verdict_for(&mut state, own_id),
+            PolicyVerdict::Score { .. }
+        ));
+
+        // Only the opponent's creature is legal: no alternative, no veto here
+        // (the cast-level gate is what declines the spell).
+        let (decision, candidate) = make_target_selection_ctx(
+            &mut state,
+            effect.clone(),
+            vec![TargetRef::Object(opp_id)],
+            Some(TargetRef::Object(opp_id)),
+        );
+        let ctx = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &crate::context::AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        assert!(!matches!(
+            AntiSelfHarmPolicy.verdict(&ctx),
+            PolicyVerdict::Reject { reason }
+                if reason.kind == "anti_self_harm_beneficial_opponent_target_with_own_alternative"
         ));
     }
 
