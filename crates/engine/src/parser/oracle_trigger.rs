@@ -31,6 +31,7 @@ use super::oracle_nom::condition::{
     parse_inner_condition, parse_spell_history_filter, parse_there_are_battlefield_count_clause,
 };
 use super::oracle_nom::condition::{parse_source_counters_exist, parse_source_has_counters};
+use super::oracle_nom::duration::parse_self_reference_subject;
 use super::oracle_nom::error::{oracle_err, OracleResult};
 use super::oracle_nom::filter::{
     parse_color_property, parse_enters_origin_zone, parse_property_filter, parse_with_property,
@@ -3737,6 +3738,33 @@ fn parse_unless_mana_payment(cost_str: &str) -> Option<AbilityCost> {
     Some(AbilityCost::Mana { cost: mana_cost })
 }
 
+/// CR 608.2f + CR 118.12a: true for a payer whose identity the `player_scope`
+/// fan-out binds per iteration, rather than the trigger event or a chosen target.
+fn payer_is_scope_bound(payer: &TargetFilter) -> bool {
+    matches!(payer, TargetFilter::ScopedPlayer)
+}
+
+/// CR 118.12: Extract a trigger-level "unless [player] pays {cost}" modifier,
+/// declining the hoist when the payer is scope-bound (the three text-shape
+/// deferrals live in [`hoist_unless_pay_modifier`]).
+fn extract_unless_pay_modifier(
+    text: &str,
+    condition_lower: &str,
+) -> (String, Option<UnlessPayModifier>) {
+    match hoist_unless_pay_modifier(text, condition_lower) {
+        // CR 608.2f + CR 101.4: an "each opponent / each player … unless they …"
+        // payment is one payment per affected player, offered in APNAP order, so
+        // its payer is bound only by the per-iteration fan-out. Hoisting it to the
+        // trigger root detaches it from the clause that fan-out iterates: the root
+        // resolves `ScopedPlayer` against whatever event-context machinery stamped
+        // `scoped_player` (or against nothing), taxing the controller or nobody.
+        // Decline; the per-clause path (`extract_resolution_unless_pay_modifier`)
+        // attaches it to the scoped node, where the fan-out rebinds the payer.
+        (_, Some(modifier)) if payer_is_scope_bound(&modifier.payer) => (text.to_string(), None),
+        result => result,
+    }
+}
+
 /// CR 118.12: Detect "unless [player] pays {cost}" in trigger effect text.
 /// Returns (cleaned effect text without the unless clause, optional UnlessPayModifier).
 ///
@@ -3747,7 +3775,7 @@ fn parse_unless_mana_payment(cost_str: &str) -> Option<AbilityCost> {
 /// - "destroy it unless you sacrifice a creature"        (UnlessCost::Sacrifice)
 /// - "draw a card unless you pay 2 life"                 (CR 119.4 — UnlessCost::PayLife)
 /// - "sacrifice it unless you pay {E}{E}"                (CR 107.14 — UnlessCost::PayEnergy)
-fn extract_unless_pay_modifier(
+fn hoist_unless_pay_modifier(
     text: &str,
     condition_lower: &str,
 ) -> (String, Option<UnlessPayModifier>) {
@@ -4023,6 +4051,17 @@ fn effect_references_that_player(effect_before_unless: &str) -> bool {
         || scan_contains(effect_before_unless, "to that opponent")
 }
 
+/// CR 608.2f + CR 118.12a: the scope-bearing subjects whose per-iteration player
+/// the `player_scope` fan-out binds as `scoped_player`, and which an
+/// unless-clause pronoun therefore refers to.
+fn parse_scoped_player_subject(input: &str) -> OracleResult<'_, TargetFilter> {
+    value(
+        TargetFilter::ScopedPlayer,
+        preceded(tag("each "), alt((tag("opponent "), tag("player ")))),
+    )
+    .parse(input)
+}
+
 fn infer_pronoun_unless_payer(
     effect_before_unless: &str,
     condition_lower: &str,
@@ -4039,15 +4078,18 @@ fn infer_pronoun_unless_payer(
     if effect_references_that_player(effect_before_unless) {
         return Some(TargetFilter::TriggeringPlayer);
     }
-    // CR 608.2c + CR 608.2f: in "each opponent [does X] unless they pay", the
-    // lowered ability has `player_scope = Opponent`; the runtime fan-out binds
-    // `ability.scoped_player` to each scoped opponent per iteration. The payer
+    // CR 608.2c + CR 608.2f: in "each opponent [does X] unless they pay" and in
+    // "each player [does X] unless they pay", the lowered ability has
+    // `player_scope = Opponent` / `All`; the runtime fan-out binds
+    // `ability.scoped_player` to each scoped player per iteration. The payer
     // must read that per-iteration binding via `ScopedPlayer` —
     // `resolve_effect_player_ref` maps `ScopedPlayer -> ability.scoped_player`
     // (targeting.rs). `Controller` would wrongly resolve to `state.active_player`
     // (effects/mod.rs), which is not the scoped opponent on a non-active turn.
-    if scan_contains(effect_before_unless, "each opponent ") {
-        return Some(TargetFilter::ScopedPlayer);
+    if let Some(payer) =
+        nom_primitives::scan_at_word_boundaries(effect_before_unless, parse_scoped_player_subject)
+    {
+        return Some(payer);
     }
     // CR 608.2b + CR 115.4: "... deals damage to target opponent/player
     // unless that player/they sacrifice ..." — the chosen player target pays
@@ -4420,6 +4462,23 @@ fn parse_unless_discard_cost_phrase(branch_text: &str) -> Option<AbilityCost> {
 /// (player-chosen). Those phrases stay unimplemented (Balduvian Horde class)
 /// until the unless-payment path preserves `CardSelectionMode::Random`.
 pub(crate) fn parse_unless_alt_cost(after_unless: &str) -> Option<AbilityCost> {
+    // CR 118.12 + CR 118.7a: "you pay its mana cost reduced by {N}" reduces only
+    // the generic component of the source's own mana cost.
+    if let Ok((_, (_, _, _, crate::types::mana::ManaCost::Cost { shards, generic }))) =
+        all_consuming((
+            tag::<_, _, OracleError<'_>>("you pay "),
+            nom::branch::alt((tag("its"), tag("~'s"))),
+            tag(" mana cost reduced by "),
+            nom_primitives::parse_mana_cost,
+        ))
+        .parse(after_unless.trim_end_matches('.').trim())
+    {
+        if shards.is_empty() {
+            return Some(AbilityCost::Mana {
+                cost: crate::types::mana::ManaCost::SelfManaCostReduced { reduction: generic },
+            });
+        }
+    }
     // CR 118.12 + CR 202.1: "you pay its mana cost" / "you pay ~'s mana cost" —
     // the unless cost is the ability source's OWN printed mana cost, which is
     // dynamic: it depends on the permanent the granting Aura is attached to
@@ -11302,6 +11361,41 @@ fn strip_while_state_clause(condition: &str) -> Option<(String, WhileStateGate)>
     Some((condition[..pos].trim_end().to_string(), gate))
 }
 
+/// CR 701.27e: "Some triggered abilities trigger when an object 'transforms
+/// into' an object with a specified characteristic." Such a line is a TRIGGERED
+/// ABILITY even though it is printed with `As` rather than CR 603.1's
+/// `[When/Whenever/At]` templating (Sephiroth, One-Winged Angel; Shinryu,
+/// Transcendent Rival; Curse of Leeches; Olag, Ludevic's Hubris).
+///
+/// CR 614.1c: `As [this permanent] enters …` is a REPLACEMENT effect, and
+/// `As long as …` / `As an additional cost …` are a static and a cost. The
+/// `peek` is therefore not optional garnish — it is the disambiguation. The
+/// keyword is admitted ONLY when the very next tokens are a self-reference
+/// followed by `" transforms into "`, so no other `As` head can reach this arm.
+///
+/// CR 603.1: the `alt` this feeds sits beside the printed `When`/`Whenever`
+/// templating, so the widened lexicon is a strict superset — no existing head
+/// changes meaning.
+///
+/// The self-reference token reuses [`parse_self_reference_subject`]
+/// (`oracle_nom::duration`), the single authority for source self-references —
+/// `~` (the live production path; `normalize_card_name_refs` runs upstream of
+/// both consumers) plus every `oracle_util::SELF_REF_TYPE_PHRASES` phrase
+/// ("this creature", "this permanent", …), which covers the direct callers
+/// such as `parse_trigger_line` that never normalise to `~`. Admitting that
+/// closed subject set costs nothing — the discriminating token is
+/// `" transforms into "`, and only a permanent can transform.
+pub(crate) fn parse_as_transforms_into_keyword(i: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        terminated(
+            tag("as "),
+            peek((parse_self_reference_subject, tag(" transforms into "))),
+        ),
+    )
+    .parse(i)
+}
+
 pub(crate) fn parse_trigger_condition(
     condition: &str,
     ctx: &mut ParseContext,
@@ -11410,10 +11504,16 @@ pub(crate) fn parse_trigger_condition(
     }
 
     // --- Subject + event decomposition ---
-    // Strip leading "when"/"whenever" using nom alt()
+    // CR 603.1 + CR 701.27e: strip the leading trigger keyword. `When`/`Whenever`
+    // are CR 603.1's printed templating; the CR 701.27e `As … transforms into …`
+    // head is admitted through `parse_as_transforms_into_keyword`, which guards
+    // itself against CR 614.1c `As … enters` replacements. `At` is deliberately
+    // absent: phase triggers are claimed upstream by `try_parse_phase_trigger`
+    // before this runs, and stripping `at ` would strand the phase clause.
     let after_keyword = alt((
         value((), tag::<_, _, OracleError<'_>>("whenever ")),
         value((), tag("when ")),
+        parse_as_transforms_into_keyword,
     ))
     .parse(lower.as_str())
     .map(|(rest, _)| rest)
@@ -14045,9 +14145,14 @@ fn try_parse_event(
         /// stack (e.g. Huge Truck "becomes the target of a backup ability").
         BecomesTargetBackupAbility,
         /// CR 115.1a + CR 602.2b: the targeting source is an ability (not a spell)
-        /// on the stack — "becomes the target of an ability [you control]". Loki,
-        /// God of Mischief.
-        BecomesTargetAbility,
+        /// on the stack — "becomes the target of an ability [you control]" (Loki,
+        /// God of Mischief) or, narrowed by kind, "…of an activated ability"
+        /// (Professor Hojo) / "…of a triggered ability". `kind` is the CR 113.3b vs
+        /// CR 113.3c distinction the text names; `None` is the unqualified form,
+        /// which admits both kinds.
+        BecomesTargetAbility {
+            kind: Option<crate::types::ability::StackAbilityKind>,
+        },
         /// CR 120.1 + CR 120.2a + CR 120.2b + CR 120.6 + CR 120.10: Passive-voice
         /// damage-received event, decomposed into its independent grammatical axes
         /// instead of one variant per cell of their product. Replaces the former
@@ -14361,16 +14466,35 @@ fn try_parse_event(
             value(SimpleEvent::Saddles, tag("saddles a mount")),
         )))
         .or(alt((
-            // CR 115.1a + CR 602.2b: "becomes the target of an ability [you control]".
+            // CR 115.1a + CR 602.2b: "become(s) the target of an ability [you control]".
             // Ability-only source (excludes spells) — distinct from the spell-or-
             // ability arm. Placed in this THIRD `.or(alt(..))` block because the
             // second block is at nom 8.0's 21/21 `alt` tuple-arity ceiling. Loki,
             // God of Mischief. The trailing controller/source clause is validated by
             // the dispatch arm's remaining-empty guard (rejects source-restricted
             // siblings like Skophos Maze-Warden / Agrus Kos).
-            value(
-                SimpleEvent::BecomesTargetAbility,
-                tag("becomes the target of an ability"),
+            //
+            // Composed, not enumerated: the verb number (singular / plural subject)
+            // and the ability kind are independent axes, so each is one `alt`.
+            // CR 113.3b / CR 113.3c: "activated" and "triggered" narrow the source
+            // to that one kind (Professor Hojo reads "…of an activated ability");
+            // the bare "an ability" admits both.
+            map(
+                preceded(
+                    (alt((tag("becomes"), tag("become"))), tag(" the target of ")),
+                    alt((
+                        value(
+                            Some(crate::types::ability::StackAbilityKind::Activated),
+                            tag("an activated ability"),
+                        ),
+                        value(
+                            Some(crate::types::ability::StackAbilityKind::Triggered),
+                            tag("a triggered ability"),
+                        ),
+                        value(None, tag("an ability")),
+                    )),
+                ),
+                |kind| SimpleEvent::BecomesTargetAbility { kind },
             ),
             // CR 702.26c: "phases in" / "phase in" — phasing trigger.
             value(SimpleEvent::PhasesIn, tag("phases in")),
@@ -14469,7 +14593,7 @@ fn try_parse_event(
             // and Agrus Kos ("...of an ability that targets only it...") — instead of
             // silently dropping the restriction and over-firing. Scoped to THIS arm
             // only; the shared spell-or-ability arms are untouched.
-            SimpleEvent::BecomesTargetAbility => {
+            SimpleEvent::BecomesTargetAbility { kind } => {
                 let (controller, tail) = parse_target_source_controller_tail(remaining);
                 if !tail.trim().is_empty() {
                     return None;
@@ -14478,10 +14602,15 @@ fn try_parse_event(
                 // CR 110.1: scope the permanent leaf to the battlefield so a targeted
                 // graveyard/exile card (also a TargetRef::Object) does not fire.
                 set_trigger_subject(&mut def, &battlefield_scope_permanent(subject));
+                // CR 113.3b / CR 113.3c: carry the printed kind so "an activated
+                // ability" does not fire on a triggered ability that targets the
+                // subject. `StackEntryKind::matches_stack_ability_kind` enforces it at
+                // match time, including against the virtual stack projection of an
+                // in-flight activation (`install_virtual_targeting_source`).
                 def.valid_source = Some(TargetFilter::StackAbility {
                     controller,
                     tag: None,
-                    kind: None,
+                    kind,
                 });
             }
             // CR 120.1 + CR 120.2a + CR 120.2b + CR 120.4b + CR 120.10: the channel axis

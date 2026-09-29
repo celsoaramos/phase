@@ -210,6 +210,53 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 91 — PendingManaAbility.chosen_counter_count is retyped to the required
+ *      chosen_counter_counts array (#9207). A v90 peer cannot deserialize
+ *      the new state. P2P moves in lockstep to wire 73.
+ * 90 — FormatConfig gains `allow_experimental_dungeons`, the per-session
+ *      capability flag behind the experimental dungeon pool. A v89 peer
+ *      parses a v90 GameState but runs the game without the host's pool;
+ *      the exact-match handshake refuses the pairing. P2P moves in lockstep
+ *      (wire 72); lobby carriers move too (LOBBY_PROTOCOL_VERSION 13).
+ * 89 — CR 118.9b graveyard permissions that require a casting method (Sabin,
+ *      Master Monk: "using its blitz ability"): GraveyardCastPermission gains
+ *      required_cast_keyword and casting-menu options gain additional_cost. A
+ *      v88 peer would drop the method silently and admit a printed-cost cast.
+ *      The same bump carries the announced graveyard permission (CR 601.2a-b):
+ *      casting-menu options gain authority, ChoosePermanentTypeSlot gains
+ *      permission, and the cast's context gains graveyard_permission_latch.
+ * 88 — WaitingFor.DeclareBlockers gains block_capacities (CR 509.1a +
+ *      CR 101.1): each able blocker's block limit, null for any number — see
+ *      PROTOCOL_VERSION's own `/// 88` entry in
+ *      crates/lobby-broker/src/protocol.rs. This client renders the map
+ *      directly as the pile stepper's ceiling; the exact-match version check
+ *      at connect refuses a mismatched pairing.
+ * 87 — WaitingFor.DigRestSplitChoice and Effect.Dig.rest_split_top_count
+ *      extend serialized game state for Telling Time-class rest piles. The
+ *      exact handshake refuses v86 peers; P2P moves in lockstep (wire 69).
+ *      Lobby messages are unchanged.
+ * 86 — GameEvent gained the tagged Melded variant. Full-game event frames
+ *      can carry it, so the exact handshake refuses v85 peers. P2P moves in
+ *      lockstep (wire 68); lobby messages are unchanged.
+ * 85 — GameEvent gained the tagged DieRollIgnored { player_id, sides, result }
+ *      display event. StateUpdate carries GameEvent[]; older peers would
+ *      accept the connection but omit ignored dice from the roll overlay.
+ *      P2P moves in lockstep; lobby messages are unchanged.
+ * 84 — WaitingFor.ChooseDungeon options (DungeonPreview) gained required
+ *      `card`, `rooms`, and `room_count`: the whole dungeon behind each
+ *      choice, so the prompt previews each card instead of describing only
+ *      its entry room. A PARSE bump like 67, not a capability bump like 24:
+ *      none of the fields is serde-optional, so a v83 peer fails
+ *      deserialization on a snapshot paused at the dungeon choice, and the
+ *      reverse skew throws in render — this client reads `card`
+ *      unconditionally to resolve the preview art. Saved games still load
+ *      through the choice-preview migration. P2P moves in lockstep; lobby
+ *      messages are unchanged.
+ * 83 — CR 601.2c + CR 602.2b target-gated activation costs (Professor Hojo,
+ *      Kopala): ReduceAbilityCost statics carry targets and frequency,
+ *      GameState journals each turn's activations, and the activation cost
+ *      carrier holds the target-settlement lock. A v82 peer would drop these
+ *      silently and price one activation differently.
  * 82 — Added-phase anchoring (CR 500.8–500.10): AdditionalPhase.after is an
  *      ExtraPhaseAnchor, DelayedTriggerCondition gained AtBeginningOfAddedPhase,
  *      ExtraPhase and extra_phase_resume entries carry a TurnSegment and a
@@ -564,8 +611,9 @@ export class NativeEngineVersionMismatchError extends Error {
  *      PendingCast.activation_cost_snapshot and AbilityModeChoice
  *      activation_cost_snapshot fields are additive and skipped when empty, so
  *      every spell frame is byte-identical to v78.
+ *
  */
-export const PROTOCOL_VERSION = 82;
+export const PROTOCOL_VERSION = 91;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
@@ -596,6 +644,19 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * PROTOCOL_VERSION moved twice for GameState-only changes and the derived lobby
  * window went disjoint from the deployed broker's.
  *
+ * 14 — PairingView.report_gate gains a `Hosted` arm (the Rust ReportGate enum's
+ *      new variant), the "a field's type changed" trigger. No broker emits it
+ *      until server-authoritative hosting is wired behind
+ *      MIN_LOBBY_PROTOCOL_FOR_HOSTED_MATCH (a later PR); mirrored in the
+ *      `ReportGate` union in types.ts so the wire type stays 1:1.
+ * 13 — FormatConfig gains `allow_experimental_dungeons` (#[serde(default)]) —
+ *      the "a lobby field is added" trigger — on its three lobby carriers:
+ *      CreateGameWithSettings (client → broker), JoinTargetInfo and PeerInfo
+ *      (broker → client). A CAPABILITY bump like 3, not a parse bump, so
+ *      MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL stays at 2: against a pre-13
+ *      broker the flag is absent and this client classifies JoinTargetInfo
+ *      frames without it, while a v12 client keeps creating and joining
+ *      games that simply never carry the override.
  * 12 — JoinTargetInfo gains an optional `draft_metadata`, the shape LobbyGame
  *      already carries — the "a lobby field is added" trigger.
  *      MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL stays at 2 and no capability floor is
@@ -714,7 +775,7 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * 1 — Initial lobby-owned version, covering the lobby variant set unchanged
  *     since #1880.
  */
-export const LOBBY_PROTOCOL_VERSION = 12;
+export const LOBBY_PROTOCOL_VERSION = 14;
 
 /**
  * Lowest broker LOBBY_PROTOCOL_VERSION this client accepts.
