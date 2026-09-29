@@ -11,6 +11,7 @@
 //! attack made a token AND drew a card, whatever the life totals.
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::types::player::PlayerId;
 use engine::types::actions::GameAction;
 use engine::types::game_state::WaitingFor;
 use engine::types::phase::Phase;
@@ -38,7 +39,14 @@ fn vampires(runner: &GameRunner) -> usize {
 }
 
 fn attack(my_life: i32, their_life: i32) -> Outcome {
-    let mut scenario = GameScenario::new();
+    attack_with(&[my_life, their_life], |_| {})
+}
+
+/// Seat one player per entry of `lives` (P0 attacks P1 with Preacher), declare
+/// the attack, run `in_response` while both triggers are on the stack, then
+/// resolve everything.
+fn attack_with(lives: &[i32], in_response: impl FnOnce(&mut GameRunner)) -> Outcome {
+    let mut scenario = GameScenario::new_n_player(lives.len() as u8, 42);
     scenario.at_phase(Phase::PreCombatMain);
     let preacher = {
         let mut b = scenario.add_creature(P0, "Preacher of the Schism", 2, 4);
@@ -46,8 +54,9 @@ fn attack(my_life: i32, their_life: i32) -> Outcome {
         b.id()
     };
     scenario.with_library_top(P0, &["Plains", "Plains", "Plains"]);
-    scenario.with_life(P0, my_life);
-    scenario.with_life(P1, their_life);
+    for (seat, life) in lives.iter().enumerate() {
+        scenario.with_life(PlayerId(seat as u8), *life);
+    }
     let mut runner = scenario.build();
 
     runner.state_mut().active_player = P0;
@@ -64,6 +73,7 @@ fn attack(my_life: i32, their_life: i32) -> Outcome {
             other => panic!("unexpected waiting_for before attackers: {other:?}"),
         }
     }
+    let my_life = lives[0];
     let hand_before = runner.state().players[0].hand.len();
     let vampires_before = vampires(&runner);
     runner
@@ -79,6 +89,7 @@ fn attack(my_life: i32, their_life: i32) -> Outcome {
             break;
         }
     }
+    in_response(&mut runner);
     runner.advance_until_stack_empty();
     Outcome {
         vampires: vampires(&runner) - vampires_before,
@@ -111,5 +122,41 @@ fn ahead_on_life_draws_only() {
         "defender is not the most-life player → no token"
     );
     assert_eq!(o.drew, 1, "you have the most life → draw");
+    assert_eq!(o.life_lost, 1);
+}
+
+/// CR 102.1: "the most life" is over ALL players, the attacker included. With
+/// three players and the attacker leading (30 / 20 / 10), the defender (20)
+/// is not the most-life player even though it leads the opponents — so no
+/// token. An opponents-only maximum would wrongly make one.
+#[test]
+fn three_players_attacker_leads_so_defender_gets_no_token() {
+    let o = attack_with(&[30, 20, 10], |_| {});
+    assert_eq!(o.vampires, 0, "20 is not the most life at a 30/20/10 table");
+    assert_eq!(o.drew, 1, "the attacker has the most life → draw");
+    assert_eq!(o.life_lost, 1);
+}
+
+/// Three players, the defender leads (10 / 25 / 20): token, and no draw.
+#[test]
+fn three_players_defender_leads_makes_token_only() {
+    let o = attack_with(&[10, 25, 20], |_| {});
+    assert_eq!(o.vampires, 1, "the defender has the most life → token");
+    assert_eq!(o.drew, 0, "the attacker is behind → no draw");
+    assert_eq!(o.life_lost, 0);
+}
+
+/// CR 508.1m + CR 603.4: both gates are read when Preacher is declared an
+/// attacker. The attacker leads at declaration (20 / 10); the defender then
+/// gains life to 30 while the triggers are on the stack. The draw still
+/// resolves (its "while" gate is not an intervening "if"), and the token
+/// never triggered (the defender was not the most-life player at declaration).
+#[test]
+fn life_change_in_response_does_not_undo_the_declaration_read() {
+    let o = attack_with(&[20, 10], |runner| {
+        runner.state_mut().players[1].life = 30;
+    });
+    assert_eq!(o.vampires, 0, "the defender was behind when attackers were declared");
+    assert_eq!(o.drew, 1, "the draw gate passed at declaration and is not rechecked");
     assert_eq!(o.life_lost, 1);
 }

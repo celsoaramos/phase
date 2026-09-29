@@ -5358,8 +5358,10 @@ fn preacher_of_the_schism_keeps_both_life_gates() {
 /// The "the player" arm only binds when the most-life qualifier follows.
 #[test]
 fn attacks_the_player_without_most_life_qualifier_does_not_bind_player_scope() {
-    // Unmodelled qualifiers: no "or tied" tail, a different superlative, and
-    // speed (no per-candidate reader) must never leave a bare Player scope.
+    // CR 508.1b: unmodelled "the player …" qualifiers — no "or tied" tail, a
+    // different superlative, and speed (no per-candidate reader) — must stay
+    // explicitly unsupported. The discriminating check is that NO `Attacks`
+    // trigger comes out at all: an unscoped one would fire on every attack.
     for text in [
         "Whenever this creature attacks the player with the fewest cards in hand, draw a card.",
         "Whenever this creature attacks the player with the most life, draw a card.",
@@ -5367,10 +5369,14 @@ fn attacks_the_player_without_most_life_qualifier_does_not_bind_player_scope() {
     ] {
         let triggers = parse_trigger_lines(text, "Probe");
         assert!(
+            !triggers.is_empty(),
+            "{text}: the line must still surface (as unsupported), not vanish"
+        );
+        assert!(
             triggers
                 .iter()
-                .all(|t| t.attack_target_filter.is_none() || t.valid_target.is_some()),
-            "{text}: an unmodelled 'the player' qualifier must not widen to every player: {triggers:?}"
+                .all(|t| !matches!(t.mode, TriggerMode::Attacks)),
+            "{text}: no generic Attacks trigger may escape: {triggers:?}"
         );
     }
     // Reach guard: the same grammar reads another property, not just life.
