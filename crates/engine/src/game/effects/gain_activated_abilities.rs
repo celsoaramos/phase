@@ -66,12 +66,21 @@ pub fn resolve(
     // remains readable at resolution — GATE #1, proven by the runtime test).
     let donor_id = match donor_filter {
         // CR 400.7: Symbiote's cost exiles it before the incarnation is
-        // captured, so the exiled card is still the current source here.
-        TargetFilter::SelfRef => ability.self_ref_binding(state).ok_or_else(|| {
-            EffectError::MissingParam(
-                "GainActivatedAbilitiesOfTarget donor is no longer the same object".to_string(),
-            )
-        })?,
+        // captured, so the exiled card is still the current source here. A
+        // donor that left and returned since is a new object with nothing to
+        // donate (CR 609.3): complete as a no-op, with the same completion
+        // event a live donor emits, so the rest of the chain runs unchanged.
+        TargetFilter::SelfRef => match ability.self_ref_binding(state) {
+            Some(donor_id) => donor_id,
+            None => {
+                events.push(GameEvent::EffectResolved {
+                    kind: EffectKind::from(&ability.effect),
+                    source_id: ability.source_id,
+                    subject: None,
+                });
+                return Ok(());
+            }
+        },
         _ => ability
             .targets
             .iter()
