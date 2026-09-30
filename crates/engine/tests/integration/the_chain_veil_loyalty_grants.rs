@@ -162,6 +162,10 @@ fn make_grant_ability(controller: PlayerId, source: ObjectId) -> ResolvedAbility
         selected_target_incarnations: Vec::new(),
         illegal_target_slots: Vec::new(),
         targets: vec![],
+        declares_chosen_group: None,
+        reads_chosen_group: None,
+        declares_return_result: None,
+        reads_return_result: None,
         kind: AbilityKind::Activated,
         sub_ability: None,
         else_ability: None,
@@ -184,7 +188,7 @@ fn make_grant_ability(controller: PlayerId, source: ObjectId) -> ResolvedAbility
         chosen_x: None,
         cost_paid_object: None,
         noted_mana_payment: None,
-        cost_paid_object_ids: Vec::new(),
+        cost_paid_objects: Vec::new(),
         effect_context_object: None,
         amassed_army_object: None,
         ability_index: None,
@@ -206,6 +210,8 @@ fn make_grant_ability(controller: PlayerId, source: ObjectId) -> ResolvedAbility
         modal: None,
         mode_abilities: vec![],
         parent_target_missing_reason: None,
+        activation_cost_reduction: None,
+        activation_record: None,
     }
 }
 
