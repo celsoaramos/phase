@@ -20171,6 +20171,23 @@ declare_game_state! {
     pub consumed_before_priority_trigger_events:
         Vec<crate::game::triggers::ConsumedTriggerEventOccurrence>,
 
+    /// CR 601.2c + CR 601.2i + CR 603.3: `BecomesTarget` events a spell announced while being
+    /// cast. `casting::emit_targeting_events` withholds them here while the spell's CR 601.2a
+    /// placeholder is on the stack and its object has not moved to the stack. The spell's
+    /// stack-placement authority (`casting_costs::finalize_cast_with_phyrexian_choices_inner`)
+    /// publishes them into the action where it becomes cast, immediately before `SpellCast`, so
+    /// they are reported once and scanned with that cast's observers. `casting::handle_cancel_cast`,
+    /// `casting_costs::handle_resolution_cast_rejection` and a fresh `announce_spell_on_stack`
+    /// discard them (CR 601.2 + CR 733.1; CR 400.7). Keyed by each event's `source_id`. Empty
+    /// after every finalize, cancel and resolution-cast rejection; other placeholder removals
+    /// (player elimination, remove_from_zone) leave inert rows that are never published, because
+    /// publishing needs a finalize, which needs a fresh announcement, which discards them. Not
+    /// compared by `impl PartialEq for GameState` (transient coordination, like
+    /// `consumed_before_priority_trigger_events`). Not redacted: spell targets are public. Not a
+    /// `LIVE_EVENT_CARRIER_FIELDS` root: it holds no `ZoneChanged`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_cast_target_events: Vec<GameEvent>,
+
     // CR 607.2a + CR 406.5: Exile tracking for "until leaves" linked abilities.
     #[serde(default)]
     pub exile_links: Vec<ExileLink>,
@@ -27191,6 +27208,7 @@ impl GameState {
             deferred_triggers: Vec::new(),
             pending_trigger_order: None,
             consumed_before_priority_trigger_events: Vec::new(),
+            held_cast_target_events: Vec::new(),
             exile_links: Vec::new(),
             paradigm_primed: Vec::new(),
             delayed_triggers: Vec::new(),
@@ -29571,6 +29589,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         deferred_triggers: _,
         pending_trigger_order: _,
         consumed_before_priority_trigger_events: _,
+        held_cast_target_events: _,
         exile_links: _,
         paradigm_primed: _,
         delayed_triggers: _,

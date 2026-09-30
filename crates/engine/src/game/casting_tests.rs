@@ -24519,7 +24519,7 @@ fn target_declaration_classifies_opponent_object_as_a_provisional_crime() {
     );
     let mut events = Vec::new();
     emit_targeting_events(
-        &state,
+        &mut state,
         &[TargetRef::Object(target)],
         ObjectId(99),
         PlayerId(0),
@@ -24558,7 +24558,7 @@ fn emit_targeting_events_own_object_no_crime() {
     );
     let mut events = Vec::new();
     emit_targeting_events(
-        &state,
+        &mut state,
         &[TargetRef::Object(target)],
         ObjectId(99),
         PlayerId(0),
@@ -24574,10 +24574,10 @@ fn emit_targeting_events_own_object_no_crime() {
 
 #[test]
 fn target_declaration_classifies_opponent_player_as_a_provisional_crime() {
-    let state = setup_game_at_main_phase();
+    let mut state = setup_game_at_main_phase();
     let mut events = Vec::new();
     emit_targeting_events(
-        &state,
+        &mut state,
         &[TargetRef::Player(PlayerId(1))],
         ObjectId(99),
         PlayerId(0),
@@ -24676,7 +24676,7 @@ fn pay_and_push_emits_targeting_events_for_chained_spell_targets() {
     // CR 601.2c: This direct payment-boundary test bypasses the normal target
     // declaration continuation, so reproduce its event before paying costs.
     emit_targeting_events(
-        &state,
+        &mut state,
         &flatten_targets_in_chain(&ability),
         object_id,
         PlayerId(0),
@@ -24721,6 +24721,93 @@ fn pay_and_push_emits_targeting_events_for_chained_spell_targets() {
             GameEvent::CrimeCommitted { player_id } if *player_id == PlayerId(0)
         )
     }));
+}
+
+/// CR 601.2a: `spell_cast_announced_not_placed` is true only for a spell whose
+/// placeholder `StackEntryKind::Spell` entry is on the stack while its object
+/// is still in the origin zone — the window in which `emit_targeting_events`
+/// withholds its `BecomesTarget` events.
+#[test]
+fn spell_cast_announced_not_placed_classifies_sources() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_object(
+        &mut state,
+        CardId(77),
+        PlayerId(0),
+        "Announced Spell".to_string(),
+        Zone::Hand,
+    );
+    // Reach-guard: no placeholder yet → not a spell being cast.
+    assert!(!spell_cast_announced_not_placed(&state, spell));
+
+    // CR 601.2a: the placeholder `announce_spell_on_stack` pushes (object stays
+    // in its origin zone until finalize moves it).
+    state.stack.push_back(StackEntry {
+        id: spell,
+        source_id: spell,
+        controller: PlayerId(0),
+        kind: StackEntryKind::Spell {
+            card_id: CardId(77),
+            ability: None,
+            casting_variant: CastingVariant::Normal,
+            actual_mana_spent: 0,
+        },
+    });
+    assert!(spell_cast_announced_not_placed(&state, spell));
+
+    // The same object after finalize's move to the stack (same object id):
+    // it has become cast, so its targets are no longer withheld.
+    state.objects.get_mut(&spell).unwrap().zone = Zone::Stack;
+    assert!(!spell_cast_announced_not_placed(&state, spell));
+
+    // A spell entry whose object was born on the stack (a copy) → false.
+    let copy = create_object(
+        &mut state,
+        CardId(78),
+        PlayerId(0),
+        "Copy".to_string(),
+        Zone::Stack,
+    );
+    state.stack.push_back(StackEntry {
+        id: copy,
+        source_id: copy,
+        controller: PlayerId(0),
+        kind: StackEntryKind::Spell {
+            card_id: CardId(78),
+            ability: None,
+            casting_variant: CastingVariant::Normal,
+            actual_mana_spent: 0,
+        },
+    });
+    assert!(!spell_cast_announced_not_placed(&state, copy));
+
+    // A battlefield source with an activated ability on the stack: no Spell
+    // entry carries its id → false.
+    let permanent = create_object(
+        &mut state,
+        CardId(79),
+        PlayerId(0),
+        "Rod".to_string(),
+        Zone::Battlefield,
+    );
+    state.stack.push_back(StackEntry {
+        id: ObjectId(900),
+        source_id: permanent,
+        controller: PlayerId(0),
+        kind: StackEntryKind::ActivatedAbility {
+            source_id: permanent,
+            ability: Box::new(ResolvedAbility::new(
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                Vec::new(),
+                permanent,
+                PlayerId(0),
+            )),
+        },
+    });
+    assert!(!spell_cast_announced_not_placed(&state, permanent));
 }
 
 // ── Modal spell tests ────────────────────────────────────────────────

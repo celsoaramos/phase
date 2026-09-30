@@ -8978,7 +8978,7 @@ fn prepare_trigger_targets(state: &GameState, trigger: &PendingTrigger) -> Prepa
             }
             let mut events = Vec::new();
             super::casting::emit_targeting_events(
-                &prepared_state,
+                &mut prepared_state,
                 &super::ability_utils::declared_targets_in_chain(&prepared_trigger.ability),
                 prepared_trigger.source_id,
                 prepared_trigger.controller,

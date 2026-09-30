@@ -754,34 +754,88 @@ pub(crate) fn sacrifice_cost_bounds_with_chosen_x(
 
 /// Emit `BecomesTarget` events for each target at target declaration.
 ///
+/// CR 601.2c: targets are declared here. CR 601.2i + CR 603.3: a spell's are
+/// reported when it becomes cast — while `source_id` is a spell still being
+/// cast ([`spell_cast_announced_not_placed`]), its events are withheld in
+/// `GameState::held_cast_target_events` and published by the stack-placement
+/// authority (`casting_costs::finalize_cast_with_phyrexian_choices_inner`)
+/// immediately before `SpellCast`, so a cast that pauses between announcement
+/// and stack placement still reports them exactly once, scanned with that
+/// cast's observers. Activations, triggered abilities and spells already on the
+/// stack emit into `events` directly.
+///
 /// Crime commitment is deliberately separate: CR 700.13's targeting
 /// classification is retained through the in-flight action and recorded only
 /// after the spell or ability has successfully reached the stack.
 pub(crate) fn emit_targeting_events(
-    _state: &GameState,
+    state: &mut GameState,
     targets: &[TargetRef],
     source_id: ObjectId,
     controller: PlayerId,
     events: &mut Vec<GameEvent>,
 ) {
+    let withhold = spell_cast_announced_not_placed(state, source_id);
     for target in targets {
-        match target {
-            TargetRef::Object(obj_id) => {
-                events.push(GameEvent::BecomesTarget {
-                    target: TargetRef::Object(*obj_id),
-                    source_id,
-                    source_controller: controller,
-                });
-            }
-            TargetRef::Player(pid) => {
-                events.push(GameEvent::BecomesTarget {
-                    target: TargetRef::Player(*pid),
-                    source_id,
-                    source_controller: controller,
-                });
-            }
+        let event = GameEvent::BecomesTarget {
+            target: target.clone(),
+            source_id,
+            source_controller: controller,
+        };
+        if withhold {
+            state.held_cast_target_events.push(event);
+        } else {
+            events.push(event);
         }
     }
+}
+
+/// CR 601.2a: whether `source_id` is a spell whose casting has been proposed
+/// but that has not yet become cast — its placeholder `StackEntryKind::Spell`
+/// entry (pushed by `announce_spell_on_stack`, `id` = the spell's object id) is
+/// on the stack while the object itself still sits in its origin zone, which it
+/// leaves only when finalize performs the move to the stack.
+///
+/// The `StackEntryKind::Spell` conjunct excludes battlefield sources
+/// (activated and loyalty abilities), which have no spell entry. The
+/// `zone != Zone::Stack` conjunct excludes objects already in `Zone::Stack`: a
+/// spell that has become cast (its cast triggers target with it as source) and
+/// copies born on the stack.
+pub(crate) fn spell_cast_announced_not_placed(state: &GameState, source_id: ObjectId) -> bool {
+    state
+        .stack
+        .iter()
+        .any(|entry| entry.id == source_id && matches!(entry.kind, StackEntryKind::Spell { .. }))
+        && state
+            .objects
+            .get(&source_id)
+            .is_some_and(|obj| obj.zone != Zone::Stack)
+}
+
+/// CR 601.2i + CR 603.3: move `spell`'s withheld `BecomesTarget` events into
+/// `events` in announcement order, keeping any other spell's rows.
+pub(crate) fn publish_held_cast_target_events(
+    state: &mut GameState,
+    spell: ObjectId,
+    events: &mut Vec<GameEvent>,
+) {
+    let (published, kept): (Vec<GameEvent>, Vec<GameEvent>) =
+        std::mem::take(&mut state.held_cast_target_events)
+            .into_iter()
+            .partition(|event| held_target_event_of(event, spell));
+    state.held_cast_target_events = kept;
+    events.extend(published);
+}
+
+/// CR 601.2 + CR 733.1 / CR 400.7: drop `spell`'s withheld `BecomesTarget`
+/// events — its cast was reversed, or a new casting of the object begins.
+pub(crate) fn discard_held_cast_target_events(state: &mut GameState, spell: ObjectId) {
+    state
+        .held_cast_target_events
+        .retain(|event| !held_target_event_of(event, spell));
+}
+
+fn held_target_event_of(event: &GameEvent, spell: ObjectId) -> bool {
+    matches!(event, GameEvent::BecomesTarget { source_id, .. } if *source_id == spell)
 }
 
 /// CR 700.13: Whether this announced target set commits a crime for `controller`.
@@ -18242,6 +18296,9 @@ fn announce_spell_on_stack(
     // stale behold creature-type choice left on the spell object from a prior
     // resolution (#5051; cancel rewind uses the same clear in handle_cancel_cast).
     clear_cast_scoped_creature_type_choice(state, prepared.object_id);
+    // CR 400.7: a new announcement is a new casting of this object; nothing
+    // withheld from an earlier, abandoned announcement may be published by it.
+    discard_held_cast_target_events(state, prepared.object_id);
 
     stack::push_to_stack(
         state,
@@ -27458,6 +27515,9 @@ pub fn handle_cancel_cast(
     _events: &mut Vec<GameEvent>,
 ) {
     state.cancelled_casts.push(pending.object_id);
+    // CR 601.2 + CR 733.1: the reversed cast's announced targets never became
+    // targets of a spell; its withheld `BecomesTarget` events are discarded.
+    discard_held_cast_target_events(state, pending.object_id);
 
     // CR 601.2 + CR 733.1: Backing out of a cast reverses every choice and
     // payment made during it ("the entire action is reversed"). A pre-cost

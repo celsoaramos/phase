@@ -12172,6 +12172,12 @@ fn finalize_cast_with_phyrexian_choices_inner(
 
     priority::clear_priority_passes(state);
 
+    // CR 601.2i + CR 603.3: the spell becomes cast here; its announced
+    // `BecomesTarget` events are reported in this action, beside `SpellCast`, so
+    // every scan of this cast's observers (Priority pipeline,
+    // `park_cast_during_resolution_cast_observers`, terminal settlement)
+    // collects them once, in the same CR 603.3b batch.
+    super::casting::publish_held_cast_target_events(state, object_id, events);
     events.push(GameEvent::SpellCast {
         card_id,
         controller: player,
@@ -12886,6 +12892,10 @@ fn handle_resolution_cast_rejection(
         )
         .expect("rposition yielded a live stack index");
     }
+    // CR 733.1: the cast is reversed; its announced targets never become
+    // targets of a spell, so their withheld `BecomesTarget` events are
+    // discarded, not published.
+    super::casting::discard_held_cast_target_events(state, object_id);
 
     let needs_choice = match reject_action {
         // CR 702.85a: Cascade — misses + the hit (declined at cast time) all
