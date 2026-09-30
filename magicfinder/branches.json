@@ -136,5 +136,8 @@
   },
   {
     "branch": "card/target-events-across-payment-pause"
+  },
+  {
+    "branch": "ai/beneficial-spell-opponent-target"
   }
 ]
