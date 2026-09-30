@@ -36,10 +36,11 @@ use crate::parser::oracle_ir::effect_chain::{
 };
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, AbilityKind, AbilityUseTally, AdditionalCostOrigin,
-    CastManaObjectScope, CastManaSpentMetric, CastVariantPaid, CoinFlipResult, Comparator,
-    ControllerRef, CountScope, DamageChannel, DigSource, Duration, Effect, EffectOutcomeSignal,
-    FilterProp, GuessOutcome, ObjectScope, ParsedCondition, PlayerScope, PtStat, PtValueScope,
-    QuantityExpr, QuantityRef, StaticCondition, TargetFilter, TypeFilter, TypedFilter,
+    AttachCardinality, AttachSelection, CastManaObjectScope, CastManaSpentMetric, CastVariantPaid,
+    CoinFlipResult, Comparator, ControllerRef, CountScope, DamageChannel, DigSource, Duration,
+    Effect, EffectOutcomeSignal, FilterProp, GuessOutcome, ObjectScope, ParsedCondition,
+    PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, StaticCondition, TargetFilter,
+    TypeFilter, TypedFilter,
 };
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
@@ -314,7 +315,7 @@ pub(crate) fn strip_leading_general_conditional(
         if let Some(condition) = player_damage_scry
             .or(effect_discard_drain)
             .or_else(|| try_nom_condition_as_ability_condition(cond_text, ctx))
-            .or_else(|| parse_condition_text(cond_text))
+            .or_else(|| parse_condition_text_in(cond_text, ctx))
             .or_else(|| parse_control_count_as_ability_condition(cond_text))
             .or_else(|| parse_and_conjunction_condition(cond_text, ctx))
         {
@@ -346,7 +347,7 @@ fn parse_and_conjunction_condition(
     for part in parts {
         let part = part.trim();
         let condition = try_nom_condition_as_ability_condition(part, ctx)
-            .or_else(|| parse_condition_text(part))
+            .or_else(|| parse_condition_text_in(part, ctx))
             .or_else(|| parse_control_count_as_ability_condition(part))?;
         conditions.push(condition);
     }
@@ -1765,6 +1766,10 @@ pub(super) fn try_parse_moved_card_subtype_attach_followup(
     let attach = Effect::Attach {
         attachment: TargetFilter::SelfRef,
         target: TargetFilter::ParentTarget,
+        // The attachment is the source; the host is the returned permanent.
+        selection: AttachSelection::AtResolution {
+            count: AttachCardinality::One,
+        },
     };
     Some((condition, attach, is_optional))
 }
@@ -4016,7 +4021,7 @@ pub(super) fn strip_suffix_conditional(
 
     if let Some(condition) = parse_triggering_spell_targets_filter_ability_condition(condition_core)
         .or_else(|| try_nom_condition_as_ability_condition(condition_core, ctx))
-        .or_else(|| parse_condition_text(condition_core))
+        .or_else(|| parse_condition_text_in(condition_core, ctx))
         .or_else(|| parse_control_count_as_ability_condition(condition_core))
     {
         return (Some(condition), effect_text);
@@ -4238,6 +4243,83 @@ fn parse_target_controller_poison_threshold(input: &str) -> OracleResult<'_, i32
     .parse(input)
 }
 
+/// CR 601.2 + CR 608.2c: `parse_condition_text` for a clause in a known parse
+/// context. A cast-time battlefield snapshot (`ControllerControlledMatchingAsCast`)
+/// is stamped only on the cast spell's own ability chain
+/// (`stamp_controller_controlled_as_cast`); a triggered ability's resolved
+/// ability never receives it, so the gate would always read false. Inside a
+/// trigger the condition is therefore declined rather than published as a gate
+/// that can never open.
+pub(super) fn parse_condition_text_in(text: &str, ctx: &ParseContext) -> Option<AbilityCondition> {
+    parse_condition_text(text)
+        .filter(|condition| !(ctx.in_trigger && reads_cast_time_snapshot(condition)))
+}
+
+pub(super) fn reads_cast_time_snapshot(condition: &AbilityCondition) -> bool {
+    match condition {
+        AbilityCondition::ControllerControlledMatchingAsCast { .. } => true,
+        AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
+            conditions.iter().any(reads_cast_time_snapshot)
+        }
+        AbilityCondition::Not { condition }
+        | AbilityCondition::ConditionInstead { inner: condition } => {
+            reads_cast_time_snapshot(condition)
+        }
+        AbilityCondition::WhenYouDo
+        | AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn
+        | AbilityCondition::AdditionalCostPaidInstead
+        | AbilityCondition::AlternativeManaCostPaid
+        | AbilityCondition::EffectOutcome { .. }
+        | AbilityCondition::EventOutcomeWon
+        | AbilityCondition::SourceEnteredThisTurn
+        | AbilityCondition::HasMaxSpeed
+        | AbilityCondition::IsMonarch
+        | AbilityCondition::IsInitiative
+        | AbilityCondition::HasCityBlessing
+        | AbilityCondition::HasEnduringStory
+        | AbilityCondition::ControlsCommander { .. }
+        | AbilityCondition::DiscardedCardMatchesFilter { .. }
+        | AbilityCondition::IsRingBearer
+        | AbilityCondition::HasObjectTarget
+        | AbilityCondition::IsYourTurn
+        | AbilityCondition::FirstCombatPhaseOfTurn
+        | AbilityCondition::FirstEndStepOfTurn
+        | AbilityCondition::SourceIsTapped
+        | AbilityCondition::SourceAttachedToCreature
+        | AbilityCondition::DayNightIsNeither
+        | AbilityCondition::AdditionalCostPaid { .. }
+        | AbilityCondition::CoinFlipOutcome { .. }
+        | AbilityCondition::WasCast { .. }
+        | AbilityCondition::CastDuringPhase { .. }
+        | AbilityCondition::CurrentPhaseIs { .. }
+        | AbilityCondition::CastTimingPermission { .. }
+        | AbilityCondition::ManaColorSpent { .. }
+        | AbilityCondition::RevealedHasCardType { .. }
+        | AbilityCondition::ObjectsShareQuality { .. }
+        | AbilityCondition::TargetSharesNameWithOtherExiledThisWay { .. }
+        | AbilityCondition::CastVariantPaid { .. }
+        | AbilityCondition::CastVariantPaidInstead { .. }
+        | AbilityCondition::QuantityCheck { .. }
+        | AbilityCondition::PreviousEffectAmount { .. }
+        | AbilityCondition::CompletedDungeon { .. }
+        | AbilityCondition::TargetHasKeywordInstead { .. }
+        | AbilityCondition::TargetMatchesFilter { .. }
+        | AbilityCondition::TriggeringSpellTargetsFilter { .. }
+        | AbilityCondition::SourceMatchesFilter { .. }
+        | AbilityCondition::PostReplacementDamageSourceMatchesFilter { .. }
+        | AbilityCondition::ZoneChangeObjectMatchesFilter { .. }
+        | AbilityCondition::ControllerControlsMatching { .. }
+        | AbilityCondition::WasStartingPlayer { .. }
+        | AbilityCondition::SpellCastWithVariantThisTurn { .. }
+        | AbilityCondition::ZoneChangedThisWay { .. }
+        | AbilityCondition::CostPaidObjectMatchesFilter { .. }
+        | AbilityCondition::DayNightIs { .. }
+        | AbilityCondition::AbilityUseCountThisTurn { .. }
+        | AbilityCondition::SourceLacksKeyword { .. }
+        | AbilityCondition::ScopedPlayerMatches { .. } => false,
+    }
+}
+
 pub(super) fn parse_condition_text(text: &str) -> Option<AbilityCondition> {
     let text = text.trim().trim_end_matches('.');
 
@@ -4265,15 +4347,11 @@ pub(super) fn parse_condition_text(text: &str) -> Option<AbilityCondition> {
         return Some(condition);
     }
 
-    // CR 601.2b/f: the two-legged DTK rider comes FIRST — its own left leg
-    // ("you revealed a Dragon card") is not a shape the single-leg
-    // controlled-as-cast parser below can read, so putting it after would only
-    // hide it behind a decline. Adjacent by family, not by precedence.
-    if let Some(condition) = parse_revealed_or_controlled_as_cast_condition_text(text) {
+    if let Some(condition) = parse_controller_controlled_as_cast_condition_text(text) {
         return Some(condition);
     }
 
-    if let Some(condition) = parse_controller_controlled_as_cast_condition_text(text) {
+    if let Some(condition) = parse_revealed_or_controlled_as_cast_condition_text(text) {
         return Some(condition);
     }
 
@@ -4491,7 +4569,15 @@ fn parse_controller_controlled_as_cast_condition(
     input: &str,
 ) -> OracleResult<'_, AbilityCondition> {
     let (rest, _) = tag("you controlled ").parse(input)?;
-    let (filter, remainder) = parse_type_phrase_folding(rest);
+    parse_controlled_as_cast_body(rest)
+}
+
+/// CR 601.2 + CR 608.2c: The "<type phrase> as you cast this spell" body shared by
+/// the plain "you controlled …" gate and the "you revealed … or controlled …"
+/// disjunction. A cast-time snapshot of the controller's battlefield, not a
+/// resolution-time read.
+fn parse_controlled_as_cast_body(input: &str) -> OracleResult<'_, AbilityCondition> {
+    let (filter, remainder) = parse_type_phrase_folding(input);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(OracleError::new(
             input,
@@ -4507,31 +4593,6 @@ fn parse_controller_controlled_as_cast_condition(
     ))
 }
 
-/// CR 601.2b/f + CR 608.2c: the Dragons of Tarkir "reveal a Dragon" rider —
-/// "you revealed a/an \<T\> card or controlled a/an \<T\> as you cast this spell"
-/// (Draconic Roar, Foul-Tongue Invocation, Orator of Ojutai, Scaleguard
-/// Sentinels, Dragonlord's Prerogative, Silumgar's Scorn).
-///
-/// Two genuinely alternative ways to satisfy ONE printed rider, under a trailing
-/// casting-time snapshot they share:
-///   * "you revealed a \<T\> card" — the spell's OPTIONAL additional cost
-///     (`AdditionalCost::Optional(Reveal)`) was paid, which is exactly what
-///     `additional_cost_paid_any` tests.
-///   * "you controlled a \<T\> as you cast this spell" — the existing
-///     `ControllerControlledMatchingAsCast` board snapshot.
-///
-/// A player who already controls a Dragon reveals nothing, so the pair is an
-/// `Or`, never an `And`.
-///
-/// `parse_and_conjunction_condition`'s generic splitter cannot reach this shape,
-/// and no "or" sibling of it could: the trailing "as you cast this spell" is
-/// shared, so a split hands the left leg no snapshot and the right leg no "you".
-/// Both legs must name the same type — a mismatch is not this rider.
-///
-/// Whole family, measured before the fix (v0.89.0): the condition was dropped,
-/// and only four of the six even raised a `SwallowedClause` warning. Draconic
-/// Roar's extra 3 damage, Foul-Tongue's 4 life and Orator's draw fired
-/// unconditionally; Scaleguard Sentinels parsed no ability at all.
 fn parse_revealed_or_controlled_as_cast_condition_text(text: &str) -> Option<AbilityCondition> {
     let lower = text.to_ascii_lowercase();
     nom_parse_lower(&lower, |input| {
@@ -4539,45 +4600,37 @@ fn parse_revealed_or_controlled_as_cast_condition_text(text: &str) -> Option<Abi
     })
 }
 
+/// CR 601.2b + CR 601.2h + CR 608.2c: "you revealed a <type> card or controlled a
+/// <type> as you cast this spell" (Draconic Roar, Foul-Tongue Invocation). The
+/// revealed half is the spell's optional "you may reveal a <type> card from your
+/// hand" additional cost, so it reads the same cast-time additional-cost-paid flag
+/// as "if it was kicked"; the controlled half is the cast-time battlefield
+/// snapshot. Either satisfies the gate, so the two compose as an `Or` rather than
+/// a bespoke variant.
+///
+/// The revealed noun phrase must itself be a well-formed type phrase, so a
+/// reveal of something this grammar does not model declines the whole clause.
 fn parse_revealed_or_controlled_as_cast_condition(
     input: &str,
 ) -> OracleResult<'_, AbilityCondition> {
     let (rest, _) = tag("you revealed ").parse(input)?;
-    let (rest, _) = alt((tag("a "), tag("an "))).parse(rest)?;
-    let (rest, revealed_type) = terminated(
-        take_until(" card or controlled "),
-        tag(" card or controlled "),
+    let (rest, revealed) = terminated(
+        take_until::<_, _, OracleError<'_>>(" or "),
+        alt((tag(" or you controlled "), tag(" or controlled "))),
     )
     .parse(rest)?;
-    let (rest, _) = alt((tag("a "), tag("an "))).parse(rest)?;
-    let (rest, controlled_type) = terminated(
-        take_until(" as you cast this spell"),
-        tag(" as you cast this spell"),
-    )
-    .parse(rest)?;
-
-    let (revealed_filter, revealed_rem) = parse_type_phrase_folding(revealed_type.trim());
-    let (controlled_filter, controlled_rem) = parse_type_phrase_folding(controlled_type.trim());
-    if !revealed_rem.trim().is_empty()
-        || !controlled_rem.trim().is_empty()
-        || matches!(controlled_filter, TargetFilter::Any)
-        || revealed_filter != controlled_filter
-    {
+    let (revealed_filter, revealed_remainder) = parse_type_phrase_folding(revealed);
+    if matches!(revealed_filter, TargetFilter::Any) || !revealed_remainder.trim().is_empty() {
         return Err(nom::Err::Error(OracleError::new(
             input,
             nom::error::ErrorKind::Fail,
         )));
     }
-
+    let (rest, controlled) = parse_controlled_as_cast_body(rest)?;
     Ok((
         rest,
         AbilityCondition::Or {
-            conditions: vec![
-                AbilityCondition::additional_cost_paid_any(),
-                AbilityCondition::ControllerControlledMatchingAsCast {
-                    filter: inject_controller_you(controlled_filter),
-                },
-            ],
+            conditions: vec![AbilityCondition::additional_cost_paid_any(), controlled],
         },
     ))
 }
@@ -4982,7 +5035,7 @@ pub(crate) fn lower_instead_condition(
     ctx: &mut ParseContext,
 ) -> Option<AbilityCondition> {
     try_nom_condition_as_ability_condition(cond_text, ctx)
-        .or_else(|| parse_condition_text(cond_text))
+        .or_else(|| parse_condition_text_in(cond_text, ctx))
         .or_else(|| parse_control_count_as_ability_condition(cond_text))
 }
 
@@ -5105,6 +5158,7 @@ pub(crate) fn try_parse_dig_instead_alternative(
         player: prev_player,
         count: prev_count,
         rest_destination: prev_rest,
+        rest_split_top_count: prev_rest_split_top_count,
         rest_order: prev_rest_order,
         reveal: prev_reveal,
         ..
@@ -5183,6 +5237,7 @@ pub(crate) fn try_parse_dig_instead_alternative(
         filter: alt_filter,
         destination: alt_destination,
         rest_destination: alt_rest,
+        rest_split_top_count: alt_rest_split_top_count,
         rest_order: alt_rest_order,
         enter_tapped: alt_enter_tapped,
         enters_attacking: alt_enters_attacking,
@@ -5203,7 +5258,7 @@ pub(crate) fn try_parse_dig_instead_alternative(
     // ordering is purely defensive.
     let condition = parse_additional_cost_instead_condition_fragment(&cond_text)
         .or_else(|| try_nom_condition_as_ability_condition(&cond_text, ctx))
-        .or_else(|| parse_condition_text(&cond_text))
+        .or_else(|| parse_condition_text_in(&cond_text, ctx))
         .or_else(|| parse_control_count_as_ability_condition(&cond_text))
         .or_else(|| parse_cast_using_teamwork_condition_text(&cond_text))?;
 
@@ -5221,6 +5276,35 @@ pub(crate) fn try_parse_dig_instead_alternative(
         up_to: alt_up_to,
         filter: alt_filter,
         rest_destination: alt_rest.or(*prev_rest),
+        // CR 608.2c ("read the whole text and apply the rules of English"):
+        // the remainder instruction is inherited ONLY when the alternative is
+        // silent about the remainder. Precedence mirrors `alt_rest` /
+        // `alt_rest_order` directly above and below:
+        //
+        //   1. the alternative named its own split      -> use it;
+        //   2. the alternative named a UNIFORM remainder
+        //      destination ("...put the rest on the bottom
+        //      of your library") -> `None`. An explicit
+        //      one-position instruction is not merely a
+        //      different destination, it positively says
+        //      "all of it goes to one place", which
+        //      overrides the base branch's split instead
+        //      of being contaminated by it;
+        //   3. the alternative said nothing about the
+        //      remainder             -> inherit the base branch's split,
+        //                               exactly as `prev_rest` and
+        //                               `prev_reveal` are inherited.
+        //
+        // Before this precedence existed, case 2 kept the base's split and the
+        // alternative branch tried to partition a remainder its own text had
+        // already sent uniformly to one position.
+        rest_split_top_count: alt_rest_split_top_count.map(|boxed| *boxed).or_else(|| {
+            if alt_rest.is_some() {
+                None
+            } else {
+                prev_rest_split_top_count.clone()
+            }
+        }),
         rest_order: alt_rest.map_or(*prev_rest_order, |_| alt_rest_order),
         reveal: *prev_reveal,
         enter_tapped: alt_enter_tapped,
@@ -5756,11 +5840,19 @@ pub(crate) fn static_condition_to_ability_condition(
         // no `AbilityCondition` counterpart yet. Return `None` rather than
         // lowering it to `Not(IsYourTurn)`, which would be wrong in 2HG.
         | StaticCondition::DuringOpponentsTurn
-        // CR 508.6: the existential "a player attacked you during their last turn"
-        // gate drives a self-spell cost reduction (Avenge), not an
-        // effect-resolution rider; no `AbilityCondition` equivalent — lowering
-        // returns `None`.
-        | StaticCondition::AnyPlayerAttackedYouLastTurn
+        // CR 508.6 + CR 608.2: no `AbilityCondition` equivalent on either scope;
+        // `None` for DIFFERENT reasons.
+        //
+        // Default (`AnyPlayer`) scope: it drives a self-spell cost reduction
+        // (Avenge), not an effect-resolution rider.
+        //
+        // Anchored (`AttackedPlayer`) scope: an `AbilityCondition` is evaluated
+        // during RESOLUTION (CR 608.2), by which point the declare-attackers
+        // turn-based action is long past and no `declared_attack` is in context;
+        // the resolving ability need not belong to an attacking creature at all,
+        // so there is no attacker whose latched record could answer. The anchor
+        // is structurally unavailable here, not merely unused.
+        | StaticCondition::AnyPlayerAttackedYouLastTurn { .. }
         | StaticCondition::None => None,
     }
 }
@@ -9936,7 +10028,10 @@ mod tests {
         let attach = def
             .sub_ability
             .expect("expected conditional attach sub-ability");
-        let Effect::Attach { attachment, target } = &*attach.effect else {
+        let Effect::Attach {
+            attachment, target, ..
+        } = &*attach.effect
+        else {
             panic!("expected attach sub-ability, got {:?}", attach.effect);
         };
         assert_eq!(*attachment, TargetFilter::TriggeringSource);
@@ -11811,6 +11906,7 @@ mod tests {
                 Effect::Attach {
                     attachment: TargetFilter::SelfRef,
                     target: TargetFilter::ParentTarget,
+                    ..
                 }
             ),
             "moved card must be the attachment (SelfRef) and the source the host (ParentTarget), got {effect:?}"

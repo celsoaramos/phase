@@ -115,10 +115,12 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "ScryChoice",
     "RippleRevealChoice",
     "RippleBottomOrder",
+    "RevealUntilBottomOrder",
     "ArrangePlanarDeckTopChoice",
     "CoinFlipKeepChoice",
     "DieKeepChoice",
     "DigChoice",
+    "DigRestSplitChoice",
     "SurveilChoice",
     "RevealChoice",
     "SearchChoice",
@@ -128,6 +130,9 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     // CR 701.4a: behold a [quality] — single-pick from a mixed-zone candidate
     // list (BeholdChoiceModal, rendered via CardChoiceModal).
     "BeholdChoice",
+    // CR 701.71a: empower Jace N — single-pick among the controller's Jace
+    // planeswalker tokens (EmpowerJaceChoiceModal, rendered via CardChoiceModal).
+    "EmpowerJaceChoice",
     "ChooseOneOfBranch",
     "ConniveDiscard",
     "DiscardChoice",

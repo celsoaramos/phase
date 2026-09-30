@@ -52,12 +52,14 @@ import { ConfirmDialog } from "../ui/ConfirmDialog.tsx";
 import { ModalPanelShell } from "../ui/ModalPanelShell";
 import { MenuSelect } from "../ui/MenuSelect";
 import { downloadBackup, importBackupFromFile, type ImportMode } from "../../services/backup.ts";
+import { attemptSavedDeckWrite } from "../../services/savedDeckWriteFailure.ts";
 import { isDesktopTauri } from "../../services/platform.ts";
 import { useCloudSyncStore } from "../../stores/cloudSyncStore.ts";
 import { useSetCatalog } from "../../hooks/useSetSymbols.ts";
 import { DiscordIcon, GoogleIcon } from "../ui/ProviderIcons";
 import { VisualPackManager } from "./visual-packs/VisualPackManager.tsx";
 import { OfflinePreparationSection } from "./OfflinePreparationSection.tsx";
+import { LlmOpponentsSection } from "./LlmOpponentsSection.tsx";
 
 import { TroubleshootingDialog } from "../help/TroubleshootingDialog";
 
@@ -103,6 +105,7 @@ function formatSpeed(value: number, max: number, labels: { instant: string; slow
 }
 const SETTINGS_TABS = [
   { id: "gameplay" },
+  { id: "ai" },
   { id: "experimental" },
   { id: "visual" },
   { id: "combat" },
@@ -505,6 +508,12 @@ export function PreferencesModal({
                       )}
                     </SettingGroup>
                   </div>
+                </SettingsSection>
+              )}
+
+              {activeTab === "ai" && (
+                <SettingsSection title={t("llm.title")}>
+                  <LlmOpponentsSection />
                 </SettingsSection>
               )}
 
@@ -1175,7 +1184,9 @@ function DataSection() {
       setError(null);
       setStatus(null);
       try {
-        const result = await importBackupFromFile(file, mode);
+        const restored = await attemptSavedDeckWrite("restore", () => importBackupFromFile(file, mode));
+        if (!restored.ok) return;
+        const result = restored.value;
         const base = result.preferencesReplaced
           ? t("data.importedWithPreferences", { count: result.decksImported })
           : t("data.imported", { count: result.decksImported });

@@ -96,6 +96,17 @@ pub fn resolve(
     let mut payment_ability = ability.clone();
     payment_ability.controller = payer;
 
+    // CR 601.2h + CR 608.2c: a resolution-time Composite is staged before
+    // any sub-cost can mutate canonical state. The transaction descriptor owns
+    // the untouched base plus a replayable root; the ordinary authority below
+    // runs only on its guarded shadow.
+    if matches!(cost, AbilityCost::Composite { .. })
+        && !state.payment_transaction_replay
+        && state.payment_transaction.is_none()
+    {
+        return crate::game::payment_transaction::begin(state, ability, events);
+    }
+
     // CR 118.1 + CR 118.5: Per-object scaled mana cost (was
     // `PaymentCost::ScaledMana`). `scale` is resolution-only metadata: the mana
     // `cost` base (which may carry colored pips) is multiplied by `times`; when
@@ -299,6 +310,7 @@ fn resolve_ability_cost_payment(
     events: &mut Vec<GameEvent>,
 ) -> Result<PaymentOutcome, EffectError> {
     if matches!(cost, AbilityCost::Composite { .. })
+        && !state.payment_transaction_replay
         && !costs::can_pay(
             state,
             payer,
@@ -378,7 +390,16 @@ fn resolution_mana_x_max(
     loop {
         let mut concrete = cost.clone();
         concrete.concretize_x(max);
-        if casting::can_pay_effect_mana_cost_after_auto_tap(state, payer, source_id, &concrete) {
+        // CR 605.3b + CR 616.1: the chosen amount is paid through
+        // `pay_unless_cost`, which has no resume root, so the offered range must
+        // not count a mana source whose own cost would pause.
+        if casting::can_pay_effect_mana_cost_after_auto_tap(
+            state,
+            payer,
+            source_id,
+            &concrete,
+            casting::PausedManaPayment::Unresumable,
+        ) {
             return Some(max);
         }
         if max == 0 {
@@ -998,7 +1019,14 @@ mod tests {
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &pay, &mut events, 0).unwrap();
 
-        assert_eq!(state.players[0].life, 18);
+        // R5 keeps the authoritative base untouched while the Phyrexian
+        // replacement prompt is open; the projected shadow carries the
+        // provisional life loss.
+        assert_eq!(state.players[0].life, 20);
+        assert_eq!(
+            crate::game::payment_transaction::project(&state).players[0].life,
+            18
+        );
         assert_eq!(
             state.players[0].energy, 2,
             "the later energy cost must remain unpaid during the replacement choice"

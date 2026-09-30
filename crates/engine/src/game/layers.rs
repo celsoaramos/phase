@@ -28,11 +28,12 @@ use crate::game::quantity::{
 };
 use crate::game::speed::{effective_speed, has_max_speed};
 use crate::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, BasicLandType,
-    CardTypeSetSource, CastingPermission, ChosenSubtypeKind, CommanderOwnership,
-    ContinuousModification, CopiableValues, Duration, Effect, FilterProp, ManaContribution,
-    ManaProduction, PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, StaticCondition,
-    StaticDefinition, TargetFilter, TriggerGrantProducerKey, TriggerProducerOrigin, TypedFilter,
+    AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, AttackedYouScope,
+    BasicLandType, CardTypeSetSource, CastingPermission, ChosenSubtypeKind, CommanderOwnership,
+    ContinuousModification, CopiableValues, Designation, Duration, Effect, FilterProp,
+    ManaContribution, ManaProduction, PlayerFilter, PlayerScope, QuantityExpr, QuantityRef,
+    StaticCondition, StaticDefinition, TargetFilter, TriggerGrantProducerKey,
+    TriggerProducerOrigin, TypedFilter,
 };
 use crate::types::attribution::EffectRef;
 use crate::types::card_type::{
@@ -605,6 +606,9 @@ fn permission_duration_expires_at(
         // CR 610.3: ended by the monarch zone-change duration in
         // `zone_pipeline`, not by a turn boundary.
         Duration::UntilOpponentBecomesMonarch => false,
+        // CR 611.2a + CR 601.2i: ended by the spell-cast expiry in
+        // `casting_costs`, not by a turn boundary.
+        Duration::UntilEvent { .. } => false,
         // CR 611.2a: no stated end.
         Duration::Permanent => false,
     }
@@ -675,6 +679,10 @@ pub(crate) fn casting_permission_duration_is_enforceable(
         // casting permissions — no pass revokes a permission when an opponent
         // becomes the monarch.
         Duration::UntilOpponentBecomesMonarch => false,
+        // CR 611.2a + CR 601.2i: the spell-cast expiry in `casting_costs` ends
+        // transient continuous effects only — no pass revokes a casting
+        // permission when a spell becomes cast.
+        Duration::UntilEvent { .. } => false,
     }
 }
 
@@ -1074,6 +1082,7 @@ pub(crate) fn prune_lapsed_host_bound_casting_permissions(state: &mut GameState)
                 | Duration::ForAsLongAs { .. }
                 | Duration::UntilSourceExilesAnotherCard
                 | Duration::UntilOpponentBecomesMonarch
+                | Duration::UntilEvent { .. }
                 | Duration::Permanent => continue,
             };
             if !still_live {
@@ -1176,6 +1185,9 @@ pub(crate) fn prune_lapsed_host_bound_effects(state: &mut GameState) {
             | Duration::ForAsLongAs { .. }
             | Duration::UntilSourceExilesAnotherCard
             | Duration::UntilOpponentBecomesMonarch
+            // CR 611.2a + CR 601.2i: ended by the spell-cast expiry in
+            // `casting_costs`, not by a host lapse.
+            | Duration::UntilEvent { .. }
             | Duration::Permanent => false,
         })
         .map(|e| e.id)
@@ -1351,6 +1363,13 @@ pub(crate) struct ConditionContext {
     /// still empty at that point — the attacker is not recorded until
     /// CR 508.1k — so this is the only anchor available there.
     pub declared_attack: Option<AttackTarget>,
+    /// CR 113.1b + CR 109.5: the PLAYER who has the ability being evaluated,
+    /// when that differs from the source object's controller — a permission a
+    /// resolved effect granted to a player ("target player gains \"During your
+    /// turn, …\""). "You"/"your" in that ability mean this player, so the
+    /// whose-turn leaves (`DuringYourTurn`, `DuringOpponentsTurn`) read it in
+    /// preference to the source object's controller. `None` everywhere else.
+    pub ability_holder: Option<PlayerId>,
 }
 
 impl ConditionContext {
@@ -1358,6 +1377,7 @@ impl ConditionContext {
     pub(crate) const NONE: Self = Self {
         recipient: None,
         declared_attack: None,
+        ability_holder: None,
     };
 
     /// CR 611.3a recipient anchor only.
@@ -1365,6 +1385,16 @@ impl ConditionContext {
         Self {
             recipient: Some(id),
             declared_attack: None,
+            ability_holder: None,
+        }
+    }
+
+    /// CR 113.1b + CR 109.5: the player-holder anchor only.
+    pub(crate) const fn ability_holder(player: PlayerId) -> Self {
+        Self {
+            recipient: None,
+            declared_attack: None,
+            ability_holder: Some(player),
         }
     }
 
@@ -1372,6 +1402,27 @@ impl ConditionContext {
     pub(crate) const fn with_declared_attack(mut self, target: Option<AttackTarget>) -> Self {
         self.declared_attack = target;
         self
+    }
+
+    /// Which designation subject this evaluation context can bind. Paired
+    /// with `StaticMode::binds_designation_scope` at parse time.
+    pub(crate) fn binds_designation_scope(&self, scope: &PlayerScope) -> bool {
+        match scope {
+            PlayerScope::Controller => true,
+            PlayerScope::RecipientController => self.recipient.is_some(),
+            // No static designation resolver currently binds this subject.
+            PlayerScope::DefendingPlayer => false,
+            // Engine limitation, not CR-mandated: no binding authority for
+            // these scopes is carried by this layer evaluation context.
+            PlayerScope::ScopedPlayer
+            | PlayerScope::Target
+            | PlayerScope::Opponent { .. }
+            | PlayerScope::AllPlayers { .. }
+            | PlayerScope::ParentObjectTargetController
+            | PlayerScope::SourceChosenPlayer
+            | PlayerScope::AnyTurn
+            | PlayerScope::SpecificPlayer { .. } => false,
+        }
     }
 }
 
@@ -1411,26 +1462,57 @@ pub(crate) fn evaluate_condition_with_recipient(
     )
 }
 
-/// CR 109.4 + CR 725.5 (static analogue of the trigger-side CR 603.4 gate):
-/// layer evaluation has no triggering event and no combat anchor, so it cannot
-/// resolve any [`PlayerScope`] other than `Controller`. A scoped designation
-/// leaf is therefore unanswerable here.
-///
-/// Reject the whole condition at the entry boundary — returning `false` from the
-/// leaf would let [`StaticCondition::Not`] invert it into an APPLIED
-/// restriction, which is exactly the printed "unless that player is the
-/// monarch" shape. CR 725.5 independently prescribes "the effect does nothing"
-/// for the analogous vacant-monarch case, so `false` here is the
-/// rules-prescribed outcome rather than an invented default.
-///
-/// Purely structural (no `GameState` needed), mirroring the shape of
-/// `condition_uses_recipient_context` and `static_condition_uses_object_population`
-/// in this module. Delegates the leaf question and the Boolean-combinator walk
-/// to [`StaticCondition::has_unbindable_designation_anchor`] — the single
-/// authority shared with any parser-time gate that must decline to mark such a
-/// condition "supported" when it can never bind at runtime.
-fn static_condition_has_unresolvable_designation_anchor(condition: &StaticCondition) -> bool {
-    condition.has_unbindable_designation_anchor()
+/// CR 725.5: a monarch-dependent static effect does nothing while nobody is
+/// monarch. CR 726 gives no equivalent vacancy rule for initiative, so this
+/// answer is explicitly per designation.
+fn designation_is_held(state: &GameState, designation: Designation) -> bool {
+    match designation {
+        Designation::Monarch => !eval_no_monarch(state),
+    }
+}
+
+/// CR 109.4 + CR 725.5: refuse the whole condition when its designation
+/// subject cannot be bound or the designation is vacant. Refusing at entry
+/// prevents `Not` from inverting a missing answer into an applied restriction.
+/// `NoMonarch` carries no designation subject and remains independently true
+/// when no player is monarch.
+fn static_condition_has_unanswerable_designation_anchor(
+    state: &GameState,
+    condition: &StaticCondition,
+    context: ConditionContext,
+) -> bool {
+    condition.has_unanswerable_designation_anchor(|designation, scope| {
+        context.binds_designation_scope(scope) && designation_is_held(state, designation)
+    })
+}
+
+/// Resolve the player whose designation a static condition names. An absent
+/// subject has no fallback: the entry gate must reject it before `Not` can
+/// invert the leaf's false value.
+fn designation_player(
+    state: &GameState,
+    scope: &PlayerScope,
+    controller: PlayerId,
+    _source_id: ObjectId,
+    context: ConditionContext,
+) -> Option<PlayerId> {
+    match scope {
+        PlayerScope::Controller => Some(controller), // CR 109.5.
+        // CR 303.4m: "enchanted creature" is the Aura's current recipient.
+        PlayerScope::RecipientController => context
+            .recipient
+            .and_then(|id| state.objects.get(&id))
+            .map(|object| object.controller),
+        PlayerScope::DefendingPlayer
+        | PlayerScope::ScopedPlayer
+        | PlayerScope::Target
+        | PlayerScope::Opponent { .. }
+        | PlayerScope::AllPlayers { .. }
+        | PlayerScope::ParentObjectTargetController
+        | PlayerScope::SourceChosenPlayer
+        | PlayerScope::AnyTurn
+        | PlayerScope::SpecificPlayer { .. } => None,
+    }
 }
 
 /// Selects the controller that supplies "you" for an active effect's
@@ -1500,6 +1582,11 @@ fn condition_uses_recipient_context(condition: &StaticCondition) -> bool {
         // creature this static applies to), not the source, so this condition is
         // recipient-relative regardless of what its filter reads.
         StaticCondition::DefendingPlayerControls { .. } => true,
+        // CR 303.4m + CR 611.3a: resolve a recipient-anchored monarch subject
+        // for each affected object, not once against the source.
+        StaticCondition::IsMonarch { player } => {
+            matches!(player, PlayerScope::RecipientController)
+        }
         // CR 105.2 + CR 611.3a: "Enchanted creature gets +3/+3 unless IT shares a
         // color…" — the color check is on the recipient (the enchanted creature),
         // not the Aura source, so it must route through the recipient-eval path.
@@ -1610,7 +1697,7 @@ fn static_condition_uses_object_population(condition: &StaticCondition) -> bool 
         | StaticCondition::CompletedADungeon
         | StaticCondition::WasStartingPlayer { .. }
         | StaticCondition::SpellCastWithVariantThisTurn { .. }
-        | StaticCondition::AnyPlayerAttackedYouLastTurn
+        | StaticCondition::AnyPlayerAttackedYouLastTurn { .. }
         | StaticCondition::OpponentPoisonAtLeast { .. }
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::DuringYourTurn
@@ -1768,7 +1855,12 @@ fn static_condition_characteristic_reads_at(
         | StaticCondition::CompletedADungeon
         | StaticCondition::WasStartingPlayer { .. }
         | StaticCondition::SpellCastWithVariantThisTurn { .. }
-        | StaticCondition::AnyPlayerAttackedYouLastTurn
+        // CR 506.3: the anchored revenge gate reads the ATTACK TARGET VALUE and
+        // the turn-history snapshot — never an object characteristic — unlike
+        // `DefendingPlayerControls` above, which reads the target's CONTROLLER.
+        // It therefore belongs in the empty bucket, not with the controller
+        // readers.
+        | StaticCondition::AnyPlayerAttackedYouLastTurn { .. }
         | StaticCondition::OpponentPoisonAtLeast { .. }
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::DuringYourTurn
@@ -1893,7 +1985,7 @@ fn entered_object_perturbs_static_condition(
         | StaticCondition::CompletedADungeon
         | StaticCondition::WasStartingPlayer { .. }
         | StaticCondition::SpellCastWithVariantThisTurn { .. }
-        | StaticCondition::AnyPlayerAttackedYouLastTurn
+        | StaticCondition::AnyPlayerAttackedYouLastTurn { .. }
         | StaticCondition::OpponentPoisonAtLeast { .. }
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::DuringYourTurn
@@ -1978,7 +2070,7 @@ pub(crate) fn evaluate_condition_with_context(
     source_id: ObjectId,
     context: ConditionContext,
 ) -> bool {
-    if static_condition_has_unresolvable_designation_anchor(condition) {
+    if static_condition_has_unanswerable_designation_anchor(state, condition, context) {
         return false;
     }
     evaluate_condition_inner(state, condition, controller, source_id, context)
@@ -2122,22 +2214,29 @@ fn evaluate_condition_inner(
         // opponents cast cost {1} more"). Bind to the source permanent's
         // controller directly so the gate is correct in every call path; fall
         // back to `controller` only when the source object is absent.
+        //
+        // CR 113.1b + CR 109.5: when the ability belongs to a PLAYER (a
+        // resolution-granted permission), "your turn" is that holder's turn.
         StaticCondition::DuringYourTurn => {
-            let source_controller = state
-                .objects
-                .get(&source_id)
-                .map(|obj| obj.controller)
-                .unwrap_or(controller);
+            let source_controller = context.ability_holder.unwrap_or_else(|| {
+                state
+                    .objects
+                    .get(&source_id)
+                    .map(|obj| obj.controller)
+                    .unwrap_or(controller)
+            });
             state.active_player == source_controller
         }
         // CR 102.3 + CR 805.4a: team-aware opponent relation. A teammate
         // holding `active_player` does not make this an opponent's turn.
         StaticCondition::DuringOpponentsTurn => {
-            let source_controller = state
-                .objects
-                .get(&source_id)
-                .map(|obj| obj.controller)
-                .unwrap_or(controller);
+            let source_controller = context.ability_holder.unwrap_or_else(|| {
+                state
+                    .objects
+                    .get(&source_id)
+                    .map(|obj| obj.controller)
+                    .unwrap_or(controller)
+            });
             super::players::is_opponent(state, source_controller, state.active_player)
         }
         // CR 103.1: True when the scoped player took the first turn of the
@@ -2148,14 +2247,55 @@ fn evaluate_condition_inner(
         StaticCondition::SpellCastWithVariantThisTurn { variant } => {
             crate::game::restrictions::spell_cast_with_variant_this_turn(state, variant)
         }
-        // CR 508.6 + CR 109.5: True when any other player declared a creature
-        // attacking the controller ("you") during that player's most recent
-        // completed turn. Existential; the defender is the controller, so a player
-        // who attacked someone else — or the controller's own attacks — do not
-        // satisfy it.
-        StaticCondition::AnyPlayerAttackedYouLastTurn => state.players.iter().any(|p| {
+        // CR 508.6 + CR 109.5: True when any player OTHER than the controller
+        // declared a creature attacking the controller ("you") during that
+        // player's most recent completed turn. Existential; the defender is the
+        // controller, so a player who attacked someone else — or the
+        // controller's own attacks — do not satisfy it.
+        StaticCondition::AnyPlayerAttackedYouLastTurn {
+            scope: AttackedYouScope::AnyPlayer,
+        } => state.players.iter().any(|p| {
             p.id != controller && state.player_attacked_player_last_turn(p.id, controller)
         }),
+        // CR 508.6 + CR 508.1b + CR 506.3: the SAME CR 508.6 question, asked
+        // about ONE player — the player this creature is attacking. "This
+        // creature can attack PLAYERS WHO attacked you during their last turn."
+        //
+        // Anchor resolution mirrors the `DefendingPlayerControls` arm below,
+        // over the kind-PRESERVING accessors instead of the kind-collapsing
+        // ones. CR 508.1c: while a declaration is under validation,
+        // `declared_attack` is AUTHORITATIVE and does not fall through to the
+        // latch — a bound planeswalker/battle target yielding no attacked player
+        // IS the CR 508.1c answer. CR 508.1k: once declared, the latched
+        // `AttackerInfo` answers, until CR 506.4 removal drops the record.
+        //
+        // CR 506.3 + CR 310.9d: kind-preserving. CR 508.5 would collapse a
+        // planeswalker attack to its controller and a battle attack to its
+        // protector; that is the DEFENDING-PLAYER rule and is deliberately NOT
+        // applied here, because the printed text restricts the attack target to
+        // a player. CR 508.5 is the CONTRAST, not the warrant.
+        //
+        // No anchor bindable => no attacked player => false.
+        //
+        // CR 508.6 + CR 109.5: the `!= controller` guard mirrors the existential
+        // arm's `p.id != controller`, so the two scopes agree on CR 508.6's
+        // subject exclusion and the anchored reading stays a strict REFINEMENT
+        // of the existential one (anchored-true => existential-true). The
+        // creature-level deferral in `static_abilities::unanchored_defending_player_deferral`
+        // depends on that ordering.
+        StaticCondition::AnyPlayerAttackedYouLastTurn {
+            scope: AttackedYouScope::AttackedPlayer,
+        } => {
+            let attacking = context.recipient.unwrap_or(source_id);
+            let attacked = match context.declared_attack {
+                Some(target) => crate::game::combat::attacked_player_for_target(target),
+                None => crate::game::combat::attacked_player_for_attacker(state, attacking),
+            };
+            attacked.is_some_and(|attacked| {
+                attacked != controller
+                    && state.player_attacked_player_last_turn(attacked, controller)
+            })
+        }
         // CR 105.2 + CR 611.3a: the subject is the recipient (the enchanted
         // creature, "it"), not the Aura source; fall back to the source only when
         // evaluated without a recipient (the source gate defers to per-recipient).
@@ -2395,22 +2535,13 @@ fn evaluate_condition_inner(
                 .find(|a| a.object_id == source_id)
                 .is_some_and(|a| a.blocked)
         }),
-        // CR 725.1 + CR 109.5: a static ability's "you" is the object's current
-        // controller. Layer evaluation has no trigger event and no combat
-        // anchor, so no other scope can EVER resolve here. The scoped form never
-        // reaches this arm — `evaluate_condition{,_with_recipient}` has already
-        // rejected the condition at its entry boundary — and
-        // `coverage::static_condition_feature` reports those scopes `Unhandled`,
-        // so coverage does not claim support.
-        //
-        // CR 725.5: while there is no monarch, a monarch-dependent continuous
-        // effect does nothing, and begins to apply once a player becomes the
-        // monarch. `eval_is_monarch` returns false for a vacant designation and
-        // layers re-evaluate on the monarch change, which is exactly that.
-        StaticCondition::IsMonarch {
-            player: PlayerScope::Controller,
-        } => eval_is_monarch(state, controller),
-        StaticCondition::IsMonarch { .. } => false,
+        // CR 725.1: monarch identity; CR 109.5 and CR 303.4m provide the
+        // source and recipient subjects. CR 725.5 vacancy is handled at the
+        // entry gate, before `Not` can invert a missing designation.
+        StaticCondition::IsMonarch { player } => {
+            designation_player(state, player, controller, source_id, context)
+                .is_some_and(|player| eval_is_monarch(state, player))
+        }
         // CR 726.3: True when the controller has the initiative.
         StaticCondition::IsInitiative => eval_is_initiative(state, controller),
         // CR 725.1: True when no player holds the monarch designation.
@@ -2692,6 +2823,10 @@ fn seed_live_characteristics_from_base(obj: &mut crate::game::game_object::GameO
     // Subsequent layer effects that mutate `obj.abilities` / definitions
     // trigger copy-on-write via `Arc::make_mut`.
     obj.abilities = Arc::clone(&obj.base_abilities);
+    // CR 613.1a + CR 613.1f: the ability-slot provenance is layer-derived with
+    // `abilities`; layer 1 and layer 6 re-establish it this pass.
+    obj.granted_abilities_from = None;
+    obj.layer1_copy_effect = None;
     obj.materialize_base_trigger_definitions();
     // CR 611.2c + CR 613.1: reseed the printed baseline, carrying resolution-created
     // continuous effects across the reset. See
@@ -3257,6 +3392,7 @@ pub fn evaluate_layers(state: &mut GameState) {
     // characteristics are determined. These flags feed CR 510.1 combat damage
     // assignment and must observe final post-layer characteristics.
     apply_combat_assignment_rule_effects(state);
+    super::exile_links::latch_new_controllers(state, &prev_controllers);
 
     // CR 302.6: Re-apply summoning sickness for any permanent whose effective
     // controller changed during this evaluation. The diff is taken against
@@ -3586,7 +3722,7 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
                     .as_ref()
                     .is_some_and(|f| target_filter_reads_zone(f, zone))
         }
-        QuantityRef::TargetZoneCardCount { zone: zone_ref } => {
+        QuantityRef::TargetZoneCardCount { zone: zone_ref, .. } => {
             zone_ref_denotes_zone(zone_ref, zone)
         }
         // Filter-based object counts read `zone` iff their filter is zone-scoped
@@ -3626,7 +3762,7 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         QuantityRef::HandSize { .. }
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::LifeAboveStarting
-        | QuantityRef::StartingLifeTotal
+        | QuantityRef::StartingLifeTotal { .. }
         | QuantityRef::TriggeringDiscoverValue
         | QuantityRef::TriggeringScryLookCount
         | QuantityRef::TriggeringScryBottomCount
@@ -3965,7 +4101,7 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
         // classification.
         QuantityRef::HandSize { .. }
         | QuantityRef::GraveyardSize { .. }
-        | QuantityRef::StartingLifeTotal
+        | QuantityRef::StartingLifeTotal { .. }
         | QuantityRef::TriggeringDiscoverValue
         | QuantityRef::TriggeringScryLookCount
         | QuantityRef::TriggeringScryBottomCount
@@ -4339,7 +4475,7 @@ fn static_condition_reads_life(condition: &StaticCondition) -> bool {
         | StaticCondition::CompletedADungeon
         | StaticCondition::WasStartingPlayer { .. }
         | StaticCondition::SpellCastWithVariantThisTurn { .. }
-        | StaticCondition::AnyPlayerAttackedYouLastTurn
+        | StaticCondition::AnyPlayerAttackedYouLastTurn { .. }
         | StaticCondition::OpponentPoisonAtLeast { .. }
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::Unrecognized { .. }
@@ -8834,6 +8970,10 @@ fn apply_continuous_effect_filtered(
                     modification_index: effect.mod_index,
                 };
                 apply_copiable_values(obj, values, copy_effect);
+                // CR 613.1a + CR 607.5: the last applied copy effect supplies this
+                // pass's characteristic abilities; a later copy overwrites it
+                // (timestamp order).
+                obj.layer1_copy_effect = Some(copy_effect);
                 // Display routing follows the copy: override the baseline
                 // restored by the layer reset so the copy renders the source's
                 // art. Reverts automatically when the copy effect expires.
@@ -9080,6 +9220,8 @@ fn apply_continuous_effect_filtered(
             }
             ContinuousModification::RemoveAllAbilities => {
                 Arc::make_mut(&mut obj.abilities).clear();
+                // CR 613.1f: every ability added after this removal is granted.
+                obj.granted_abilities_from = Some(0);
                 obj.trigger_definitions.clear();
                 // CR 613.1f + CR 611.2c: Layer 6 removes the object's ABILITIES.
                 // A replacement created by the resolution of a spell or ability is
@@ -9325,6 +9467,10 @@ fn apply_continuous_effect_filtered(
                 let mut granted = *definition.clone();
                 super::ability_utils::concretize_granting_object(&mut granted, effect.source_id);
                 if !obj.abilities.iter().any(|a| a == &granted) {
+                    // CR 613.1f + CR 607.1: layer-6 grants follow the
+                    // characteristic prefix; the first one marks its end.
+                    obj.granted_abilities_from
+                        .get_or_insert(obj.abilities.len());
                     Arc::make_mut(&mut obj.abilities).push(granted);
                 }
             }
@@ -9574,6 +9720,9 @@ fn set_land_subtype_replacing(obj: &mut crate::game::game_object::GameObject, su
     obj.card_types.subtypes.retain(|s| !is_land_subtype(s));
     obj.card_types.subtypes.push(subtype);
     Arc::make_mut(&mut obj.abilities).clear();
+    // CR 305.7: no rules-text ability survives; later-added abilities are not
+    // characteristic.
+    obj.granted_abilities_from = Some(0);
     obj.trigger_definitions.clear();
     // CR 305.7: "It loses all abilities generated from its rules text... Note that
     // this doesn't remove any abilities that were granted to the land by other
@@ -9928,6 +10077,45 @@ mod tests {
 
     fn setup() -> GameState {
         GameState::new_two_player(42)
+    }
+
+    /// CR 113.1b + CR 109.5: a player-held ability's whose-turn leaves read the
+    /// HOLDER bound in `ConditionContext::ability_holder`, not the source object's
+    /// controller. With no holder bound they read the source controller.
+    #[test]
+    fn whose_turn_leaves_read_the_ability_holder_when_bound() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(900),
+            PlayerId(0),
+            "Grant Spell".to_string(),
+            Zone::Graveyard,
+        );
+        state.active_player = PlayerId(0);
+        let eval = |state: &GameState, condition: &StaticCondition, context| {
+            evaluate_condition_with_context(state, condition, PlayerId(1), source, context)
+        };
+        let holder = ConditionContext::ability_holder(PlayerId(1));
+
+        // Holder P1 on P0's turn.
+        assert!(!eval(&state, &StaticCondition::DuringYourTurn, holder));
+        assert!(eval(&state, &StaticCondition::DuringOpponentsTurn, holder));
+        // No holder: the source's controller (P0) is the reference.
+        assert!(eval(
+            &state,
+            &StaticCondition::DuringYourTurn,
+            ConditionContext::NONE
+        ));
+        assert!(!eval(
+            &state,
+            &StaticCondition::DuringOpponentsTurn,
+            ConditionContext::NONE
+        ));
+
+        state.active_player = PlayerId(1);
+        assert!(eval(&state, &StaticCondition::DuringYourTurn, holder));
+        assert!(!eval(&state, &StaticCondition::DuringOpponentsTurn, holder));
     }
 
     #[test]
@@ -11054,6 +11242,202 @@ mod tests {
         );
         assert!(live[0].is_resolution_installed());
         assert!(live[0].is_consumed, "runtime state survives Humility too");
+    }
+
+    /// An activated ability whose effect draws `count` cards — distinct
+    /// abilities for the slot-provenance fixtures below.
+    fn draw_ability(count: i32) -> AbilityDefinition {
+        AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: count },
+                target: TargetFilter::Controller,
+            },
+        )
+    }
+
+    /// A creature whose printed activated abilities are `abilities`.
+    fn creature_with_abilities(
+        state: &mut GameState,
+        name: &str,
+        abilities: Vec<AbilityDefinition>,
+    ) -> ObjectId {
+        let id = make_creature(state, name, 1, 1, PlayerId(0));
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.base_abilities = Arc::new(abilities.clone());
+        obj.abilities = Arc::new(abilities);
+        obj.base_characteristics_initialized = true;
+        id
+    }
+
+    fn install_until_end_of_turn(
+        state: &mut GameState,
+        host: ObjectId,
+        modification: ContinuousModification,
+    ) -> u64 {
+        state.add_transient_continuous_effect(
+            host,
+            PlayerId(0),
+            Duration::UntilEndOfTurn,
+            TargetFilter::SpecificObject { id: host },
+            vec![modification],
+            None,
+        )
+    }
+
+    fn relayer(state: &mut GameState) {
+        state.layers_dirty.mark_full();
+        evaluate_layers(state);
+    }
+
+    /// CR 613.1a + CR 613.1f + CR 607.1 + CR 607.5: the live activated slots
+    /// split exactly into the characteristic prefix (of the winning layer-1
+    /// copiable set) and the layer-6 granted tail — including an identical
+    /// re-grant after an ability-removing effect — and the split is
+    /// layer-derived.
+    #[test]
+    fn activated_slot_provenance_tracks_layer_1_set_and_layer_6_grants() {
+        use crate::types::ability::{
+            AbilityProvenance, CharacteristicSetRef, CopyEffectInstanceRef,
+        };
+        let own = AbilityProvenance::Characteristic(CharacteristicSetRef::Own);
+
+        // (i) base [A] + grant B → A characteristic, B granted.
+        let mut state = setup();
+        let host = creature_with_abilities(&mut state, "Host", vec![draw_ability(1)]);
+        install_until_end_of_turn(
+            &mut state,
+            host,
+            ContinuousModification::GrantAbility {
+                definition: Box::new(draw_ability(2)),
+            },
+        );
+        relayer(&mut state);
+        let obj = &state.objects[&host];
+        assert_eq!(obj.abilities.len(), 2, "reach: the grant applied");
+        assert_eq!(obj.activated_ability_provenance(0), own);
+        assert_eq!(
+            obj.activated_ability_provenance(1),
+            AbilityProvenance::Granted
+        );
+        assert_eq!(
+            obj.activated_ability_provenance(2),
+            AbilityProvenance::Granted
+        );
+
+        // (ii) base [A] + an identical grant of A → deduplicated; still printed.
+        let mut state = setup();
+        let host = creature_with_abilities(&mut state, "Host", vec![draw_ability(1)]);
+        install_until_end_of_turn(
+            &mut state,
+            host,
+            ContinuousModification::GrantAbility {
+                definition: Box::new(draw_ability(1)),
+            },
+        );
+        relayer(&mut state);
+        let obj = &state.objects[&host];
+        assert_eq!(obj.abilities.len(), 1);
+        assert_eq!(obj.granted_abilities_from, None);
+        assert_eq!(obj.activated_ability_provenance(0), own);
+
+        // (iii) base [A], B granted, all abilities removed, then an identical A
+        // granted (timestamp order) → the live A is the grant, not the printed
+        // ability: the removal re-opens the granted tail at slot 0.
+        let mut state = setup();
+        let host = creature_with_abilities(&mut state, "Host", vec![draw_ability(1)]);
+        install_until_end_of_turn(
+            &mut state,
+            host,
+            ContinuousModification::GrantAbility {
+                definition: Box::new(draw_ability(2)),
+            },
+        );
+        install_until_end_of_turn(&mut state, host, ContinuousModification::RemoveAllAbilities);
+        install_until_end_of_turn(
+            &mut state,
+            host,
+            ContinuousModification::GrantAbility {
+                definition: Box::new(draw_ability(1)),
+            },
+        );
+        relayer(&mut state);
+        let obj = &state.objects[&host];
+        assert_eq!(obj.abilities.len(), 1, "reach: removed, then re-granted");
+        assert_eq!(
+            obj.activated_ability_provenance(0),
+            AbilityProvenance::Granted
+        );
+
+        // (iv) a layer-1 copy supplying [X, Y] + a layer-6 grant of Z.
+        let mut state = setup();
+        let host = creature_with_abilities(&mut state, "Host", vec![draw_ability(1)]);
+        let donor =
+            creature_with_abilities(&mut state, "Donor", vec![draw_ability(3), draw_ability(4)]);
+        let donor_values =
+            crate::game::printed_cards::intrinsic_copiable_values(&state.objects[&donor]);
+        let copy_id = install_until_end_of_turn(
+            &mut state,
+            host,
+            ContinuousModification::CopyValues {
+                values: Box::new(donor_values),
+                display_source: crate::game::game_object::DisplaySource::Card,
+                printed_ref: None,
+                token_image_ref: None,
+            },
+        );
+        install_until_end_of_turn(
+            &mut state,
+            host,
+            ContinuousModification::GrantAbility {
+                definition: Box::new(draw_ability(5)),
+            },
+        );
+        relayer(&mut state);
+        let copied = CharacteristicSetRef::Copied(CopyEffectInstanceRef {
+            continuous_effect_id: copy_id,
+            modification_index: 0,
+        });
+        let obj = &state.objects[&host];
+        assert_eq!(obj.name, "Donor", "reach: the copy applied");
+        assert_eq!(obj.abilities.len(), 3);
+        assert_eq!(
+            obj.layer1_copy_effect,
+            Some(CopyEffectInstanceRef {
+                continuous_effect_id: copy_id,
+                modification_index: 0,
+            })
+        );
+        assert_eq!(obj.characteristic_set(), copied);
+        assert_eq!(
+            obj.activated_ability_provenance(0),
+            AbilityProvenance::Characteristic(copied)
+        );
+        assert_eq!(
+            obj.activated_ability_provenance(1),
+            AbilityProvenance::Characteristic(copied)
+        );
+        assert_eq!(
+            obj.activated_ability_provenance(2),
+            AbilityProvenance::Granted
+        );
+
+        // (vi) Leaving the battlefield reverts both layer-derived fields.
+        let mut reverted = state.objects[&host].clone();
+        reverted.revert_layered_characteristics_to_base();
+        assert_eq!(reverted.granted_abilities_from, None);
+        assert_eq!(reverted.layer1_copy_effect, None);
+
+        // (v) Once the copy and the grant end, the next pass re-derives the
+        // object's own printed set with no granted tail.
+        prune_end_of_turn_effects(&mut state);
+        relayer(&mut state);
+        let obj = &state.objects[&host];
+        assert_eq!(obj.name, "Host", "reach: the copy ended");
+        assert_eq!(obj.abilities.len(), 1);
+        assert_eq!(obj.granted_abilities_from, None);
+        assert_eq!(obj.layer1_copy_effect, None);
+        assert_eq!(obj.activated_ability_provenance(0), own);
     }
 
     fn add_unspent_blue_mana(state: &mut GameState, player: PlayerId, count: usize) {
@@ -18174,6 +18558,7 @@ mod tests {
                 condition: None,
                 duration_subject: None,
                 end_permission: None,
+                duration_event_source: None,
                 source_name: String::new(),
             });
         let mut effects = vec![];
@@ -18208,6 +18593,7 @@ mod tests {
                 condition: None,
                 duration_subject: None,
                 end_permission: None,
+                duration_event_source: None,
                 source_name: String::new(),
             });
         let mut effects = vec![];
@@ -18254,6 +18640,7 @@ mod tests {
                     condition: None,
                     duration_subject: None,
                     end_permission: None,
+                    duration_event_source: None,
                     source_name: String::new(),
                 });
         }
@@ -19495,6 +19882,163 @@ mod tests {
         assert_eq!(bear_obj.toughness, Some(3));
     }
 
+    #[test]
+    fn recipient_anchored_monarch_condition_binds_only_with_a_recipient() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Source Aura".to_string(),
+            Zone::Battlefield,
+        );
+        let recipient = make_creature(&mut state, "Recipient", 2, 2, PlayerId(1));
+        let affirmative = StaticCondition::IsMonarch {
+            player: PlayerScope::RecipientController,
+        };
+        let negated = StaticCondition::Not {
+            condition: Box::new(affirmative.clone()),
+        };
+        state.monarch = Some(PlayerId(0));
+        assert!(!evaluate_condition(
+            &state,
+            &affirmative,
+            PlayerId(0),
+            source
+        ));
+        assert!(!evaluate_condition(&state, &negated, PlayerId(0), source));
+        assert!(!evaluate_condition_with_recipient(
+            &state,
+            &affirmative,
+            PlayerId(0),
+            source,
+            recipient
+        ));
+        assert!(evaluate_condition_with_recipient(
+            &state,
+            &negated,
+            PlayerId(0),
+            source,
+            recipient
+        ));
+        state.monarch = Some(PlayerId(1));
+        assert!(evaluate_condition_with_recipient(
+            &state,
+            &affirmative,
+            PlayerId(0),
+            source,
+            recipient
+        ));
+        assert!(!evaluate_condition_with_recipient(
+            &state,
+            &negated,
+            PlayerId(0),
+            source,
+            recipient
+        ));
+    }
+
+    /// A synthetic continuous static is necessary because the parser gate
+    /// accepts RecipientController only at CantUntap. This exercises the layer
+    /// pipeline's per-recipient routing without claiming a printed card uses it.
+    #[test]
+    fn recipient_controller_monarch_anthem_applies_per_recipient_in_continuous_mode() {
+        let mut state = setup();
+        let anthem = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Monarch Recipient Anthem".to_string(),
+            Zone::Battlefield,
+        );
+        let timestamp = state.next_timestamp();
+        {
+            let object = state.objects.get_mut(&anthem).unwrap();
+            object.card_types.core_types.push(CoreType::Enchantment);
+            object.base_card_types = object.card_types.clone();
+            object.timestamp = timestamp;
+            object.static_definitions.push(
+                StaticDefinition::continuous()
+                    .condition(StaticCondition::IsMonarch {
+                        player: PlayerScope::RecipientController,
+                    })
+                    .affected(TargetFilter::Typed(TypedFilter::creature()))
+                    .modifications(vec![
+                        ContinuousModification::AddPower { value: 1 },
+                        ContinuousModification::AddToughness { value: 1 },
+                    ]),
+            );
+        }
+        let p0_creature = make_creature(&mut state, "P0 Bear", 2, 2, PlayerId(0));
+        let p1_creature = make_creature(&mut state, "P1 Bear", 2, 2, PlayerId(1));
+        state.monarch = Some(PlayerId(1));
+        evaluate_layers(&mut state);
+        assert_eq!(state.objects[&p0_creature].power, Some(2));
+        assert_eq!(state.objects[&p1_creature].power, Some(3));
+        state.monarch = Some(PlayerId(0));
+        evaluate_layers(&mut state);
+        assert_eq!(state.objects[&p0_creature].power, Some(3));
+        assert_eq!(state.objects[&p1_creature].power, Some(2));
+    }
+
+    #[test]
+    fn vacant_monarch_static_condition_is_false_in_both_polarities_cr_725_5() {
+        for (monarch, condition, expected_power) in [
+            (
+                None,
+                StaticCondition::IsMonarch {
+                    player: PlayerScope::Controller,
+                },
+                2,
+            ),
+            (
+                None,
+                StaticCondition::Not {
+                    condition: Box::new(StaticCondition::IsMonarch {
+                        player: PlayerScope::Controller,
+                    }),
+                },
+                2,
+            ),
+            (None, StaticCondition::NoMonarch, 3),
+            (
+                Some(PlayerId(0)),
+                StaticCondition::IsMonarch {
+                    player: PlayerScope::Controller,
+                },
+                3,
+            ),
+        ] {
+            let mut state = setup();
+            state.monarch = monarch;
+            let anthem = create_object(
+                &mut state,
+                CardId(0),
+                PlayerId(0),
+                "Vacancy Anthem".to_string(),
+                Zone::Battlefield,
+            );
+            let timestamp = state.next_timestamp();
+            {
+                let object = state.objects.get_mut(&anthem).unwrap();
+                object.card_types.core_types.push(CoreType::Enchantment);
+                object.base_card_types = object.card_types.clone();
+                object.timestamp = timestamp;
+                object.static_definitions.push(
+                    StaticDefinition::continuous()
+                        .condition(condition)
+                        .affected(TargetFilter::Typed(
+                            TypedFilter::creature().controller(ControllerRef::You),
+                        ))
+                        .modifications(vec![ContinuousModification::AddPower { value: 1 }]),
+                );
+            }
+            let bear = make_creature(&mut state, "Bear", 2, 2, PlayerId(0));
+            evaluate_layers(&mut state);
+            assert_eq!(state.objects[&bear].power, Some(expected_power));
+        }
+    }
+
     /// CR 109.4 + CR 725.5: layer evaluation has no triggering event and no
     /// combat anchor, so a SCOPED monarch subject is unanswerable there. It must
     /// be false in BOTH polarities.
@@ -19502,9 +20046,9 @@ mod tests {
     /// The negated case is the revert-failing one: without the entry-boundary
     /// gate in `evaluate_condition{,_with_recipient}` the leaf's `false` inverts
     /// under `StaticCondition::Not` and the anthem applies UNCONDITIONALLY —
-    /// which is exactly the printed "unless that player is the monarch"
-    /// (Fall from Favor) restriction shape, applied when the engine cannot
-    /// identify the player at all.
+    /// which is the shape of an unbindable designation subject here:
+    /// `DefendingPlayer` has no layer declaration context. The printed Fall
+    /// from Favor line instead binds `RecipientController` at its untap step.
     #[test]
     fn scoped_monarch_static_condition_is_false_in_both_polarities_cr_725_5() {
         for (label, condition) in [
@@ -22636,7 +23180,7 @@ mod tests {
                 placement: None,
                 exile_links: ExileLinkSpec::default(),
                 replacement_applied: Default::default(),
-                face_down_in_exile: false,
+                face_down_in_exile: crate::types::ability::ExileConcealment::Public,
             },
             &mut events,
         );
@@ -22702,7 +23246,7 @@ mod tests {
                 placement: None,
                 exile_links: ExileLinkSpec::default(),
                 replacement_applied: Default::default(),
-                face_down_in_exile: false,
+                face_down_in_exile: crate::types::ability::ExileConcealment::Public,
             },
             &mut events,
         );
@@ -24702,6 +25246,84 @@ mod tests {
         id
     }
 
+    const ELENDA_ORACLE: &str = "As long as your life total is greater than your starting life total, Elenda gets +1/+1 and has menace. Elenda gets an additional +5/+5 as long as your life total is at least 10 greater than your starting life total.";
+
+    fn parsed_elenda_statics() -> Vec<StaticDefinition> {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            ELENDA_ORACLE,
+            "Elenda, Saint of Dusk",
+            &[],
+            &["Legendary".to_string(), "Creature".to_string()],
+            &["Vampire".to_string(), "Knight".to_string()],
+        );
+        assert_eq!(parsed.statics.len(), 2, "both Elenda statics must parse");
+        parsed.statics
+    }
+
+    fn make_elenda(
+        state: &mut GameState,
+        player: PlayerId,
+        statics: &[StaticDefinition],
+    ) -> ObjectId {
+        let id = make_creature(state, "Elenda, Saint of Dusk", 4, 4, player);
+        state.objects.get_mut(&id).unwrap().static_definitions = statics.to_vec().into();
+        id
+    }
+
+    /// Drive a real life gain/loss effect, which routes through the production
+    /// replacement and layer-invalidation paths, then perform the production
+    /// layer pass before observing Elenda.
+    fn resolve_test_life_change(
+        state: &mut GameState,
+        source: ObjectId,
+        player: PlayerId,
+        amount: u32,
+        gain: bool,
+    ) {
+        let effect = if gain {
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed {
+                    value: amount as i32,
+                },
+                player: TargetFilter::Controller,
+            }
+        } else {
+            Effect::LoseLife {
+                amount: QuantityExpr::Fixed {
+                    value: amount as i32,
+                },
+                target: None,
+            }
+        };
+        let targets = if gain {
+            Vec::new()
+        } else {
+            vec![TargetRef::Player(player)]
+        };
+        let ability = ResolvedAbility::new(effect, targets, source, player);
+        let mut events = Vec::new();
+        if gain {
+            crate::game::effects::life::resolve_gain(state, &ability, &mut events)
+                .expect("production life-gain resolution");
+        } else {
+            crate::game::effects::life::resolve_lose(state, &ability, &mut events)
+                .expect("production life-loss resolution");
+        }
+        evaluate_layers(state);
+    }
+
+    fn assert_elenda_characteristics(
+        state: &GameState,
+        elenda: ObjectId,
+        power_toughness: i32,
+        menace: bool,
+    ) {
+        let object = &state.objects[&elenda];
+        assert_eq!(object.power, Some(power_toughness));
+        assert_eq!(object.toughness, Some(power_toughness));
+        assert_eq!(object.keywords.contains(&Keyword::Menace), menace);
+    }
+
     /// A self-affecting CDA that adds the controller's life total to its own
     /// power (Serra Avatar class) — the canonical dynamic-quantity life reader.
     fn life_total_cda(player_scope: PlayerScope) -> StaticDefinition {
@@ -24734,7 +25356,9 @@ mod tests {
             player: PlayerScope::Controller
         }));
         // CR 119.1: a format constant, not a live read.
-        assert!(!quantity_ref_reads_life(&QuantityRef::StartingLifeTotal));
+        assert!(!quantity_ref_reads_life(&QuantityRef::StartingLifeTotal {
+            player: PlayerScope::Controller,
+        }));
         // A non-life player scalar.
         assert!(!quantity_ref_reads_life(&QuantityRef::HandSize {
             player: PlayerScope::Controller
@@ -24969,6 +25593,151 @@ mod tests {
             .modifications(vec![ContinuousModification::AddPower { value: 2 }]);
         make_life_static_source(&mut state, "Serra Ascendant-ish", P0, def);
         assert_full_escalation_on_guard(&mut state);
+    }
+
+    /// CR 119: exercise Elenda's printed thresholds with production life events
+    /// and a fresh layer pass at every boundary. The unsupported-static
+    /// fail-open behavior would make the additional +5/+5 unconditional, so
+    /// the 20/21 and 29/30 transitions discriminate that regression.
+    #[test]
+    fn elenda_life_thresholds_follow_standard_starting_life() {
+        let mut state = setup();
+        let statics = parsed_elenda_statics();
+        let elenda = make_elenda(&mut state, P0, &statics);
+        evaluate_layers(&mut state);
+        assert_elenda_characteristics(&state, elenda, 4, false);
+
+        resolve_test_life_change(&mut state, elenda, P0, 1, true);
+        assert_elenda_characteristics(&state, elenda, 5, true);
+        resolve_test_life_change(&mut state, elenda, P0, 8, true);
+        assert_elenda_characteristics(&state, elenda, 5, true);
+        resolve_test_life_change(&mut state, elenda, P0, 1, true);
+        assert_elenda_characteristics(&state, elenda, 10, true);
+        resolve_test_life_change(&mut state, elenda, P0, 1, false);
+        assert_elenda_characteristics(&state, elenda, 5, true);
+    }
+
+    /// CR 119: Two-Headed Giant uses the shared team total (30 starting life)
+    /// for Elenda's life-above-starting condition.
+    #[test]
+    fn elenda_life_thresholds_follow_two_headed_giant_team_life() {
+        let mut state = GameState::new(FormatConfig::two_headed_giant(), 4, 42);
+        let statics = parsed_elenda_statics();
+        let elenda = make_elenda(&mut state, P0, &statics);
+        assert_eq!(crate::game::players::team_life_total(&state, P0), 30);
+        evaluate_layers(&mut state);
+        assert_elenda_characteristics(&state, elenda, 4, false);
+
+        resolve_test_life_change(&mut state, elenda, P0, 9, true);
+        assert_eq!(crate::game::players::team_life_total(&state, P0), 39);
+        assert_elenda_characteristics(&state, elenda, 5, true);
+        resolve_test_life_change(&mut state, elenda, P0, 1, true);
+        assert_eq!(crate::game::players::team_life_total(&state, P0), 40);
+        assert_elenda_characteristics(&state, elenda, 10, true);
+        resolve_test_life_change(&mut state, elenda, P0, 1, false);
+        assert_eq!(crate::game::players::team_life_total(&state, P0), 39);
+        assert_elenda_characteristics(&state, elenda, 5, true);
+    }
+
+    /// CR 103.4e + CR 904.5: Archenemy's baseline is player-specific. Elenda
+    /// controlled by the archenemy uses 40, while the same permanent under a
+    /// hero uses that hero's 20-life baseline even when its owner is the
+    /// archenemy. Every transition uses the production life and layer paths.
+    #[test]
+    fn elenda_life_thresholds_follow_archenemy_and_current_controller() {
+        let mut state = GameState::new(FormatConfig::archenemy(), 4, 42);
+        assert_eq!(state.players[0].life, 40);
+        assert_eq!(state.players[1].life, 20);
+        let statics = parsed_elenda_statics();
+        let archenemy_elenda = make_elenda(&mut state, P0, &statics);
+        let hero_controlled_elenda = make_elenda(&mut state, P0, &statics);
+        evaluate_layers(&mut state);
+        assert_elenda_characteristics(&state, archenemy_elenda, 4, false);
+        assert_elenda_characteristics(&state, hero_controlled_elenda, 4, false);
+
+        resolve_test_life_change(&mut state, archenemy_elenda, P0, 1, true);
+        assert_elenda_characteristics(&state, archenemy_elenda, 5, true);
+        resolve_test_life_change(&mut state, archenemy_elenda, P0, 8, true);
+        assert_elenda_characteristics(&state, archenemy_elenda, 5, true);
+        resolve_test_life_change(&mut state, archenemy_elenda, P0, 1, true);
+        assert_elenda_characteristics(&state, archenemy_elenda, 10, true);
+        resolve_test_life_change(&mut state, archenemy_elenda, P0, 1, false);
+        assert_elenda_characteristics(&state, archenemy_elenda, 5, true);
+
+        // Put owner and current controller on opposite sides of their starting
+        // baselines at the same 30 life: owner P0 is 10 below 40, controller
+        // P1 is 10 above 20. A wrong owner-bound lookup leaves this at 4/4.
+        resolve_test_life_change(&mut state, archenemy_elenda, P0, 19, false);
+        resolve_test_life_change(&mut state, hero_controlled_elenda, P1, 10, true);
+        assert_eq!(state.players[0].life, 30);
+        assert_eq!(state.players[1].life, 30);
+        add_change_controller_effect(
+            &mut state,
+            hero_controlled_elenda,
+            hero_controlled_elenda,
+            P1,
+            Duration::UntilEndOfTurn,
+        );
+        evaluate_layers(&mut state);
+        assert_eq!(state.objects[&hero_controlled_elenda].owner, P0);
+        assert_eq!(state.objects[&hero_controlled_elenda].controller, P1);
+        assert_elenda_characteristics(&state, hero_controlled_elenda, 10, true);
+
+        add_change_controller_effect(
+            &mut state,
+            hero_controlled_elenda,
+            hero_controlled_elenda,
+            P0,
+            Duration::UntilEndOfTurn,
+        );
+        evaluate_layers(&mut state);
+        assert_eq!(state.objects[&hero_controlled_elenda].controller, P0);
+        assert_elenda_characteristics(&state, hero_controlled_elenda, 4, false);
+    }
+
+    /// CR 613.1b + CR 119: Elenda's threshold reads the current controller's
+    /// life, not its owner's. The owner begins at 20 while the opponent has 30;
+    /// gaining control activates the same parsed statics, and control returning
+    /// to the owner deactivates them again.
+    #[test]
+    fn elenda_life_threshold_follows_current_controller_after_control_change() {
+        let mut state = setup();
+        let statics = parsed_elenda_statics();
+        let elenda_p0 = make_elenda(&mut state, P0, &statics);
+        let elenda_p1 = make_elenda(&mut state, P1, &statics);
+        evaluate_layers(&mut state);
+        assert_elenda_characteristics(&state, elenda_p0, 4, false);
+        assert_elenda_characteristics(&state, elenda_p1, 4, false);
+
+        resolve_test_life_change(&mut state, elenda_p1, P1, 10, true);
+        assert_eq!(state.players.iter().find(|p| p.id == P0).unwrap().life, 20);
+        assert_eq!(state.players.iter().find(|p| p.id == P1).unwrap().life, 30);
+        assert_elenda_characteristics(&state, elenda_p0, 4, false);
+        assert_elenda_characteristics(&state, elenda_p1, 10, true);
+
+        add_change_controller_effect(
+            &mut state,
+            elenda_p0,
+            elenda_p0,
+            P1,
+            Duration::UntilEndOfTurn,
+        );
+        evaluate_layers(&mut state);
+        assert_eq!(state.objects[&elenda_p0].controller, P1);
+        assert_elenda_characteristics(&state, elenda_p0, 10, true);
+
+        // A later Layer 2 effect returns control to P0, whose life is still 20.
+        add_change_controller_effect(
+            &mut state,
+            elenda_p0,
+            elenda_p0,
+            P0,
+            Duration::UntilEndOfTurn,
+        );
+        evaluate_layers(&mut state);
+        assert_eq!(state.objects[&elenda_p0].controller, P0);
+        assert_elenda_characteristics(&state, elenda_p0, 4, false);
+        assert_elenda_characteristics(&state, elenda_p1, 10, true);
     }
 
     /// `LifeAboveStarting` reader — a CDA keyed on life-above-starting. Reverting

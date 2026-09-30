@@ -387,10 +387,10 @@ pub(crate) fn parse_target_with_disjunctive_restriction(text: &str) -> (TargetFi
     (filter, &rest[consumed..])
 }
 
-/// CR 205.2a + CR 601.2h: Fold a DETERMINER-led right conjunct onto an
+/// CR 205.2a + CR 701.21a: Fold a DETERMINER-led right conjunct onto an
 /// already-parsed left conjunct — "another creature or an artifact"
-/// (Mold Folk's `{1}, Sacrifice another creature or an artifact:`) and the
-/// mirror-image "an artifact or another creature" (Malevolent Noble).
+/// (Mold Folk's sacrifice cost and Gut's resolution-time sacrifice effect) and
+/// the mirror-image "an artifact or another creature" (Malevolent Noble).
 ///
 /// Takes `base` and `rest` rather than parsing the phrase itself, and that split
 /// is LOAD-BEARING, not a style choice. In this surface "another" scopes only the
@@ -400,7 +400,7 @@ pub(crate) fn parse_target_with_disjunctive_restriction(text: &str) -> (TargetFi
 /// sacrifice it to pay the cost of its activated ability"; Gut, True Soul Zealot
 /// (2022-06-10): "If Gut somehow becomes an artifact, you may sacrifice it to its
 /// own ability." Stamping `FilterProp::Another` onto the right leg would make an
-/// artifact-ified source unable to pay with itself: the sacrifice-cost path runs
+/// artifact-ified source unable to sacrifice itself: the sacrifice-choice path runs
 /// `find_eligible_sacrifice_targets` -> `matches_target_filter` ->
 /// `matches_filter_prop`, whose `Another` arm reduces to
 /// `!source_is_current_object(state, source, object_id)` here, because
@@ -443,10 +443,12 @@ pub(crate) fn parse_target_with_disjunctive_restriction(text: &str) -> (TargetFi
 /// The real reason is BLAST RADIUS. `parse_type_phrase_folding_with_ctx` is the shared
 /// entry point for target phrases, cost filters, trigger filters, keyword costs
 /// and condition subjects; widening it changes every one of those at once, and
-/// the pinning test above exists precisely to stop that happening casually. A
-/// COST, by contrast, has no verb to elide — the entire phrase is the filter — so
-/// its consumer can opt into the union reading on its own, and the measured
-/// effect stays the eight cost-position cards this change actually intends.
+/// the pinning test above exists precisely to stop that happening casually.
+/// A sacrifice cost or effect, by contrast, owns its noun phrase and can opt
+/// into this reading without guessing whether a subsequent verb was elided.
+/// This grammar is shared
+/// by the cost-position cards and resolution-time sacrifice effects without
+/// changing general-purpose target and condition parsing.
 /// The disambiguator is the consumer's intent, which is what a wrapper expresses
 /// and a widened branch cannot.
 /// Mirrors [`parse_target_with_disjunctive_restriction`] directly above: parse
@@ -468,9 +470,11 @@ pub(crate) fn fold_article_led_type_union(base: TargetFilter, rest: &str) -> (Ta
     // A right conjunct that carries no TYPE content is not treated as a union leg.
     // Deliberately stricter than `target_filter_has_meaningful_content`: a bare
     // "or a token" parses to `Typed{[], [Token]}`, which matches only tokens
-    // rather than every object, but it is a property-only leg the cost grammar
-    // has no corpus instance of, so this bails to today's behaviour rather than
-    // guessing. Widening to accept property-only legs needs its own measurement.
+    // rather than every object. Old Man Willow is a real property-only RHS
+    // instance, but this opt-in helper deliberately supports type-bearing RHS
+    // only. The sacrifice imperative must keep an unsupported token RHS red
+    // instead of discarding it. Accepting property-only legs needs its own
+    // measurement.
     let TargetFilter::Typed(ref right_typed) = right else {
         return (base, rest);
     };
@@ -2398,6 +2402,25 @@ fn parse_named_filter_locative_zone_terminator(
     Ok((&input[consumed..], ()))
 }
 
+/// CR 201.2: byte length of the literal card name at the start of `name_text`
+/// (the text right after "named "). The name runs to the earliest *clause*
+/// boundary (`parse_named_filter_terminator`), tried at each space/comma so
+/// comma- and "and"-bearing names survive ("Ebondeath, Dracolich"; "Gisa and
+/// Geralf"); with no clause boundary it ends at the first `.`, `:` or `;`, else
+/// at end of input. Single authority for both the positive "named X" branch of
+/// `parse_type_phrase_folding_with_ctx` and the negated
+/// `oracle_nom::filter::parse_not_named_suffix`.
+pub(crate) fn named_filter_name_end(name_text: &str) -> usize {
+    name_text
+        .char_indices()
+        .filter(|&(_, c)| c == ' ' || c == ',')
+        .find(|&(idx, _)| parse_named_filter_terminator(&name_text[idx..]).is_ok())
+        .map_or_else(
+            || name_text.find(['.', ':', ';']).unwrap_or(name_text.len()),
+            |(idx, _)| idx,
+        )
+}
+
 fn parse_named_filter_terminator(input: &str) -> Result<(&str, ()), nom::Err<OracleError<'_>>> {
     alt((
         // Controller-scope suffixes (CR 109.4). Longest-match-first.
@@ -2466,6 +2489,42 @@ fn parse_named_filter_terminator(input: &str) -> Result<(&str, ()), nom::Err<Ora
                     tag("she "),
                     tag("you "),
                     tag("its "),
+                )),
+            ),
+        ),
+        // CR 201.2 + CR 603.4: a comma followed by an imperative effect verb
+        // ends the name — it is the boundary between an intervening-if
+        // condition and its effect ("if you don't control another permanent
+        // named The Majestic Duo, create a token …"). Legendary epithets are
+        // noun phrases and never open with one of these verbs; "counter" is
+        // left out because it does open one ("Gimli, Counter of Kills"). The
+        // trailing space keeps a name-final verb ("Untap, Upkeep, Draw") whole.
+        value(
+            (),
+            (
+                tag(", "),
+                alt((
+                    alt((
+                        tag("create "),
+                        tag("draw "),
+                        tag("put "),
+                        tag("return "),
+                        tag("exile "),
+                        tag("destroy "),
+                        tag("sacrifice "),
+                        tag("search "),
+                        tag("gain "),
+                    )),
+                    alt((
+                        tag("lose "),
+                        tag("look "),
+                        tag("reveal "),
+                        tag("mill "),
+                        tag("scry "),
+                        tag("copy "),
+                        tag("shuffle "),
+                        tag("add "),
+                    )),
                 )),
             ),
         ),
@@ -4096,14 +4155,7 @@ pub fn parse_type_phrase_folding_with_ctx<'a>(
         // terminator (see `parse_named_filter_terminator`), which preserves
         // comma/and-bearing names while ending the name at the controller
         // suffix, relative pronoun, predicate verb, or referential comma clause.
-        let name_end = name_text
-            .char_indices()
-            .filter(|&(_, c)| c == ' ' || c == ',')
-            .find(|&(idx, _)| parse_named_filter_terminator(&name_text[idx..]).is_ok())
-            .map_or_else(
-                || name_text.find(['.', ':', ';']).unwrap_or(name_text.len()),
-                |(idx, _)| idx,
-            );
+        let name_end = named_filter_name_end(name_text);
         let raw_name = name_text[..name_end].trim();
         if !raw_name.is_empty() {
             // Reconstruct original-case name from the same position in `text`
@@ -6739,9 +6791,15 @@ pub(crate) fn parse_mana_value_suffix(
     }
 
     let (rest, _) = parse_suffix_subject_head(trimmed).ok()?;
-    let (rest, _) = tag::<_, _, OracleError<'_>>("mana value ")
-        .parse(rest)
-        .ok()?;
+    // CR 202.3: "converted mana cost" is mana value under its former name, still
+    // printed in unmodernized Oracle text (M'Odo, the Gnarled Oracle; Underdark
+    // Beholder). Accepting it here keeps their bound instead of dropping it.
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("mana value "),
+        tag("converted mana cost "),
+    ))
+    .parse(rest)
+    .ok()?;
 
     // CR 202.3 + CR 120.3: Dynamic comparisons referencing the triggering event.
     // "that damage" → `EventContextAmount` (damage amount captured at trigger).
@@ -8208,12 +8266,33 @@ fn parse_shared_quality_reference<'a>(
         }
     }
 
-    let (filter, rest) = parse_target(input);
+    let (filter, rest) = parse_target_disjunction(input);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
             nom::error::ErrorKind::Fail,
         )));
+    }
+    Ok((rest, filter))
+}
+
+/// CR 109.2 + CR 109.2a: parse a reference noun phrase that may be a two-leg
+/// disjunction — "a creature you control **or** a creature card in your
+/// graveyard" (Guardian Project, Volo) — into `TargetFilter::Or`.
+///
+/// Each leg is parsed by `parse_target`, so the per-leg zone semantics are the
+/// ordinary ones: a zone-less type description means a permanent on the
+/// battlefield (CR 109.2) while a leg naming a zone keeps it (CR 109.2a). The
+/// single-leg path returns exactly what `parse_target` returned, so callers that
+/// never see a disjunction are unaffected.
+///
+/// Extracted from `parse_shared_quality_reference` so the name-relation
+/// combinator in `oracle_effect::search` shares one authority for the reference
+/// axis instead of duplicating the disjunction handling.
+pub(crate) fn parse_target_disjunction(input: &str) -> (TargetFilter, &str) {
+    let (filter, rest) = parse_target(input);
+    if matches!(filter, TargetFilter::Any) {
+        return (filter, rest);
     }
     let rest_trimmed = rest.trim_start();
     if let Ok((after_or, sep)) =
@@ -8221,17 +8300,17 @@ fn parse_shared_quality_reference<'a>(
     {
         let (filter2, rest2) = parse_target(after_or);
         if !matches!(filter2, TargetFilter::Any) {
-            return Ok((
-                rest2,
+            return (
                 TargetFilter::Or {
                     filters: vec![filter, filter2],
                 },
-            ));
+                rest2,
+            );
         }
         // Fall through: only accept the first leg if the disjunction tail didn't parse.
         let _ = sep;
     }
-    Ok((rest, filter))
+    (filter, rest)
 }
 
 /// CR 608.2k: "the sacrificed/exiled <noun>" — an untargeted reference to the
@@ -8266,9 +8345,112 @@ fn parse_cost_paid_object_reference<'a>(
     Ok((rest, TargetFilter::CostPaidObject))
 }
 
-pub(crate) fn parse_zone_changed_this_turn_suffix(
+/// CR 400.7: The origin zone named by a "put there from <zone>" provenance
+/// clause. Factored out of [`parse_zone_changed_this_turn_suffix`] so the
+/// affirmative form and the "anywhere other than" negated form below read the
+/// same zone vocabulary through one production instead of two lists that can
+/// drift apart.
+fn parse_zone_change_origin_zone(input: &str) -> nom::IResult<&str, Zone, OracleError<'_>> {
+    alt((
+        value(Zone::Battlefield, tag("the battlefield")),
+        value(Zone::Graveyard, tag("a graveyard")),
+        value(Zone::Graveyard, tag("your graveyard")),
+        value(Zone::Graveyard, tag("graveyard")),
+        value(Zone::Exile, tag("exile")),
+        value(Zone::Hand, tag("a hand")),
+        value(Zone::Hand, tag("your hand")),
+        value(Zone::Hand, tag("hand")),
+        value(Zone::Library, tag("a library")),
+        value(Zone::Library, tag("your library")),
+        value(Zone::Library, tag("library")),
+    ))
+    .parse(input)
+}
+
+/// CR 400.7: The "that (were|was) put there from …" provenance
+/// clause shared by the affirmative form ("… from your library this turn" —
+/// Kagha, Shadow Archdruid; The Fourteenth Doctor) and the negated form
+/// ("… from anywhere other than the battlefield this turn" — Banon, the
+/// Returners' Leader).
+///
+/// Returns the AND-combined properties the clause states, plus the number of
+/// bytes consumed. The negated form yields TWO properties rather than a lone
+/// `Not`, and both are load-bearing:
+///
+///   * `ZoneChangedThisTurn { from: None, to }` — the card must have arrived in
+///     `to` THIS TURN at all. Without it a card that has sat in the graveyard
+///     since an earlier turn satisfies the `Not` vacuously (it has no
+///     battlefield→graveyard record either), which would widen the printed
+///     "this turn" pool to the whole graveyard.
+///   * `Not(ZoneChangedThisTurn { from: Some(excluded), to })` — the origin
+///     exclusion itself, expressed through the existing general
+///     [`FilterProp::Not`] combinator rather than a negated-origin sibling.
+///
+/// `FilterProp::ZoneChangedThisTurn` reads the object's most recent zone-change
+/// record, so an earlier graveyard visit cannot qualify its current residency.
+pub(crate) fn parse_graveyard_pool_provenance_suffix(
     input: &str,
     to: Option<Zone>,
+) -> Option<(Vec<FilterProp>, usize)> {
+    let trimmed = input.trim_start();
+    let offset = input.len() - trimmed.len();
+
+    // The negated form is tried first — its "from anywhere other
+    // than " head strictly extends the affirmative "from " head, so the
+    // affirmative production would otherwise match the shorter prefix and leave
+    // "anywhere other than …" as an unconsumed residual.
+    let negated = (
+        tag::<_, _, OracleError<'_>>("that "),
+        alt((tag("were "), tag("was "))),
+        alt((tag("put "), tag("placed "), tag("moved "))),
+        tag("there from anywhere other than "),
+        parse_zone_change_origin_zone,
+        // REQUIRED here, unlike the affirmative production below, which keeps
+        // `opt` for compatibility with the shapes already shipping. Without a
+        // time limiter this production would narrow an unlimited exclusion
+        // ("put there from anywhere other than the battlefield", no "this
+        // turn") to a this-turn pool — under-permissive, and silently so. No
+        // printed card prints the unlimited form; requiring the limiter costs
+        // nothing today and refuses rather than guesses if one appears.
+        tag(" this turn"),
+    )
+        .map(|(_, _, _, _, excluded, _)| excluded)
+        .parse(trimmed);
+
+    if let Ok((rest, excluded)) = negated {
+        return Some((
+            vec![
+                FilterProp::ZoneChangedThisTurn { from: None, to },
+                FilterProp::Not {
+                    prop: Box::new(FilterProp::ZoneChangedThisTurn {
+                        from: Some(excluded),
+                        to,
+                    }),
+                },
+            ],
+            offset + trimmed.len() - rest.len(),
+        ));
+    }
+
+    // CR 400.7: the affirmative form, with the time phrase REQUIRED. The shared
+    // helper keeps `opt` for its existing callers, whose own grammars already
+    // bound the clause; here an omitted "this turn" would be silently narrowed
+    // to a this-turn pool by a `ZoneChangedThisTurn` result, so the pool path
+    // refuses instead and the shape stays an honest gap.
+    parse_zone_change_provenance(input, to, true).map(|(prop, consumed)| (vec![prop], consumed))
+}
+
+/// CR 400.7: the shared "that (were|was) put there from <zone> [this turn]"
+/// production.
+///
+/// `require_this_turn` is the one axis the two callers differ on, so the grammar
+/// is parameterized rather than duplicated: `parse_zone_changed_this_turn_suffix`
+/// passes `false` (preserving every shape already shipping), and the graveyard
+/// pool path passes `true`.
+fn parse_zone_change_provenance(
+    input: &str,
+    to: Option<Zone>,
+    require_this_turn: bool,
 ) -> Option<(FilterProp, usize)> {
     let trimmed = input.trim_start();
     let offset = input.len() - trimmed.len();
@@ -8277,24 +8459,16 @@ pub(crate) fn parse_zone_changed_this_turn_suffix(
         alt((tag("were "), tag("was "))),
         alt((tag("put "), tag("placed "), tag("moved "))),
         tag("there from "),
-        alt((
-            value(Zone::Battlefield, tag("the battlefield")),
-            value(Zone::Graveyard, tag("a graveyard")),
-            value(Zone::Graveyard, tag("your graveyard")),
-            value(Zone::Graveyard, tag("graveyard")),
-            value(Zone::Exile, tag("exile")),
-            value(Zone::Hand, tag("a hand")),
-            value(Zone::Hand, tag("your hand")),
-            value(Zone::Hand, tag("hand")),
-            value(Zone::Library, tag("a library")),
-            value(Zone::Library, tag("your library")),
-            value(Zone::Library, tag("library")),
-        )),
-        opt(tag(" this turn")),
+        parse_zone_change_origin_zone,
     )
-        .map(|(_, _, _, _, from, _)| from)
+        .map(|(_, _, _, _, from)| from)
         .parse(trimmed)
         .ok()?;
+    let rest = match tag::<_, _, OracleError<'_>>(" this turn").parse(rest) {
+        Ok((after, _)) => after,
+        Err(_) if require_this_turn => return None,
+        Err(_) => rest,
+    };
     Some((
         FilterProp::ZoneChangedThisTurn {
             from: Some(from),
@@ -8302,6 +8476,13 @@ pub(crate) fn parse_zone_changed_this_turn_suffix(
         },
         offset + trimmed.len() - rest.len(),
     ))
+}
+
+pub(crate) fn parse_zone_changed_this_turn_suffix(
+    input: &str,
+    to: Option<Zone>,
+) -> Option<(FilterProp, usize)> {
+    parse_zone_change_provenance(input, to, false)
 }
 
 fn zone_for_scope(props: &[FilterProp]) -> Option<Zone> {
@@ -10035,14 +10216,27 @@ enum ZoneQual {
 pub(crate) fn scan_zone_phrase(
     text: &str,
 ) -> Option<(Zone, Option<ControllerRef>, Vec<FilterProp>)> {
+    scan_zone_phrase_span(text).map(|(_span, zone, ctrl, props)| (zone, ctrl, props))
+}
+
+/// `scan_zone_phrase`, plus the matched phrase itself as a slice of `text` —
+/// for callers that must read the qualifier the phrase was parsed from rather
+/// than rescan the whole text for it.
+pub(crate) fn scan_zone_phrase_span(
+    text: &str,
+) -> Option<(&str, Zone, Option<ControllerRef>, Vec<FilterProp>)> {
     let mut offset = 0;
     while offset <= text.len() {
-        if let Some((props, ctrl, _consumed)) = parse_zone_suffix(&text[offset..]) {
+        if let Some((props, ctrl, consumed)) = parse_zone_suffix(&text[offset..]) {
             let zone = props.iter().find_map(|p| match p {
                 FilterProp::InZone { zone } => Some(*zone),
                 _ => None,
             })?;
-            return Some((zone, ctrl, props));
+            // `consumed` counts bytes of the lowercased phrase, so the span is exact
+            // only for text whose lowercase keeps its byte length (callers pass
+            // lowercased text); otherwise it may be empty.
+            let span = text[offset..].get(..consumed).unwrap_or_default();
+            return Some((span, zone, ctrl, props));
         }
         match text[offset..].find(' ') {
             Some(i) => offset += i + 1,
@@ -10357,6 +10551,53 @@ mod tests {
             TargetFilter::And { filters } => filters.iter().find_map(typed_leg),
             _ => None,
         }
+    }
+
+    /// CR 201.2: regression pin for extracting `named_filter_name_end`. The
+    /// positive "named X" branch keeps a comma-bearing name whole and still ends
+    /// the name at a controller suffix or a predicate verb (issue #2016).
+    #[test]
+    fn named_filter_name_end_keeps_comma_names_and_stops_at_clauses() {
+        assert_eq!(
+            named_filter_name_end("bruna, the fading light you control"),
+            "bruna, the fading light".len()
+        );
+        assert_eq!(
+            named_filter_name_end("bonder's ornament draws a card"),
+            "bonder's ornament".len()
+        );
+        assert_eq!(
+            named_filter_name_end("ebondeath, dracolich"),
+            "ebondeath, dracolich".len()
+        );
+        assert_eq!(named_filter_name_end("foo with flying"), "foo".len());
+        // An imperative effect verb after a comma ends the name (the
+        // intervening-if boundary) — but an epithet that merely starts with a
+        // verb-shaped word, or a name-final verb, stays whole.
+        assert_eq!(
+            named_filter_name_end("the majestic duo, create a token that's a copy of it"),
+            "the majestic duo".len()
+        );
+        assert_eq!(
+            named_filter_name_end("gimli, counter of kills you control"),
+            "gimli, counter of kills".len()
+        );
+        assert_eq!(
+            named_filter_name_end("untap, upkeep, draw"),
+            "untap, upkeep, draw".len()
+        );
+
+        let (filter, rest) =
+            parse_type_phrase_folding("permanent named bonder's ornament draws a card");
+        let tf = typed_leg(&filter).expect("typed filter");
+        assert!(
+            tf.properties.contains(&FilterProp::Named {
+                name: "bonder's ornament".to_string()
+            }),
+            "{:?}",
+            tf.properties
+        );
+        assert_eq!(rest.trim(), "draws a card");
     }
 
     /// Extract the `AggregateFunction` a superlative-property suffix encodes,
