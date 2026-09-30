@@ -4418,6 +4418,10 @@ fn collect_pending_triggers_with_collection(
     // CR 603.2c: Track which batched triggers (source_id, trig_idx) have already
     // fired in this pass so "one or more" triggers fire at most once per batch.
     let mut batched_this_pass: HashSet<(ObjectId, usize)> = HashSet::new();
+    // CR 726.2: the initiative steal is "whenever ONE OR MORE creatures a
+    // player controls deal combat damage", so each damaging player steals at
+    // most once per pass no matter how many of their creatures connect.
+    let mut initiative_stolen_this_pass: HashSet<PlayerId> = HashSet::new();
     let off_zone_trigger_sources = if events.is_empty() {
         Vec::new()
     } else {
@@ -6138,7 +6142,7 @@ fn collect_pending_triggers_with_collection(
             }
         }
 
-        // CR 725.2: At the beginning of the initiative holder's upkeep,
+        // CR 726.2: At the beginning of the initiative holder's upkeep,
         // that player ventures into the Undercity. Synthetic game-rule trigger.
         if let GameEvent::PhaseChanged {
             phase: Phase::Upkeep,
@@ -6272,8 +6276,8 @@ fn collect_pending_triggers_with_collection(
             }
         }
 
-        // CR 725.2: When a creature deals combat damage to the initiative holder,
-        // its controller takes the initiative. Synthetic game-rule trigger.
+        // CR 726.2: When one or more creatures a player controls deal combat
+        // damage to the initiative holder, that player takes the initiative.
         if let GameEvent::DamageDealt {
             source_id,
             target: TargetRef::Player(target_player),
@@ -6284,7 +6288,9 @@ fn collect_pending_triggers_with_collection(
             if state.initiative == Some(*target_player) {
                 if let Some(attacker) = state.objects.get(source_id) {
                     let new_holder = attacker.controller;
-                    if new_holder != *target_player {
+                    if new_holder != *target_player
+                        && initiative_stolen_this_pass.insert(new_holder)
+                    {
                         let source_context = trigger_source_context_for_latch(state, attacker);
                         let mut take_init = ResolvedAbility::new(
                             Effect::TakeTheInitiative,
@@ -8270,6 +8276,22 @@ fn event_attacker_from_trigger_event(
         .map(ObjectIncarnationRef::from_object)
 }
 
+/// CR 601.2i + CR 400.7: Bind the exact spell object and incarnation a
+/// spell-cast trigger's "that spell" / self-cast "this spell" names, at the
+/// moment the triggered ability is put on the stack. `None` for any trigger
+/// event other than `SpellCast`, or when its spell is no longer on the stack.
+/// Mirrors `event_attacker_from_trigger_event`'s shape.
+fn triggering_spell_pin(
+    state: &GameState,
+    trigger_event: Option<&GameEvent>,
+) -> Option<ObjectIncarnationRef> {
+    let GameEvent::SpellCast { object_id, .. } = trigger_event? else {
+        return None;
+    };
+    let obj = state.objects.get(object_id)?;
+    (obj.zone == Zone::Stack).then(|| ObjectIncarnationRef::from_object(obj))
+}
+
 /// CR 603.3 + CR 603.3c + CR 603.3d: Push a pending trigger to the stack with
 /// its event batch keyed by entry id. Returns the new entry's `ObjectId` so
 /// callers can stash it in `state.pending_trigger_entry` when the entry is
@@ -8506,6 +8528,7 @@ fn push_pending_trigger_to_stack_with_firing_and_duration_events(
     // narrowed attack-trigger event, not the triggered ability's source.
     let event_attacker = event_attacker_from_trigger_event(state, trigger_event.as_ref());
     ability.bind_force_block_attacker_recursive(event_attacker);
+    ability.context.triggering_spell = triggering_spell_pin(state, trigger_event.as_ref());
     seed_batched_attack_parent_targets(&mut ability, trigger_event.as_ref());
     seed_event_context_parent_targets(
         &mut ability,
@@ -8548,9 +8571,10 @@ fn push_pending_trigger_to_stack_with_firing_and_duration_events(
     );
     let crime_candidate = super::casting::targets_commit_crime(
         state,
-        &super::ability_utils::flatten_targets_in_chain(&ability),
+        &super::ability_utils::declared_targets_in_chain(&ability),
         controller,
     );
+    let reveal_caused_card = reveal_causing_card(&ability);
     let entry = StackEntry {
         id: entry_id,
         source_id,
@@ -8568,8 +8592,32 @@ fn push_pending_trigger_to_stack_with_firing_and_duration_events(
         },
     };
     stack::push_triggered_to_stack(state, entry, firing, events);
+    // CR 701.20a: "If revealing a card causes a triggered ability to trigger,
+    // the card remains revealed until that triggered ability leaves the
+    // stack." Lease the card's current occurrence to this entry.
+    if let Some(card) = reveal_caused_card {
+        state.grant_stack_bound_reveal(entry_id, &[card]);
+    }
     super::casting::commit_crime_after_stack_placement(state, crime_candidate, controller, events);
     entry_id
+}
+
+/// CR 701.20a: the card whose reveal caused this triggered ability — the
+/// reveal-until hit behind a "When you reveal a <filter> card this way"
+/// reflexive (the `EffectOutcomeSignal::RevealUntilMatched` guard), read from
+/// the ability's bound "that card" referent. `None` for every other trigger.
+fn reveal_causing_card(ability: &ResolvedAbility) -> Option<ObjectId> {
+    let reveal_caused = ability
+        .condition
+        .as_ref()
+        .is_some_and(super::effects::condition_has_reveal_until_matched_guard);
+    if !reveal_caused {
+        return None;
+    }
+    ability
+        .effect_context_object
+        .as_ref()
+        .map(|snapshot| snapshot.object_id)
 }
 
 /// CR 603.3c + CR 603.3d: True iff the top of `state.stack` is the trigger
@@ -8630,6 +8678,8 @@ pub(crate) fn abandon_ceased_pending_trigger(
         // per-entry tables when an entry leaves the stack.
         state.stack_paid_facts.remove(&entry_id);
         state.stack_trigger_event_batches.remove(&entry_id);
+        // CR 701.20a: the vanished entry can no longer keep a card revealed.
+        state.release_stack_bound_reveals(entry_id);
         let pending_firing = state.pending_trigger_firing;
         let stack_firing = state.stack_trigger_firings.remove(&entry_id);
         if let (Some(pending_firing), Some(stack_firing)) = (pending_firing, stack_firing) {
@@ -8751,6 +8801,10 @@ fn assign_pending_trigger_entry_ability(
         state,
         trigger_event,
     ));
+    // CR 601.2i: the same replacement would otherwise discard the pin bound at
+    // push time (`push_pending_trigger_to_stack_with_firing_and_duration_events`)
+    // for "that spell" / self-cast "this spell".
+    assigned_ability.context.triggering_spell = triggering_spell_pin(state, trigger_event);
 
     let Some(entry) = state
         .stack
@@ -8925,7 +8979,7 @@ fn prepare_trigger_targets(state: &GameState, trigger: &PendingTrigger) -> Prepa
             let mut events = Vec::new();
             super::casting::emit_targeting_events(
                 &prepared_state,
-                &super::ability_utils::flatten_targets_in_chain(&prepared_trigger.ability),
+                &super::ability_utils::declared_targets_in_chain(&prepared_trigger.ability),
                 prepared_trigger.source_id,
                 prepared_trigger.controller,
                 &mut events,
@@ -14114,6 +14168,15 @@ fn trigger_condition_designation_anchors_resolvable(
             source_context,
             trigger_event,
         ),
+        TriggerCondition::EventTime { condition } => {
+            trigger_condition_designation_anchors_resolvable(
+                state,
+                condition,
+                controller,
+                source_context,
+                trigger_event,
+            )
+        }
         _ => true,
     }
 }
@@ -15185,6 +15248,16 @@ fn evaluate_trigger_condition_with_source(
             source_context,
             trigger_event,
         ),
+        // CR 508.1m + CR 603.4: an event-time gate evaluates its wrapped
+        // condition when the trigger event occurs; it never reaches the
+        // resolution recheck (`stack_condition_for_trigger` drops it).
+        TriggerCondition::EventTime { condition } => evaluate_trigger_condition_with_source(
+            state,
+            condition,
+            controller,
+            source_context,
+            trigger_event,
+        ),
         // CR 309.7: True when the controller has completed a dungeon. `specific: None`
         // matches "any dungeon"; `specific: Some(d)` matches dungeon `d`. Negation
         // ("haven't completed Tomb of Annihilation") wraps via `Not`.
@@ -15580,6 +15653,9 @@ fn stack_condition_for_trigger(
     }
 
     match condition {
+        // CR 508.1m + CR 603.4: a "while" gate was read at the trigger event and
+        // is not an intervening `if`, so it never becomes a resolution recheck.
+        TriggerCondition::EventTime { .. } => None,
         TriggerCondition::And { conditions } => {
             let mut remaining: Vec<TriggerCondition> = conditions
                 .iter()
@@ -18850,6 +18926,35 @@ pub mod tests {
             stack_condition_for_trigger(&non_attacks, &negated),
             Some(negated)
         );
+    }
+
+    /// CR 508.1m + CR 603.4: an event-time "while" gate never reaches the
+    /// stack, in any trigger mode, while a genuine intervening `if` beside it
+    /// keeps its resolution recheck.
+    #[test]
+    fn stack_condition_strips_event_time_gates_but_keeps_intervening_if() {
+        let intervening_if = TriggerCondition::SourceEnteredThisTurn;
+        let event_time = TriggerCondition::EventTime {
+            condition: Box::new(TriggerCondition::SourceIsAttacking),
+        };
+        for mode in [TriggerMode::Attacks, TriggerMode::SpellCast] {
+            let trigger = make_trigger(mode.clone());
+            assert_eq!(
+                stack_condition_for_trigger(&trigger, &event_time),
+                None,
+                "{mode:?}: an event-time gate must not be rechecked on resolution"
+            );
+            assert_eq!(
+                stack_condition_for_trigger(
+                    &trigger,
+                    &TriggerCondition::And {
+                        conditions: vec![event_time.clone(), intervening_if.clone()],
+                    },
+                ),
+                Some(intervening_if.clone()),
+                "{mode:?}: the intervening-if beside it must stay on the stack"
+            );
+        }
     }
 
     #[test]
@@ -22564,6 +22669,7 @@ pub mod tests {
                 trigger_event: None,
                 trigger_events: Vec::new(),
                 trigger_match_count: None,
+                return_result_occurrence: None,
             }
         }
 
@@ -39383,6 +39489,23 @@ pub mod tests {
         })
     }
 
+    /// CR 605.4a + CR 704.3: a paused accepted triggered-mana occurrence is part
+    /// of the mana ability that triggered it, so no player receives priority
+    /// (and no state-based action is checked) until its fixed point completes.
+    #[test]
+    fn a_paused_triggered_mana_fixed_point_withholds_priority() {
+        let mut state = setup();
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        assert!(!state.withholds_priority());
+        let node = crate::types::resolved_commands::RulesExecutionNodeRef::TriggeredMana(
+            crate::types::resolved_commands::SettlementNodeOrdinal(7),
+        );
+        state.pending_triggered_mana_resume = Some(triggered_mana_sidecar(&mut state, node));
+        assert!(state.withholds_priority());
+    }
+
     /// Round-20 closure map, "Why the carrier is not part of
     /// `resolution_completion_can_settle`": the settlement predicate takes the
     /// triggered-mana sidecar **and only that carrier**.
@@ -48646,8 +48769,10 @@ pub mod tests {
             );
             assert_eq!(
                 trigger.condition,
-                Some(TriggerCondition::SourceIsAttacking),
-                "precondition: the parsed trigger must carry the SourceIsAttacking gate"
+                Some(TriggerCondition::EventTime {
+                    condition: Box::new(TriggerCondition::SourceIsAttacking),
+                }),
+                "precondition: the parsed trigger must carry the event-time SourceIsAttacking gate"
             );
             state
                 .objects
@@ -49108,3 +49233,89 @@ mod push_first_contract_tests;
 #[cfg(test)]
 #[path = "triggers_pr7_order_template_tests.rs"]
 mod pr7_order_template_tests;
+
+#[cfg(test)]
+mod pending_trigger_pin_reassignment_tests {
+    use super::*;
+    use crate::game::zones::create_object;
+    use crate::types::card_type::CoreType;
+    use crate::types::identifiers::{CardId, ObjectIncarnationRef};
+
+    /// CR 601.2i: re-assigning a pending trigger's ability
+    /// (`mutate_pending_trigger_entry` -> `assign_pending_trigger_entry_ability`)
+    /// must rebind `context.triggering_spell` from the entry's own `SpellCast`
+    /// trigger event, even when the replacement ability arrives unpinned — the
+    /// same replacement pattern `bind_force_block_attacker_recursive` already
+    /// gets at this seam for "that Wolf".
+    #[test]
+    fn pending_trigger_assignment_rebinds_triggering_spell_pin() {
+        let mut state = GameState::new_two_player(42);
+        let spell_card_id = CardId(state.next_object_id);
+        let spell_id = create_object(
+            &mut state,
+            spell_card_id,
+            PlayerId(0),
+            "Test Spell".to_string(),
+            Zone::Stack,
+        );
+        state
+            .objects
+            .get_mut(&spell_id)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Instant);
+
+        let entry_id = ObjectId(state.next_object_id);
+        state.next_object_id += 1;
+        state.stack.push_back(StackEntry {
+            id: entry_id,
+            source_id: spell_id,
+            controller: PlayerId(0),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: spell_id,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::NoOp,
+                    vec![],
+                    spell_id,
+                    PlayerId(0),
+                )),
+                condition: None,
+                trigger_event: Some(GameEvent::SpellCast {
+                    controller: PlayerId(0),
+                    object_id: spell_id,
+                    card_id: spell_card_id,
+                    cast_mana_value: None,
+                }),
+                description: None,
+                source_name: String::new(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        });
+        state.pending_trigger_entry = Some(entry_id);
+
+        // Unpinned replacement — mirrors an ordinary target/mode construction
+        // step that clones from a fresh `PendingTrigger` rather than carrying
+        // the stack-push-time pin forward itself.
+        let unpinned_ability = ResolvedAbility::new(Effect::NoOp, vec![], spell_id, PlayerId(0));
+        assert!(
+            mutate_pending_trigger_entry(&mut state, &unpinned_ability),
+            "the entry must still be found on the stack"
+        );
+
+        let assigned_pin = state
+            .stack
+            .iter()
+            .find(|entry| entry.id == entry_id)
+            .and_then(|entry| entry.ability())
+            .and_then(|ability| ability.context.triggering_spell);
+        let expected = ObjectIncarnationRef::from_object(&state.objects[&spell_id]);
+        assert_eq!(
+            assigned_pin,
+            Some(expected),
+            "assigning an unpinned ability must rebind the pin from the entry's own trigger event"
+        );
+    }
+}

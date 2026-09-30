@@ -5,7 +5,7 @@ use crate::types::ability::{
     SpellCastingOptionKind, TargetFilter, TypeFilter,
 };
 use crate::types::card_type::{CoreType, Supertype};
-use crate::types::counter::{CounterMatch, CounterType};
+use crate::types::counter::CounterType;
 use crate::types::game_state::{BattlefieldEntryRecord, CastOccurrence, CastingVariant};
 use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaColor, ManaCost};
@@ -889,12 +889,16 @@ pub(crate) fn tap_permanent_for_cost(
 
 /// CR 602.5b: If an activated ability has a restriction on its use (e.g., "Activate only once
 /// each turn"), the restriction continues to apply even if its controller changes.
+///
+/// CR 602.2 + CR 601.2i: `record` is the activation's facts captured before
+/// its cost was paid; it joins the activator's turn journal here.
 pub fn record_ability_activation(
     state: &mut crate::types::game_state::GameState,
     source_id: ObjectId,
     ability_index: usize,
+    record: Option<crate::types::game_state::AbilityActivationRecord>,
 ) {
-    crate::game::ledger::record_ability_activation(state, source_id, ability_index)
+    crate::game::ledger::record_ability_activation(state, source_id, ability_index, record)
         .expect("activated ability must have a valid ledger prefix");
 }
 
@@ -1204,15 +1208,14 @@ fn activation_restriction_applies(
             minimum,
             maximum,
         } => {
-            let count: u32 = state
+            // CR 122.1: exact total, compared in u64 so an upper bound is never
+            // satisfied by a count that actually exceeds it.
+            let count = state
                 .objects
                 .get(&source_id)
-                .map(|obj| match counters {
-                    CounterMatch::Any => obj.counters.values().sum(),
-                    CounterMatch::OfType(ct) => obj.counters.get(ct).copied().unwrap_or(0),
-                })
+                .map(|obj| counters.count_in(&obj.counters))
                 .unwrap_or(0);
-            count >= *minimum && maximum.is_none_or(|max| count <= max)
+            crate::game::conditions::counter_count_within_bounds(count, *minimum, *maximum)
         }
     }
 }
@@ -1441,17 +1444,15 @@ pub(crate) fn evaluate_condition(
             let lhs_expr = QuantityExpr::Ref { qty: lhs.clone() };
             let lhs_val =
                 crate::game::quantity::resolve_quantity_scoped(state, &lhs_expr, source_id, player);
-            state
-                .players
-                .iter()
-                .filter(|candidate| candidate.id != player)
-                .all(|candidate| {
+            // CR 102.2 + CR 102.3 + CR 800.4a: each opponent still in the game,
+            // not every other seat (a player who left the game or a teammate is
+            // not an opponent).
+            crate::game::players::opponents(state, player)
+                .into_iter()
+                .all(|opponent| {
                     let rhs_expr = QuantityExpr::Ref { qty: rhs.clone() };
                     let rhs_val = crate::game::quantity::resolve_quantity_scoped(
-                        state,
-                        &rhs_expr,
-                        source_id,
-                        candidate.id,
+                        state, &rhs_expr, source_id, opponent,
                     );
                     comparator.evaluate(lhs_val, rhs_val)
                 })
@@ -2542,7 +2543,7 @@ mod tests {
     #[test]
     fn activation_once_each_turn_uses_shared_counter() {
         let mut state = crate::types::game_state::GameState::new_two_player(42);
-        record_ability_activation(&mut state, ObjectId(10), 1);
+        record_ability_activation(&mut state, ObjectId(10), 1, None);
 
         let result = check_activation_restrictions(
             &state,

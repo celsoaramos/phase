@@ -35,6 +35,7 @@ use crate::types::ability::{
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::keywords::Keyword;
+use crate::types::mana::ManaColor;
 use crate::types::player::PlayerCounterKind;
 use crate::types::zones::Zone;
 
@@ -3470,29 +3471,85 @@ fn parse_lost_game_player_count(input: &str) -> OracleResult<'_, QuantityRef> {
     ))
 }
 
-/// CR 119.3 + CR 700.1: Parse a "for each" opponent clause qualified by a
-/// life-change predicate — "(of your) opponents who lost/gained life this
-/// turn". Reached by the for-each clause path (Belbe, Corrupted Observer:
-/// "{C}{C} for each of your opponents who lost life this turn"). The leading
-/// "of your "/"of " is optional. Each qualifier is one `alt()` arm — no
-/// permutation enumeration.
-fn parse_for_each_opponents_life_change(input: &str) -> OracleResult<'_, QuantityRef> {
-    let (rest, _) = opt(alt((tag("of your "), tag("of ")))).parse(input)?;
-    // Singular "opponent who lost life this turn" (Gev, Scaled Scorch's per-each
-    // counter scaling) and plural "opponents who …" (Belbe, Corrupted Observer)
-    // resolve to the same `PlayerCount` over the qualifying-opponents set.
-    let (rest, _) = alt((tag("opponents "), tag("opponent "))).parse(rest)?;
-    let (rest, filter) = alt((
-        value(
-            PlayerFilter::OpponentLostLife,
-            tag("who lost life this turn"),
+/// CR 119.3: Which direction of this-turn life change a "for each" player
+/// predicate reads. A parse-local axis, not an engine type: the two values
+/// select between existing `PlayerFilter` / `QuantityRef` carriers below and
+/// never reach the AST themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifeChangeDirection {
+    Lost,
+    Gained,
+}
+
+/// CR 119.3 + CR 608.2c + CR 608.2h: Parse a "for each" player-population
+/// clause qualified by a life-change predicate — "(of your) opponents who
+/// lost/gained life this turn" and "players who lost/gained life this turn".
+/// Reached by the for-each clause path (Belbe, Corrupted Observer: "{C}{C} for
+/// each of your opponents who lost life this turn"; Reaper's Scythe: "put a
+/// soul counter on this Equipment for each player who lost life this turn").
+/// Population and direction are independent `alt()` axes — no permutation
+/// enumeration. The possessive "of your "/"of " prefix is part of the OPPONENT
+/// arm only: "for each of your opponents who …" is the printed grammar, while
+/// the all-players spelling is bare ("for each player who …"); no card says
+/// "of your players who …".
+///
+/// The two populations carry the same predicate but different existing wire
+/// forms: the opponent spellings keep their dedicated
+/// `PlayerFilter::OpponentLostLife` / `OpponentGainedLife` variants (their
+/// historical representation, byte-identical card data), while the
+/// all-players spelling composes the general per-candidate attribute
+/// predicate `PlayerFilter::PlayerAttribute` with
+/// `QuantityRef::LifeLostThisTurn` / `LifeGainedThisTurn` compared `GE 1`
+/// ("lost/gained life this turn" is `> 0`). That is the same
+/// `PlayerRelation::All` census `parse_for_each_graveyard_size_clause` uses,
+/// and it correctly includes the ability's controller — "each player" is not
+/// "each opponent".
+fn parse_for_each_life_change_players(input: &str) -> OracleResult<'_, QuantityRef> {
+    // Population axis: singular and plural spellings of the same population
+    // resolve identically (Gev, Scaled Scorch's singular "opponent who lost
+    // life this turn" and Belbe's plural "opponents who …").
+    let (rest, relation) = alt((
+        preceded(
+            opt(alt((tag("of your "), tag("of ")))),
+            value(
+                PlayerRelation::Opponent,
+                alt((tag("opponents "), tag("opponent "))),
+            ),
         ),
+        value(PlayerRelation::All, alt((tag("players "), tag("player ")))),
+    ))
+    .parse(input)?;
+    let (rest, direction) = alt((
+        value(LifeChangeDirection::Lost, tag("who lost life this turn")),
         value(
-            PlayerFilter::OpponentGainedLife,
+            LifeChangeDirection::Gained,
             tag("who gained life this turn"),
         ),
     ))
     .parse(rest)?;
+    let filter = match (relation, direction) {
+        (PlayerRelation::Opponent, LifeChangeDirection::Lost) => PlayerFilter::OpponentLostLife,
+        (PlayerRelation::Opponent, LifeChangeDirection::Gained) => PlayerFilter::OpponentGainedLife,
+        (PlayerRelation::All, direction) => PlayerFilter::PlayerAttribute {
+            relation,
+            attr: Box::new(match direction {
+                LifeChangeDirection::Lost => QuantityRef::LifeLostThisTurn {
+                    player: PlayerScope::ScopedPlayer,
+                },
+                LifeChangeDirection::Gained => QuantityRef::LifeGainedThisTurn {
+                    player: PlayerScope::ScopedPlayer,
+                },
+            }),
+            comparator: Comparator::GE,
+            value: Box::new(QuantityExpr::Fixed { value: 1 }),
+        },
+        // The population axis above yields only Opponent or All; a Controller
+        // population has no "for each player" reading and is not constructible
+        // here. Fail closed rather than fabricate a filter.
+        (PlayerRelation::Controller, _) => {
+            return Err(oracle_err(input));
+        }
+    };
     Ok((rest, QuantityRef::PlayerCount { filter }))
 }
 
@@ -4722,6 +4779,14 @@ fn parse_devotion_ref(input: &str) -> OracleResult<'_, QuantityRef> {
             },
         ));
     }
+    if let Ok((rest, colors)) = parse_wedge_clan_colors(rest) {
+        return Ok((
+            rest,
+            QuantityRef::Devotion {
+                colors: DevotionColors::Fixed(colors),
+            },
+        ));
+    }
     let (rest, color) = super::primitives::parse_color(rest)?;
     // Check for " and [color]" for multi-color devotion
     if let Ok((rest2, _)) = tag::<_, _, OracleError<'_>>(" and ").parse(rest) {
@@ -4740,6 +4805,37 @@ fn parse_devotion_ref(input: &str) -> OracleResult<'_, QuantityRef> {
             colors: DevotionColors::Fixed(vec![color]),
         },
     ))
+}
+
+/// CR 700.5: A devotion to a Khans-block clan name ("your devotion to Jeskai")
+/// is a devotion to that clan's three colors, i.e. the multi-color form of
+/// devotion ("devotion to [color 1] and [color 2]", extended to three colors).
+/// The clan-to-colors mapping is the printed reminder text on Devoted Abzan /
+/// Jeskai / Mardu / Sultai / Temur. Colors are returned in WUBRG order.
+fn parse_wedge_clan_colors(input: &str) -> OracleResult<'_, Vec<ManaColor>> {
+    alt((
+        value(
+            vec![ManaColor::White, ManaColor::Black, ManaColor::Green],
+            tag("abzan"),
+        ),
+        value(
+            vec![ManaColor::White, ManaColor::Blue, ManaColor::Red],
+            tag("jeskai"),
+        ),
+        value(
+            vec![ManaColor::White, ManaColor::Black, ManaColor::Red],
+            tag("mardu"),
+        ),
+        value(
+            vec![ManaColor::Blue, ManaColor::Black, ManaColor::Green],
+            tag("sultai"),
+        ),
+        value(
+            vec![ManaColor::Blue, ManaColor::Red, ManaColor::Green],
+            tag("temur"),
+        ),
+    ))
+    .parse(input)
 }
 
 /// CR 700.5: Chroma — "the number of \<color\> mana symbols in the mana costs of
@@ -5084,7 +5180,7 @@ fn parse_for_each_clause_ref_with_they_controller(
                 parse_for_each_one_life_changed,
             )),
             alt((
-                parse_for_each_opponents_life_change,
+                parse_for_each_life_change_players,
                 parse_lost_game_player_count,
             )),
             parse_counter_added_this_turn_for_each,
@@ -6010,7 +6106,11 @@ fn parse_for_each_commander_cast_count(input: &str) -> OracleResult<'_, Quantity
     let (rest, _) = opt(tag("s")).parse(rest)?;
     let (rest, _) = tag(" ").parse(rest)?;
     let (rest, _) = alt((tag("you've"), tag("youve"))).parse(rest)?;
-    let (rest, _) = tag(" cast your commander from the command zone this game").parse(rest)?;
+    // CR 903.8: "a commander" / "your commander" both count the controller's
+    // command-zone casts; the resolver sums over every commander the player owns.
+    let (rest, _) = tag(" cast ").parse(rest)?;
+    let (rest, _) = alt((tag("your"), tag("a"))).parse(rest)?;
+    let (rest, _) = tag(" commander from the command zone this game").parse(rest)?;
     Ok((rest, QuantityRef::CommanderCastFromCommandZoneCount))
 }
 
@@ -7808,8 +7908,42 @@ mod tests {
         assert_eq!(qty, QuantityRef::PlayerCount { filter: expected });
     }
 
+    /// CR 119.3: the all-players population composes the general per-candidate
+    /// attribute predicate: `PlayerAttribute { relation: All, attr:
+    /// LifeLost/GainedThisTurn, GE 1 }`.
+    fn assert_all_players_life_change_count(qty: QuantityRef, attr: QuantityRef) {
+        assert_eq!(
+            qty,
+            QuantityRef::PlayerCount {
+                filter: PlayerFilter::PlayerAttribute {
+                    relation: PlayerRelation::All,
+                    attr: Box::new(attr),
+                    comparator: Comparator::GE,
+                    value: Box::new(QuantityExpr::Fixed { value: 1 }),
+                },
+            }
+        );
+    }
+
+    fn life_lost_this_turn_attr() -> QuantityRef {
+        QuantityRef::LifeLostThisTurn {
+            player: PlayerScope::ScopedPlayer,
+        }
+    }
+
+    fn life_gained_this_turn_attr() -> QuantityRef {
+        QuantityRef::LifeGainedThisTurn {
+            player: PlayerScope::ScopedPlayer,
+        }
+    }
+
+    /// CR 119.3 + CR 608.2c: both populations and both life-change directions
+    /// parse through one combinator. The opponent spellings keep their
+    /// dedicated `PlayerFilter` wire forms; the all-players spellings compose
+    /// `PlayerAttribute` over the per-candidate life-change scalar (Reaper's
+    /// Scythe / Strefan, Maurer Progenitor).
     #[test]
-    fn parse_for_each_opponents_life_change_full_surfaces() {
+    fn parse_for_each_life_change_players_full_surfaces() {
         for (phrase, expected) in [
             (
                 "opponents who lost life this turn",
@@ -7841,10 +7975,33 @@ mod tests {
             assert_eq!(rest, "", "life-change phrase should fully consume");
             assert_opponent_life_change_count(qty, expected);
         }
+
+        for (phrase, attr) in [
+            ("player who lost life this turn", life_lost_this_turn_attr()),
+            (
+                "players who lost life this turn",
+                life_lost_this_turn_attr(),
+            ),
+            (
+                "player who gained life this turn",
+                life_gained_this_turn_attr(),
+            ),
+            (
+                "players who gained life this turn",
+                life_gained_this_turn_attr(),
+            ),
+        ] {
+            let (rest, qty) = parse_for_each_clause_ref_complete(phrase)
+                .unwrap_or_else(|_| panic!("life-change phrase should parse: {phrase}"));
+            assert_eq!(rest, "", "life-change phrase should fully consume");
+            assert_all_players_life_change_count(qty, attr);
+        }
     }
 
     #[test]
-    fn parse_for_each_opponents_life_change_rejects_suffix_and_wrong_duration() {
+    fn parse_for_each_life_change_players_rejects_suffix_and_wrong_duration() {
+        // Positive reach guard: the opponent spelling (whose possessive prefix
+        // the all-players spelling must NOT inherit) parses in this same test.
         let (rest, qty) = parse_for_each_clause_ref_complete("opponent who lost life this turn")
             .expect("positive life-change phrase should reach parser");
         assert_eq!(rest, "");
@@ -7856,6 +8013,26 @@ mod tests {
         .is_err());
         assert!(parse_for_each_clause_ref_complete("opponent who lost life this game").is_err());
         assert!(parse_for_each_clause_ref_complete("opponents who gained life this game").is_err());
+        // The all-players spelling rejects the same non-this-turn durations and
+        // unmodeled qualifiers, so it cannot smuggle an unrelated clause in.
+        assert!(parse_for_each_clause_ref_complete("player who lost life this game").is_err());
+        assert!(parse_for_each_clause_ref_complete("players who gained life last turn").is_err());
+        assert!(parse_for_each_clause_ref_complete(
+            "player who lost life this turn and controls a creature"
+        )
+        .is_err());
+        // CR 119.3: the "of your "/"of " possessive is opponent-only grammar
+        // ("for each of your opponents who …"); the all-players spelling is
+        // bare, so the possessive forms must NOT parse (no card prints them).
+        assert!(
+            parse_for_each_clause_ref_complete("of your players who lost life this turn").is_err()
+        );
+        assert!(
+            parse_for_each_clause_ref_complete("of your player who gained life this turn").is_err()
+        );
+        assert!(
+            parse_for_each_clause_ref_complete("of players who gained life this turn").is_err()
+        );
     }
 
     #[test]
@@ -12188,6 +12365,47 @@ mod tests {
         .unwrap();
         assert_eq!(q, QuantityRef::CommanderCastFromCommandZoneCount);
         assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn test_parse_for_each_commander_cast_count_a_commander() {
+        for text in [
+            "time you've cast a commander from the command zone this game",
+            "times you've cast a commander from the command zone this game",
+            "times youve cast a commander from the command zone this game",
+        ] {
+            let (rest, q) = parse_for_each_clause_ref(text).unwrap();
+            assert_eq!(q, QuantityRef::CommanderCastFromCommandZoneCount, "{text}");
+            assert_eq!(rest, "");
+        }
+        assert!(parse_for_each_clause_ref(
+            "times you've cast an artifact from the command zone this game"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_parse_devotion_wedge_clan() {
+        use ManaColor::*;
+        for (clan, colors) in [
+            ("abzan", vec![White, Black, Green]),
+            ("jeskai", vec![White, Blue, Red]),
+            ("mardu", vec![White, Black, Red]),
+            ("sultai", vec![Blue, Black, Green]),
+            ("temur", vec![Blue, Red, Green]),
+        ] {
+            let text = format!("your devotion to {clan}");
+            let (rest, q) = parse_quantity_ref(&text).unwrap();
+            assert_eq!(
+                q,
+                QuantityRef::Devotion {
+                    colors: DevotionColors::Fixed(colors)
+                },
+                "{clan}"
+            );
+            assert_eq!(rest, "");
+        }
+        assert!(parse_quantity_ref("your devotion to khans").is_err());
     }
 
     // --- Half-rounded fractional expressions (CR 107.1a) ---
