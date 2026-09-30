@@ -20151,6 +20151,19 @@ declare_game_state! {
     pub consumed_before_priority_trigger_events:
         Vec<crate::game::triggers::ConsumedTriggerEventOccurrence>,
 
+    /// CR 601.2c + CR 603.2 + CR 603.3b: `BecomesTarget` events a spell's
+    /// target announcement produced in an action that left the cast paused
+    /// before the spell reached the stack (a Phyrexian life-or-mana choice, a
+    /// manual mana payment). The post-action trigger scan only runs on
+    /// actions that settle at `Priority`, so without this carrier those
+    /// events were dropped and "whenever ~ becomes the target of a spell"
+    /// never fired (Venerated Rotpriest with Apostle's Blessing, or with any
+    /// spell paid manually). Keyed by the spell's object id; released into the
+    /// action that puts that spell on the stack, discarded if the cast is
+    /// cancelled. Transient engine coordination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_cast_target_events: Option<(ObjectId, Vec<GameEvent>)>,
+
     // CR 607.2a + CR 406.5: Exile tracking for "until leaves" linked abilities.
     #[serde(default)]
     pub exile_links: Vec<ExileLink>,
@@ -27065,6 +27078,7 @@ impl GameState {
             deferred_triggers: Vec::new(),
             pending_trigger_order: None,
             consumed_before_priority_trigger_events: Vec::new(),
+            held_cast_target_events: None,
             exile_links: Vec::new(),
             paradigm_primed: Vec::new(),
             delayed_triggers: Vec::new(),
@@ -29444,6 +29458,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         deferred_triggers: _,
         pending_trigger_order: _,
         consumed_before_priority_trigger_events: _,
+        held_cast_target_events: _,
         exile_links: _,
         paradigm_primed: _,
         delayed_triggers: _,

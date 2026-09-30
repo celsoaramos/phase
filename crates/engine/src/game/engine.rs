@@ -11026,6 +11026,62 @@ fn apply_action(
     )
 }
 
+/// CR 601.2c + CR 603.2 + CR 603.3b: keep the `BecomesTarget` events a paused
+/// spell cast announced, so its "becomes the target" triggers are not lost with
+/// the action that paused. Activations own their collection
+/// (`PendingCast::begin_activation_trigger_collection`) and are skipped.
+fn hold_cast_target_events(state: &mut GameState, waiting_for: &WaitingFor, events: &[GameEvent]) {
+    // Choice prompts (optional/alternative cost, X, gift recipient…) embed
+    // their `PendingCast`; payment prompts keep it on `GameState`.
+    let Some(pending) = waiting_for
+        .pending_cast_ref()
+        .or(state.pending_cast.as_deref())
+    else {
+        return;
+    };
+    if pending.activation_ability_index.is_some() {
+        return;
+    }
+    let spell = pending.object_id;
+    let announced: Vec<GameEvent> = events
+        .iter()
+        .filter(|event| {
+            matches!(event, GameEvent::BecomesTarget { source_id, .. } if *source_id == spell)
+        })
+        .cloned()
+        .collect();
+    if announced.is_empty() {
+        return;
+    }
+    match &mut state.held_cast_target_events {
+        Some((held_spell, held)) if *held_spell == spell => held.extend(announced),
+        slot => *slot = Some((spell, announced)),
+    }
+}
+
+/// CR 601.2i + CR 603.3: at a Priority boundary, once the held events' spell is
+/// on the stack, append them to this action's events so the pipeline's trigger
+/// scan collects them. Returns where they start and a copy: the caller removes
+/// them after the scan (by value — the pipeline may reorder the buffer), because
+/// the announcing action already returned (and logged) them. A
+/// cancelled cast is reversed (CR 601.2 + CR 733.1), never reaches the stack,
+/// and its events are dropped.
+fn release_held_cast_target_events(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> Option<(usize, Vec<GameEvent>)> {
+    if state.pending_cast.is_some() {
+        return None;
+    }
+    let (spell, held) = state.held_cast_target_events.take()?;
+    if !state.stack.iter().any(|entry| entry.id == spell) {
+        return None;
+    }
+    let start = events.len();
+    events.extend(held.iter().cloned());
+    Some((start, held))
+}
+
 fn apply_non_priority_pass_action(
     state: &mut GameState,
     actor: PlayerId,
@@ -15640,6 +15696,11 @@ fn apply_non_priority_pass_action(
         // the action's result, not the pre-action state (fixes stale TargetSelection
         // after CancelCast).
         state.waiting_for = waiting_for.clone();
+        // CR 601.2c + CR 603.3: a spell whose cast paused after its targets
+        // were announced reaches the stack in THIS action; its held
+        // `BecomesTarget` events join the scan below, then leave the returned
+        // events — the announcing action already reported them.
+        let held_events = release_held_cast_target_events(state, &mut events);
         // CR 704.3 + CR 704.5f: a token battlefield entry postponed by an as-enters choice is
         // realized HERE, before the pipeline below, so the CR 400.7 row is written ahead of that
         // pipeline's SBA pass and survives a copy that enters with 0 toughness. It also puts the
@@ -15656,6 +15717,13 @@ fn apply_non_priority_pass_action(
             triggers_processed_inline,
             skip_deferred_trigger_drain,
         )?;
+        if let Some((start, held)) = held_events {
+            for event in held {
+                if let Some(at) = events[start..].iter().position(|e| *e == event) {
+                    events.remove(start + at);
+                }
+            }
+        }
         // CR 732.2a: the SECOND sampling site — a stack entry announced while a player
         // answers a FORCED pre-priority window.
         //
@@ -15738,6 +15806,12 @@ fn apply_non_priority_pass_action(
         }
         return Ok(ActionResult::applied(events, wf));
     }
+
+    // CR 601.2c + CR 603.2: the action announced a spell's targets but left
+    // the cast paused (Phyrexian choice, manual payment, optional cost). The
+    // scan above only runs at Priority, so hold those events until the spell
+    // is on the stack.
+    hold_cast_target_events(state, &waiting_for, &events);
 
     // CR 603.2 + CR 603.3b + CR 608.2g: a cast made during an unresolved
     // effect can leave the reducer at that effect's next choice (not Priority).
