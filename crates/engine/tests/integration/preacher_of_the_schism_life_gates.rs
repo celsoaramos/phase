@@ -11,10 +11,10 @@
 //! attack made a token AND drew a card, whatever the life totals.
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::player::PlayerId;
 use engine::types::actions::GameAction;
 use engine::types::game_state::WaitingFor;
 use engine::types::phase::Phase;
+use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
 use super::rules::AttackTarget;
@@ -156,7 +156,13 @@ fn life_change_in_response_does_not_undo_the_declaration_read() {
     let o = attack_with(&[20, 10], |runner| {
         runner.state_mut().players[1].life = 30;
     });
-    assert_eq!(o.vampires, 0, "the defender was behind when attackers were declared");
-    assert_eq!(o.drew, 1, "the draw gate passed at declaration and is not rechecked");
+    assert_eq!(
+        o.vampires, 0,
+        "the defender was behind when attackers were declared"
+    );
+    assert_eq!(
+        o.drew, 1,
+        "the draw gate passed at declaration and is not rechecked"
+    );
     assert_eq!(o.life_lost, 1);
 }
