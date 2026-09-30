@@ -132,7 +132,8 @@
     "branch": "card/preacher-of-the-schism-conditions"
   },
   {
-    "branch": "card/sacrificed-source-self-counter"
+    "branch": "card/sacrificed-source-self-counter",
+    "pr": 9407
   },
   {
     "branch": "card/target-events-across-payment-pause"
