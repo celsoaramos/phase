@@ -2130,9 +2130,8 @@ pub enum CastFromZoneDriver {
     /// and return — the controller casts the card later, during the granting
     /// effect's own (or a future) priority window. The default for every
     /// permission-granting cast-from-zone effect: Discover/Nashi/Jeleva-style
-    /// "you may cast those exiled cards" and Rebound's next-upkeep recast offer
-    /// (CR 702.88a), whose `duration: Some(UntilEndOfTurn)` then prunes the
-    /// unused permission.
+    /// "you may cast those exiled cards", whose `duration` then governs how
+    /// long the unused permission survives.
     #[default]
     LingeringPermission,
     /// CR 608.2g: Cast the card *as the granting ability resolves* — the card
@@ -2140,7 +2139,9 @@ pub enum CastFromZoneDriver {
     /// and the CR 608.2g timing bypass (sorcery-speed / empty-stack /
     /// active-player gates do not apply) is armed. Set by Suspend's
     /// last-time-counter trigger (CR 702.62a) so a suspended sorcery recast at
-    /// upkeep is not blocked by the sorcery-speed gate (issue #1520).
+    /// upkeep is not blocked by the sorcery-speed gate (issue #1520), and by
+    /// Rebound's next-upkeep arming hook (CR 702.88a) for the same reason
+    /// (issue #6461).
     DuringResolution,
     /// CR 608.2g: Open a RESOLUTION-SCOPED free-cast window over the batch of
     /// cards the same resolution just produced ("… from among them") — the
@@ -4698,11 +4699,9 @@ pub enum CastingPermission {
         /// Suspend, Discover, Cascade, etc., handled by
         /// `zones::apply_zone_exit_cleanup`).
         ///
-        /// CR 702.88a (Rebound): used by the Rebound recast permission with
-        /// `Duration::UntilEndOfTurn` so the granted "cast this card from
-        /// exile without paying its mana cost" offer expires at the cleanup
-        /// step of the upkeep on which it was offered if the controller
-        /// declines or fails to cast.
+        /// Durational grants (Emry-class "you may cast that card this turn"
+        /// offers) carry `Some(...)` here so the permission expires at the
+        /// stated boundary if the controller declines or fails to cast.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration: Option<Duration>,
         /// CR 611.2a + CR 400.7: Identity of the permanent whose continued
@@ -13293,6 +13292,54 @@ pub fn is_chosen_remove_counter_cost_count(count: u32) -> bool {
     )
 }
 
+/// CR 118.3 + CR 601.2h: whether a cost's chosen-count self-`RemoveCounter`
+/// leaves (leaves whose count is [`is_chosen_remove_counter_cost_count`])
+/// combine an `Any`-type leaf with an `OfType` leaf. This is the one
+/// combination with no sound reservation model: reserving the `Any` leaf's
+/// full announced amount against a later `OfType` leaf's typed availability
+/// is overly conservative (an `Any` leaf can draw from ANY type, so its
+/// announced amount doesn't necessarily compete with a specific later type),
+/// but NOT reserving it risks the untyped removal (`remove_counters_for_mana_cost`'s
+/// `Any` arm, which has no player-directed type allocation and iterates the
+/// object's counter types in an unspecified order) silently consuming
+/// counters a later typed leaf needed. Two `OfType` leaves of the same type,
+/// or two `Any` leaves, have no such ambiguity: both members of either pair
+/// draw from literally the same pool, so an exact aggregate reservation is
+/// sound and remains supported.
+///
+/// Shared between the parser (which must not accept this shape as an
+/// ordinary supported cost — `demote_unsupported_composite_counter_choice_costs`
+/// in `oracle.rs`) and the mana-ability runtime (`advance_mana_ability_activation`
+/// in `mana_abilities.rs`, which must refuse to activate it), so the two
+/// layers can never disagree about which shape is unsupported.
+pub fn chosen_count_remove_counter_leaves_mix_any_with_typed(cost: &AbilityCost) -> bool {
+    fn collect<'a>(cost: &'a AbilityCost, leaves: &mut Vec<&'a CounterMatch>) {
+        match cost {
+            AbilityCost::Composite { costs } => {
+                for cost in costs {
+                    collect(cost, leaves);
+                }
+            }
+            AbilityCost::RemoveCounter {
+                count,
+                counter_type,
+                target: None,
+                ..
+            } if is_chosen_remove_counter_cost_count(*count) => {
+                leaves.push(counter_type);
+            }
+            _ => {}
+        }
+    }
+    let mut leaves = Vec::new();
+    collect(cost, &mut leaves);
+    leaves.len() > 1
+        && leaves.iter().any(|leaf| matches!(leaf, CounterMatch::Any))
+        && leaves
+            .iter()
+            .any(|leaf| matches!(leaf, CounterMatch::OfType(_)))
+}
+
 /// CR 606.5: Is this activation cost a planeswalker loyalty-ability cost?
 ///
 /// Two shapes qualify: the fixed `[+N]` / `[−N]` / `[0]` form (`Loyalty`), and
@@ -18643,17 +18690,19 @@ pub enum Effect {
         /// CR 611.2a: Optional durational scope propagated onto the granted
         /// `CastingPermission::ExileWithAltCost { duration, .. }` so the
         /// permission is pruned by the standard layer prune helpers.
-        /// CR 702.88a (Rebound): set to `Some(Duration::UntilEndOfTurn)` by
-        /// the Rebound arming flow so the next-upkeep recast offer expires
-        /// at end of turn if not used. `None` for all standing cast-from-zone
-        /// grants (Discover, Suspend, Nashi, etc.).
+        /// Carried by timed grants (Emry-class "you may cast that card this
+        /// turn" offers). `None` for all standing cast-from-zone grants
+        /// (Discover, Nashi, Jeleva, etc.) and for during-resolution casts
+        /// (Suspend's last-counter cast, Rebound's upkeep recast), which
+        /// grant no lingering permission at all.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration: Option<Duration>,
         /// CR 608.2g vs CR 118.9: Which casting mechanism this effect drives —
-        /// cast the card as the granting ability resolves (`DuringResolution`,
-        /// Suspend's last-counter cast per CR 702.62a) versus grant a lingering
-        /// permission the controller acts on at a later priority window
-        /// (`LingeringPermission`, the default for Discover/Nashi/Rebound). The
+        /// cast the card as the granting ability resolves (`DuringResolution`:
+        /// Suspend's last-counter cast per CR 702.62a, Rebound's upkeep
+        /// recast per CR 702.88a) versus grant a lingering permission the
+        /// controller acts on at a later priority window
+        /// (`LingeringPermission`, the default for Discover/Nashi). The
         /// router in `cast_from_zone::resolve` reads THIS field, not `duration`
         /// (which is CR 611.2a permission-expiry and means nothing about the
         /// casting mechanism). See issue #1520.
@@ -25760,6 +25809,22 @@ impl TargetChoiceTiming {
 // Definition types -- fully typed, zero HashMap
 // ---------------------------------------------------------------------------
 
+/// Identity of one announced target group within an ability definition chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ChosenGroupId(pub u32);
+
+/// Identity of one return instruction in a parsed ability chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ReturnResultId(pub u32);
+
+/// The prior-object predicate and final destination read by a delayed effect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReturnResultReadSpec {
+    pub noun: TargetFilter,
+    pub destination: Zone,
+    pub recipient: ControllerRef,
+}
+
 /// Parsed ability definition with typed effect. Zero remaining_params.
 ///
 /// `Serialize` is hand-written (see `impl Serialize for AbilityDefinition`) so
@@ -25774,6 +25839,12 @@ impl TargetChoiceTiming {
 pub struct AbilityDefinition {
     pub kind: AbilityKind,
     pub effect: Box<Effect>,
+    /// Group announced by this clause, including its mutually exclusive cost branch.
+    pub declares_chosen_group: Option<ChosenGroupId>,
+    /// Exact announced group consumed by this clause.
+    pub reads_chosen_group: Option<ChosenGroupId>,
+    pub declares_return_result: Option<ReturnResultId>,
+    pub reads_return_result: Option<(ReturnResultId, ReturnResultReadSpec)>,
     pub cost: Option<AbilityCost>,
     pub sub_ability: Option<Box<AbilityDefinition>>,
     /// CR 608.2c: Alternative branch executed when the condition on this ability is NOT met.
@@ -25944,6 +26015,14 @@ struct AbilityDefinitionRepr<'a> {
     // would silently drop a `null` key the existing JSON / snapshots expect.
     kind: &'a AbilityKind,
     effect: &'a Effect,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declares_chosen_group: &'a Option<ChosenGroupId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reads_chosen_group: &'a Option<ChosenGroupId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declares_return_result: &'a Option<ReturnResultId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reads_return_result: &'a Option<(ReturnResultId, ReturnResultReadSpec)>,
     cost: &'a Option<AbilityCost>,
     sub_ability: &'a Option<Box<AbilityDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -26023,6 +26102,10 @@ impl Serialize for AbilityDefinition {
         let AbilityDefinition {
             kind,
             effect,
+            declares_chosen_group,
+            reads_chosen_group,
+            declares_return_result,
+            reads_return_result,
             cost,
             sub_ability,
             else_ability,
@@ -26067,6 +26150,10 @@ impl Serialize for AbilityDefinition {
             kind,
             // `effect` is `&Box<Effect>` from the destructure; deref to `&Effect`.
             effect,
+            declares_chosen_group,
+            reads_chosen_group,
+            declares_return_result,
+            reads_return_result,
             cost,
             sub_ability,
             else_ability,
@@ -26142,6 +26229,14 @@ impl Serialize for AbilityDefinition {
 struct AbilityDefinitionDe {
     kind: AbilityKind,
     effect: Box<Effect>,
+    #[serde(default)]
+    declares_chosen_group: Option<ChosenGroupId>,
+    #[serde(default)]
+    reads_chosen_group: Option<ChosenGroupId>,
+    #[serde(default)]
+    declares_return_result: Option<ReturnResultId>,
+    #[serde(default)]
+    reads_return_result: Option<(ReturnResultId, ReturnResultReadSpec)>,
     #[serde(default)]
     cost: Option<AbilityCost>,
     #[serde(default)]
@@ -26239,6 +26334,10 @@ impl<'de> Deserialize<'de> for AbilityDefinition {
         Ok(AbilityDefinition {
             kind: de.kind,
             effect: de.effect,
+            declares_chosen_group: de.declares_chosen_group,
+            reads_chosen_group: de.reads_chosen_group,
+            declares_return_result: de.declares_return_result,
+            reads_return_result: de.reads_return_result,
             cost: de.cost,
             sub_ability: de.sub_ability,
             else_ability: de.else_ability,
@@ -26499,6 +26598,10 @@ impl AbilityDefinition {
         Self {
             kind,
             effect: Box::new(effect),
+            declares_chosen_group: None,
+            reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             cost: None,
             sub_ability: None,
             else_ability: None,
@@ -26805,6 +26908,17 @@ pub enum EffectOutcomeSignal {
     /// happened (impossible commit per CR 609.3, empty hand) the source
     /// `SpellContext::guess_outcome` is `None` and NEITHER polarity fires.
     Guessed { outcome: GuessOutcome },
+    /// CR 701.20a + CR 603.12: the immediately preceding reveal-until met its
+    /// until-condition — it revealed a card matching its until-filter. Guards
+    /// the "When you reveal a <filter> card this way" reflexive (Yuna's
+    /// Whistle, Calibrated Blast), whose trigger event is exactly that
+    /// until-condition. Read from the reveal-until's own one-hop verdict
+    /// (`ParentTargetMissingReason::RevealUntil` on a whiff): peeked on the
+    /// state slot at the inline creation gate, and carried on the child for a
+    /// resumed root or the materialized stack object (stable: the pending
+    /// trigger takes the slot at materialization). A generic "When you do"
+    /// after a reveal-until carries no such guard.
+    RevealUntilMatched,
 }
 
 /// CR 602.2a + CR 608.2c: which per-turn tally of a single printed ability
@@ -27573,7 +27687,9 @@ impl AbilityCondition {
             } => true,
             AbilityCondition::EffectOutcome {
                 signal:
-                    EffectOutcomeSignal::CurrentScopeSucceeded | EffectOutcomeSignal::Guessed { .. },
+                    EffectOutcomeSignal::CurrentScopeSucceeded
+                    | EffectOutcomeSignal::Guessed { .. }
+                    | EffectOutcomeSignal::RevealUntilMatched,
             } => false,
             AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn
             | AbilityCondition::AdditionalCostPaidInstead
@@ -27890,6 +28006,13 @@ impl ForwardedResultContext {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingForwardedZoneResult {
+    pub producer: ObjectId,
+    pub selected: Option<Vec<ObjectIncarnationRef>>,
+    pub group: Option<crate::types::identifiers::LogicalZoneChangeGroupId>,
+}
+
 /// Casting-time facts that flow with a spell from casting through resolution.
 /// Conditions in the sub_ability chain are evaluated against this context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -27899,12 +28022,24 @@ pub struct SpellContext {
     /// ordinary ability-chain handoffs without widening every ability literal.
     #[serde(default, skip_serializing_if = "ExileConcealment::is_public")]
     pub face_down_in_exile: ExileConcealment,
+    /// CR 603.7 + CR 603.10a + CR 608.2h: The battlefield-departure event a
+    /// phase-delayed triggered ability was created under ("When this creature
+    /// dies, at the beginning of the next end step, …"). The later phase event
+    /// that fires the ability names no object, so object look-back reads ("that
+    /// many", "its power", "this creature's counters") resolve against this
+    /// departure's last-known information instead. Stamped only by
+    /// `delayed_trigger::resolve`; `None` everywhere else, including every
+    /// event-delayed trigger, which reads the event that fires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_lookback_event: Option<Box<crate::types::events::GameEvent>>,
     /// CR 608.2c: The immediate `forward_result` producer's complete ordered
     /// result. `None` means no producer has run in this resolution; `Some([])`
     /// is a completed producer that moved no objects and intentionally blocks
     /// inherited-target fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarded_result_context: Option<Box<ForwardedResultContext>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_forwarded_zone_result: Option<PendingForwardedZoneResult>,
     /// CR 610.3b: specified duration events observed after a triggered ability
     /// triggered but before this initial zone-change effect occurred.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -28075,6 +28210,23 @@ pub struct SpellContext {
     /// `apply_parent_chain_context` so it never reaches a grandchild.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_damage_source: Option<TargetDamageSourceBinding>,
+    /// CR 601.2i + CR 400.7: For a triggered ability whose trigger event is a
+    /// spell being cast ("that spell" / a self-cast "this spell"), that
+    /// spell's object and incarnation as they stood when this ability was put
+    /// on the stack. Bound at the single triggered-stack-entry constructor
+    /// (`triggers.rs::push_pending_trigger_to_stack_with_firing_and_duration_events`)
+    /// and re-bound when a pending entry's ability is assigned
+    /// (`triggers.rs::assign_pending_trigger_entry_ability`); read by
+    /// `targeting::triggering_spell`. `None` for a non-spell-cast trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triggering_spell: Option<ObjectIncarnationRef>,
+    /// CR 602.2a + CR 607.1 + CR 613.1f: provenance of the activated ability this
+    /// stack object came from on its source, bound at announcement
+    /// (`casting::record_activation_announcement`). Never set for triggered
+    /// abilities — theirs is read from `trigger_definition_ref` — so trigger
+    /// batch-run context equality is unaffected. Not redacted from viewer states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ability_provenance: Option<AbilityProvenance>,
 }
 
 impl SpellContext {
@@ -28688,6 +28840,15 @@ pub enum TriggerCondition {
     /// with `And`/`Or`. Replaces per-leaf `negated: bool` fields and the
     /// `NotYourTurn` / `WasNotCast` / `NotCompletedDungeon` sibling-pair variants.
     Not { condition: Box<TriggerCondition> },
+    /// CR 508.1m + CR 508.2a + CR 603.4: a trigger-EVENT gate — the "Whenever ~
+    /// attacks while <state>" form. It is read when the trigger event occurs and
+    /// never again: CR 603.4's resolution recheck "only applies to an 'if' that
+    /// immediately follows a trigger condition", so `stack_condition_for_trigger`
+    /// drops this wrapper from the stacked condition while a genuine intervening
+    /// `if` beside it stays rechecked. Pugnacious Hammerskull's 2023-11-10
+    /// ruling: a Dinosaur that enters after the attack declaration does not stop
+    /// the stun counter.
+    EventTime { condition: Box<TriggerCondition> },
 }
 
 impl TriggerCondition {
@@ -28785,7 +28946,8 @@ impl TriggerCondition {
             | TriggerCondition::TriggeringSpellMatchesFilter { .. }
             | TriggerCondition::And { .. }
             | TriggerCondition::Or { .. }
-            | TriggerCondition::Not { .. } => None,
+            | TriggerCondition::Not { .. }
+            | TriggerCondition::EventTime { .. } => None,
         }
     }
 }
@@ -29507,6 +29669,30 @@ pub struct CopyEffectInstanceRef {
     pub modification_index: usize,
 }
 
+/// CR 607.1 + CR 607.5 + CR 613.1a: the copiable-value set that supplied an
+/// object's characteristic abilities. Abilities acquired from one copy effect
+/// are linked only to one another (CR 607.5); the object's own printed
+/// abilities form the `Own` set (CR 607.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum CharacteristicSetRef {
+    /// No copy effect applies in layer 1.
+    #[default]
+    Own,
+    /// The exact winning layer-1 copy effect (CR 707.2 + CR 707.9a).
+    Copied(CopyEffectInstanceRef),
+}
+
+/// CR 607.1 + CR 613.1f: whether a functioning ability is one of its
+/// object's characteristic abilities (of the given copiable set) or one it
+/// gained in layer 6. CR 607.1 links only the former; CR 607.1a self-grants are conservatively treated as the latter (fail closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum AbilityProvenance {
+    Characteristic(CharacteristicSetRef),
+    Granted,
+}
+
 /// Payload-free identity of the continuous-effect occurrence which produced a
 /// Layer-6 trigger candidate.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -29599,6 +29785,35 @@ pub enum TriggerDefinitionOccurrenceRef {
     /// validation rejects it from an observable game state.
     #[serde(skip_serializing, skip_deserializing)]
     Unmaterialized,
+}
+
+impl TriggerDefinitionOccurrenceRef {
+    /// CR 607.1 + CR 607.5 + CR 613.1f: whether this trigger occurrence is one
+    /// of its object's characteristic abilities (and of which copiable set) or
+    /// one it gained in layer 6. `None` when the occurrence carries no
+    /// attributable set.
+    pub fn provenance(&self) -> Option<AbilityProvenance> {
+        match self {
+            Self::Printed { .. } => {
+                Some(AbilityProvenance::Characteristic(CharacteristicSetRef::Own))
+            }
+            // CR 607.5 + CR 707.9a: acquired as a copiable value of this copy effect.
+            Self::CopiedValue { copy_effect, .. } => Some(AbilityProvenance::Characteristic(
+                CharacteristicSetRef::Copied(*copy_effect),
+            )),
+            // CR 613.1f: layer-6 grant instances.
+            Self::KeywordCompanion { .. } | Self::Granted { .. } | Self::ExpandedGrant { .. } => {
+                Some(AbilityProvenance::Granted)
+            }
+            // CR 607.5 + CR 707.9a pair a retained ability with its copy effect,
+            // but this occurrence carries only a recipient-local grant instance,
+            // not that effect's `CopyEffectInstanceRef` — fail closed (no
+            // emblem-linked card is in this class).
+            Self::CopyRetained { .. } => None,
+            // Never observable at runtime.
+            Self::Unmaterialized => None,
+        }
+    }
 }
 
 /// Exact identity of a trigger definition that functions on one object
@@ -32386,6 +32601,26 @@ pub enum ParentTargetMissingReason {
     /// an offerable option (CR 608.2d) nor a license for the generic
     /// source fallback, which would move the resolving spell itself.
     ExileTop,
+    /// CR 701.20a + CR 603.12: an `Effect::RevealUntil` exhausted the library
+    /// without revealing any card matching its until-filter, so no matching
+    /// card was revealed "this way" and nothing is bound as "that card".
+    /// Consulted by the `ParentTarget` `ChangeZone` no-op guard and the
+    /// optional-effect feasibility probe (as every reason is), and by the
+    /// `EffectOutcomeSignal::RevealUntilMatched` guard of a "When you reveal a
+    /// <filter> card this way" reflexive: that trigger event did not occur.
+    RevealUntil,
+}
+
+#[cfg(test)]
+mod parent_target_missing_reason_tests {
+    use super::ParentTargetMissingReason;
+
+    #[test]
+    fn reveal_until_reason_round_trips_through_json() {
+        let json = serde_json::to_string(&Some(ParentTargetMissingReason::RevealUntil)).unwrap();
+        let back: Option<ParentTargetMissingReason> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Some(ParentTargetMissingReason::RevealUntil));
+    }
 }
 
 /// CR 608.2c: what a chain split — a `player_scope` fan-out, or a multi-target
@@ -32548,6 +32783,14 @@ impl AttachTargetBindings {
 pub struct ResolvedAbility {
     pub effect: Effect,
     pub targets: Vec<TargetRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declares_chosen_group: Option<ChosenGroupId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reads_chosen_group: Option<ChosenGroupId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declares_return_result: Option<ReturnResultId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reads_return_result: Option<(ReturnResultId, ReturnResultReadSpec)>,
     /// Attribution only. Triggered abilities additionally carry the exact
     /// context below; callers must never use this raw id to rebind a departed
     /// source to a newer incarnation.
@@ -32953,13 +33196,18 @@ pub struct ResolvedAbility {
     /// CR 401.5 + CR 608.2c (issue #1365) + CR 609.3 + issue #4950
     /// (Thoughtseize): Stamped ONLY by `effects::apply_parent_chain_context`
     /// at the exact moment this ability is handed off as the immediate
-    /// sub_ability of a `Dig`/`ChooseFromZone`/`RevealHand` reveal-choice that
+    /// sub_ability of a `Dig`/`ChooseFromZone`/`RevealHand` reveal-choice/
+    /// `ExileTop`/`RevealUntil` that
     /// came up with nothing (empty library, no eligible card to choose, or an
     /// empty reveal-choice eligible set respectively) — never set any other
     /// way, so it cannot be confused with a stale value from an unrelated
     /// resolution. See [`ParentTargetMissingReason`] for what each variant
     /// gates and who consults it.
-    #[serde(skip)]
+    ///
+    /// Serialized: a child parked on a paused continuation carries this across
+    /// a `GameState` round trip (reconnect, persistence, P2P resume), where the
+    /// `WhenYouDo` gate and the `ParentTarget` guards still read it on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_target_missing_reason: Option<ParentTargetMissingReason>,
 }
 
@@ -32985,6 +33233,10 @@ impl PartialEq for ResolvedAbility {
         let Self {
             effect: a_effect,
             targets: a_targets,
+            declares_chosen_group: a_declares_chosen_group,
+            reads_chosen_group: a_reads_chosen_group,
+            declares_return_result: a_declares_return_result,
+            reads_return_result: a_reads_return_result,
             source_id: a_source_id,
             cast_occurrence: a_cast_occurrence,
             source_incarnation: a_source_incarnation,
@@ -33049,6 +33301,10 @@ impl PartialEq for ResolvedAbility {
         let Self {
             effect: b_effect,
             targets: b_targets,
+            declares_chosen_group: b_declares_chosen_group,
+            reads_chosen_group: b_reads_chosen_group,
+            declares_return_result: b_declares_return_result,
+            reads_return_result: b_reads_return_result,
             source_id: b_source_id,
             cast_occurrence: b_cast_occurrence,
             source_incarnation: b_source_incarnation,
@@ -33113,6 +33369,10 @@ impl PartialEq for ResolvedAbility {
 
         a_effect == b_effect
             && a_targets == b_targets
+            && a_declares_chosen_group == b_declares_chosen_group
+            && a_reads_chosen_group == b_reads_chosen_group
+            && a_declares_return_result == b_declares_return_result
+            && a_reads_return_result == b_reads_return_result
             && a_source_id == b_source_id
             && a_cast_occurrence == b_cast_occurrence
             && a_source_incarnation == b_source_incarnation
@@ -33222,6 +33482,10 @@ impl ResolvedAbility {
         Self {
             effect,
             targets,
+            declares_chosen_group: None,
+            reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             source_id,
             cast_occurrence: None,
             controller,
@@ -33392,6 +33656,39 @@ impl ResolvedAbility {
         }
     }
 
+    /// CR 603.7 + CR 603.10a: Record the battlefield-departure event this
+    /// phase-delayed ability was created under on every node of its chain, so
+    /// a node that resolves without a parent hand-off still carries it.
+    pub fn set_creation_lookback_event_recursive(
+        &mut self,
+        event: &crate::types::events::GameEvent,
+    ) {
+        self.context.creation_lookback_event = Some(Box::new(event.clone()));
+        if let Some(sub) = self.sub_ability.as_mut() {
+            sub.set_creation_lookback_event_recursive(event);
+        }
+        if let Some(else_branch) = self.else_ability.as_mut() {
+            else_branch.set_creation_lookback_event_recursive(event);
+        }
+    }
+
+    /// Visit every carried creation look-back event in this chain. Used by the
+    /// viewer projection to redact hidden-zone records (CR 400.2).
+    pub fn for_each_creation_lookback_event_mut(
+        &mut self,
+        f: &mut impl FnMut(&mut crate::types::events::GameEvent),
+    ) {
+        if let Some(event) = self.context.creation_lookback_event.as_deref_mut() {
+            f(event);
+        }
+        if let Some(sub) = self.sub_ability.as_mut() {
+            sub.for_each_creation_lookback_event_mut(f);
+        }
+        if let Some(else_branch) = self.else_ability.as_mut() {
+            else_branch.for_each_creation_lookback_event_mut(f);
+        }
+    }
+
     /// CR 608.2c: Updates the owned source projection for the current
     /// resolution segment without rebinding its source/controller or crossing
     /// an independent sequential instruction.
@@ -33506,6 +33803,10 @@ impl ResolvedAbility {
         self.trigger_source = None;
         self.trigger_definition_ref = None;
         self.force_block_attacker = None;
+        // CR 104.4b: the pin names an advancing incarnation of the triggering
+        // spell (CR 400.7), so it is cleared alongside the other per-instance
+        // identity fields above for the same loop-equality reason.
+        self.context.triggering_spell = None;
         // CR 104.4b + CR 400.7: `normalize_for_loop` compares canonicalized
         // clones for repeated-position equality, and the all-zone incarnation
         // bump advances a pinned referent's epoch on every zone change. A
@@ -33774,6 +34075,33 @@ impl ResolvedAbility {
         if let Some(else_branch) = self.else_ability.as_mut() {
             else_branch.set_source_transformation_count_recursive(count);
         }
+    }
+
+    /// CR 602.2a + CR 607.1: Propagate the announced activated ability's
+    /// provenance through every branch of the ability.
+    pub fn set_source_ability_provenance_recursive(
+        &mut self,
+        provenance: Option<AbilityProvenance>,
+    ) {
+        self.context.source_ability_provenance = provenance;
+        if let Some(sub) = self.sub_ability.as_mut() {
+            sub.set_source_ability_provenance_recursive(provenance);
+        }
+        if let Some(else_branch) = self.else_ability.as_mut() {
+            else_branch.set_source_ability_provenance_recursive(provenance);
+        }
+    }
+
+    /// CR 607.1 + CR 113.7a: single read authority for the provenance of the
+    /// ability this stack object came from on its source — the activated fact
+    /// latched at announcement, else the trigger definition occurrence it was
+    /// created from. `None` when neither is attributable.
+    pub fn source_ability_provenance(&self) -> Option<AbilityProvenance> {
+        self.context.source_ability_provenance.or_else(|| {
+            self.trigger_definition_ref
+                .as_ref()
+                .and_then(|definition| definition.occurrence.provenance())
+        })
     }
     /// CR 400.7: True when the triggered source matches the object in its captured
     /// `expected_zone` at the captured incarnation.
@@ -34755,8 +35083,106 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::events::GameEvent;
+    use crate::types::game_state::{DelayedTrigger, GameState, ZoneChangeRecord};
     use crate::types::mana::ZoneSpendPolarity;
     use crate::types::zones::Zone;
+
+    /// CR 607.1 + CR 607.5 + CR 613.1f: every trigger occurrence classifies
+    /// exhaustively — printed and copied-value occurrences are characteristic
+    /// of their copiable set, layer-6 grants are granted, and occurrences with
+    /// no attributable set are `None`. `ResolvedAbility::source_ability_provenance`
+    /// prefers the announcement latch, then the trigger occurrence.
+    #[test]
+    fn ability_provenance_classifies_occurrences_and_prefers_the_latch() {
+        let copy = CopyEffectInstanceRef {
+            continuous_effect_id: 3,
+            modification_index: 1,
+        };
+        let grant = TriggerGrantInstanceRef(2);
+        let printed = TriggerDefinitionOccurrenceRef::Printed {
+            base_set: TriggerBaseSetInstanceRef::INITIAL,
+            printed_index: 0,
+        };
+        let cases = [
+            (
+                printed.clone(),
+                Some(AbilityProvenance::Characteristic(CharacteristicSetRef::Own)),
+            ),
+            (
+                TriggerDefinitionOccurrenceRef::CopiedValue {
+                    copy_effect: copy,
+                    copied_slot: 0,
+                    printed_origin: None,
+                },
+                Some(AbilityProvenance::Characteristic(
+                    CharacteristicSetRef::Copied(copy),
+                )),
+            ),
+            (
+                TriggerDefinitionOccurrenceRef::KeywordCompanion {
+                    grant_instance: grant,
+                    companion_index: 0,
+                },
+                Some(AbilityProvenance::Granted),
+            ),
+            (
+                TriggerDefinitionOccurrenceRef::Granted {
+                    grant_instance: grant,
+                },
+                Some(AbilityProvenance::Granted),
+            ),
+            (
+                TriggerDefinitionOccurrenceRef::ExpandedGrant {
+                    grant_instance: grant,
+                    provider: Box::new(TriggerDefinitionRef {
+                        source: ObjectIncarnationRef::of(ObjectId(1), 0),
+                        occurrence: printed.clone(),
+                    }),
+                    provider_output_index: 0,
+                },
+                Some(AbilityProvenance::Granted),
+            ),
+            (
+                TriggerDefinitionOccurrenceRef::CopyRetained {
+                    grant_instance: grant,
+                    source_base_set: TriggerBaseSetInstanceRef::INITIAL,
+                    source_printed_index: 0,
+                },
+                None,
+            ),
+            (TriggerDefinitionOccurrenceRef::Unmaterialized, None),
+        ];
+        for (occurrence, expected) in &cases {
+            assert_eq!(occurrence.provenance(), *expected, "{occurrence:?}");
+        }
+
+        let mut ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(1),
+            crate::types::player::PlayerId(0),
+        );
+        assert_eq!(ability.source_ability_provenance(), None, "neither");
+        ability.trigger_definition_ref = Some(TriggerDefinitionRef {
+            source: ObjectIncarnationRef::of(ObjectId(1), 0),
+            occurrence: printed,
+        });
+        assert_eq!(
+            ability.source_ability_provenance(),
+            Some(AbilityProvenance::Characteristic(CharacteristicSetRef::Own)),
+            "the trigger occurrence answers"
+        );
+        ability.set_source_ability_provenance_recursive(Some(AbilityProvenance::Granted));
+        assert_eq!(
+            ability.source_ability_provenance(),
+            Some(AbilityProvenance::Granted),
+            "the announcement latch wins"
+        );
+    }
 
     /// Issue #8485: `origin` and `source_object` are additive and wire-compatible.
     ///
@@ -34933,6 +35359,61 @@ mod tests {
             serde_json::from_value::<SpellContext>(wire).expect("attachment bindings round-trip"),
             populated
         );
+    }
+
+    #[test]
+    fn spell_context_creation_lookback_round_trips() {
+        let event = GameEvent::ZoneChanged {
+            object_id: ObjectId(7),
+            from: Some(Zone::Battlefield),
+            to: Zone::Graveyard,
+            record: Box::new(ZoneChangeRecord::test_minimal(
+                ObjectId(7),
+                Some(Zone::Battlefield),
+                Zone::Graveyard,
+            )),
+        };
+
+        let populated = SpellContext {
+            creation_lookback_event: Some(Box::new(event.clone())),
+            ..SpellContext::default()
+        };
+        let round_tripped: SpellContext =
+            serde_json::from_value(serde_json::to_value(&populated).expect("context serializes"))
+                .expect("context deserializes");
+        assert_eq!(round_tripped, populated);
+
+        let absent = SpellContext::default();
+        let absent_round_tripped: SpellContext =
+            serde_json::from_value(serde_json::to_value(&absent).expect("context serializes"))
+                .expect("context deserializes");
+        assert_eq!(absent_round_tripped, absent);
+        assert!(serde_json::to_value(&absent)
+            .expect("context serializes")
+            .get("creation_lookback_event")
+            .is_none());
+
+        let mut ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(1),
+            crate::types::player::PlayerId(0),
+        );
+        ability.context = populated;
+
+        let mut state = GameState::new_two_player(42);
+        state.delayed_triggers.push(DelayedTrigger::new(
+            DelayedTriggerCondition::AtNextPhase { phase: Phase::End },
+            Box::new(ability),
+            crate::types::player::PlayerId(0),
+            ObjectId(1),
+            true,
+        ));
+        let cloned = state.clone();
+        assert_eq!(cloned, state);
     }
 
     /// CR 102.1 — `TargetFilter::PlayerMatching::is_player_scope()` is a DECIDED

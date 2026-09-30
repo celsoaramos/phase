@@ -18,7 +18,9 @@ use crate::types::casting_costs::{
     CostReductionOutcome, ManaCarrier, ReductionProvenance, SettledTail,
 };
 use crate::types::events::{ActivatedAbilityKind, GameEvent};
-use crate::types::game_state::{AbilityActivationRecord, ActivationTargetFact, LKISnapshot};
+use crate::types::game_state::{
+    AbilityActivationRecord, ActivationTargetFact, LKISnapshot, TransientContinuousEffect,
+};
 use crate::types::game_state::{
     ActivationResidual, ActivationTargetSelection, AlternativeAdditionalCostDescription,
     CastOfferKind, CastPaymentMode, CastingPermissionIndex, CastingVariant,
@@ -51,7 +53,7 @@ use super::ability_utils::{
     assign_targets_in_chain, auto_select_targets, auto_select_targets_for_ability,
     begin_target_selection, begin_target_selection_for_ability, build_resolved_from_def,
     build_target_slots, build_target_slots_for_announcement, compute_unavailable_modes,
-    filter_references_target_player, flatten_targets_in_chain,
+    declared_targets_in_chain, filter_references_target_player, flatten_targets_in_chain,
     has_legal_target_assignment_for_ability, modal_choice_for_player,
     simple_legal_target_assignment_exists_for_ability, target_constraints_from_modal,
     unresolved_x_target_construction_error, TargetSlotBuildOutcome,
@@ -1543,11 +1545,12 @@ fn graveyard_spell_objects_available_to_cast(
     player: PlayerId,
     graveyard: &im::Vector<ObjectId>,
 ) -> Vec<ObjectId> {
-    let permission_sources = if state.active_player == player {
-        graveyard_permission_sources(state, player, Some(CardPlayMode::Cast))
-    } else {
-        Vec::new()
-    };
+    // CR 601.3 + CR 702.8a + CR 117.1a: no blanket whose-turn gate here. A
+    // permission that says "during your turn" / "during each of your turns"
+    // carries `StaticCondition::DuringYourTurn`, which `graveyard_permission_sources`
+    // evaluates through `active_static_definitions`. One without turn words lets a
+    // Flash or instant card be cast from the graveyard on any turn.
+    let permission_sources = graveyard_permission_sources(state, player, Some(CardPlayMode::Cast));
     let mut keyword_objects = Vec::new();
     let mut permission_objects = Vec::new();
     let mut timed_permission_objects = Vec::new();
@@ -1601,7 +1604,7 @@ fn graveyard_spell_objects_available_to_cast(
 
         // CR 601.2a + CR 604.3: Cards in graveyard castable via static
         // permission from a battlefield permanent (Lurrus, Karador, etc.).
-        // CR 117.1c: "Each of your turns" — only during controller's turn.
+        // Any whose-turn restriction is the permission's own condition.
         if graveyard_object_castable_by_permission_sources(
             state,
             player,
@@ -3750,9 +3753,10 @@ pub(crate) fn castable_from_current_zone(
                     && has_effective_graveyard_cast_keyword(state, obj.id, obj))
                     || has_graveyard_timed_alt_cost_permission(state, obj, player))
                     && normal_cost_route())
-                // CR 601.2a + CR 117.1c: Graveyard cast via static permission (Lurrus, etc.).
+                // CR 601.2a + CR 601.3: Graveyard cast via static permission
+                // (Lurrus, etc.). Whose turn it must be is the permission's own
+                // condition, not a blanket gate here.
                 || (obj.zone == Zone::Graveyard
-                    && state.active_player == player
                     && graveyard_permission_source(state, player, obj.id).is_some())
                 // CR 401.5 + CR 118.9 + CR 601.2a: Top-of-library cast via static
                 // permission (Realmwalker, Future Sight, Bolas's Citadel, etc.). The card
@@ -5014,9 +5018,22 @@ fn exile_permission_timing_active(
     }
 }
 
-/// CR 601.2a + CR 113.6b: Enumerate every battlefield permanent controlled by
-/// `player` whose `StaticMode::ExileCastPermission` static is currently
-/// functioning. The returned filter is owned by the static definition (via
+/// CR 114.4: emblem abilities function in the command zone. Yields every
+/// command-zone emblem, in command-zone order; each caller restricts the
+/// player (the exile path by the static's `ExileCastGrantee`, the graveyard
+/// path by the owner gate — CR 114.2).
+fn command_zone_emblems(state: &GameState) -> impl Iterator<Item = ObjectId> + '_ {
+    state
+        .command_zone
+        .iter()
+        .copied()
+        .filter(move |&id| state.objects.get(&id).is_some_and(|obj| obj.is_emblem))
+}
+
+/// CR 601.2a + CR 113.6b: Enumerate every battlefield permanent and every
+/// command-zone emblem whose `StaticMode::ExileCastPermission` static is
+/// currently functioning; the `grantee` match and the own-exiles pool restrict
+/// `player`. The returned filter is owned by the static definition (via
 /// `active_static_definitions`) and lives at least as long as the inferred
 /// borrow.
 ///
@@ -5027,6 +5044,7 @@ fn exile_permission_sources(state: &GameState, player: PlayerId) -> Vec<ExilePer
         .battlefield
         .iter()
         .copied()
+        .chain(command_zone_emblems(state))
         .filter_map(|source_id| {
             let obj = state.objects.get(&source_id)?;
             active_static_definitions(state, obj).find_map(|definition| match definition.mode {
@@ -5050,7 +5068,8 @@ fn exile_permission_sources(state: &GameState, player: PlayerId) -> Vec<ExilePer
                 } => {
                     // CR 406.6 + CR 607.1: "you may …" grants only the source's
                     // controller; "each player may … cards they exiled" grants
-                    // every player their own share of the pool.
+                    // every player their own share of the pool. CR 114.2: an
+                    // emblem's controller is the player who owns it.
                     let own_exiles_of = match grantee {
                         ExileCastGrantee::SourceController => {
                             if obj.controller != player {
@@ -5409,12 +5428,7 @@ fn graveyard_permission_sources(
     play_mode_filter: Option<CardPlayMode>,
 ) -> Vec<GraveyardPermissionSource<'_>> {
     let mut source_ids: Vec<ObjectId> = state.battlefield.iter().copied().collect();
-    source_ids.extend(state.command_zone.iter().copied().filter(|&id| {
-        state
-            .objects
-            .get(&id)
-            .is_some_and(|obj| obj.is_emblem && obj.owner == player)
-    }));
+    source_ids.extend(command_zone_emblems(state));
     if let Some(player_data) = state.players.iter().find(|p| p.id == player) {
         source_ids.extend(player_data.graveyard.iter().copied());
     }
@@ -5581,6 +5595,23 @@ fn transient_graveyard_permission_sources(
                     if !graveyard_permission_play_mode_matches(play_mode, play_mode_filter) {
                         return None;
                     }
+                    // CR 113.1b + CR 109.5: a permission granted to a PLAYER is
+                    // that player's ability, so its "you"/"your" mean the
+                    // grantee. Evaluate only holder-bound conditions; other
+                    // leaves fail closed rather than reading the grantor.
+                    if let Some(condition) = definition.condition.as_ref() {
+                        if !holder_bound_condition_is_modeled(condition)
+                            || !super::layers::evaluate_condition_with_context(
+                                state,
+                                condition,
+                                player,
+                                tce.source_id,
+                                super::layers::ConditionContext::ability_holder(player),
+                            )
+                        {
+                            return None;
+                        }
+                    }
                     definition
                         .affected
                         .as_ref()
@@ -5608,6 +5639,84 @@ fn transient_graveyard_permission_sources(
                 },
             )
         })
+}
+
+/// CR 113.1b + CR 109.5: true when every leaf of a player-granted permission's
+/// condition evaluates against the ability's HOLDER once
+/// `ConditionContext::ability_holder` is bound. Today that's only the whose-turn
+/// leaves (`layers::evaluate_condition_inner` reads `ability_holder` there) and
+/// boolean compositions of them.
+///
+/// Every other leaf reads the source object or a source-derived filter context.
+/// For example, `IsPresent` builds `FilterContext::from_source`, so "you control
+/// a Zombie" would count the GRANTING spell's controller's Zombies. Those leaves
+/// are refused (fail closed) rather than evaluated for the wrong player.
+/// Exhaustive with no wildcard, so a new `StaticCondition` variant must be
+/// classified here.
+fn holder_bound_condition_is_modeled(condition: &StaticCondition) -> bool {
+    match condition {
+        StaticCondition::DuringYourTurn | StaticCondition::DuringOpponentsTurn => true,
+        StaticCondition::And { conditions } | StaticCondition::Or { conditions } => {
+            conditions.iter().all(holder_bound_condition_is_modeled)
+        }
+        StaticCondition::Not { condition } => holder_bound_condition_is_modeled(condition),
+        StaticCondition::DevotionGE { .. }
+        | StaticCondition::IsPresent { .. }
+        | StaticCondition::ChosenColorIs { .. }
+        | StaticCondition::ChosenLabelIs { .. }
+        | StaticCondition::QuantityComparison { .. }
+        | StaticCondition::HasMaxSpeed
+        | StaticCondition::SpeedGE { .. }
+        | StaticCondition::DayNightIs { .. }
+        | StaticCondition::HasCounters { .. }
+        | StaticCondition::CastVariantPaid { .. }
+        | StaticCondition::RecipientHasCounters { .. }
+        | StaticCondition::ClassLevelGE { .. }
+        | StaticCondition::DefendingPlayerControls { .. }
+        | StaticCondition::SourceAttackingAlone
+        | StaticCondition::SourceIsAttacking
+        | StaticCondition::SourceIsBlocking
+        | StaticCondition::SourceIsBlocked
+        | StaticCondition::IsMonarch { .. }
+        | StaticCondition::IsInitiative
+        | StaticCondition::NoMonarch
+        | StaticCondition::HasCityBlessing
+        | StaticCondition::HasEnduringStory
+        | StaticCondition::CompletedADungeon
+        | StaticCondition::WasStartingPlayer { .. }
+        | StaticCondition::SpellCastWithVariantThisTurn { .. }
+        | StaticCondition::AnyPlayerAttackedYouLastTurn { .. }
+        | StaticCondition::OpponentPoisonAtLeast { .. }
+        | StaticCondition::UnlessPay { .. }
+        | StaticCondition::Unrecognized { .. }
+        | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
+        | StaticCondition::SourceEnteredThisTurn
+        | StaticCondition::SourceHasDealtDamage
+        | StaticCondition::WasCast { .. }
+        | StaticCondition::IsRingBearer
+        | StaticCondition::RingLevelAtLeast { .. }
+        | StaticCondition::ControlsCommander { .. }
+        | StaticCondition::SourceIsTapped
+        | StaticCondition::IsTapped { .. }
+        | StaticCondition::SourceIsFaceUp
+        | StaticCondition::SourceIsSaddled
+        | StaticCondition::SourceControllerEquals { .. }
+        | StaticCondition::SourceIsEquipped
+        | StaticCondition::SourceIsEnchanted
+        | StaticCondition::SourceIsMonstrous
+        | StaticCondition::SourceIsHarnessed
+        | StaticCondition::SourceAttachedToCreature
+        | StaticCondition::SourceMatchesFilter { .. }
+        | StaticCondition::TopOfLibraryMatches { .. }
+        | StaticCondition::RecipientMatchesFilter { .. }
+        | StaticCondition::RecipientAttackingOwnerTarget { .. }
+        | StaticCondition::SourceIsPaired
+        | StaticCondition::SourceInZone { .. }
+        | StaticCondition::EnchantedIsFaceDown
+        | StaticCondition::AdditionalCostPaid
+        | StaticCondition::CastingAsVariant { .. }
+        | StaticCondition::None => false,
+    }
 }
 
 fn graveyard_permission_play_mode_matches(
@@ -8588,10 +8697,10 @@ fn prepare_spell_cast_announced(
             KeywordKind::Escape,
         );
     let has_mayhem = mayhem_castable_from_graveyard(state, player, object_id);
-    // CR 601.2a + CR 117.1c: Graveyard cast via static permission (Lurrus, etc.)
-    // is possible on the caster's turn only; which permission authorizes it is
-    // resolved once the casting method is known (see `graveyard_authority`).
-    let graveyard_permission_route = obj.zone == Zone::Graveyard && state.active_player == player;
+    // CR 601.2a + CR 601.3: A graveyard grant's own condition controls whose
+    // turn permits the cast. The exact permission is resolved once the casting
+    // method is known (see `graveyard_authority`).
+    let graveyard_permission_route = obj.zone == Zone::Graveyard;
     let has_graveyard_alt_cost = has_graveyard_timed_alt_cost_permission(state, obj, player);
     let has_hand_alt_cost = has_hand_alt_cost_permission(state, obj, player);
     // CR 608.2g: A free-cast window (Invoke Calamity) or targeted
@@ -9876,10 +9985,11 @@ fn prepare_spell_cast_announced(
 /// whenever the cast has no accepted reduction and no election).
 #[derive(Debug, Clone, Default)]
 pub(super) struct CostFinalizeContext {
-    /// Reductions that are not derivable from the board at this seam. Today
-    /// this is exactly the accepted Defiler-cycle life payment (CR 601.2b),
-    /// whose acceptance lives in the answer to `WaitingFor::DefilerPayment`
-    /// rather than in any static.
+    /// Reductions that are not derivable from the board at this seam: the
+    /// accepted Defiler-cycle life payment (CR 601.2b), whose acceptance lives
+    /// in the answer to `WaitingFor::DefilerPayment` rather than in any static,
+    /// and the reduction an Emerge or Offering sacrifice earned before a
+    /// deferred target declaration (CR 702.119a + CR 702.48c).
     extra: Vec<CostModification>,
     /// The caster's CR 601.2b + CR 601.2f election, once made.
     election: Option<CostReductionElection>,
@@ -9898,8 +10008,10 @@ impl CostFinalizeContext {
     /// that must agree with it) has to run under this rather than
     /// [`CostFinalizeContext::PREVIEW`], or it silently replaces the caster's
     /// elected order with the caster-optimal default and drops an accepted
-    /// Defiler reduction.
-    fn from_pending(pending: &PendingCast) -> Self {
+    /// Defiler reduction. The additional-cost declaration preview runs under it
+    /// too, so an optional cost is offered against the total the kept
+    /// sacrifice reduction will lock in.
+    pub(super) fn from_pending(pending: &PendingCast) -> Self {
         Self {
             extra: pending
                 .accepted_cost_reductions
@@ -10795,7 +10907,7 @@ pub(super) fn lock_in_total_cost(
     extra: &[CostReductionEntry],
     election: Option<&CostReductionElection>,
 ) -> CostLockOutcome {
-    // Hot path. `pay_and_push` runs this on EVERY cast, including the simulated
+    // Hot path. `pay_and_push_with_lock` runs this on EVERY cast, including the simulated
     // ones the AI search drives, so the overwhelmingly common board — no
     // `ModifyCost` static anywhere and nothing accepted — must not pay for a
     // second round of modifier collection. Behaviour-neutral: with no reduction
@@ -12363,6 +12475,38 @@ fn battlefield_cost_modifier_applies_before_targets(
     })
 }
 
+/// CR 604.1: presence gate for transient (duration-scoped) `ModifyCost`
+/// grants. The O(1) `static_mode_presence` index tracks only battlefield /
+/// command-zone printed statics, never TCE-borne `GrantStaticAbility` modes,
+/// so this small scan of `transient_continuous_effects` is the gate for the
+/// transient side — mirroring the split presence gate in
+/// `collect_static_activated_ability_cost_modifiers`.
+fn transient_modify_cost_present(state: &GameState) -> bool {
+    state.transient_continuous_effects.iter().any(|tce| {
+        tce.modifications.iter().any(|m| {
+            matches!(
+                m,
+                ContinuousModification::GrantStaticAbility { definition }
+                    if matches!(definition.mode, StaticMode::ModifyCost { .. })
+            )
+        })
+    })
+}
+
+/// CR 601.2f: label a transient grant's row in the reduction-order prompt. A
+/// live source object names itself; a source that changed zones or is a
+/// dungeon sentinel uses the name snapshotted at construction (CR 400.7).
+/// Reading the current dungeon here would mislabel an earlier room's grant
+/// after its dungeon completes or the marker enters another dungeon.
+fn transient_grant_display_name(state: &GameState, tce: &TransientContinuousEffect) -> String {
+    state
+        .objects
+        .get(&tce.source_id)
+        .map(|obj| obj.name.clone())
+        .or_else(|| (!tce.source_name.is_empty()).then(|| tce.source_name.clone()))
+        .unwrap_or_default()
+}
+
 fn collect_battlefield_cost_modifiers(
     state: &GameState,
     caster: PlayerId,
@@ -12394,8 +12538,16 @@ fn collect_battlefield_cost_modifiers(
     // a reduction's `saturating_sub` floor can never clamp generic to 0 ahead of a
     // later increase (which would overcharge the spell, order-dependently).
     let mut collected = Vec::new();
-    // CR 604.1: O(1) presence gate — no ModifyCost static means no cost modifiers.
-    if !static_kind_present(state, StaticModeKind::ModifyCost) {
+    // CR 604.1: presence gate — nothing to do unless a printed ModifyCost
+    // static (CR 611.3) OR a duration-scoped continuous ModifyCost grant
+    // (CR 611.2 — Moonrise Towers' transient "spells you cast this turn cost
+    // {3} less") is present. The O(1) `static_mode_presence` index covers only
+    // battlefield/command-zone printed statics, so the transient authority
+    // needs its own small TCE scan — the same split gate the activation-side
+    // collector uses for transient `ReduceAbilityCost`.
+    let has_static = static_kind_present(state, StaticModeKind::ModifyCost);
+    let has_transient = transient_modify_cost_present(state);
+    if !has_static && !has_transient {
         return collected;
     }
     crate::game::perf_counters::record_static_full_scan();
@@ -12512,6 +12664,151 @@ fn collect_battlefield_cost_modifiers(
                 },
                 display_name: src_obj.name.clone(),
             });
+        }
+    }
+
+    // CR 611.2 + CR 601.2f: duration-scoped continuous ModifyCost grants
+    // that are genuinely player-wide (Moonrise Towers' "spells you cast this
+    // turn cost {3} less", installed as a SpecificPlayer TCE layers never
+    // grafts onto any object). Installed by a resolving ability as a
+    // GenericEffect grant and read here, off the TCE, through the SAME gates
+    // as battlefield statics — there is no parallel reduction pathway.
+    // Mirrors the activation-side transient collector; the spell path simply
+    // never had one, so these grants silently did nothing. Object-bound
+    // grants stay on the functioning-static path above and are never read
+    // here (CR 611.2c).
+    if has_transient {
+        for tce in &state.transient_continuous_effects {
+            // CR 611.2a: a lapsed effect stays stored until a sweep, so list
+            // presence is not liveness — the shared authority decides whether
+            // this grant still applies before anything else reads it.
+            if !super::layers::transient_effect_is_live(state, tce) {
+                continue;
+            }
+            // CR 611.2c + CR 604.1: only player-wide grants are read off the
+            // TCE. An object-bound grant is grafted onto its recipient by the
+            // layer-6 apply, so `game_functioning_statics` already yields it
+            // and the static pass owns it — reading it here too double-counts
+            // (Will X=2 reducing {3} to {0}), and reading it after its
+            // recipient stops functioning would re-scope an object-bound
+            // definition into a board-wide discount on unrelated spells.
+            if !matches!(tce.affected, TargetFilter::SpecificPlayer { .. }) {
+                continue;
+            }
+            let grants =
+                tce.modifications
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ordinal, modification)| match modification {
+                        ContinuousModification::GrantStaticAbility { definition } => {
+                            match &definition.mode {
+                                StaticMode::ModifyCost { .. } => Some((ordinal, definition)),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    });
+            for (ordinal, definition) in grants {
+                let Some(modifier) = definition.board_wide_cost_modifier() else {
+                    continue;
+                };
+                if !super::layers::transient_gate_conditions(tce).all(|condition| {
+                    super::layers::evaluate_condition(
+                        state,
+                        condition,
+                        tce.controller,
+                        tce.source_id,
+                    )
+                }) {
+                    continue;
+                }
+                if definition.condition.as_ref().is_some_and(|condition| {
+                    !evaluate_cost_mod_static_condition(
+                        state,
+                        condition,
+                        caster,
+                        tce.controller,
+                        tce.source_id,
+                        casting_variant,
+                    )
+                }) {
+                    continue;
+                }
+                if !modifier.caster_scope.admits(caster, tce.controller) {
+                    continue;
+                }
+                let BoardWideCostModifier {
+                    mode,
+                    amount,
+                    spell_filter,
+                    dynamic_count,
+                    caster_scope: _,
+                    condition: _,
+                    reach,
+                } = modifier;
+                let is_raise = matches!(mode, CostModifyMode::Raise);
+                // The spell itself is the filter context, not the TCE source:
+                // the matcher requires an existing source object and a
+                // sourceless grant (dungeon sentinel) has none, while the
+                // spell exists by construction and its controller IS the
+                // caster — which the caster-scope gate above already bound to
+                // the grantor. So "you" resolves to the right player either
+                // way, with no stale-source dependency.
+                let filter_analysis = spell_filter.map_or(
+                    PreTargetCostFilterAnalysis::TargetIndependentRelevant,
+                    |filter| {
+                        analyze_cost_filter_before_targets_for(
+                            state, caster, spell_id, filter, spell_id, fused,
+                        )
+                    },
+                );
+                if target_sensitive_only && !filter_analysis.is_target_dependent() {
+                    continue;
+                }
+                if selected_ability.is_none() && filter_analysis.is_target_dependent() {
+                    continue;
+                }
+                if let Some(filter) = spell_filter {
+                    let matches = if let Some(ability) = selected_ability {
+                        spell_matches_cost_filter_with_selected_targets_for(
+                            state, caster, spell_id, filter, spell_id, ability, fused,
+                        )
+                    } else {
+                        spell_matches_cost_filter_for(
+                            state, caster, spell_id, filter, spell_id, fused,
+                        )
+                    };
+                    if !matches {
+                        continue;
+                    }
+                }
+                let base_amount = amount.clone();
+                let multiplier = if let Some(qty_ref) = dynamic_count {
+                    let qty_expr = crate::types::ability::QuantityExpr::Ref {
+                        qty: qty_ref.clone(),
+                    };
+                    super::quantity::resolve_quantity(
+                        state,
+                        &qty_expr,
+                        tce.controller,
+                        tce.source_id,
+                    )
+                    .max(0) as u32
+                } else {
+                    1
+                };
+                collected.push(CostModification {
+                    is_raise,
+                    amount: base_amount,
+                    multiplier,
+                    reach,
+                    provenance: ReductionProvenance::TransientEffect {
+                        effect: tce.id,
+                        ordinal: ordinal.min(u8::MAX as usize) as u8,
+                    },
+                    display_name: transient_grant_display_name(state, tce),
+                });
+            }
         }
     }
 
@@ -18154,7 +18451,7 @@ fn continue_with_prepared(
                 assign_targets_in_chain(state, &mut resolved, &targets)?;
                 emit_targeting_events(
                     state,
-                    &flatten_targets_in_chain(&resolved),
+                    &declared_targets_in_chain(&resolved),
                     prepared.object_id,
                     player,
                     events,
@@ -18240,7 +18537,7 @@ fn continue_with_prepared(
             assign_targets_in_chain(state, &mut resolved, &targets)?;
             emit_targeting_events(
                 state,
-                &flatten_targets_in_chain(&resolved),
+                &declared_targets_in_chain(&resolved),
                 prepared.object_id,
                 player,
                 events,
@@ -18637,7 +18934,7 @@ fn continue_with_prepared(
             assign_targets_in_chain(state, &mut resolved, &targets)?;
             emit_targeting_events(
                 state,
-                &flatten_targets_in_chain(&resolved),
+                &declared_targets_in_chain(&resolved),
                 prepared.object_id,
                 player,
                 events,
@@ -23106,7 +23403,14 @@ pub(crate) fn resolve_non_self_discard_requirement_with_ability(
     let Some((count, filter, _selection)) = find_non_self_discard(cost) else {
         return Ok(None);
     };
-    let count = super::quantity::resolve_quantity(state, count, player, source_id).max(0) as usize;
+    // CR 107.3a: the ability carries the announced X that a "discard X cards"
+    // count reads; without it X would resolve to 0 and the cost would be skipped.
+    let count = ability
+        .map_or_else(
+            || super::quantity::resolve_quantity(state, count, player, source_id),
+            |ability| super::quantity::resolve_quantity_with_targets(state, count, ability),
+        )
+        .max(0) as usize;
     // CR 601.2h + CR 701.9a: A resolved zero-card discard is paid by doing nothing — never
     // surface a dead selection prompt for it.
     if count == 0 {
@@ -23843,7 +24147,9 @@ pub(crate) fn removable_counter_count_for_cost_selection(
 ) -> u32 {
     match (counter_type, selection) {
         (crate::types::counter::CounterMatch::Any, CounterCostSelection::AmongObjects) => {
-            obj.counters.values().copied().sum()
+            // CR 122.1: exact total clamped to u32. This bounds how many counters
+            // may be selected, an availability ("at least N") use only.
+            u32::try_from(crate::types::counter::counter_total(&obj.counters)).unwrap_or(u32::MAX)
         }
         _ => removable_counter_count(obj, counter_type),
     }
@@ -26071,9 +26377,8 @@ fn activate_with_cost_carrier(
     resolved.ability_index = Some(ability_index);
     // CR 602.2 + CR 601.2c (capture A): the activation's journal facts,
     // captured now, before any cost is paid. Target settlement adds the
-    // committed targets on every target-first route.
-    resolved.activation_record =
-        capture_activation_record(state, player, source_id, ability_index, &resolved).map(Box::new);
+    // committed targets on every target-first route. CR 602.2a: provenance too.
+    record_activation_announcement(state, player, source_id, ability_index, &mut resolved);
     // CR 602.2b + CR 601.2b/c: an X announcement can determine how many
     // targets an ability has. Before X is chosen, target-slot construction may
     // reject that specific class of otherwise legal activation; defer only that
@@ -26734,7 +27039,7 @@ fn activate_with_cost_carrier(
             // declares targets before any activation cost is paid.
             emit_targeting_events(
                 state,
-                &flatten_targets_in_chain(&resolved),
+                &declared_targets_in_chain(&resolved),
                 source_id,
                 player,
                 events,
@@ -26857,7 +27162,7 @@ fn activate_with_cost_carrier(
     let record = take_activation_record(&mut resolved, player)?;
     let entry_id = ObjectId(state.next_object_id);
     state.next_object_id += 1;
-    let announced_targets = flatten_targets_in_chain(&resolved);
+    let announced_targets = declared_targets_in_chain(&resolved);
     let crime_candidate = targets_commit_crime(state, &announced_targets, player);
 
     stack::push_to_stack(
@@ -27002,6 +27307,28 @@ pub(crate) fn capture_activation_record(
     )
 }
 
+/// CR 602.2a + CR 607.1 + CR 613.1f: bind the facts an activated ability
+/// takes from its announcement — the journal record and whether the
+/// announced slot is a characteristic ability of its source (and of which
+/// copiable set) — while `ability_index` and the definition are bound to the
+/// same live `abilities`. Both ride `ability` to the stack; later cost
+/// payment cannot change them.
+pub(crate) fn record_activation_announcement(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    ability_index: usize,
+    ability: &mut ResolvedAbility,
+) {
+    ability.activation_record =
+        capture_activation_record(state, player, source_id, ability_index, ability).map(Box::new);
+    let provenance = state
+        .objects
+        .get(&source_id)
+        .map(|source| source.activated_ability_provenance(ability_index));
+    ability.set_source_ability_provenance_recursive(provenance);
+}
+
 /// [`capture_activation_record`] from an ability definition and its committed
 /// targets.
 pub(crate) fn capture_activation_record_from(
@@ -27063,7 +27390,20 @@ fn capture_settled_targets(state: &GameState, player: PlayerId, pending: &mut Pe
     };
     match pending.ability.activation_record.as_deref_mut() {
         Some(record) => record.targets = fresh.targets,
-        None => pending.ability.activation_record = Some(Box::new(fresh)),
+        None => {
+            pending.ability.activation_record = Some(Box::new(fresh));
+            // CR 602.2a: same announcement-phase binding as the record (before
+            // payment).
+            if pending.ability.context.source_ability_provenance.is_none() {
+                let provenance = state
+                    .objects
+                    .get(&pending.object_id)
+                    .map(|source| source.activated_ability_provenance(ability_index));
+                pending
+                    .ability
+                    .set_source_ability_provenance_recursive(provenance);
+            }
+        }
     }
 }
 

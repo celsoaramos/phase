@@ -808,6 +808,7 @@
     "titleTargets": "Bersagli: {{targets}}",
     "titlePaid": "Pagato: {{paid}}",
     "titleContext": "Contesto: {{context}}",
+    "revealedCards": "Rivelata: {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}} mana",
     "paidColorsSpent": "{{count}} colori",
@@ -1347,6 +1348,8 @@
     },
     "config": {
       "startingLife": "Punti vita iniziali",
+      "experimentalDungeons": "Dungeon sperimentali",
+      "experimentalDungeonsHelp": "Offri Baldur's Gate Wilderness nelle opzioni del dungeon e quando prendi l'iniziativa. Sperimentale e non ufficiale.",
       "players": "Giocatori",
       "whoGoesFirst": "Chi inizia",
       "firstPlayer": {
@@ -1382,6 +1385,7 @@
       "target": "Bersaglio",
       "return": "Restituisci",
       "discard": "Scarta",
+      "reveal": "Rivela",
       "evidence": "Prove",
       "manifest": "Manifesta",
       "untap": "Stappa",
@@ -2276,6 +2280,12 @@
     "dontAskAgain": "Non chiedere di nuovo in questa partita",
     "dontAskAgainForSameCard": "Usa questa scelta per ogni copia di questa carta in questa partita"
   },
+  "keywordDetail": {
+    "selfManaCost": "il suo costo di mana",
+    "selfManaValue": "il suo valore di mana",
+    "manaCostReduced": "il suo costo di mana ridotto di {{reduction}}",
+    "spliceOnto": "su {{subtype}} {{cost}}"
+  },
   "resolutionOptionalPayment": {
     "title": "Scegli un pagamento opzionale",
     "pay": "Paga {{cost}}",
@@ -2294,7 +2304,8 @@
       "zoneHand": "la tua mano",
       "discard": "Scarta {{count}} {{cards}}",
       "exile": "Esilia {{count}} {{cards}} da {{zone}}",
-      "haveOpponentGainLife": "Fai guadagnare {{amount}} punti vita a un avversario"
+      "haveOpponentGainLife": "Fai guadagnare {{amount}} punti vita a un avversario",
+      "reveal": "Rivela {{count}} {{cards}} da {{zone}}"
     }
   },
   "topOrBottom": {

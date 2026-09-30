@@ -106,6 +106,29 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  76 — game_setup and state_update carry GameState, whose delayed triggered
+ *       abilities now serialize SpellContext.creation_lookback_event and whose
+ *       trigger source contexts serialize TriggerSourceContext.mana_cost. A v75
+ *       peer would drop both and resolve differently, so first contact rejects
+ *       the skew. Bumped in lockstep with full-game protocol 94.
+ *  75 — ReductionProvenance gains SacrificedForCost, carried by GameState's
+ *       PendingCast and WaitingFor.OrderCostReductions. Bumped with full-game
+ *       protocol 93 so first contact rejects the new provenance.
+ *  74 — game_setup and state_update carry GameState, whose paused
+ *       continuations now serialize ResolvedAbility.parent_target_missing_reason
+ *       including the new RevealUntil reason (a reveal-until whiff), whose
+ *       conditions may carry EffectOutcomeSignal.RevealUntilMatched, and which
+ *       carries the CR 701.20a stack-bound reveal leases. A v73
+ *       peer cannot parse the tags and would drop the verdict, so first contact
+ *       rejects the skew. Bumped in lockstep with full-game protocol 92.
+ *  73 — GameState retypes PendingManaAbility.chosen_counter_count to the
+ *       required chosen_counter_counts array (#9207). Bumped with full-game
+ *       protocol 91 so first contact rejects the incompatible state shape.
+ *  72 — game_setup and state_update carry GameState, whose FormatConfig gains
+ *       allow_experimental_dungeons, the per-session flag behind the
+ *       experimental dungeon pool. A v71 peer would fail the flag closed and
+ *       run the game without the pool the host chose, so first contact
+ *       rejects the skew instead. Bumped in lockstep with full-game protocol 90.
  *  71 — game_setup and state_update carry GameState, whose graveyard cast
  *       permissions can now require a casting method (required_cast_keyword),
  *       and casting-menu options carry the non-mana part of their cost
@@ -467,7 +490,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 71 as const;
+export const WIRE_PROTOCOL_VERSION = 76 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

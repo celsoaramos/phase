@@ -846,6 +846,7 @@
     "titleTargets": "対象: {{targets}}",
     "titlePaid": "支払い: {{paid}}",
     "titleContext": "文脈: {{context}}",
+    "revealedCards": "公開中: {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}}マナ",
     "paidColorsSpent": "{{count}}色",
@@ -1390,6 +1391,8 @@
     },
     "config": {
       "startingLife": "開始時のライフ",
+      "experimentalDungeons": "実験的ダンジョン",
+      "experimentalDungeonsHelp": "ダンジョン探索とイニシアティブ取得で Baldur's Gate Wilderness を選択可能にします。実験的かつ非公式。",
       "players": "プレイヤー",
       "whoGoesFirst": "先攻プレイヤー",
       "firstPlayer": {
@@ -1425,6 +1428,7 @@
       "target": "対象",
       "return": "戻す",
       "discard": "捨てる",
+      "reveal": "公開",
       "evidence": "証拠",
       "manifest": "予示",
       "untap": "アンタップ",
@@ -2319,6 +2323,12 @@
     "dontAskAgain": "このゲームでは再度確認しない",
     "dontAskAgainForSameCard": "このゲームではこのカードのすべてのコピーにこの選択を使用"
   },
+  "keywordDetail": {
+    "selfManaCost": "そのマナ・コスト",
+    "selfManaValue": "そのマナ総量",
+    "manaCostReduced": "そのマナ・コストから{{reduction}}少ないコスト",
+    "spliceOnto": "{{subtype}}へ {{cost}}"
+  },
   "resolutionOptionalPayment": {
     "title": "任意の支払いを選択",
     "pay": "{{cost}}を支払う",
@@ -2337,7 +2347,8 @@
       "zoneHand": "あなたの手札",
       "discard": "{{count}}{{cards}}を捨てる",
       "exile": "{{zone}}から{{count}}{{cards}}を追放",
-      "haveOpponentGainLife": "対戦相手1人に{{amount}}点のライフを得させる"
+      "haveOpponentGainLife": "対戦相手1人に{{amount}}点のライフを得させる",
+      "reveal": "{{zone}}から{{count}}{{cards}}を公開する"
     }
   },
   "topOrBottom": {

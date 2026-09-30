@@ -808,6 +808,7 @@
     "titleTargets": "Cibles : {{targets}}",
     "titlePaid": "Payé : {{paid}}",
     "titleContext": "Contexte : {{context}}",
+    "revealedCards": "Révélée : {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}} mana",
     "paidColorsSpent": "{{count}} couleurs",
@@ -1347,6 +1348,8 @@
     },
     "config": {
       "startingLife": "Points de vie de départ",
+      "experimentalDungeons": "Donjons expérimentaux",
+      "experimentalDungeonsHelp": "Proposer Baldur's Gate Wilderness dans les donjons et à la prise d'initiative. Expérimental et non officiel.",
       "players": "Joueurs",
       "whoGoesFirst": "Qui commence",
       "firstPlayer": {
@@ -1382,6 +1385,7 @@
       "target": "Cible",
       "return": "Renvoyer",
       "discard": "Défausser",
+      "reveal": "Révéler",
       "evidence": "Preuves",
       "manifest": "Manifester",
       "untap": "Dégager",
@@ -2276,6 +2280,12 @@
     "dontAskAgain": "Ne plus demander pendant cette partie",
     "dontAskAgainForSameCard": "Utiliser ce choix pour chaque copie de cette carte dans cette partie"
   },
+  "keywordDetail": {
+    "selfManaCost": "son coût de mana",
+    "selfManaValue": "sa valeur de mana",
+    "manaCostReduced": "son coût de mana réduit de {{reduction}}",
+    "spliceOnto": "sur {{subtype}} {{cost}}"
+  },
   "resolutionOptionalPayment": {
     "title": "Choisissez un paiement optionnel",
     "pay": "Payer {{cost}}",
@@ -2294,7 +2304,8 @@
       "zoneHand": "votre main",
       "discard": "Défaussez-vous de {{count}} {{cards}}",
       "exile": "Exilez {{count}} {{cards}} depuis {{zone}}",
-      "haveOpponentGainLife": "Faites gagner {{amount}} points de vie à un adversaire"
+      "haveOpponentGainLife": "Faites gagner {{amount}} points de vie à un adversaire",
+      "reveal": "Révélez {{count}} {{cards}} de {{zone}}"
     }
   },
   "topOrBottom": {

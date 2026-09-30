@@ -808,6 +808,7 @@
     "titleTargets": "Alvos: {{targets}}",
     "titlePaid": "Pago: {{paid}}",
     "titleContext": "Contexto: {{context}}",
+    "revealedCards": "Revelada: {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}} de mana",
     "paidColorsSpent": "{{count}} cores",
@@ -1347,6 +1348,8 @@
     },
     "config": {
       "startingLife": "Vida Inicial",
+      "experimentalDungeons": "Masmorras experimentais",
+      "experimentalDungeonsHelp": "Oferecer Baldur's Gate Wilderness nas opções de masmorra e ao tomar a iniciativa. Experimental e não oficial.",
       "players": "Jogadores",
       "whoGoesFirst": "Quem Começa",
       "firstPlayer": {
@@ -1382,6 +1385,7 @@
       "target": "Alvo",
       "return": "Devolver",
       "discard": "Descartar",
+      "reveal": "Revelar",
       "evidence": "Evidência",
       "manifest": "Manifestar",
       "untap": "Desvirar",
@@ -2276,6 +2280,12 @@
     "dontAskAgain": "Não perguntar novamente neste jogo",
     "dontAskAgainForSameCard": "Usar esta escolha para cada cópia desta carta neste jogo"
   },
+  "keywordDetail": {
+    "selfManaCost": "seu custo de mana",
+    "selfManaValue": "seu valor de mana",
+    "manaCostReduced": "seu custo de mana reduzido em {{reduction}}",
+    "spliceOnto": "em {{subtype}} {{cost}}"
+  },
   "resolutionOptionalPayment": {
     "title": "Escolha um pagamento opcional",
     "pay": "Pagar {{cost}}",
@@ -2294,7 +2304,8 @@
       "zoneHand": "sua mão",
       "discard": "Descarte {{count}} {{cards}}",
       "exile": "Exile {{count}} {{cards}} de {{zone}}",
-      "haveOpponentGainLife": "Faça um oponente ganhar {{amount}} pontos de vida"
+      "haveOpponentGainLife": "Faça um oponente ganhar {{amount}} pontos de vida",
+      "reveal": "Revele {{count}} {{cards}} de {{zone}}"
     }
   },
   "topOrBottom": {

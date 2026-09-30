@@ -10066,7 +10066,11 @@ pub(super) fn absorb_trailing_rounding_suffix(
     (amount, rest)
 }
 
-fn parse_pump_modifier_phrase(input: &str) -> OracleResult<'_, (PtValue, PtValue)> {
+/// CR 613.4c: the bare P/T-modification phrase inside a pump clause ("+2/-2",
+/// "an additional +1/+1"). Shared with `subject.rs`'s P/T-disjunction arm so a
+/// "gets +1/-1 or -1/+1" branch item parses through exactly the same grammar as
+/// the single-modification `parse_pump_clause_with_context` path.
+pub(super) fn parse_pump_modifier_phrase(input: &str) -> OracleResult<'_, (PtValue, PtValue)> {
     let (rest, _) = opt(alt((
         tag::<_, _, OracleError<'_>>("an additional "),
         tag("additional "),
@@ -10711,6 +10715,17 @@ pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Opt
         // binding would fall back to `None` and the bug would survive.
         return parse_event_context_quantity(expression);
     }
+    // CR 608.2c + CR 202.3: the prepositional twin, "the mana value of that
+    // card" (Yuna's Whistle) — the same demonstrative, non-target referent as
+    // the possessive above, so it binds the same `ObjectScope::Demonstrative`
+    // (the effect-context object: e.g. a reveal-until hit's pre-move LKI).
+    if is_mana_value_of_that_card_where_x(expression_lower.as_str()) {
+        return Some(QuantityExpr::Ref {
+            qty: QuantityRef::ObjectManaValue {
+                scope: ObjectScope::Demonstrative,
+            },
+        });
+    }
     // CDA-quantity classification takes precedence: it is the more specific
     // where-X interpreter (object counts, "that spell's mana value",
     // "the number of age counters on this enchantment", etc.).
@@ -10783,6 +10798,20 @@ fn is_that_card_mana_value_where_x(expression_lower: &str) -> bool {
     all_consuming(preceded(
         tag::<_, _, OracleError<'_>>("that card's "),
         alt((tag("mana value"), tag("converted mana cost"))),
+    ))
+    .parse(expression_lower)
+    .is_ok()
+}
+
+/// CR 608.2c + CR 202.3: Match EXACTLY `the mana value of that card` (or the
+/// `converted mana cost` synonym) — the prepositional form of
+/// [`is_that_card_mana_value_where_x`], with the same literal-`card`-only and
+/// mana-value-only restrictions.
+pub(super) fn is_mana_value_of_that_card_where_x(expression_lower: &str) -> bool {
+    all_consuming((
+        tag::<_, _, OracleError<'_>>("the "),
+        alt((tag("mana value"), tag("converted mana cost"))),
+        tag(" of that card"),
     ))
     .parse(expression_lower)
     .is_ok()
@@ -11364,6 +11393,26 @@ pub(super) fn apply_where_x_effect_expression(
         }
         Effect::Scry { count, .. } => {
             bind_where_x_quantity(count, where_x_expression, &mut unbound_where_x);
+        }
+        // CR 107.3i + CR 608.2d: a trailing "where X is …" defines X for the whole
+        // instruction, and a branch of a resolution-time choice is PART of that
+        // instruction — "all instances of X on an object have the same value".
+        // Structurally the branch is a nested `AbilityDefinition`, exactly like the
+        // `mode_abilities` / `else_ability` / `sub_ability` links that
+        // `apply_where_x_ability_expression` already walks, so it is walked the same
+        // way and each branch reports its own gap.
+        //
+        // Without this arm the walk stopped at the branch boundary. Liliana of the
+        // Dark Realms — "[-3]: Target creature gets +X/+X or -X/-X until end of turn,
+        // where X is the number of Swamps you control" — kept a bare
+        // `PtValue::Variable("X")` in both branches, i.e. a silent +0/+0 that still
+        // reads as supported. The totality guard at the end of this function cannot
+        // catch that: its probe is anchored on `QuantityRef` keys, and a P/T slot
+        // holding `PtValue::Variable` is not one.
+        Effect::ChooseOneOf { branches, .. } => {
+            for branch in branches.iter_mut() {
+                apply_where_x_ability_expression(branch, where_x_expression);
+            }
         }
         Effect::Pump {
             power, toughness, ..

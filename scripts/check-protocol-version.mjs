@@ -33,6 +33,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // (`GraveyardCastPermission.required_cast_keyword`), the casting-menu
 // option's `additional_cost`, and the announced graveyard permission (the
 // option's `authority`, the slot prompt's `permission`, the latched terms).
+// v91 retypes PendingManaAbility's required chosen-counter count (#9207).
+// v93 adds the SacrificedForCost reduction provenance.
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.
 const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
@@ -49,11 +51,18 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +16: the v87 Dig rest-split serialized choice and effect field.
 // +17: the v88 CR 509.1a + CR 101.1 block-capacities capability bump.
 // +18: the v89 graveyard cast-method requirement and permission announcement.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 18;
+// +19: the v90 FormatConfig.allow_experimental_dungeons capability flag.
+// +20: the v91 PendingManaAbility chosen-counter count retype.
+// +21: the v92 serialized ParentTargetMissingReason carrier and its
+// RevealUntil reveal-until whiff verdict.
+// +22: the v93 SacrificedForCost reduction provenance.
+// +23: the v94 phase-delayed departure look-back carrier
+// (SpellContext.creation_lookback_event) and TriggerSourceContext.mana_cost.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 23;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
-const EXPECTED_LOBBY_PROTOCOL_VERSION = 12;
+const EXPECTED_LOBBY_PROTOCOL_VERSION = 14;
 // The capability FLOOR for correlated tournament settlement — a different kind
 // of number from the other version constants here, and the reason it is pinned
 // separately. Those track a surface's current version; this one is frozen at the
@@ -90,7 +99,12 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +16: wire 70 moves with full-game v88 for block-capacities.
 // +17: wire 71 moves with full-game v89 for the graveyard cast-method
 // requirement and permission announcement.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 17;
+// +18: wire 72 moves with full-game v90 for the experimental-dungeon capability flag.
+// +19: wire 73 moves with full-game v91 for the counter-count retype.
+// +20: wire 74 moves with full-game v92 for the serialized reveal-until verdict.
+// +21: wire 75 moves with full-game v93 for the SacrificedForCost provenance.
+// +22: wire 76 moves with full-game v94 for the departure look-back carrier.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 22;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse

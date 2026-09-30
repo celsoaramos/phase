@@ -210,6 +210,33 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 94 — SpellContext.creation_lookback_event carries the battlefield departure a
+ *      phase-delayed triggered ability was created under (CR 603.7 + CR 603.10a
+ *      + CR 608.2h), and TriggerSourceContext.mana_cost captures the observed
+ *      object's layered mana cost (CR 707.2 + CR 708.2a). A v93 peer would drop
+ *      both; the exact-match handshake refuses the pairing. P2P moves in
+ *      lockstep (wire 76); lobby messages are unchanged.
+ * 93 — ReductionProvenance gains SacrificedForCost, the reduction an Emerge
+ *      or Offering sacrifice earns before a deferred target declaration. A
+ *      v92 peer cannot deserialize it. P2P moves in lockstep to wire 75.
+ * 92 — ResolvedAbility.parent_target_missing_reason is serialized and
+ *      ParentTargetMissingReason gains RevealUntil (CR 701.20a + CR 603.12),
+ *      the reveal-until whiff verdict read by the new
+ *      EffectOutcomeSignal.RevealUntilMatched reflexive guard on resume, plus
+ *      the CR 701.20a reveal lease (ResolvedInformationLifetime
+ *      UntilStackObjectLeaves and GameState.stack_bound_reveals, presented
+ *      through the new DerivedViews.stack_revealed_cards). A v91
+ *      peer cannot parse the new tags; the exact-match handshake
+ *      refuses the pairing. P2P moves in lockstep (wire 74); lobby messages
+ *      are unchanged.
+ * 91 — PendingManaAbility.chosen_counter_count is retyped to the required
+ *      chosen_counter_counts array (#9207). A v90 peer cannot deserialize
+ *      the new state. P2P moves in lockstep to wire 73.
+ * 90 — FormatConfig gains `allow_experimental_dungeons`, the per-session
+ *      capability flag behind the experimental dungeon pool. A v89 peer
+ *      parses a v90 GameState but runs the game without the host's pool;
+ *      the exact-match handshake refuses the pairing. P2P moves in lockstep
+ *      (wire 72); lobby carriers move too (LOBBY_PROTOCOL_VERSION 13).
  * 89 — CR 118.9b graveyard permissions that require a casting method (Sabin,
  *      Master Monk: "using its blitz ability"): GraveyardCastPermission gains
  *      required_cast_keyword and casting-menu options gain additional_cost. A
@@ -605,7 +632,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 89;
+export const PROTOCOL_VERSION = 94;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
@@ -636,6 +663,19 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * PROTOCOL_VERSION moved twice for GameState-only changes and the derived lobby
  * window went disjoint from the deployed broker's.
  *
+ * 14 — PairingView.report_gate gains a `Hosted` arm (the Rust ReportGate enum's
+ *      new variant), the "a field's type changed" trigger. No broker emits it
+ *      until server-authoritative hosting is wired behind
+ *      MIN_LOBBY_PROTOCOL_FOR_HOSTED_MATCH (a later PR); mirrored in the
+ *      `ReportGate` union in types.ts so the wire type stays 1:1.
+ * 13 — FormatConfig gains `allow_experimental_dungeons` (#[serde(default)]) —
+ *      the "a lobby field is added" trigger — on its three lobby carriers:
+ *      CreateGameWithSettings (client → broker), JoinTargetInfo and PeerInfo
+ *      (broker → client). A CAPABILITY bump like 3, not a parse bump, so
+ *      MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL stays at 2: against a pre-13
+ *      broker the flag is absent and this client classifies JoinTargetInfo
+ *      frames without it, while a v12 client keeps creating and joining
+ *      games that simply never carry the override.
  * 12 — JoinTargetInfo gains an optional `draft_metadata`, the shape LobbyGame
  *      already carries — the "a lobby field is added" trigger.
  *      MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL stays at 2 and no capability floor is
@@ -754,7 +794,7 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * 1 — Initial lobby-owned version, covering the lobby variant set unchanged
  *     since #1880.
  */
-export const LOBBY_PROTOCOL_VERSION = 12;
+export const LOBBY_PROTOCOL_VERSION = 14;
 
 /**
  * Lowest broker LOBBY_PROTOCOL_VERSION this client accepts.
@@ -1548,7 +1588,7 @@ export class WebSocketAdapter implements EngineAdapter {
     // A client-supplied actor here would provide zero additional safety and
     // only creates a spoofing surface if it were ever put on the wire.
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new AdapterError("WS_ERROR", "WebSocket not connected", false);
+      throw new AdapterError(AdapterErrorCode.ACTION_NOT_SENT, "WebSocket not connected", false);
     }
 
     this.emit({ type: "actionPendingChanged", pending: true });
@@ -1561,7 +1601,7 @@ export class WebSocketAdapter implements EngineAdapter {
         this.pendingResolve = null;
         this.pendingReject = null;
         this.emit({ type: "actionPendingChanged", pending: false });
-        reject(new AdapterError("WS_CLOSED", "Failed to send action", true));
+        reject(new AdapterError(AdapterErrorCode.ACTION_NOT_SENT, "Failed to send action", true));
       }
     });
   }
