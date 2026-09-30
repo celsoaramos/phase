@@ -4,7 +4,8 @@
 //! CR 400.7: an object that moves from one zone to another becomes a new object
 //! with no memory of, or relation to, its previous existence. An activated
 //! ability's "this creature" / "~" names the object that activated it; once
-//! that object is gone, the instruction has no referent (CR 608.2b).
+//! that object is gone, the instruction has no referent and does nothing
+//! (CR 400.7; CR 609.3 — an effect does only as much as it can).
 //!
 //! Field report: Carrion Feeder ("Sacrifice a creature: Put a +1/+1 counter on
 //! this creature") sacrificed itself to pay for its own ability while under
@@ -548,6 +549,181 @@ fn connive_after_its_source_is_flickered_uses_last_known_information() {
     let (counters, graveyard) = connive_after_activation(true);
     assert_eq!(graveyard, 1, "the draw and discard still happen");
     assert_eq!(counters, 0, "the returned creature is not the conniver");
+}
+
+/// Threaten's shape: a control change that outlives the stack.
+const BORROW: &str = "Gain control of target creature until end of turn.";
+
+fn graveyard_count(
+    runner: &GameRunner,
+    owner: engine::types::player::PlayerId,
+    name: &str,
+) -> usize {
+    runner
+        .state()
+        .objects
+        .values()
+        .filter(|o| o.zone == Zone::Graveyard && o.owner == owner && o.name == name)
+        .count()
+}
+
+fn hand_size(runner: &GameRunner, player: engine::types::player::PlayerId) -> usize {
+    runner
+        .state()
+        .players
+        .iter()
+        .find(|p| p.id == player)
+        .expect("the player is seated")
+        .hand
+        .len()
+}
+
+/// Pass priority (with the stack non-empty) until `player` holds it, so the
+/// next `cast` is theirs.
+fn give_priority_to(runner: &mut GameRunner, player: engine::types::player::PlayerId) {
+    for _ in 0..2 {
+        if matches!(runner.state().waiting_for, WaitingFor::Priority { player: p } if p == player) {
+            return;
+        }
+        let depth = runner.state().stack.len();
+        runner
+            .act(GameAction::PassPriority)
+            .expect("passing priority is accepted");
+        assert_eq!(
+            runner.state().stack.len(),
+            depth,
+            "one pass hands priority over without resolving the stack"
+        );
+    }
+    panic!(
+        "priority never reached {player:?}: {:?}",
+        runner.state().waiting_for
+    );
+}
+
+/// CR 701.50b + CR 400.7: "who controlled it" is the DEPARTED permanent's
+/// last controller — not its owner, and not the controller of the permanent
+/// that returned. P0 controls a P1-owned conniver, activates it, and the
+/// flicker returns it under its owner's control before the ability resolves:
+/// P0 draws and discards, P1's library is untouched, the returned creature
+/// gets no counter.
+#[test]
+fn connive_after_flicker_under_owners_control_is_performed_by_the_last_controller() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let conniver = scenario
+        .add_creature_from_oracle(P1, "Conniver", 2, 2, CONNIVER)
+        .controlled_by(P0)
+        .id();
+    scenario.with_library_top(P0, &["P0 Lib"]);
+    scenario.with_library_top(P1, &["P1 Lib"]);
+    let flicker_spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Flicker", true, FLICKER)
+        .id();
+    let mut runner = scenario.build();
+    assert_eq!(runner.state().objects[&conniver].controller, P0);
+
+    let index = costed_ability(&runner, conniver);
+    activate_onto_stack(&mut runner, conniver, index, None);
+    let _ = runner
+        .cast(flicker_spell)
+        .target_objects(&[conniver])
+        .commit();
+    runner.resolve_top();
+    assert_eq!(
+        runner.state().objects[&conniver].controller,
+        P1,
+        "the flicker returned the creature under its owner's control"
+    );
+
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        graveyard_count(&runner, P0, "P0 Lib"),
+        1,
+        "the departed conniver's last controller drew and discarded"
+    );
+    assert_eq!(hand_size(&runner, P0), 0);
+    assert_eq!(
+        graveyard_count(&runner, P1, "P1 Lib"),
+        0,
+        "the owner did not connive"
+    );
+    assert_eq!(hand_size(&runner, P1), 0, "the owner did not draw");
+    assert_eq!(
+        p1p1(&runner, conniver),
+        0,
+        "the returned creature is not the conniver"
+    );
+}
+
+/// CR 701.50b: the last controller is read at DEPARTURE, so it is not the
+/// ability's controller either. P0 activates a P1-owned conniver it controls;
+/// in response P1 takes it back (Threaten's shape) and then flickers it. The
+/// permanent left under P1's control, so P1 draws and discards; the
+/// activator P0 does not.
+#[test]
+fn connive_after_control_change_and_flicker_is_performed_by_the_last_controller_not_the_activator()
+{
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let conniver = scenario
+        .add_creature_from_oracle(P1, "Conniver", 2, 2, CONNIVER)
+        .controlled_by(P0)
+        .id();
+    scenario.with_library_top(P0, &["P0 Lib"]);
+    scenario.with_library_top(P1, &["P1 Lib"]);
+    let borrow = scenario
+        .add_spell_to_hand_from_oracle(P1, "Borrow", true, BORROW)
+        .id();
+    let flicker_spell = scenario
+        .add_spell_to_hand_from_oracle(P1, "Flicker", true, FLICKER)
+        .id();
+    let mut runner = scenario.build();
+
+    let index = costed_ability(&runner, conniver);
+    activate_onto_stack(&mut runner, conniver, index, None);
+    let ability_controller = runner.state().stack.last().map(|entry| entry.controller);
+    assert_eq!(ability_controller, Some(P0), "P0 activated the connive");
+
+    give_priority_to(&mut runner, P1);
+    let _ = runner.cast(borrow).target_objects(&[conniver]).commit();
+    runner.resolve_top();
+    assert_eq!(
+        runner.state().objects[&conniver].controller,
+        P1,
+        "P1 took control before the conniver left"
+    );
+
+    give_priority_to(&mut runner, P1);
+    let _ = runner
+        .cast(flicker_spell)
+        .target_objects(&[conniver])
+        .commit();
+    runner.resolve_top();
+    assert_eq!(runner.state().objects[&conniver].controller, P1);
+
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        graveyard_count(&runner, P1, "P1 Lib"),
+        1,
+        "the departed conniver's last controller (P1) drew and discarded"
+    );
+    assert_eq!(hand_size(&runner, P1), 0);
+    assert_eq!(
+        graveyard_count(&runner, P0, "P0 Lib"),
+        0,
+        "the ability's controller did not connive"
+    );
+    assert_eq!(
+        hand_size(&runner, P0),
+        0,
+        "the ability's controller did not draw"
+    );
+    assert_eq!(
+        p1p1(&runner, conniver),
+        0,
+        "the returned creature is not the conniver"
+    );
 }
 
 /// Activate the endure (flickering the creature in response when asked) and
