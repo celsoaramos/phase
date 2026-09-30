@@ -5576,7 +5576,7 @@ fn parse_your_opponents_control_no(input: &str) -> OracleResult<'_, StaticCondit
 
 /// Parse "you don't control a/an/another [type]" → Not(IsPresent).
 ///
-/// CR 109.4 + CR 603.2: the article is PEEKED, not consumed — the same shape as
+/// The article is PEEKED, not consumed — the same shape as
 /// `parse_you_control_a` — so "another " reaches `parse_type_phrase_folding`,
 /// which maps it to `FilterProp::Another` (Pugnacious Hammerskull: "attacks
 /// while you don't control another Dinosaur"). Consuming "a "/"an " only made
@@ -14081,7 +14081,7 @@ mod tests {
         assert!(matches!(c, StaticCondition::Not { .. }));
     }
 
-    /// CR 109.4: "another" survives the negated presence gate as `FilterProp::Another`
+    /// "another" survives the negated presence gate as `FilterProp::Another`
     /// (Pugnacious Hammerskull, The Majestic Duo). Before, only "a "/"an " were accepted
     /// and the whole condition failed to parse.
     #[test]

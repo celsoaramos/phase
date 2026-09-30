@@ -3,16 +3,17 @@
 //!
 //! CR 508.1m: the attack trigger fires when attackers are declared; the
 //! "while" gate is read at that moment (official ruling 2023-11-10).
-//! CR 109.4: "another Dinosaur" = a Dinosaur you control OTHER than the source.
+//! "another Dinosaur" excludes the source from the controlled Dinosaur set.
 //!
 //! Field report (2026-09-28): the negated control gate failed to parse on
 //! "another", the whole while-gate was dropped, and the stun counter landed on
 //! every attack — even with a second Dinosaur on the battlefield.
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::game::zones;
+use engine::game::zone_pipeline::{move_object_for_test, ZoneMoveRequest};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
+use engine::types::events::GameEvent;
 use engine::types::game_state::{StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::phase::Phase;
@@ -139,14 +140,22 @@ fn dinosaur_entering_in_response_does_not_stop_the_stun() {
         "the while-gate must not be carried to the stack as a recheck, got {stacked:?}"
     );
 
-    // Another Dinosaur enters in response, through the real zone-change path.
+    // Another Dinosaur enters in response through the replacement-aware
+    // production zone-change pipeline (CR 614.1).
     let mut events = Vec::new();
-    zones::move_to_zone(
-        runner.state_mut(),
-        late_dinosaur,
-        Zone::Battlefield,
-        &mut events,
+    assert!(
+        !move_object_for_test(
+            runner.state_mut(),
+            ZoneMoveRequest::effect(late_dinosaur, Zone::Battlefield, late_dinosaur),
+            &mut events,
+        ),
+        "the response move must complete without a replacement choice"
     );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        GameEvent::ZoneChanged { object_id, to: Zone::Battlefield, .. }
+            if *object_id == late_dinosaur
+    )));
     assert_eq!(
         runner.state().objects[&late_dinosaur].zone,
         Zone::Battlefield
