@@ -8370,7 +8370,7 @@ fn effect_references_tracked_set(effect: &Effect) -> bool {
     false
 }
 
-fn quantity_expr_references_tracked_set(qty: &QuantityExpr) -> bool {
+pub(crate) fn quantity_expr_references_tracked_set(qty: &QuantityExpr) -> bool {
     match qty {
         QuantityExpr::Fixed { .. } => false,
         QuantityExpr::Ref { qty } => match qty {

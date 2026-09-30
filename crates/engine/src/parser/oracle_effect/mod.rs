@@ -1906,16 +1906,27 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
     // printed-trigger effect context (`parse_trigger_line`), which likewise seeds
     // `subject`. Scoped to `DamageDone`; a `SelfRef`/`Any` subject ("he", Human
     // Torch) is left unset so its body keeps the source binding.
-    if matches!(trigger_def.mode, TriggerMode::DamageDone) {
-        if let Some(subject) = trigger_def
-            .valid_source
-            .clone()
-            .filter(|f| !matches!(f, TargetFilter::SelfRef | TargetFilter::Any))
-        {
-            inner_ctx.subject = Some(subject);
-        }
+    //
+    // CR 508.1 + CR 608.2k: the same holds for an attack trigger ("whenever a
+    // creature attacks this turn, it gets +1/+0" — Song of Blood): "it" is the
+    // attacking creature, the event's `valid_card`, exactly as in the printed
+    // form ("Whenever a creature you control attacks, it gets …", Fervent
+    // Charge), not the spell that created the delayed trigger.
+    let event_subject = match trigger_def.mode {
+        TriggerMode::DamageDone => trigger_def.valid_source.clone(),
+        TriggerMode::Attacks => trigger_def.valid_card.clone(),
+        _ => None,
+    };
+    if let Some(subject) =
+        event_subject.filter(|f| !matches!(f, TargetFilter::SelfRef | TargetFilter::Any))
+    {
+        inner_ctx.subject = Some(subject);
     }
     let inner = parse_effect_chain_with_context(effect_text, AbilityKind::Spell, &mut inner_ctx);
+    // CR 603.7 + CR 608.2c: a body that counts the creating chain's set ("for
+    // each creature card put into your graveyard this way") must make the
+    // producer publish it; see `ability_definition_uses_tracked_set`.
+    let uses_tracked_set = ability_definition_uses_tracked_set(&inner);
 
     Some(ParsedEffectClause {
         unlowered_guard: None,
@@ -1925,7 +1936,7 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
                 expiry,
             },
             effect: Box::new(inner),
-            uses_tracked_set: false,
+            uses_tracked_set,
         },
         duration: None,
         sub_ability: None,
@@ -32554,6 +32565,12 @@ fn ability_definition_uses_tracked_set(def: &AbilityDefinition) -> bool {
     if let Effect::CreateDelayedTrigger { effect, .. } = def.effect.as_ref() {
         uses_tracked_set |= ability_definition_uses_tracked_set(effect);
     }
+    // CR 608.2c: a quantity that counts the chain's set ("for each creature card
+    // put into your graveyard this way" — Song of Blood) consumes it just like a
+    // `TrackedSet` filter does. Same authority the runtime publish gate uses.
+    def.effect.for_each_quantity_expr(&mut |qty| {
+        uses_tracked_set |= crate::game::effects::quantity_expr_references_tracked_set(qty);
+    });
     uses_tracked_set
         || def
             .sub_ability
