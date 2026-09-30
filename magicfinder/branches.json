@@ -126,10 +126,12 @@
     "branch": "card/lyzolda-roadkill-rodney"
   },
   {
-    "branch": "card/pugnacious-hammerskull-another"
+    "branch": "card/pugnacious-hammerskull-another",
+    "pr": 9375
   },
   {
-    "branch": "card/preacher-of-the-schism-conditions"
+    "branch": "card/preacher-of-the-schism-conditions",
+    "pr": 9389
   },
   {
     "branch": "card/sacrificed-source-self-counter",
