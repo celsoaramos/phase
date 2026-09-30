@@ -5366,6 +5366,9 @@ fn attacks_the_player_without_most_life_qualifier_does_not_bind_player_scope() {
         "Whenever this creature attacks the player with the fewest cards in hand, draw a card.",
         "Whenever this creature attacks the player with the most life, draw a card.",
         "Whenever this creature attacks the player with the most speed or tied for most speed, draw a card.",
+        // Partially recognised: the leader grammar matches a prefix, but the
+        // qualifier continues past it — the terminator check must decline.
+        "Whenever this creature attacks the player with the most life or tied for most life and controls a Forest, draw a card.",
     ] {
         let triggers = parse_trigger_lines(text, "Probe");
         assert!(
@@ -5379,6 +5382,25 @@ fn attacks_the_player_without_most_life_qualifier_does_not_bind_player_scope() {
             "{text}: no generic Attacks trigger may escape: {triggers:?}"
         );
     }
+    // Positive reach guard for the partial case above: the SAME qualifier,
+    // ending at the clause boundary, binds the scoped leader filter — so the
+    // decline is caused by the trailing rider, not by the grammar failing.
+    let triggers = parse_trigger_lines(
+        "Whenever this creature attacks the player with the most life or tied for most life, draw a card.",
+        "Probe",
+    );
+    assert_eq!(triggers.len(), 1);
+    assert_eq!(triggers[0].mode, TriggerMode::Attacks);
+    assert_eq!(
+        triggers[0].attack_target_filter,
+        Some(AttackTargetFilter::Player)
+    );
+    let vt = format!("{:?}", triggers[0].valid_target);
+    assert!(
+        vt.contains("LifeTotal") && vt.contains("GE"),
+        "the complete qualifier must scope the defender, got {vt}"
+    );
+
     // Reach guard: the same grammar reads another property, not just life.
     let triggers = parse_trigger_lines(
         "Whenever this creature attacks the player with the most cards in hand or tied for most cards in hand, draw a card.",

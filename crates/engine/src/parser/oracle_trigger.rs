@@ -13876,9 +13876,17 @@ fn try_parse_event(
                         // Detect it with a zero-consumption `peek`, never
                         // `starts_with`. The trailing space inside the tag IS the
                         // word boundary, so "whoever"/"whose" cannot match.
-                        declined_unmodelled_predicate = peek(tag::<_, _, OracleError<'_>>("who "))
-                            .parse(after_noun)
-                            .is_ok();
+                        // CR 508.1b: the `with the …` leader family is the same
+                        // case — its arm binds `Player` on a PREFIX match, so a
+                        // qualifier that continues past the recognised part
+                        // ("… or tied for most life and controls a Forest")
+                        // fails the terminator here and must decline too.
+                        declined_unmodelled_predicate = peek(alt((
+                            tag::<_, _, OracleError<'_>>("who "),
+                            tag("with the "),
+                        )))
+                        .parse(after_noun)
+                        .is_ok();
                     }
                 }
             }
