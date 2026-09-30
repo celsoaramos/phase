@@ -38413,6 +38413,14 @@ fn effect_clash_with_opponent() {
     assert!(matches!(e, Effect::Clash), "expected Clash, got: {e:?}");
 }
 
+/// CR 508.5 + CR 701.30b: "clash with defending player" (Marvo, Deep Operative)
+/// is a clash whose opponent is the player the attacking source is attacking.
+#[test]
+fn effect_clash_with_defending_player() {
+    let e = parse_effect("clash with defending player");
+    assert!(matches!(e, Effect::Clash), "expected Clash, got: {e:?}");
+}
+
 #[test]
 fn effect_populate() {
     let e = parse_effect("populate");

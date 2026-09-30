@@ -12667,11 +12667,23 @@ pub(super) fn parse_imperative_family_ast(
         }
         // CR 701.36a: "populate"
         "populate" => Some(ImperativeFamilyAst::Populate),
-        // CR 701.30: "clash with an opponent"
+        // CR 701.30: "clash with an opponent".
+        //
+        // CR 508.5 + CR 701.30b: "clash with defending player" (Marvo, Deep
+        // Operative — "Whenever ~ attacks, clash with defending player") names
+        // the opponent the attacking source is attacking. In a two-player game
+        // that player is the only opponent, so the clash proceeds without a
+        // prompt; with several opponents `clash::resolve` still asks the
+        // controller to choose (the defending-player binding is not carried on
+        // the field-less `Effect::Clash`). Before this arm the clause fell
+        // through unparsed and the attack trigger resolved doing nothing.
         "clash" => {
             if tag::<_, _, OracleError<'_>>("clash with an opponent")
                 .parse(lower)
                 .is_ok()
+                || tag::<_, _, OracleError<'_>>("clash with defending player")
+                    .parse(lower)
+                    .is_ok()
             {
                 Some(ImperativeFamilyAst::Clash)
             } else {

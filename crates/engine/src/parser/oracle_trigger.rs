@@ -18551,6 +18551,37 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
         }
     }
 
+    // CR 701.30d + CR 603.4: "whenever you win a clash" (Marvo, Deep Operative)
+    // is the win-gated clash trigger of "whenever you clash and win" (Sylvan
+    // Echoes) with the verb first. Same contract: the win requirement rides on
+    // `clash_result` into trigger MATCHING, so a lost or tied clash never
+    // creates a pending trigger. Before this arm the head fell through to
+    // `TriggerMode::Unknown` and the card's draw + free cast never happened.
+    if all_consuming(preceded(
+        alt((tag::<_, _, OracleError<'_>>("whenever "), tag("when "))),
+        value(
+            (),
+            (
+                tag("you"),
+                space1,
+                tag("win"),
+                space1,
+                tag("a"),
+                space1,
+                tag("clash"),
+            ),
+        ),
+    ))
+    .parse(lower)
+    .is_ok()
+    {
+        let mut def = make_base();
+        def.mode = TriggerMode::Clashed;
+        def.valid_target = Some(TargetFilter::Controller);
+        def.clash_result = Some(ClashResult::Won);
+        return Some((TriggerMode::Clashed, def));
+    }
+
     // CR 701.30: "whenever a player clashes" — fires for any clashing player.
     if all_consuming(preceded(
         alt((tag::<_, _, OracleError<'_>>("whenever "), tag("when "))),

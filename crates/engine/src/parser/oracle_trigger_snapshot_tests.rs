@@ -906,6 +906,35 @@ fn trigger_a_player_clashes() {
 /// draw a card" effect is a plain OPTIONAL draw with NO `EventOutcomeWon`
 /// condition (Sylvan Echoes). Before support this clause fell through to
 /// `TriggerMode::Unknown`.
+/// CR 701.30d + CR 603.4: "Whenever you win a clash" (Marvo, Deep Operative) is
+/// the same win-gated clash trigger as Sylvan Echoes' "whenever you clash and
+/// win", verb first. Before support this head fell through to
+/// `TriggerMode::Unknown`, so Marvo's draw and free cast never happened.
+#[test]
+fn trigger_you_win_a_clash_whenever() {
+    let def = parse_trigger_line(
+        "Whenever you win a clash, draw a card. Then you may cast a spell from your hand with mana value 8 or less without paying its mana cost.",
+        "Marvo, Deep Operative",
+    );
+    assert_eq!(def.mode, TriggerMode::Clashed);
+    assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+    assert_eq!(
+        def.clash_result,
+        Some(ClashResult::Won),
+        "the win requirement must live on the trigger's clash_result so MATCHING is gated"
+    );
+    let Some(execute) = def.execute.as_deref() else {
+        panic!("expected trigger body");
+    };
+    assert!(
+        matches!(execute.effect.as_ref(), Effect::Draw { .. }),
+        "expected a draw effect first, got {:?}",
+        execute.effect
+    );
+    assert_eq!(execute.condition, None, "no resolution-time win gate");
+    assert!(!execute.optional, "the draw is mandatory; only the cast is 'you may'");
+}
+
 #[test]
 fn trigger_you_clash_and_win_whenever() {
     let def = parse_trigger_line(
