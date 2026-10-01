@@ -58,7 +58,14 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +22: the v93 SacrificedForCost reduction provenance.
 // +23: the v94 phase-delayed departure look-back carrier
 // (SpellContext.creation_lookback_event) and TriggerSourceContext.mana_cost.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 23;
+// +24: the v95 FilterProp::BlockStatus reshape (Unblocked → BlockStatus { status }).
+// +25: the v96 QuantityRef::NameStickerLetterCount tagged quantity.
+// +26: the v97 serialized TargetReadOrigin (`target_reads`) instruction
+// provenance.
+// +27: the v98 PerPlayerScope::Opponents value, the PerPlayerChoiceOrder and
+// SubstituteChooser chooser purposes, and the per-player frame's current and
+// nominee fields.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 27;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
@@ -104,7 +111,12 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +20: wire 74 moves with full-game v92 for the serialized reveal-until verdict.
 // +21: wire 75 moves with full-game v93 for the SacrificedForCost provenance.
 // +22: wire 76 moves with full-game v94 for the departure look-back carrier.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 22;
+// +23: wire 77 moves with full-game v95 for the FilterProp::BlockStatus reshape.
+// +24: wire 78 moves with full-game v96 for name-sticker quantities.
+// +25: wire 79 moves with full-game v97 for the serialized TargetReadOrigin.
+// +26: wire 80 moves with full-game v98 for per-player choice order and
+// PerPlayerScope::Opponents.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 26;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse

@@ -4557,20 +4557,22 @@ pub struct PendingChooseOneOf {
 }
 
 /// CR 101.4 + CR 608.2c: Per-player `ChooseFromZone { zone_owner: EachPlayer }`
-/// iteration state. A single chooser (the spell's controller) picks one card
-/// from EACH player's zone in APNAP order; this stashes the players not yet
-/// prompted while the current player's `WaitingFor::ChooseFromZoneChoice` is
-/// outstanding. Created when the first player's choice is parked, drained after
-/// each pick accumulates into the resolution chain's tracked set, and disposed
-/// once every player has been prompted — at which point the parked
+/// iteration state. A single chooser picks one card from EACH player's zone;
+/// this stashes the players not yet chosen for while either the controller's
+/// order prompt (CR 101.4c, `current == None`) or one player's
+/// `WaitingFor::ChooseFromZoneChoice` (`current == Some(player)`) is
+/// outstanding. Created when the first prompt is parked, drained after each
+/// pick accumulates into the resolution chain's tracked set, and disposed
+/// once every player has been chosen for — at which point the parked
 /// `pending_continuation` (e.g. "put those cards onto the battlefield") runs.
-/// Building block for Breach the Multiverse.
+/// Building block for Breach the Multiverse and Ultimate Magic: Meteor.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PendingPerPlayerZoneChoice {
     /// The `Effect::ChooseFromZone` ability whose per-player body repeats. Its
     /// `zone`/`filter`/`count`/`chooser` describe each player's prompt.
     pub ability: Box<ResolvedAbility>,
-    /// Players not yet prompted, in APNAP order.
+    /// Players not yet chosen for, in APNAP order. When the controller makes
+    /// every choice, this is the set they order (CR 101.4c), not an order.
     pub remaining_players: Vec<PlayerId>,
     /// CR 603.7 + CR 608.2c: Whether a pick from THIS per-player iteration has
     /// already started its fresh chosen-card tracked set. The first non-empty
@@ -4581,6 +4583,16 @@ pub struct PendingPerPlayerZoneChoice {
     /// published, then `true` for the remainder of the iteration.
     #[serde(default)]
     pub accumulated: bool,
+    /// The iterated player whose pool choice is pending, or `None` while the
+    /// order choice (CR 101.4c) is pending. Kept through an election, so a
+    /// pending pool is never lost while its maker is being replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<PlayerId>,
+    /// CR 800.4g: the player elected to make the pending pool choice when the
+    /// player who would make it has left the game. Bound to that one choice:
+    /// cleared when it completes or is skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nominee: Option<PlayerId>,
 }
 
 /// CR 401.4 + CR 608.2c: Per-owner library-order prompts for one
@@ -6963,7 +6975,7 @@ pub enum PendingCounterPostAction {
     ///
     /// Serialized surface: this enum reaches persisted state through
     /// `PendingEffectResolved::post_actions`, carried on the
-    /// `RESOLUTION_STATE_WIRE_VERSION` = 3 frame wire. A new externally-tagged
+    /// the current versioned frame wire. A new externally-tagged
     /// variant is backward compatible — no save written before it can contain
     /// one, so existing saves still decode — but NOT forward compatible: a build
     /// predating this variant cannot decode a save taken mid-paused-proliferate.
@@ -13381,12 +13393,16 @@ pub enum PersistedRestoreError {
     RehydrationFailed(String),
     #[error("persisted state has unsettled resolution ownership at priority")]
     UnsettledPriorityResolution,
+    #[error("persisted state contains an ownerless post-replacement dispatch")]
+    OwnerlessPostReplacementDispatch,
     #[error("persisted terminal-rest recovery did not make strict progress")]
     TerminalRestRecoveryExhausted,
     #[error("persisted priority state has deferred triggers that could not settle")]
     DeferredTriggerSettlement,
     #[error("persisted priority settlement failed: {0}")]
     PrioritySettlementFailed(String),
+    #[error("persisted per-player choice cannot be restored: {0}")]
+    InvalidPerPlayerChoice(String),
 }
 
 impl PreparedPersistedGameState {
@@ -13572,6 +13588,10 @@ impl PersistedGameState {
         state
             .validate_payment_transaction()
             .map_err(PersistedRestoreError::InvalidPaymentTransaction)?;
+        crate::game::effects::choose_from_zone::migrate_legacy_per_player_frame_on_restore(
+            &mut state,
+        )
+        .map_err(PersistedRestoreError::InvalidPerPlayerChoice)?;
         state
             .format_config
             .reject_unimplemented_range_of_influence()
@@ -13598,6 +13618,45 @@ impl PersistedGameState {
         // each caller.
         let recovered_terminal_rest =
             crate::game::engine::recover_terminal_resolution_rest_on_restore(&mut state)?;
+        // Priority-time recovery gets first chance to retire the exact terminal
+        // rest it owns. A Dispatching marker left afterward has no synchronous
+        // dispatch handle at the persistence boundary, wherever it sits in the
+        // typed frame stack or within one PostReplacement frame's drain stack.
+        if state.resolution_stack.iter().any(|frame| match frame {
+            ResolutionFrame::PostReplacement(drains) => drains
+                .drains
+                .iter()
+                .any(|drain| matches!(drain.status, DrainStatus::Dispatching)),
+            ResolutionFrame::AbilityContinuation(_)
+            | ResolutionFrame::RepeatFor(_)
+            | ResolutionFrame::RepeatUntil(_)
+            | ResolutionFrame::RepeatedOptionalPayment(_)
+            | ResolutionFrame::ChangeZone(_)
+            | ResolutionFrame::BatchDelivery(_)
+            | ResolutionFrame::CounterMoves(_)
+            | ResolutionFrame::CounterRemovals(_)
+            | ResolutionFrame::CounterAdditions(_)
+            | ResolutionFrame::CopyToken(_)
+            | ResolutionFrame::DebugCardEntries(_)
+            | ResolutionFrame::EachPlayerCopyChosen(_)
+            | ResolutionFrame::ChooseOneOf(_)
+            | ResolutionFrame::VoteBallot(_)
+            | ResolutionFrame::PerPlayerZoneChoice(_)
+            | ResolutionFrame::PerCategoryZoneChoice(_)
+            | ResolutionFrame::OptionalEffect(_)
+            | ResolutionFrame::CoinFlip(_)
+            | ResolutionFrame::DieRoll(_)
+            | ResolutionFrame::Proliferate(_)
+            | ResolutionFrame::MultiDraw(_)
+            | ResolutionFrame::Discard(_)
+            | ResolutionFrame::ConniveReentry(_)
+            | ResolutionFrame::LifeTotalAssignment(_)
+            | ResolutionFrame::SpellResolution(_)
+            | ResolutionFrame::MutateMerge(_)
+            | ResolutionFrame::CipherEncode(_) => false,
+        }) {
+            return Err(PersistedRestoreError::OwnerlessPostReplacementDispatch);
+        }
         Ok(PreparedPersistedGameState {
             state,
             finalization,
@@ -13625,12 +13684,19 @@ pub struct ResolutionOptionalPaymentOption {
     pub cost: AbilityCost,
 }
 
-/// Why a controller is selecting an opponent for a zone choice.
+/// Why a controller is selecting a player for a zone choice.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ZoneOpponentChooserPurpose {
     #[default]
     Ordinary,
     BindReciprocalConsume,
+    /// CR 101.4c: the single chooser of a per-player iteration picks whose
+    /// selection to make next. Candidates may include the chooser themself.
+    PerPlayerChoiceOrder,
+    /// CR 800.4g + CR 800.4h: the player who would make a pending per-player
+    /// pick has left the game; the next player in turn order after the
+    /// object's controller elects another player to make that one choice.
+    SubstituteChooser,
 }
 
 impl ZoneOpponentChooserPurpose {
@@ -21415,6 +21481,15 @@ declare_game_state! {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chosen_color_this_resolution: Option<crate::types::mana::ManaColor>,
 
+    /// CR 608.2c + CR 123.1: the sticker the current resolution's most recent
+    /// PutSticker instruction placed ("that sticker"). Cleared at every
+    /// top-level resolution and at the start of every PutSticker instruction,
+    /// so a put that places nothing (declined, no candidate, CR 123.3b-refused,
+    /// CR 400.7-stale) leaves no antecedent; preserved across the sticker-choice
+    /// prompt, whose answer resolves at depth 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placed_sticker_this_resolution: Option<crate::types::stickers::AppliedSticker>,
+
     /// CR 609.7a-b: The most recently chosen damage source and its source
     /// filter. Set by `DamageSourceChoice`, consumed by prevention/replacement
     /// continuation effects, and then cleared.
@@ -22046,6 +22121,15 @@ declare_game_state! {
     #[serde(skip)]
     pub(crate) active_accepted_triggered_mana_node: Option<RulesExecutionNodeRef>,
 
+    /// CR 605.3b + CR 605.4a: Depth of inline mana-ability subresolutions
+    /// currently executing (a mana ability's `sub_ability` chain or a stackless
+    /// triggered mana ability). Mana abilities resolve immediately, so this is
+    /// zero at every action boundary. A per-player zone choice refuses to park
+    /// while it is nonzero: such a choice would belong to the mana ability, not
+    /// to the resolution carrier above it.
+    #[serde(skip)]
+    pub(crate) mana_subresolution_depth: u32,
+
     /// Debug-only witness that the trigger-construction finisher ran at most
     /// once per reducer action. The finisher is applied at the outermost handler
     /// return of each of its enumerated action seams; a second call in the same
@@ -22131,6 +22215,7 @@ pub(crate) enum GameStateDecodeMode {
     ResolutionWireV1,
     ResolutionWireV2,
     ResolutionWireV3,
+    ResolutionWireV4,
     DirectCurrentRaw,
 }
 
@@ -22490,6 +22575,7 @@ impl GameStateDecode {
             GameStateDecodeMode::ResolutionWireV1
             | GameStateDecodeMode::ResolutionWireV2
             | GameStateDecodeMode::ResolutionWireV3
+            | GameStateDecodeMode::ResolutionWireV4
             | GameStateDecodeMode::DirectCurrentRaw => {
                 return Err("invalid persisted resolution-state decode mode".to_string());
             }
@@ -22568,6 +22654,7 @@ impl GameStateDecode {
             GameStateDecodeMode::ResolutionWireV1
                 | GameStateDecodeMode::ResolutionWireV2
                 | GameStateDecodeMode::ResolutionWireV3
+                | GameStateDecodeMode::ResolutionWireV4
         ));
         reject_legacy_exploit_event_evidence(value)?;
         reject_legacy_raw_prompt_authority(value)?;
@@ -23354,6 +23441,15 @@ pub struct DrawSequenceFrame {
     /// `Moved` replacement choice. The frame owns its ledger and suffix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_delivery: Option<PendingDrawDelivery>,
+    /// A count-modifying replacement may run its draw as a nested instruction
+    /// so its rider waits for that draw. The nested instruction's actual library
+    /// deliveries are credited to this owner when it completes.
+    #[serde(default)]
+    pub delivery_owner: Option<DrawSequenceFrameId>,
+    /// Set only while the current frame's count-and-rider replacement is
+    /// dispatching the child draw that substitutes for its in-flight unit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capture_next_child_delivery: bool,
     /// CR 608.2c: running total of cards ACTUALLY delivered across every
     /// completed unit of this instruction. This is the value a later "that many"
     /// clause on the same card reads ("Draw two cards, then discard that many") —
@@ -23475,6 +23571,8 @@ impl DrawSequenceStack {
             origin,
             remaining: count,
             pending_delivery: None,
+            delivery_owner: None,
+            capture_next_child_delivery: false,
             accumulated: 0,
         });
         debug_assert!(
@@ -23507,10 +23605,9 @@ impl DrawSequenceStack {
     /// Two states that differ only in how many draw frames the game has allocated
     /// over its lifetime are the same position, so the monotonic `next_frame_id`
     /// allocator and the per-frame `frame_id` (both pure identity) are excluded.
-    /// What remains is exactly what the predecessor `Option<PendingMultiDraw>`
-    /// compared: who is drawing, how many units are owed, how many have landed,
-    /// and the completion origin. Origin is included because different origins
-    /// produce different eventual game states when their frames complete.
+    /// What remains is who is drawing, how many units are owed, how many have
+    /// landed, the completion origin, and whether a child result still belongs
+    /// to its parent. Origin and result ownership affect the eventual state.
     ///
     /// This must NOT be the derived `PartialEq`. Comparing the allocator would
     /// mean two identical positions never compare equal, and CR 104.4b loop
@@ -23527,13 +23624,15 @@ impl DrawSequenceStack {
                     && a.accumulated == b.accumulated
                     && a.origin == b.origin
                     && a.pending_delivery == b.pending_delivery
+                    && a.delivery_owner.is_some() == b.delivery_owner.is_some()
+                    && a.capture_next_child_delivery == b.capture_next_child_delivery
             })
     }
 
     /// Returns `Err` describing the first broken invariant, if any.
     pub fn validate(&self) -> Result<(), String> {
         let mut seen = std::collections::HashSet::new();
-        for frame in &self.frames {
+        for (index, frame) in self.frames.iter().enumerate() {
             if frame.frame_id.0 >= self.next_frame_id {
                 return Err(format!(
                     "draw frame {:?} is at or above the allocator {} — a stale ID can alias a live frame",
@@ -23542,6 +23641,35 @@ impl DrawSequenceStack {
             }
             if !seen.insert(frame.frame_id) {
                 return Err(format!("duplicate draw frame id {:?}", frame.frame_id));
+            }
+            if let Some(owner) = frame.delivery_owner {
+                let Some(parent) = index
+                    .checked_sub(1)
+                    .and_then(|parent| self.frames.get(parent))
+                else {
+                    return Err(format!(
+                        "draw frame {:?} has a result owner that is not its parent",
+                        frame.frame_id
+                    ));
+                };
+                if parent.frame_id != owner {
+                    return Err(format!(
+                        "draw frame {:?} has a result owner that is not its parent",
+                        frame.frame_id
+                    ));
+                }
+                if parent.player != frame.player {
+                    return Err(format!(
+                        "draw frame {:?} has a result owner with a different player",
+                        frame.frame_id
+                    ));
+                }
+            }
+            if frame.capture_next_child_delivery && index + 1 != self.frames.len() {
+                return Err(format!(
+                    "draw frame {:?} is waiting to capture a child below another frame",
+                    frame.frame_id
+                ));
             }
         }
         Ok(())
@@ -25183,6 +25311,35 @@ impl GameState {
         applied: HashSet<AppliedReplacementKey>,
         origin: DrawSequenceOrigin,
     ) -> DrawSequenceFrameId {
+        self.try_push_draw_sequence_with_origin(player, count, applied, origin)
+            .expect("a captured child result must belong to the same player")
+    }
+
+    /// Pushes a draw instruction unless it would consume a pending child-result
+    /// capture for a different player. A mismatched child is rejected and the
+    /// capture is cancelled so no later, unrelated child can inherit it.
+    pub(crate) fn try_push_draw_sequence_with_origin(
+        &mut self,
+        player: PlayerId,
+        count: u32,
+        applied: HashSet<AppliedReplacementKey>,
+        origin: DrawSequenceOrigin,
+    ) -> Option<DrawSequenceFrameId> {
+        let pending_delivery_owner = self
+            .active_draw_sequence()
+            .filter(|frame| frame.capture_next_child_delivery)
+            .map(|frame| (frame.frame_id, frame.player));
+        if let Some((_, owner_player)) = pending_delivery_owner {
+            if owner_player != player {
+                self.active_draw_sequence_mut()
+                    .expect("a captured child result has an active owner")
+                    .capture_next_child_delivery = false;
+                return None;
+            }
+            self.active_draw_sequence_mut()
+                .expect("a captured child result has an active owner")
+                .capture_next_child_delivery = false;
+        }
         if self.active_multi_draw_frame().is_none() {
             self.resolution_stack.push_multi_draw(MultiDrawFrame {
                 draw_sequences: DrawSequenceStack::with_next_frame_id(
@@ -25196,6 +25353,16 @@ impl GameState {
             .expect("a newly installed multi-draw frame must be active")
             .draw_sequences
             .push_with_replacement_applied_and_origin(player, count, applied, origin);
+        if let Some((owner_id, _)) = pending_delivery_owner {
+            self.draw_sequence_frame_mut(frame_id)
+                .expect("the new child draw remains on the active stack")
+                .delivery_owner = Some(owner_id);
+        }
+        debug_assert!(
+            self.active_multi_draw_frame()
+                .is_some_and(|frame| frame.draw_sequences.validate().is_ok()),
+            "draw result ownership must point to the immediate same-player parent frame"
+        );
         let next_frame_id = self
             .active_multi_draw_frame()
             .expect("active multi-draw frame remains resident after push")
@@ -25203,7 +25370,7 @@ impl GameState {
             .next_frame_id();
         self.resolution_stack
             .observe_draw_sequence_frame_id(next_frame_id);
-        frame_id
+        Some(frame_id)
     }
 
     /// Returns the innermost active draw instruction, if MultiDraw owns the
@@ -27357,6 +27524,7 @@ impl GameState {
             last_named_choice: None,
             chosen_counter_kind_this_resolution: None,
             chosen_color_this_resolution: None,
+            placed_sticker_this_resolution: None,
             last_chosen_damage_source: None,
             all_creature_types: Vec::new(),
             all_card_names: Arc::from([]),
@@ -27419,6 +27587,7 @@ impl GameState {
             pending_triggered_mana_resume: None,
             pending_trigger_construction_priority_recipient: None,
             active_accepted_triggered_mana_node: None,
+            mana_subresolution_depth: 0,
             trigger_construction_finisher_ran_this_action: false,
             pending_discard_for_cost: None,
             pending_cast: None,
@@ -28331,6 +28500,10 @@ impl GameState {
         // loop pre-filter fingerprint.
         self.chosen_counter_kind_this_resolution.hash(&mut h);
         self.chosen_color_this_resolution.hash(&mut h);
+        // CR 608.2c: "that sticker" can change what a following instruction
+        // reads (phase-2 quantity), so distinct live values must not share a
+        // loop pre-filter fingerprint.
+        self.placed_sticker_this_resolution.hash(&mut h);
         self.stack.len().hash(&mut h);
         self.objects.len().hash(&mut h);
         // im::Vector<ObjectId>: Hash, ordered.
@@ -29742,6 +29915,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         last_named_choice: _,
         chosen_counter_kind_this_resolution: _,
         chosen_color_this_resolution: _,
+        placed_sticker_this_resolution: _,
         last_chosen_damage_source: _,
         all_creature_types: _,
         all_card_names: _,
@@ -29804,6 +29978,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         pending_triggered_mana_resume: _,
         pending_trigger_construction_priority_recipient: _,
         active_accepted_triggered_mana_node: _,
+        mana_subresolution_depth: _,
         trigger_construction_finisher_ran_this_action: _,
         pending_discard_for_cost: _,
         pending_cast: _,
@@ -30116,6 +30291,7 @@ impl PartialEq for GameState {
             && self.chosen_counter_kind_this_resolution
                 == other.chosen_counter_kind_this_resolution
             && self.chosen_color_this_resolution == other.chosen_color_this_resolution
+            && self.placed_sticker_this_resolution == other.placed_sticker_this_resolution
             && self.last_revealed_ids == other.last_revealed_ids
             && self.private_look_ids == other.private_look_ids
             && self.private_look_player == other.private_look_player
@@ -36846,6 +37022,69 @@ mod tests {
             state.loop_fingerprint(),
             "a live counter-kind result can change a following resolution action"
         );
+    }
+
+    fn hot_dog_name_sticker() -> crate::types::stickers::AppliedSticker {
+        crate::types::stickers::AppliedSticker::Name {
+            locator: crate::types::stickers::StickerLocator {
+                sheet: "Ancestral Hot Dog Minotaur".into(),
+                index: 1,
+            },
+            text: "Hot Dog".into(),
+            position: 0,
+            timestamp: 1,
+        }
+    }
+
+    /// CR 608.2c: "that sticker" is resolution-scoped scratch state. A fresh
+    /// state's wire form omits it, a save without the key loads as `None`, and
+    /// a placed sticker round-trips.
+    #[test]
+    fn placed_sticker_this_resolution_wire_form() {
+        let wire = serde_json::to_value(GameState::new_two_player(42))
+            .expect("the bare GameState serializes");
+        assert!(
+            wire.get("placed_sticker_this_resolution").is_none(),
+            "a fresh state omits the key"
+        );
+        assert!(
+            serde_json::from_value::<GameState>(wire.clone()).is_ok(),
+            "the unmodified wire decodes"
+        );
+
+        let mut absent = wire;
+        absent
+            .as_object_mut()
+            .expect("GameState serializes as an object")
+            .remove("placed_sticker_this_resolution");
+        let restored = serde_json::from_value::<GameState>(absent)
+            .expect("an absent placed_sticker_this_resolution defaults");
+        assert_eq!(restored.placed_sticker_this_resolution, None);
+
+        let mut state = GameState::new_two_player(42);
+        state.placed_sticker_this_resolution = Some(hot_dog_name_sticker());
+        let wire = serde_json::to_value(&state).expect("the GameState serializes");
+        let restored =
+            serde_json::from_value::<GameState>(wire).expect("a placed sticker round-trips");
+        assert_eq!(
+            restored.placed_sticker_this_resolution,
+            state.placed_sticker_this_resolution
+        );
+    }
+
+    #[test]
+    fn loop_fingerprint_and_equality_reflect_that_sticker() {
+        let a = GameState::new_two_player(7);
+        let mut b = a.clone();
+        assert_eq!(a.loop_fingerprint(), b.loop_fingerprint());
+        assert!(a == b, "fresh clones are equal");
+        b.placed_sticker_this_resolution = Some(hot_dog_name_sticker());
+        assert_ne!(
+            a.loop_fingerprint(),
+            b.loop_fingerprint(),
+            "a live \"that sticker\" can change a following resolution action"
+        );
+        assert!(a != b, "\"that sticker\" participates in state equality");
     }
 
     #[test]

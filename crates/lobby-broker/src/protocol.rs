@@ -60,6 +60,37 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
+/// 98 — `PerPlayerScope` gains `Opponents` (CR 102.2 + CR 102.3), the
+///      team-relative population of "for each opponent, choose …" (Ultimate
+///      Magic: Meteor), written as `{"Each":"Opponents"}` inside `ZoneOwner`.
+///      `ZoneOpponentChooserPurpose` gains `PerPlayerChoiceOrder` (CR 101.4c:
+///      the chooser picks whose selection to make next) and `SubstituteChooser`
+///      (CR 800.4g: electing who makes a departed player's pick), and the
+///      parked per-player zone-choice frame gains `current` and `nominee`. A
+///      v97 peer cannot deserialize the new values. Full-game peers and P2P move in lockstep
+///      (wire 80); lobby messages are unchanged.
+/// 97 — `ResolvedAbility.target_reads` and `AbilityDefinition.target_reads`
+///      (`TargetReadOrigin`, `#[serde(default, skip_serializing_if = ...)]`) are
+///      new: `ParentAnnouncement` marks an instruction whose `Target` reads name
+///      the object the immediately preceding instruction announced (CR 115.1 +
+///      CR 608.2c — Conformer Shuriken's "If that creature has greater power
+///      than this creature, …"), so it announces no target slot of its own and
+///      inherits its parent's validated target. A v96 peer silently defaults the
+///      field, rebuilds the extra slot or reads the wrong object, and desyncs.
+///      Full-game peers and P2P move in lockstep (wire 79); lobby messages are
+///      unchanged.
+/// 96 — `QuantityRef::NameStickerLetterCount` adds a tagged name-sticker
+///      statistic to GameState ability definitions. A v95 peer cannot decode
+///      the new tag; full-game peers and P2P move in lockstep (wire 78).
+///      Lobby messages are unchanged.
+/// 95 — `FilterProp::Unblocked` is reshaped to `FilterProp::BlockStatus { status:
+///      AttackerBlockStatus }` (`Blocked` | `Unblocked`), so "blocked creature"
+///      filters (CR 509.1h: an attacking creature stays blocked for the rest of
+///      combat once blocked) are expressible. The legacy `"Unblocked"` tag still
+///      deserializes via a serde alias with a defaulted `status`, but a v94 peer
+///      cannot parse the new `"BlockStatus"` tag carried in `GameState` ability
+///      definitions. Full-game peers and P2P move in lockstep (wire 77); lobby
+///      messages are unchanged.
 /// 94 — `SpellContext.creation_lookback_event` (`#[serde(default,
 ///      skip_serializing_if = "Option::is_none")]`) carries the battlefield
 ///      departure a phase-delayed triggered ability was created under (CR 603.7
@@ -782,7 +813,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 94;
+pub const PROTOCOL_VERSION: u32 = 98;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2023,12 +2054,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 94);
+        assert_eq!(PROTOCOL_VERSION, 98);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 93);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 97);
     }
 
     #[test]
