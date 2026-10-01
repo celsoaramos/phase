@@ -846,6 +846,7 @@
     "titleTargets": "対象: {{targets}}",
     "titlePaid": "支払い: {{paid}}",
     "titleContext": "文脈: {{context}}",
+    "revealedCards": "公開中: {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}}マナ",
     "paidColorsSpent": "{{count}}色",
@@ -1427,6 +1428,7 @@
       "target": "対象",
       "return": "戻す",
       "discard": "捨てる",
+      "reveal": "公開",
       "evidence": "証拠",
       "manifest": "予示",
       "untap": "アンタップ",
@@ -2049,7 +2051,11 @@
   },
   "zoneOpponentChooser": {
     "title": "対戦相手を選択",
-    "subtitle": "選択を行う対戦相手を選択"
+    "subtitle": "選択を行う対戦相手を選択",
+    "orderTitle": "次のプレイヤーを選択",
+    "orderSubtitle": "次に選択を行う対象のプレイヤーを選択",
+    "substituteTitle": "プレイヤーを選択",
+    "substituteSubtitle": "この選択を行うプレイヤーを選択"
   },
   "pileOpponent": {
     "title": "対戦相手を選択",
@@ -2340,7 +2346,8 @@
       "zoneExile": "追放領域",
       "zoneHand": "あなたの手札",
       "discard": "{{count}}{{cards}}を捨てる",
-      "exile": "{{zone}}から{{count}}{{cards}}を追放"
+      "exile": "{{zone}}から{{count}}{{cards}}を追放",
+      "reveal": "{{zone}}から{{count}}{{cards}}を公開する"
     }
   },
   "topOrBottom": {

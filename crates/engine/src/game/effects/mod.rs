@@ -16,8 +16,8 @@ use crate::types::ability::{
     CounterKindDomain, DetachedRemainder, Duration, EachDamageRecipient, Effect, EffectError,
     EffectKind, EffectOutcomeSignal, EffectResolutionResult, EffectScope, FilterProp,
     ForEachCategoryAction, ForwardedResultContext, ManaProduction, MassLibraryShuffleMode,
-    ObjectSelectionCardinality, OpponentMayScope, PlayerFilter, PlayerRelation, PlayerScope,
-    PossessionAxis, PtValue, QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole,
+    NameStickerSet, ObjectSelectionCardinality, OpponentMayScope, PlayerFilter, PlayerRelation,
+    PlayerScope, PossessionAxis, PtValue, QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole,
     RepeatContinuation, ResolvedAbility, RevealUntilDisposition, SacrificeCost,
     SacrificeRequirement, SharedQuality, SharedQualityRelation, SiblingCondition, StaticDefinition,
     SubAbilityLink, TapStateChange, TargetChoiceTiming, TargetDamageSourceBinding, TargetFilter,
@@ -1690,12 +1690,16 @@ pub(crate) fn resume_resolution_frames(state: &mut GameState, events: &mut Vec<G
                 }
             }
             // CR 608.2c + CR 614.12a + CR 615.5: Retiring a paused replacement
-            // dispatch can expose the next ordinary continuation. Drain that
-            // exact continuation before priority; if it is the remaining
-            // Attach operation, its own completion boundary owns the printed
-            // tail. A typed Attach-choice owner remains action-owned.
-            if retired_paused_dispatch
-                && matches!(state.waiting_for, WaitingFor::Priority { .. })
+            // dispatch, or removing an exhausted frame after a nested child
+            // already retired its dispatch, can expose the next ordinary
+            // continuation. Drain that exact continuation before priority; if
+            // it is the remaining Attach operation, its own completion boundary
+            // owns the printed tail. A typed Attach-choice owner remains
+            // action-owned.
+            if matches!(
+                state.resolution_stack.last(),
+                Some(ResolutionFrame::AbilityContinuation(_))
+            ) && matches!(state.waiting_for, WaitingFor::Priority { .. })
                 && state
                     .active_ability_continuation()
                     .is_some_and(|continuation| continuation.attachment_choice.is_none())
@@ -3982,8 +3986,19 @@ pub(crate) fn apply_parent_chain_context(
     // context wholesale, so preserve the node-local intent while inheriting
     // the remaining casting-time facts from its parent.
     let child_face_down_in_exile = child.context.face_down_in_exile;
+    // CR 610.3b: `check_exile_returns` latches a specified "until" event on the
+    // exact duration-bearing ChangeZone node it happened for (after the trigger,
+    // before that node's initial zone change). Like the face-down marker, the
+    // latch is node-local: a non-ChangeZone parent (a hand reveal, a target
+    // declaration) carries none, so the wholesale hand-off must not erase it.
+    let child_duration_events = std::mem::take(&mut child.context.duration_events);
     child.context = parent.context.clone();
     child.context.face_down_in_exile |= child_face_down_in_exile;
+    for event in child_duration_events {
+        if !child.context.duration_events.contains(&event) {
+            child.context.duration_events.push(event);
+        }
+    }
     // CR 120.1 + CR 608.2b: The damage-subject binding names the object THIS
     // hand-off supplies (or fails to supply) to the immediate child's damage
     // clause. It is one-hop by construction — a grandchild's subject slot is a
@@ -4124,6 +4139,7 @@ pub(crate) fn should_propagate_parent_targets(
 pub(crate) fn can_inherit_parent_targets(sub: &ResolvedAbility) -> bool {
     sub.targets.is_empty()
         && sub.reads_chosen_group.is_none()
+        && !has_resolution_owned_zone_choice(sub)
         && (sub.target_choice_timing != TargetChoiceTiming::Resolution
             // CR 608.2c: a resolution-time instruction can still consume an
             // object selected by its parent. `ParentTarget` is not a fresh
@@ -4148,11 +4164,18 @@ pub(crate) fn can_inherit_parent_targets(sub: &ResolvedAbility) -> bool {
 /// (Worldsoul's Rage), while context references such as Beseech the Mirror's
 /// exile-linked card remain bound continuations rather than fresh choices.
 fn has_resolution_owned_zone_choice(sub: &ResolvedAbility) -> bool {
-    if sub.target_choice_timing != TargetChoiceTiming::Resolution {
-        return false;
-    }
-    let Effect::ChangeZone { origin, target, .. } = &sub.effect else {
-        return false;
+    let (target, origin) = match &sub.effect {
+        Effect::ChangeZone { origin, target, .. }
+            if sub.target_choice_timing == TargetChoiceTiming::Resolution =>
+        {
+            (target, *origin)
+        }
+        Effect::PutAtLibraryPosition { target, .. }
+            if matches!(target.extract_in_zone(), Some(Zone::Hand | Zone::Library)) =>
+        {
+            (target, target.extract_in_zone())
+        }
+        _ => return false,
     };
     let selection_zones = origin.map_or_else(|| target.extract_zones(), |zone| vec![zone]);
     !selection_zones.is_empty()
@@ -4595,7 +4618,11 @@ pub(crate) fn condition_survives_false_parent_gate(condition: &AbilityCondition)
 ///   is true" — Kathril / Mutable Pupa). That is a structural marker on the sub
 ///   (`SiblingCondition::ReplicatedOrBranch`) rather than a condition, and it
 ///   only means "independent OR-branch" on a `SequentialSibling` link, so BOTH
-///   conjuncts are part of the test.
+///   conjuncts are part of the test. The parser also stamps it on a clause gated
+///   on the mana spent to cast the spell that directly follows another such
+///   clause (CR 601.2h + CR 608.2c: "A if {R} was spent …, and B if {G} was
+///   spent …"), whose gate reads the spell's payment rather than the previous
+///   clause.
 ///
 /// Two consumers, which is why this is factored out rather than spelled twice:
 /// `resolve_ability_chain` (below) on its condition-false path, and
@@ -4870,6 +4897,9 @@ fn instruction_outlives_declined_gate(
         target_constraints,
         multi_target,
         force_block_attacker,
+        // Reads the object an earlier instruction announced, so it can name a
+        // gated result: only the default origin is unbound.
+        target_reads,
         // Walked by the caller.
         sub_ability: _,
         sub_link: _,
@@ -4943,7 +4973,8 @@ fn instruction_outlives_declined_gate(
         && target_chooser.is_none()
         && target_constraints.is_empty()
         && multi_target.is_none()
-        && force_block_attacker.is_none();
+        && force_block_attacker.is_none()
+        && *target_reads == crate::types::ability::TargetReadOrigin::OwnAnnouncement;
     unbound
         && duration
             .as_ref()
@@ -5788,6 +5819,7 @@ fn quantity_ref_counts_population_matching(
         | QuantityRef::ObjectManaValue { .. }
         | QuantityRef::ObjectColorCount { .. }
         | QuantityRef::ObjectNameWordCount { .. }
+        | QuantityRef::NameStickerLetterCount { .. }
         | QuantityRef::ObjectTypelineComponentCount { .. }
         | QuantityRef::ManaSymbolsInManaCost { .. }
         | QuantityRef::SelfManaValue
@@ -6524,7 +6556,10 @@ fn should_resolve_subability_on_optional_decline(ability: &ResolvedAbility) -> b
                     // CR 608.2d: a `Guessed` gate is a positive guess-outcome
                     // branch, not an optional-decline alternative — declining an
                     // optional effect never selects it.
-                    | EffectOutcomeSignal::Guessed { .. },
+                    | EffectOutcomeSignal::Guessed { .. }
+                    // CR 701.20a: a reveal-until-hit guard is not an
+                    // optional-decline alternative either.
+                    | EffectOutcomeSignal::RevealUntilMatched,
             },
         ) => false,
     }
@@ -6775,6 +6810,22 @@ fn effect_introduces_per_player_object_referent(effect: &Effect) -> bool {
     matches!(effect, Effect::RevealTop { .. })
 }
 
+/// CR 608.2c + CR 701.20a: a per-iteration reveal choice introduces the chosen
+/// card as that iteration's object referent (chain targets), consumed by a
+/// co-scoped `ParentTarget` clause ("exile a creature card they revealed this
+/// way" — Valki, God of Lies).
+fn effect_introduces_per_player_chosen_card_referent(effect: &Effect) -> bool {
+    reveal_hand::effect_parks_reveal_card_choice(effect)
+}
+
+/// CR 608.2c: single authority for "this clause introduces a per-iteration object
+/// referent" — consumed by the player-scope co-scope split and by the swallow
+/// audit's per-player-iteration evidence.
+pub(crate) fn effect_introduces_per_iteration_referent(effect: &Effect) -> bool {
+    effect_introduces_per_player_object_referent(effect)
+        || effect_introduces_per_player_chosen_card_referent(effect)
+}
+
 /// CR 608.2c: True when an effect (or its quantity/target) reads the parent's
 /// per-player object referent anaphorically — a `Demonstrative`/`Anaphoric`
 /// object scope in a quantity, or a `ParentTarget`/`ParentTargetSlot` target.
@@ -6833,6 +6884,10 @@ fn quantity_ref_references_demonstrative(qty: &QuantityRef) -> bool {
         | QuantityRef::CountersOn { scope, .. }
         | QuantityRef::ObjectColorCount { scope }
         | QuantityRef::ObjectNameWordCount { scope }
+        | QuantityRef::NameStickerLetterCount {
+            stickers: NameStickerSet::OnObject { scope },
+            letters: _,
+        }
         | QuantityRef::ObjectTypelineComponentCount { scope }
         | QuantityRef::ManaSymbolsInManaCost { scope, .. } => scope,
         _ => return false,
@@ -6898,7 +6953,7 @@ fn detach_after_player_scope_local_chain(
     // `PreviousEffectAmount`, the greatest discarded table-wide) is NOT a
     // referent consumer, so it still runs as its own post-all-iterations loop.
     let referent_in_scope =
-        referent_introduced || effect_introduces_per_player_object_referent(&node.effect);
+        referent_introduced || effect_introduces_per_iteration_referent(&node.effect);
     let next_is_co_scoped_anaphoric_consumer = next.player_scope.as_ref() == Some(scope)
         && referent_in_scope
         && effect_consumes_parent_object_referent(&next.effect);
@@ -8935,7 +8990,7 @@ fn affected_objects_from_events(
         Effect::Destroy { .. } | Effect::DestroyAll { .. } => events
             .iter()
             .filter_map(|event| match event {
-                GameEvent::CreatureDestroyed { object_id } => Some(*object_id),
+                GameEvent::CreatureDestroyed { object_id, .. } => Some(*object_id),
                 _ => None,
             })
             .collect(),
@@ -9168,6 +9223,65 @@ fn when_you_do_mandatory_parent_did_nothing(
         && !parent.context.optional_effect_performed
         && !effect_manages_own_outcome_flag(&parent.effect)
         && !mandatory_parent_effect_performed(&parent.effect, parent_events)
+}
+
+/// CR 603.12 + CR 701.20a: the inline half of the reveal-until-hit guard. The
+/// reveal-until that just resolved published its own one-hop verdict on
+/// `state.last_parent_target_missing_reason` (the slot its immediate child
+/// takes at the hand-off). Only a reflexive that carries the
+/// `EffectOutcomeSignal::RevealUntilMatched` guard is voided by a whiff; a
+/// generic "When you do" after a reveal-until is not. Read-only: the child's
+/// `apply_parent_chain_context` still takes the slot. The resumed-root and
+/// stack halves are the guard's own `evaluate_condition` arm, which reads the
+/// same verdict after the hand-off stamped it onto the child.
+fn reflexive_occurrence_voided_by_parent(
+    condition: &AbilityCondition,
+    parent_verdict: Option<crate::types::ability::ParentTargetMissingReason>,
+) -> bool {
+    condition_has_reveal_until_matched_guard(condition)
+        && parent_verdict == Some(crate::types::ability::ParentTargetMissingReason::RevealUntil)
+}
+
+/// Whether the root condition carries the reveal-until-hit guard, alone or as a
+/// member of the flat root `And` built by `when_you_do_with_guard`.
+pub(crate) fn condition_has_reveal_until_matched_guard(condition: &AbilityCondition) -> bool {
+    let is_guard = |condition: &AbilityCondition| {
+        matches!(
+            condition,
+            AbilityCondition::EffectOutcome {
+                signal: EffectOutcomeSignal::RevealUntilMatched,
+            }
+        )
+    };
+    match condition {
+        AbilityCondition::And { conditions } => conditions.iter().any(is_guard),
+        condition => is_guard(condition),
+    }
+}
+
+#[cfg(test)]
+mod reflexive_occurrence_verdict_tests {
+    use super::reflexive_occurrence_voided_by_parent;
+    use crate::types::ability::{AbilityCondition, EffectOutcomeSignal, ParentTargetMissingReason};
+
+    #[test]
+    fn only_the_reveal_until_hit_guard_is_voided_by_a_whiff() {
+        let guard = AbilityCondition::when_you_do_with_guard(AbilityCondition::EffectOutcome {
+            signal: EffectOutcomeSignal::RevealUntilMatched,
+        });
+        let whiff = Some(ParentTargetMissingReason::RevealUntil);
+        assert!(reflexive_occurrence_voided_by_parent(&guard, whiff));
+        assert!(!reflexive_occurrence_voided_by_parent(&guard, None));
+        assert!(!reflexive_occurrence_voided_by_parent(
+            &guard,
+            Some(ParentTargetMissingReason::Dig)
+        ));
+        // A generic "When you do" after a reveal-until whiff is not voided.
+        assert!(!reflexive_occurrence_voided_by_parent(
+            &AbilityCondition::WhenYouDo,
+            whiff
+        ));
+    }
 }
 
 fn mandatory_parent_effect_performed(effect: &Effect, events: &[GameEvent]) -> bool {
@@ -10874,6 +10988,23 @@ fn optional_effect_is_infeasible(state: &GameState, ability: &ResolvedAbility) -
             target: TargetFilter::ParentTarget,
             ..
         } => ability.parent_target_missing_reason.is_some(),
+        // CR 608.2d: "The player can’t choose an option that’s illegal or impossible".
+        // An optional placement from a private zone (e.g. Fire Prophecy / Volcanic Spite:
+        // "You may put a card from your hand on the bottom of your library. If
+        // you do, draw a card.") is impossible when the player has no eligible
+        // cards in that zone and must select a positive exact count. Zero
+        // cards remains a legal choice for zero-count and up-to placements.
+        Effect::PutAtLibraryPosition { target, count, .. } => {
+            if matches!(target, TargetFilter::ParentTarget)
+                && ability.parent_target_missing_reason.is_some()
+            {
+                return true;
+            }
+            !count.is_up_to()
+                && crate::game::quantity::resolve_quantity_with_targets(state, count, ability) > 0
+                && put_on_top::private_zone_selection(state, ability, target)
+                    .is_some_and(|(_, _, mut eligible)| eligible.next().is_none())
+        }
         Effect::CastFromZone {
             mode,
             target,
@@ -14330,6 +14461,9 @@ fn reset_top_level_resolution_state(state: &mut GameState) {
     // CR 608.2d: same reasoning, one axis over — a new top-level
     // resolution cannot inherit a prior resolution's announced colour.
     state.chosen_color_this_resolution = None;
+    // CR 608.2c: "that sticker" names a sticker this resolution's own PutSticker
+    // instruction placed; a new top-level resolution cannot inherit a prior one's.
+    state.placed_sticker_this_resolution = None;
     // CR 401.5 + CR 608.2c + CR 609.3 + issue #4950: Defense in depth —
     // `apply_parent_chain_context` already consumes this at the very next
     // parent->child hand-off after a Dig/ChooseFromZone/RevealHand sets
@@ -15533,6 +15667,7 @@ fn resolve_chain_body(
                 cardinality: Some(ObjectSelectionCardinality::Exactly { .. }),
                 ..
             }
+            | Effect::PutAtLibraryPosition { .. }
     );
     if optional_is_infeasible && auto_decline_infeasible_optional {
         return resolve_optional_effect_decision(
@@ -16583,7 +16718,13 @@ fn resolve_chain_body(
         } = event
         {
             state.player_actions_this_way.insert((*player_id, *action));
-            record_player_action_this_turn(state, *player_id, *action);
+            // Draw completions record their turn-ledger entry at the single event
+            // emission site in `draw.rs`; overlapping nested chain windows may
+            // still see that event for the resolution-local set, but must not
+            // append it to the Vec more than once.
+            if *action != PlayerActionKind::Draw {
+                record_player_action_this_turn(state, *player_id, *action);
+            }
         }
     }
 
@@ -17495,6 +17636,10 @@ fn resolve_chain_body(
                     condition,
                     ability,
                     &events[events_before..],
+                )
+                && !reflexive_occurrence_voided_by_parent(
+                    condition,
+                    state.last_parent_target_missing_reason,
                 );
             if !condition_met {
                 // CR 608.2c: This parent-side gate skips dispatching the sub
@@ -17828,14 +17973,18 @@ fn resolve_chain_body(
                 }
                 _ => None,
             };
-            if sub_clone.reads_return_result.is_some()
+            if (sub_clone.reads_return_result.is_some()
+                || state
+                    .resolution_stack
+                    .copy_token_at_child_boundary(child_stack_start))
                 && state.resolution_stack.capture_child_boundary() > child_stack_start
             {
-                // CR 608.2c: the reader follows the complete producer action.
-                // A replacement post-effect may have parked a continuation
-                // beneath the producer's batch frame, so insert this reader
-                // outside the whole child stack, at the boundary captured
-                // before resolving the producer.
+                // CR 608.2c: the rest of the chain follows the complete producer action,
+                // so insert it outside the whole child stack, at the boundary captured
+                // before resolving the producer. A named-result reader needs this because
+                // a replacement post-effect may have parked a continuation beneath the
+                // producer's batch frame; a copy-token producer parks its own batch owner
+                // at that boundary.
                 let mut pending = PendingContinuation::new(Box::new(sub_clone), state);
                 pending.pending_return_result_producer = pending_return_result_producer;
                 state
@@ -17843,7 +17992,7 @@ fn resolve_chain_body(
                         pending,
                         child_stack_start,
                     )
-                    .expect("named result reader must remain outside its producer's child stack");
+                    .expect("continuation must remain outside its producer's child stack");
             } else {
                 prepend_to_pending_continuation_with_producer(
                     state,
@@ -18292,9 +18441,9 @@ fn resolve_chain_body(
     Ok(())
 }
 
-/// `resolve_chain_body` records, through this helper, each `PlayerPerformedAction`
-/// emitted inside its window; any other caller must run outside every chain
-/// window.
+/// Append one completed player action to the turn ledger. Draw frames call this
+/// at the same point they publish their `PlayerPerformedAction`; other event kinds
+/// use their single chain or completion recorder.
 pub(crate) fn record_player_action_this_turn(
     state: &mut GameState,
     player: PlayerId,
@@ -18795,7 +18944,7 @@ pub(crate) fn evaluate_condition(
                     .current_trigger_event
                     .as_ref()
                     .and_then(|event| match event {
-                        GameEvent::CreatureDestroyed { object_id }
+                        GameEvent::CreatureDestroyed { object_id, .. }
                         | GameEvent::ZoneChanged { object_id, .. } => Some(*object_id),
                         _ => None,
                     })
@@ -18937,6 +19086,17 @@ pub(crate) fn evaluate_condition(
         AbilityCondition::EffectOutcome {
             signal: EffectOutcomeSignal::Guessed { outcome },
         } => ability.context.guess_outcome == Some(*outcome),
+        // CR 701.20a + CR 603.12: "When you reveal a <filter> card this way" —
+        // the reveal-until's own one-hop verdict, carried on this node by the
+        // parent->child hand-off (a resumed deferred reflexive, or the
+        // materialized stack object). The inline creation gate reads the same
+        // verdict before that hand-off via `reflexive_occurrence_voided_by_parent`.
+        AbilityCondition::EffectOutcome {
+            signal: EffectOutcomeSignal::RevealUntilMatched,
+        } => {
+            ability.parent_target_missing_reason
+                != Some(crate::types::ability::ParentTargetMissingReason::RevealUntil)
+        }
         AbilityCondition::EventOutcomeWon => state
             .current_trigger_event
             .as_ref()
@@ -20224,6 +20384,65 @@ mod tests {
 
     fn effect_from_json(json: &str) -> Effect {
         serde_json::from_str(json).expect("test effect shape must deserialize")
+    }
+
+    /// CR 608.2d: choosing zero is legal for zero-count and up-to placements,
+    /// while an exact positive placement needs an eligible card.
+    #[test]
+    fn optional_private_zone_placement_preserves_zero_selection_choices() {
+        for zone in [Zone::Hand, Zone::Library] {
+            for count in [
+                QuantityExpr::Fixed { value: 0 },
+                QuantityExpr::up_to(QuantityExpr::Fixed { value: 1 }),
+                QuantityExpr::Fixed { value: 1 },
+            ] {
+                let mut state = GameState::new_two_player(42);
+                let source = create_object(
+                    &mut state,
+                    CardId(900),
+                    PlayerId(0),
+                    "Placement Source".to_string(),
+                    Zone::Battlefield,
+                );
+                let permits_zero =
+                    count.is_up_to() || matches!(count, QuantityExpr::Fixed { value: 0 });
+                let mut ability = ResolvedAbility::new(
+                    Effect::PutAtLibraryPosition {
+                        target: TargetFilter::Typed(
+                            TypedFilter::new(TypeFilter::Card)
+                                .properties(vec![FilterProp::InZone { zone }]),
+                        ),
+                        count,
+                        position: crate::types::ability::LibraryPosition::Bottom,
+                    },
+                    vec![],
+                    source,
+                    PlayerId(0),
+                );
+                ability.optional = true;
+                assert!(state.players[0].hand.is_empty());
+                assert!(state.players[0].library.is_empty());
+
+                resolve_ability_chain(&mut state, &ability, &mut Vec::new(), 0)
+                    .expect("empty private-zone placement must resolve or offer its legal choice");
+                assert_eq!(
+                    matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+                    permits_zero,
+                    "only a positive exact count is impossible with an empty {zone:?}"
+                );
+                if permits_zero {
+                    crate::game::engine::apply_as_current(
+                        &mut state,
+                        crate::types::actions::GameAction::DecideOptionalEffect { accept: true },
+                    )
+                    .expect("accepting a zero-card placement must succeed");
+                }
+                assert!(state.active_optional_effect_frame().is_none());
+                assert!(state.players[0].hand.is_empty());
+                assert!(state.players[0].library.is_empty());
+                assert_eq!(state.objects[&source].zone, Zone::Battlefield);
+            }
+        }
     }
 
     #[test]
@@ -33078,6 +33297,250 @@ mod tests {
             vec![creature],
             "CR 611.2c: the published population is the later static's broadcast set"
         );
+    }
+
+    /// CR 608.2c + CR 701.20a — a per-iteration reveal CHOICE (a `RevealHand`
+    /// that parks a card choice) introduces the chosen card as that iteration's
+    /// referent, so a co-scoped `ParentTarget` consumer ("exile a creature card
+    /// they revealed this way" — Valki, God of Lies) stays inside the scoped
+    /// template. A reveal that parks no choice introduces no referent, so the same
+    /// child still detaches as the unscoped tail (unchanged behaviour).
+    #[test]
+    fn split_player_scope_keeps_reveal_choice_consumer_in_iteration() {
+        let make_chain = |card_filter: TargetFilter| {
+            let mut reveal = ResolvedAbility::new(
+                Effect::RevealHand {
+                    target: TargetFilter::Controller,
+                    card_filter,
+                    count: None,
+                    selection: crate::types::ability::CardSelectionMode::Chosen,
+                    choice_optional: false,
+                    reveal: true,
+                },
+                vec![],
+                ObjectId(1),
+                PlayerId(0),
+            );
+            reveal.player_scope = Some(PlayerFilter::Opponent);
+            let mut exile = ResolvedAbility::new(
+                Effect::ChangeZone {
+                    origin: None,
+                    destination: Zone::Exile,
+                    target: TargetFilter::ParentTarget,
+                    owner_library: false,
+                    enter_transformed: false,
+                    enters_under: None,
+                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                    enters_attacking: false,
+                    up_to: false,
+                    enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![],
+                    face_down_profile: None,
+                    enters_modified_if: None,
+                },
+                vec![],
+                ObjectId(1),
+                PlayerId(0),
+            );
+            exile.player_scope = Some(PlayerFilter::Opponent);
+            reveal.sub_ability = Some(Box::new(exile));
+            reveal
+        };
+
+        let choice = make_chain(TargetFilter::Typed(TypedFilter::creature()));
+        let (scoped, tail) = split_player_scope_chain(&choice, &PlayerFilter::Opponent);
+        assert!(
+            tail.is_none(),
+            "the chosen-card consumer stays in the iteration"
+        );
+        let kept = scoped
+            .sub_ability
+            .as_ref()
+            .expect("the ChangeZone stays attached to the reveal");
+        assert!(matches!(kept.effect, Effect::ChangeZone { .. }));
+        assert!(
+            kept.player_scope.is_none(),
+            "the kept consumer's redundant player_scope is cleared so it does not re-loop"
+        );
+
+        // Positive twin: a reveal with no card choice introduces no referent.
+        let no_choice = make_chain(TargetFilter::None);
+        let (scoped, tail) = split_player_scope_chain(&no_choice, &PlayerFilter::Opponent);
+        assert!(scoped.sub_ability.is_none());
+        let tail = tail.expect("without a choice the consumer detaches as the tail");
+        assert!(matches!(tail.effect, Effect::ChangeZone { .. }));
+    }
+
+    /// CR 608.2c — a non-choosing per-player reveal introduces no per-iteration
+    /// referent, so the next co-scoped instruction (the per-player card choice and
+    /// its `ParentTarget` consumer) detaches and fans out as its own pass after
+    /// every reveal; inside that pass the choice keeps its consumer (Valki, God of
+    /// Lies).
+    #[test]
+    fn split_player_scope_runs_the_choice_pass_after_every_reveal() {
+        let reveal_hand = |card_filter: TargetFilter, reveal: bool| Effect::RevealHand {
+            target: TargetFilter::Controller,
+            card_filter,
+            count: None,
+            selection: crate::types::ability::CardSelectionMode::Chosen,
+            choice_optional: false,
+            reveal,
+        };
+        let mut reveal_pass = ResolvedAbility::new(
+            reveal_hand(TargetFilter::None, true),
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        reveal_pass.player_scope = Some(PlayerFilter::Opponent);
+        let mut choice_pass = ResolvedAbility::new(
+            reveal_hand(TargetFilter::Typed(TypedFilter::creature()), false),
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        choice_pass.player_scope = Some(PlayerFilter::Opponent);
+        choice_pass.sub_link = SubAbilityLink::SequentialSibling;
+        let mut exile = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: None,
+                destination: Zone::Exile,
+                target: TargetFilter::ParentTarget,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        exile.player_scope = Some(PlayerFilter::Opponent);
+        exile.sub_link = SubAbilityLink::SequentialSibling;
+        choice_pass.sub_ability = Some(Box::new(exile));
+        reveal_pass.sub_ability = Some(Box::new(choice_pass));
+
+        // The reveal pass: every opponent reveals; the choice pass is the tail.
+        let (scoped, tail) = split_player_scope_chain(&reveal_pass, &PlayerFilter::Opponent);
+        assert!(
+            scoped.sub_ability.is_none(),
+            "the reveal pass keeps no later instruction in its iteration"
+        );
+        let tail = tail.expect("the choice pass detaches as the tail");
+        assert!(crate::game::effects::reveal_hand::effect_parks_reveal_card_choice(&tail.effect));
+        assert_eq!(
+            tail.player_scope,
+            Some(PlayerFilter::Opponent),
+            "the detached choice pass fans out over the same opponents"
+        );
+        assert!(matches!(
+            tail.sub_ability.as_deref().map(|sub| &sub.effect),
+            Some(Effect::ChangeZone { .. })
+        ));
+
+        // The choice pass: the chosen card's consumer stays in its iteration.
+        let (scoped, tail) = split_player_scope_chain(&tail, &PlayerFilter::Opponent);
+        assert!(tail.is_none(), "the consumer stays in the choice iteration");
+        let kept = scoped
+            .sub_ability
+            .as_ref()
+            .expect("the ChangeZone stays attached to the choice");
+        assert!(matches!(kept.effect, Effect::ChangeZone { .. }));
+        assert_eq!(
+            kept.player_scope, None,
+            "the kept consumer's redundant player_scope is cleared"
+        );
+    }
+
+    /// CR 610.3b + CR 608.2c — the parent→child hand-off keeps the child's own
+    /// "until" latch. `check_exile_returns` records a specified event on the exact
+    /// duration-bearing ChangeZone node (node-local, like the face-down marker);
+    /// a non-ChangeZone parent (Kitesail Freebooter's / Valki's hand reveal)
+    /// carries none, so a wholesale context copy would erase it and the initial
+    /// exile would happen anyway. The parent's own latches are still inherited.
+    #[test]
+    fn parent_chain_handoff_keeps_the_childs_cr610_3b_latch() {
+        use crate::types::ability::{DurationEvent, ExileConcealment};
+
+        let reveal = || {
+            ResolvedAbility::new(
+                Effect::RevealHand {
+                    target: TargetFilter::Player,
+                    card_filter: TargetFilter::Typed(TypedFilter::creature()),
+                    count: None,
+                    selection: crate::types::ability::CardSelectionMode::Chosen,
+                    choice_optional: false,
+                    reveal: true,
+                },
+                vec![],
+                ObjectId(1),
+                PlayerId(0),
+            )
+        };
+        let exile_until_leaves = || {
+            let mut exile = ResolvedAbility::new(
+                Effect::ChangeZone {
+                    origin: None,
+                    destination: Zone::Exile,
+                    target: TargetFilter::ParentTarget,
+                    owner_library: false,
+                    enter_transformed: false,
+                    enters_under: None,
+                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                    enters_attacking: false,
+                    up_to: false,
+                    enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![],
+                    face_down_profile: None,
+                    enters_modified_if: None,
+                },
+                vec![],
+                ObjectId(1),
+                PlayerId(0),
+            );
+            exile.duration = Some(Duration::UntilHostLeavesPlay);
+            exile
+        };
+        let latched = vec![DurationEvent::SourceLeftBattlefield];
+        let mut state = GameState::new_two_player(42);
+
+        // (a) The child's own latch survives a parent that carries none.
+        let parent = reveal();
+        let mut child = exile_until_leaves();
+        child.context.duration_events = latched.clone();
+        apply_parent_chain_context(&mut child, &parent, None, &mut state);
+        assert_eq!(
+            child.context.duration_events, latched,
+            "the node-local CR 610.3b latch must survive the hand-off"
+        );
+
+        // (b) Reach-guard: the hand-off ran and still inherits the parent's latch.
+        let mut parent = reveal();
+        parent.context.duration_events = latched.clone();
+        let mut child = exile_until_leaves();
+        apply_parent_chain_context(&mut child, &parent, None, &mut state);
+        assert_eq!(child.context.duration_events, latched);
+
+        // (c) Both latched: the union carries the event once.
+        let mut child = exile_until_leaves();
+        child.context.duration_events = latched.clone();
+        apply_parent_chain_context(&mut child, &parent, None, &mut state);
+        assert_eq!(child.context.duration_events, latched);
+
+        // (d) The existing node-local precedent is not regressed.
+        let parent = reveal();
+        let mut child = exile_until_leaves();
+        child.context.face_down_in_exile = ExileConcealment::FaceDown;
+        child.context.duration_events = latched.clone();
+        apply_parent_chain_context(&mut child, &parent, None, &mut state);
+        assert!(child.context.face_down_in_exile.is_face_down());
+        assert_eq!(child.context.duration_events, latched);
     }
 
     /// CR 608.2c — building-block discriminator for the per-player reveal-anaphora

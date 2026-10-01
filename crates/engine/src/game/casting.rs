@@ -5,8 +5,8 @@ use crate::types::ability::{
     CastCostModifier, CastTimingPermission, CastingPermission, ChoiceType, CombatRelationSubject,
     ContinuousModification, ControllerRef, CostObjectCount, CostPaidObjectSnapshot, CostReduction,
     CounterCostSelection, Duration, Effect, EffectKind, FilterProp, GameRestriction,
-    ModalSelectionCondition, ObjectScope, ParsedCondition, PlayerFilter, PlayerScope,
-    ProhibitedActivity, QuantityExpr, QuantityRef, ResolvedAbility, RestrictionExpiry,
+    ModalSelectionCondition, NameStickerSet, ObjectScope, ParsedCondition, PlayerFilter,
+    PlayerScope, ProhibitedActivity, QuantityExpr, QuantityRef, ResolvedAbility, RestrictionExpiry,
     RestrictionPlayerScope, StaticCondition, StaticDefinition, SubAbilityLink,
     TapCreaturesRequirement, TargetFilter, TargetRef, TypeFilter, TypedFilter,
 };
@@ -53,7 +53,7 @@ use super::ability_utils::{
     assign_targets_in_chain, auto_select_targets, auto_select_targets_for_ability,
     begin_target_selection, begin_target_selection_for_ability, build_resolved_from_def,
     build_target_slots, build_target_slots_for_announcement, compute_unavailable_modes,
-    filter_references_target_player, flatten_targets_in_chain,
+    declared_targets_in_chain, filter_references_target_player,
     has_legal_target_assignment_for_ability, modal_choice_for_player,
     simple_legal_target_assignment_exists_for_ability, target_constraints_from_modal,
     unresolved_x_target_construction_error, TargetSlotBuildOutcome,
@@ -5018,9 +5018,22 @@ fn exile_permission_timing_active(
     }
 }
 
-/// CR 601.2a + CR 113.6b: Enumerate every battlefield permanent controlled by
-/// `player` whose `StaticMode::ExileCastPermission` static is currently
-/// functioning. The returned filter is owned by the static definition (via
+/// CR 114.4: emblem abilities function in the command zone. Yields every
+/// command-zone emblem, in command-zone order; each caller restricts the
+/// player (the exile path by the static's `ExileCastGrantee`, the graveyard
+/// path by the owner gate — CR 114.2).
+fn command_zone_emblems(state: &GameState) -> impl Iterator<Item = ObjectId> + '_ {
+    state
+        .command_zone
+        .iter()
+        .copied()
+        .filter(move |&id| state.objects.get(&id).is_some_and(|obj| obj.is_emblem))
+}
+
+/// CR 601.2a + CR 113.6b: Enumerate every battlefield permanent and every
+/// command-zone emblem whose `StaticMode::ExileCastPermission` static is
+/// currently functioning; the `grantee` match and the own-exiles pool restrict
+/// `player`. The returned filter is owned by the static definition (via
 /// `active_static_definitions`) and lives at least as long as the inferred
 /// borrow.
 ///
@@ -5031,6 +5044,7 @@ fn exile_permission_sources(state: &GameState, player: PlayerId) -> Vec<ExilePer
         .battlefield
         .iter()
         .copied()
+        .chain(command_zone_emblems(state))
         .filter_map(|source_id| {
             let obj = state.objects.get(&source_id)?;
             active_static_definitions(state, obj).find_map(|definition| match definition.mode {
@@ -5054,7 +5068,8 @@ fn exile_permission_sources(state: &GameState, player: PlayerId) -> Vec<ExilePer
                 } => {
                     // CR 406.6 + CR 607.1: "you may …" grants only the source's
                     // controller; "each player may … cards they exiled" grants
-                    // every player their own share of the pool.
+                    // every player their own share of the pool. CR 114.2: an
+                    // emblem's controller is the player who owns it.
                     let own_exiles_of = match grantee {
                         ExileCastGrantee::SourceController => {
                             if obj.controller != player {
@@ -5413,12 +5428,7 @@ fn graveyard_permission_sources(
     play_mode_filter: Option<CardPlayMode>,
 ) -> Vec<GraveyardPermissionSource<'_>> {
     let mut source_ids: Vec<ObjectId> = state.battlefield.iter().copied().collect();
-    source_ids.extend(state.command_zone.iter().copied().filter(|&id| {
-        state
-            .objects
-            .get(&id)
-            .is_some_and(|obj| obj.is_emblem && obj.owner == player)
-    }));
+    source_ids.extend(command_zone_emblems(state));
     if let Some(player_data) = state.players.iter().find(|p| p.id == player) {
         source_ids.extend(player_data.graveyard.iter().copied());
     }
@@ -9975,10 +9985,11 @@ fn prepare_spell_cast_announced(
 /// whenever the cast has no accepted reduction and no election).
 #[derive(Debug, Clone, Default)]
 pub(super) struct CostFinalizeContext {
-    /// Reductions that are not derivable from the board at this seam. Today
-    /// this is exactly the accepted Defiler-cycle life payment (CR 601.2b),
-    /// whose acceptance lives in the answer to `WaitingFor::DefilerPayment`
-    /// rather than in any static.
+    /// Reductions that are not derivable from the board at this seam: the
+    /// accepted Defiler-cycle life payment (CR 601.2b), whose acceptance lives
+    /// in the answer to `WaitingFor::DefilerPayment` rather than in any static,
+    /// and the reduction an Emerge or Offering sacrifice earned before a
+    /// deferred target declaration (CR 702.119a + CR 702.48c).
     extra: Vec<CostModification>,
     /// The caster's CR 601.2b + CR 601.2f election, once made.
     election: Option<CostReductionElection>,
@@ -9997,8 +10008,10 @@ impl CostFinalizeContext {
     /// that must agree with it) has to run under this rather than
     /// [`CostFinalizeContext::PREVIEW`], or it silently replaces the caster's
     /// elected order with the caster-optimal default and drops an accepted
-    /// Defiler reduction.
-    fn from_pending(pending: &PendingCast) -> Self {
+    /// Defiler reduction. The additional-cost declaration preview runs under it
+    /// too, so an optional cost is offered against the total the kept
+    /// sacrifice reduction will lock in.
+    pub(super) fn from_pending(pending: &PendingCast) -> Self {
         Self {
             extra: pending
                 .accepted_cost_reductions
@@ -10894,7 +10907,7 @@ pub(super) fn lock_in_total_cost(
     extra: &[CostReductionEntry],
     election: Option<&CostReductionElection>,
 ) -> CostLockOutcome {
-    // Hot path. `pay_and_push` runs this on EVERY cast, including the simulated
+    // Hot path. `pay_and_push_with_lock` runs this on EVERY cast, including the simulated
     // ones the AI search drives, so the overwhelmingly common board — no
     // `ModifyCost` static anywhere and nothing accepted — must not pay for a
     // second round of modifier collection. Behaviour-neutral: with no reduction
@@ -11216,13 +11229,15 @@ fn apply_target_dependent_cost_modifiers_using(
 ) {
     // CR 601.2f: Strive per-target cost increase. Targets are chosen in
     // CR 601.2c; costs are determined in CR 601.2f. Add
-    // strive_cost * (num_targets - 1) to the total casting cost.
+    // strive_cost * (num_targets - 1) to the total casting cost. "Target"
+    // counts announced targets only (CR 115.10a): an inheriting rider's carried
+    // copy of its parent's target is not another one.
     if let Some(strive_cost) = state
         .objects
         .get(&object_id)
         .and_then(|obj| obj.strive_cost.clone())
     {
-        let target_count = super::ability_utils::flatten_targets_in_chain(ability).len();
+        let target_count = super::ability_utils::declared_targets_in_chain(ability).len();
         for _ in 1..target_count {
             *mana_cost = super::restrictions::add_mana_cost(mana_cost, &strive_cost);
         }
@@ -11333,7 +11348,9 @@ pub(crate) fn compute_spend_only_on_x_generic_count(
         );
     }
     if let Some(strive_cost) = obj.strive_cost.clone() {
-        let target_count = super::ability_utils::flatten_targets_in_chain(&pending.ability).len();
+        // CR 115.10a + CR 601.2f: Count announced targets for the Strive
+        // increase; an inherited rider's snapshot is not another target.
+        let target_count = super::ability_utils::declared_targets_in_chain(&pending.ability).len();
         for _ in 1..target_count {
             cost = super::restrictions::add_mana_cost(&cost, &strive_cost);
         }
@@ -12203,7 +12220,7 @@ fn selected_targets_match_filter(
     filter: &TargetFilter,
     require_all: bool,
 ) -> bool {
-    let targets = flatten_targets_in_chain(ability);
+    let targets = declared_targets_in_chain(ability);
     if targets.is_empty() {
         return false;
     }
@@ -18438,7 +18455,7 @@ fn continue_with_prepared(
                 assign_targets_in_chain(state, &mut resolved, &targets)?;
                 emit_targeting_events(
                     state,
-                    &flatten_targets_in_chain(&resolved),
+                    &declared_targets_in_chain(&resolved),
                     prepared.object_id,
                     player,
                     events,
@@ -18524,7 +18541,7 @@ fn continue_with_prepared(
             assign_targets_in_chain(state, &mut resolved, &targets)?;
             emit_targeting_events(
                 state,
-                &flatten_targets_in_chain(&resolved),
+                &declared_targets_in_chain(&resolved),
                 prepared.object_id,
                 player,
                 events,
@@ -18921,7 +18938,7 @@ fn continue_with_prepared(
             assign_targets_in_chain(state, &mut resolved, &targets)?;
             emit_targeting_events(
                 state,
-                &flatten_targets_in_chain(&resolved),
+                &declared_targets_in_chain(&resolved),
                 prepared.object_id,
                 player,
                 events,
@@ -23390,7 +23407,14 @@ pub(crate) fn resolve_non_self_discard_requirement_with_ability(
     let Some((count, filter, _selection)) = find_non_self_discard(cost) else {
         return Ok(None);
     };
-    let count = super::quantity::resolve_quantity(state, count, player, source_id).max(0) as usize;
+    // CR 107.3a: the ability carries the announced X that a "discard X cards"
+    // count reads; without it X would resolve to 0 and the cost would be skipped.
+    let count = ability
+        .map_or_else(
+            || super::quantity::resolve_quantity(state, count, player, source_id),
+            |ability| super::quantity::resolve_quantity_with_targets(state, count, ability),
+        )
+        .max(0) as usize;
     // CR 601.2h + CR 701.9a: A resolved zero-card discard is paid by doing nothing — never
     // surface a dead selection prompt for it.
     if count == 0 {
@@ -24127,7 +24151,9 @@ pub(crate) fn removable_counter_count_for_cost_selection(
 ) -> u32 {
     match (counter_type, selection) {
         (crate::types::counter::CounterMatch::Any, CounterCostSelection::AmongObjects) => {
-            obj.counters.values().copied().sum()
+            // CR 122.1: exact total clamped to u32. This bounds how many counters
+            // may be selected, an availability ("at least N") use only.
+            u32::try_from(crate::types::counter::counter_total(&obj.counters)).unwrap_or(u32::MAX)
         }
         _ => removable_counter_count(obj, counter_type),
     }
@@ -25405,6 +25431,10 @@ fn quantity_ref_is_board_state_relative(qty: &QuantityRef) -> bool {
         | QuantityRef::ObjectManaValue { scope }
         | QuantityRef::ObjectColorCount { scope }
         | QuantityRef::ObjectNameWordCount { scope }
+        | QuantityRef::NameStickerLetterCount {
+            stickers: NameStickerSet::OnObject { scope },
+            letters: _,
+        }
         | QuantityRef::ObjectTypelineComponentCount { scope } => {
             matches!(scope, ObjectScope::Source)
         }
@@ -26355,9 +26385,8 @@ fn activate_with_cost_carrier(
     resolved.ability_index = Some(ability_index);
     // CR 602.2 + CR 601.2c (capture A): the activation's journal facts,
     // captured now, before any cost is paid. Target settlement adds the
-    // committed targets on every target-first route.
-    resolved.activation_record =
-        capture_activation_record(state, player, source_id, ability_index, &resolved).map(Box::new);
+    // committed targets on every target-first route. CR 602.2a: provenance too.
+    record_activation_announcement(state, player, source_id, ability_index, &mut resolved);
     // CR 602.2b + CR 601.2b/c: an X announcement can determine how many
     // targets an ability has. Before X is chosen, target-slot construction may
     // reject that specific class of otherwise legal activation; defer only that
@@ -27018,7 +27047,7 @@ fn activate_with_cost_carrier(
             // declares targets before any activation cost is paid.
             emit_targeting_events(
                 state,
-                &flatten_targets_in_chain(&resolved),
+                &declared_targets_in_chain(&resolved),
                 source_id,
                 player,
                 events,
@@ -27141,7 +27170,7 @@ fn activate_with_cost_carrier(
     let record = take_activation_record(&mut resolved, player)?;
     let entry_id = ObjectId(state.next_object_id);
     state.next_object_id += 1;
-    let announced_targets = flatten_targets_in_chain(&resolved);
+    let announced_targets = declared_targets_in_chain(&resolved);
     let crime_candidate = targets_commit_crime(state, &announced_targets, player);
 
     stack::push_to_stack(
@@ -27282,8 +27311,30 @@ pub(crate) fn capture_activation_record(
         player,
         source_id,
         activation_ability_definition(state, source_id, ability_index).as_ref(),
-        &flatten_targets_in_chain(ability),
+        &declared_targets_in_chain(ability),
     )
+}
+
+/// CR 602.2a + CR 607.1 + CR 613.1f: bind the facts an activated ability
+/// takes from its announcement — the journal record and whether the
+/// announced slot is a characteristic ability of its source (and of which
+/// copiable set) — while `ability_index` and the definition are bound to the
+/// same live `abilities`. Both ride `ability` to the stack; later cost
+/// payment cannot change them.
+pub(crate) fn record_activation_announcement(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    ability_index: usize,
+    ability: &mut ResolvedAbility,
+) {
+    ability.activation_record =
+        capture_activation_record(state, player, source_id, ability_index, ability).map(Box::new);
+    let provenance = state
+        .objects
+        .get(&source_id)
+        .map(|source| source.activated_ability_provenance(ability_index));
+    ability.set_source_ability_provenance_recursive(provenance);
 }
 
 /// [`capture_activation_record`] from an ability definition and its committed
@@ -27347,7 +27398,20 @@ fn capture_settled_targets(state: &GameState, player: PlayerId, pending: &mut Pe
     };
     match pending.ability.activation_record.as_deref_mut() {
         Some(record) => record.targets = fresh.targets,
-        None => pending.ability.activation_record = Some(Box::new(fresh)),
+        None => {
+            pending.ability.activation_record = Some(Box::new(fresh));
+            // CR 602.2a: same announcement-phase binding as the record (before
+            // payment).
+            if pending.ability.context.source_ability_provenance.is_none() {
+                let provenance = state
+                    .objects
+                    .get(&pending.object_id)
+                    .map(|source| source.activated_ability_provenance(ability_index));
+                pending
+                    .ability
+                    .set_source_ability_provenance_recursive(provenance);
+            }
+        }
     }
 }
 
@@ -28156,6 +28220,10 @@ fn quantity_ref_reads_target_object(qty: &QuantityRef, read: TargetRead) -> bool
         | QuantityRef::ObjectManaValue { scope }
         | QuantityRef::ObjectColorCount { scope }
         | QuantityRef::ObjectNameWordCount { scope }
+        | QuantityRef::NameStickerLetterCount {
+            stickers: NameStickerSet::OnObject { scope },
+            letters: _,
+        }
         | QuantityRef::ObjectTypelineComponentCount { scope }
         | QuantityRef::ManaSymbolsInManaCost { scope, .. } => {
             object_scope_reads_chosen_target(scope, read)
@@ -28256,6 +28324,10 @@ fn quantity_ref_reads_target_object(qty: &QuantityRef, read: TargetRead) -> bool
         | QuantityRef::ExiledCardPower { .. }
         | QuantityRef::TrackedSetSize
         | QuantityRef::ExiledFromHandThisResolution
+        | QuantityRef::NameStickerLetterCount {
+            stickers: NameStickerSet::ThatSticker,
+            letters: _,
+        }
         | QuantityRef::PreviousEffectAmount { .. }
         | QuantityRef::PreviousEffectCount
         | QuantityRef::UnspentMana { .. }
@@ -28538,7 +28610,7 @@ fn filter_prop_reads_chosen_target(prop: &FilterProp, read: TargetRead) -> bool 
         | FilterProp::WasPlayed
         | FilterProp::Blocking
         | FilterProp::BlockingSource
-        | FilterProp::Unblocked
+        | FilterProp::BlockStatus { .. }
         | FilterProp::AttackingAlone
         | FilterProp::BlockingAlone
         | FilterProp::Tapped
@@ -28667,7 +28739,7 @@ fn parsed_condition_satisfied_with_committed_targets(
             comparator,
             rhs,
         } if parsed_condition_reads_targets(condition, TargetRead::Any) => {
-            let targets = flatten_targets_in_chain(ability);
+            let targets = declared_targets_in_chain(ability);
             let resolve = |qty: &QuantityRef, scope: PlayerId| {
                 super::quantity::resolve_quantity_scoped_with_targets(
                     state,
@@ -28696,7 +28768,7 @@ fn parsed_condition_satisfied_with_committed_targets(
 /// and every other binding are kept.
 fn ability_with_chain_targets(ability: &ResolvedAbility) -> ResolvedAbility {
     let mut chain = ability.clone();
-    chain.targets = flatten_targets_in_chain(ability);
+    chain.targets = declared_targets_in_chain(ability);
     chain
 }
 

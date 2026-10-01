@@ -841,6 +841,7 @@
     "titleTargets": "Targets: {{targets}}",
     "titlePaid": "Paid: {{paid}}",
     "titleContext": "Context: {{context}}",
+    "revealedCards": "Revealed: {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}} mana",
     "paidColorsSpent": "{{count}} colors",
@@ -1422,6 +1423,7 @@
       "target": "Target",
       "return": "Return",
       "discard": "Discard",
+      "reveal": "Reveal",
       "evidence": "Evidence",
       "manifest": "Manifest",
       "untap": "Untap",
@@ -2044,7 +2046,11 @@
   },
   "zoneOpponentChooser": {
     "title": "Choose Opponent",
-    "subtitle": "Choose which opponent makes the choice."
+    "subtitle": "Choose which opponent makes the choice.",
+    "orderTitle": "Choose Next Player",
+    "orderSubtitle": "Choose whose selection to make next.",
+    "substituteTitle": "Choose Player",
+    "substituteSubtitle": "Choose who makes this choice."
   },
   "pileOpponent": {
     "title": "Choose Opponent",
@@ -2335,7 +2341,8 @@
       "zoneExile": "exile",
       "zoneHand": "your hand",
       "discard": "Discard {{count}} {{cards}}",
-      "exile": "Exile {{count}} {{cards}} from {{zone}}"
+      "exile": "Exile {{count}} {{cards}} from {{zone}}",
+      "reveal": "Reveal {{count}} {{cards}} from {{zone}}"
     }
   },
   "topOrBottom": {

@@ -505,7 +505,11 @@ pub fn resolve_triggered_mana_ability_inline(
         // rather than defaulting to `color_options.first()`.
         state.current_triggered_mana_override = color_override;
         // Use the standard resolution entry so sub_ability chains resolve uniformly.
+        // CR 605.4a: mark the inline subresolution so work that must belong to
+        // a resolution carrier refuses to park inside it.
+        state.mana_subresolution_depth += 1;
         let _ = super::effects::resolve_ability_chain(state, ability, events, 0);
+        state.mana_subresolution_depth -= 1;
         state.current_triggered_mana_override = previous_mana_override;
         state.current_trigger_event = previous_trigger_event;
     });
@@ -3835,7 +3839,11 @@ fn resolve_mana_ability_sub_chain(
     // Errors during the sub-chain are non-fatal — mana has already been
     // added to the pool and the cost has been paid. The damage/life clause
     // of a painland cannot legitimately fail in a well-formed game state.
+    // CR 605.3b: the sub-chain is an inline subresolution; see
+    // `GameState::mana_subresolution_depth`.
+    state.mana_subresolution_depth += 1;
     let _ = super::effects::resolve_ability_chain(state, sub, events, 0);
+    state.mana_subresolution_depth -= 1;
 }
 
 fn contains_duplicate_object_id(ids: &[ObjectId]) -> bool {
@@ -4873,7 +4881,11 @@ fn removable_counter_count_for_mana_cost(
         return 0;
     };
     match counter_type {
-        CounterMatch::Any => obj.counters.values().copied().sum(),
+        // CR 122.1: exact total clamped to u32. The count feeds only "can remove
+        // at least N" availability checks, so clamping preserves every such answer.
+        CounterMatch::Any => {
+            u32::try_from(counter_type.count_in(&obj.counters)).unwrap_or(u32::MAX)
+        }
         CounterMatch::OfType(counter_type) => obj.counters.get(counter_type).copied().unwrap_or(0),
     }
 }
