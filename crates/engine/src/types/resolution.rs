@@ -98,6 +98,10 @@ pub struct OptionalEffectFrame {
     pub trigger_events: Vec<GameEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_match_count: Option<u32>,
+    /// CR 608.2c: the resolving instruction-result frame survives a choice
+    /// prompt, including save/reload before its named result is published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_result_occurrence: Option<crate::types::game_state::ReturnResultOccurrenceId>,
 }
 
 /// CR 705.1 + CR 614.1a: Discriminates which multi-flip resolver paused for a
@@ -131,6 +135,14 @@ pub struct PendingCoinFlip {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lose_effect: Option<Box<AbilityDefinition>>,
     pub kind: PendingCoinFlipKind,
+    /// CR 608.2h: the creating ability's chain-root target list, carried
+    /// across the Krark's Thumb keep-choice suspension so a counter-gated
+    /// "that many" nested in `win_effect`/`lose_effect` still resolves
+    /// against the live chain-root target once the flip's branch runs.
+    /// `#[serde(default)]` for in-flight states serialized before this field
+    /// existed.
+    #[serde(default)]
+    pub chain_root_targets: Vec<TargetRef>,
 }
 
 /// CR 706.6 + CR 614.1a: Full resolution context for a die-roll resolver paused
@@ -217,6 +229,14 @@ pub struct PendingDieRoll {
     /// forced remainder so the resume path drops both halves together.
     #[serde(default)]
     pub forced_ignored: Vec<usize>,
+    /// CR 608.2h: the creating ability's chain-root target list, carried
+    /// across the CR 706.6 ignore choice AND any mid-loop results-branch
+    /// suspension so a counter-gated "that many" nested in a results-table
+    /// branch still resolves against the live chain-root target once that
+    /// branch actually runs. `#[serde(default)]` for in-flight states
+    /// serialized before this field existed.
+    #[serde(default)]
+    pub chain_root_targets: Vec<TargetRef>,
 }
 
 /// CR 706.1 + CR 616.1: A die-roll INSTRUCTION parked across a replacement
@@ -263,6 +283,12 @@ pub struct PendingDieRollInstruction {
     /// Which caller owns the completion of this roll (see the type docs).
     #[serde(default)]
     pub continuation: DieRollContinuation,
+    /// CR 608.2h: the creating ability's chain-root target list, carried
+    /// across the CR 616.1 replacement-ordering choice so it survives into
+    /// the `PendingDieRoll` this instruction produces. `#[serde(default)]`
+    /// for in-flight states serialized before this field existed.
+    #[serde(default)]
+    pub chain_root_targets: Vec<TargetRef>,
 }
 
 /// CR 706.1: Which caller finishes a parked die-roll instruction once a CR 616.1
@@ -833,6 +859,14 @@ impl ResolutionStack {
     /// to [`frame_vec`] and this module is its parent, not its descendant.
     pub fn capture_child_boundary(&self) -> ChildStackDepth {
         self.frames.capture_depth()
+    }
+
+    /// Whether the frame at the captured `child_stack_start` is a `CopyToken` owner.
+    pub fn copy_token_at_child_boundary(&self, child_stack_start: ChildStackDepth) -> bool {
+        self.frames
+            .slot_at_captured_depth(child_stack_start)
+            .and_then(|slot| self.frames.get(slot))
+            .is_some_and(|frame| matches!(frame, ResolutionFrame::CopyToken(_)))
     }
 
     pub fn last(&self) -> Option<&ResolutionFrame> {
@@ -3670,7 +3704,7 @@ const LEGACY_TYPED_FRAME_RESOLUTION_STATE_WIRE_VERSION: u64 = 2;
 /// that can produce it is an explicit remover.
 ///
 /// The remover is `client_state_wire_value` (`crate::game::derived_views`),
-/// which strips exactly these three plus six `skip_serializing_if` siblings.
+/// which strips exactly these four plus six `skip_serializing_if` siblings.
 /// The six siblings are deliberately NOT listed here: their absence is
 /// value-dependent, so it proves nothing.
 ///
@@ -3685,35 +3719,34 @@ const LEGACY_TYPED_FRAME_RESOLUTION_STATE_WIRE_VERSION: u64 = 2;
 /// limit and what its serde-default control does and does not close. Read it
 /// there before trusting this list against a serde change. Do not delete it.
 ///
-/// STOPGAP, and scoped to stay one. This list exists only because the producer
-/// leaves no positive mark. The engine's other projection gate,
+/// The producer now also writes a positive `wire_projection` mark. This list
+/// remains as a legacy fallback for unmarked historical captures, because
+/// those bytes cannot be retroactively stamped. The engine's other projection gate,
 /// `reject_viewer_projection_as_authority` (`crate::types::game_state`), keys
 /// on a `viewer_projection` stamp its writer sets; the principled sibling here
-/// is the same thing for the client wire — a `wire_projection` stamp written at
-/// `client_state_wire_value` (`crate::game::derived_views`). That stamp is a
-/// DEFERRED item and is not shipped, so reading absence is what a reader must
-/// do UNTIL THE PRODUCER STAMPS. When it lands, this const and
-/// [`is_redacted_client_wire_projection`] are what it replaces, and a versioned
-/// payload already takes [`declare_raw_resolution_wire`]'s early return, so it
-/// can supersede this without conflicting with it.
+/// is the same thing for the client wire — the `wire_projection` stamp written
+/// at `client_state_wire_value` (`crate::game::derived_views`) is checked before
+/// any declared-version early return. The absence fingerprint below remains
+/// only for legacy unmarked captures.
 const CLIENT_WIRE_UNCONDITIONAL_FIELDS: &[&str] = &[
     "next_delayed_trigger_token",
     "next_delayed_trigger_instance",
+    "next_resolution_cast_offer_id",
     "resolved_rules_journal",
 ];
 
 /// Whether an unversioned raw payload was written by the client wire rather
-/// than by a raw persistence writer — inferred from what that writer REMOVED,
-/// because it leaves no positive mark. A fingerprint UNTIL THE PRODUCER STAMPS:
-/// see [`CLIENT_WIRE_UNCONDITIONAL_FIELDS`] for the deferred `wire_projection`
-/// stamp at `client_state_wire_value` that supersedes it.
+/// than by a raw persistence writer — legacy inference from what that writer
+/// removed. New client wires carry the positive `wire_projection` marker and
+/// are rejected before this fallback is consulted.
 ///
 /// Conjunctive on purpose. Each field individually went in at a different time
 /// — `resolved_rules_journal` in #6331 (2026-07-22), the two allocators in
 /// #6842 (2026-08-01), while `resolution_stack` itself landed in #6269
-/// (2026-07-21) — so a genuine save from a build in the 2026-07-21..22 window
-/// carries `resolution_stack` and lacks all three legitimately. Requiring all
-/// three keeps that window as small as the field history allows. It changes no
+/// (2026-07-21). `next_resolution_cast_offer_id` is newer still, but a genuine
+/// save from the 2026-07-21..22 window carries `resolution_stack` and lacks all
+/// four legitimately. Requiring all four keeps that window as small as the
+/// field history allows. It changes no
 /// outcome regardless: every `resolution_stack`-bearing unversioned payload was
 /// refused outright before the wire inference existed, so a window save fails
 /// either way. Only the wording it receives changes, and the refusal raised by
@@ -3722,8 +3755,8 @@ const CLIENT_WIRE_UNCONDITIONAL_FIELDS: &[&str] = &[
 ///
 /// The conjunction AND each entry of the `const` above are pinned by
 /// `redaction_fingerprint_is_conjunctive_over_every_unconditional_field`
-/// (`types/game_state.rs` `mod tests`), which decodes three payloads each
-/// carrying exactly one of the three keys. A `.any(…)` here, or a dropped
+/// (`types/game_state.rs` `mod tests`), which decodes four payloads each
+/// carrying exactly one of the four keys. A `.any(…)` here, or a dropped
 /// `const` entry, reddens it.
 fn is_redacted_client_wire_projection(object: &Map<String, Value>) -> bool {
     CLIENT_WIRE_UNCONDITIONAL_FIELDS
@@ -3744,19 +3777,14 @@ fn is_redacted_client_wire_projection(object: &Map<String, Value>) -> bool {
 /// 2. `client_state_wire_value` (`crate::game::derived_views`) — production
 ///    Rust, the origin of every payload that crosses the WASM boundary to the
 ///    client, and therefore of every client debug export. It runs that same
-///    derived `Serialize` and then removes nine top-level carriers plus a
-///    recursive six-key firing sweep. It removes NEITHER `resolution_stack`
-///    NOR `resolving_stack_entry`, so its output carries `resolution_stack`
-///    under exactly the same condition as (1).
+///    derived `Serialize`, writes a positive `wire_projection` marker, and
+///    removes the private top-level carriers plus recursive firing data. The
+///    shared viewer projection also removes the private `resolution_stack`.
 ///
-///    Writer (2)'s UNVERSIONED output is now REFUSED rather than inferred:
-///    [`is_redacted_client_wire_projection`] recognises it by the three
-///    unconditionally-serialized fields the redactor removes, and this function
-///    returns an error for it below. A VERSIONED client-wire payload is
-///    unaffected — it takes the first statement's early return and never
-///    reaches the fingerprint check, which is what leaves room for a future
-///    write-time `wire_projection` stamp to supersede the inference without
-///    conflicting with it.
+///    Writer (2)'s output is refused by the positive marker before any
+///    declared-version or unversioned wire inference. Historical unmarked
+///    captures still use [`is_redacted_client_wire_projection`] as a
+///    compatibility fallback below.
 ///
 ///    `phase_ai::saved_state::load_saved_game_state` is a second in-repo
 ///    consumer of this arm besides a player's restore: it decodes the
@@ -3769,13 +3797,11 @@ fn is_redacted_client_wire_projection(object: &Map<String, Value>) -> bool {
 ///
 /// This reader keys on that field, and the mapping holds for both writers.
 ///
-/// For writer (2) that agreement is a fact about a MUTABLE removal list, not a
-/// structural identity: if `client_state_wire_value` ever begins stripping
-/// `resolution_stack`, this rule silently stops applying to the entire
-/// client-wire population, with no compiler signal. That is why it is pinned by
-/// a test rather than by this comment — `client_wire_still_carries_resolution_stack`
-/// in `types/game_state.rs`'s `mod tests` goes red if the redactor's keep-list
-/// changes. Do not delete it.
+/// For historical writer (2) bytes that agreement is a fact about a MUTABLE
+/// removal list, not a structural identity. New bytes do not depend on that
+/// premise because the positive marker is checked first. The projection test
+/// in `types/game_state.rs` pins that the shared fail-closed redaction removes
+/// the private stack and emits the marker.
 ///
 /// The version stamped below is the same kind of mutable premise: the mapping
 /// is to the current typed-frame shape, whose carrier is `resolution_frames`
@@ -3812,6 +3838,7 @@ fn is_redacted_client_wire_projection(object: &Map<String, Value>) -> bool {
 /// `ResolutionStack`.
 /// The move below is a rename, not a reinterpretation.
 pub(crate) fn declare_raw_resolution_wire(value: &mut Value) -> Result<(), String> {
+    reject_wire_projection_marker(value)?;
     let object = value
         .as_object_mut()
         .ok_or_else(|| "persisted game state must be a JSON object".to_string())?;
@@ -3868,7 +3895,7 @@ pub(crate) fn declare_raw_resolution_wire(value: &mut Value) -> Result<(), Strin
         return Err(
             // Written to be TRUE of both populations that reach here, not just
             // the client-wire one. A genuine save from the 2026-07-21..22 build
-            // window lacks all three fingerprint fields legitimately, and is
+            // window lacks all four fingerprint fields legitimately, and is
             // refused by this same statement; telling that player their file is
             // a debug export would be a false statement of fact about their
             // file. So the first clause states only what is observable of the
@@ -3903,6 +3930,22 @@ pub(crate) fn declare_raw_resolution_wire(value: &mut Value) -> Result<(), Strin
                 Value::from(LEGACY_RESOLUTION_STATE_WIRE_VERSION),
             );
         }
+    }
+    Ok(())
+}
+
+/// Refuses a client projection at any persistence ingress, including a
+/// versioned/trusted envelope. Transport decoding intentionally does not call
+/// this helper because redacted client state is valid on the wire.
+pub(crate) fn reject_wire_projection_marker(value: &Value) -> Result<(), String> {
+    if value
+        .as_object()
+        .is_some_and(|object| object.contains_key("wire_projection"))
+    {
+        return Err(
+            "This saved game is missing the private rules record for the resolution it was paused in — this is what a debug export of the on-screen state looks like."
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -4185,11 +4228,13 @@ impl ResolutionStateWire {
                     }
                 }
                 normalize_legacy_completed_resolution_carrier(&mut legacy);
+                crate::types::game_state::normalize_resolution_cast_offer_allocator(&mut legacy)?;
                 let frames = canonicalize_legacy_resolution_state(&legacy)?;
                 frames
                     .validate(&legacy.waiting_for)
                     .map_err(|error| error.to_string())?;
                 crate::types::game_state::validate_trigger_firing_coherence(&legacy)?;
+                crate::types::game_state::validate_return_result_occurrence_coherence(&legacy)?;
                 #[cfg(debug_assertions)]
                 debug_assert_runtime_resolution_invariants(&legacy);
                 Ok(Self { state: legacy })
@@ -4238,6 +4283,10 @@ impl ResolutionStateWire {
                     .validate(&state.waiting_for)
                     .map_err(|error| error.to_string())?;
                 let projected = project_frames_into_legacy_state(&state, &frames)?;
+                let mut projected = projected;
+                crate::types::game_state::normalize_resolution_cast_offer_allocator(
+                    &mut projected,
+                )?;
                 let canonical = canonicalize_legacy_resolution_state(&projected)?;
                 if canonical != frames {
                     return Err(
@@ -4246,6 +4295,7 @@ impl ResolutionStateWire {
                     );
                 }
                 crate::types::game_state::validate_trigger_firing_coherence(&projected)?;
+                crate::types::game_state::validate_return_result_occurrence_coherence(&projected)?;
                 #[cfg(debug_assertions)]
                 debug_assert_runtime_resolution_invariants(&projected);
                 Ok(Self { state: projected })
@@ -4809,6 +4859,7 @@ impl LegacyOptionalEffectWire {
             // (no in-flight reproduction on a legacy-serialized optional frame).
             trigger_events: Vec::new(),
             trigger_match_count: self.pending_optional_trigger_match_count,
+            return_result_occurrence: None,
         }))
     }
 }
@@ -5588,6 +5639,7 @@ mod tests {
             .expect("empty logical group still needs its pre-delivery latch");
         ResolutionFrame::ChangeZone(Box::new(ChangeZoneFrame {
             pending: Some(PendingChangeZoneIteration {
+                pending_return_result_producer: None,
                 logical_zone_change_group,
                 paused_current: None,
                 remaining: Vec::new(),
@@ -5603,6 +5655,7 @@ mod tests {
                 conditional_enter_with_counters: Vec::new(),
                 duration: None,
                 track_exiled_by_source: false,
+                face_down_in_exile: crate::types::ability::ExileConcealment::Public,
                 moved_count: None,
                 face_down_profile: None,
                 library_placement: None,
@@ -6159,6 +6212,7 @@ mod tests {
             win_effect: None,
             lose_effect: None,
             kind: PendingCoinFlipKind::Single,
+            chain_root_targets: Vec::new(),
         });
         let mut stack = ResolutionStack::default();
         stack.push_inner(frame);
@@ -6185,11 +6239,13 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         }));
         optional_effect
             .validate(&WaitingFor::OpponentMayChoice {
                 player: PlayerId(1),
                 source_id: ObjectId(6),
+                decision_subject_id: None,
                 description: None,
                 remaining: Vec::new(),
             })
@@ -6199,6 +6255,7 @@ mod tests {
             optional_effect.validate(&WaitingFor::OpponentMayChoice {
                 player: PlayerId(1),
                 source_id: ObjectId(6),
+                decision_subject_id: None,
                 description: None,
                 remaining: Vec::new(),
             }),
@@ -6219,6 +6276,7 @@ mod tests {
             win_effect: None,
             lose_effect: None,
             kind: PendingCoinFlipKind::Single,
+            chain_root_targets: Vec::new(),
         }));
         assert_eq!(
             optional_effect.validate(&WaitingFor::CoinFlipKeepChoice {
@@ -6269,6 +6327,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         }));
         let optional_payload = v2_fixture_with_frames(optional_state, optional_frames);
         let restored: ResolutionStateWire = serde_json::from_value(optional_payload)
@@ -6354,6 +6413,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         })
     }
 
@@ -6361,6 +6421,7 @@ mod tests {
         WaitingFor::OpponentMayChoice {
             player: PlayerId(1),
             source_id: ObjectId(7),
+            decision_subject_id: None,
             description: None,
             remaining: Vec::new(),
         }
@@ -6529,6 +6590,7 @@ mod tests {
             win_effect: None,
             lose_effect: None,
             kind: PendingCoinFlipKind::Single,
+            chain_root_targets: Vec::new(),
         };
 
         let mut v1 = serde_json::to_value(&state).expect("legacy state serializes");
@@ -6786,11 +6848,13 @@ mod tests {
                 trigger_event: None,
                 trigger_events: Vec::new(),
                 trigger_match_count: None,
+                return_result_occurrence: None,
             })
         };
         let opponent_may = WaitingFor::OpponentMayChoice {
             player: PlayerId(1),
             source_id: ObjectId(81),
+            decision_subject_id: None,
             description: None,
             remaining: Vec::new(),
         };
@@ -6875,6 +6939,7 @@ mod tests {
         repeated.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
             source_id: ObjectId(100),
+            decision_subject_id: None,
             description: None,
             may_trigger_key: None,
             same_card_may_trigger_choice_available: false,
@@ -6902,6 +6967,7 @@ mod tests {
         optional.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
             source_id: ObjectId(102),
+            decision_subject_id: None,
             description: None,
             may_trigger_key: None,
             same_card_may_trigger_choice_available: false,
@@ -6913,6 +6979,7 @@ mod tests {
                 trigger_event: None,
                 trigger_events: Vec::new(),
                 trigger_match_count: None,
+                return_result_occurrence: None,
             },
         );
         apply_as_current(
@@ -6939,6 +7006,7 @@ mod tests {
                 win_effect: None,
                 lose_effect: None,
                 kind: PendingCoinFlipKind::Single,
+                chain_root_targets: Vec::new(),
             },
         );
         apply_as_current(
@@ -7360,6 +7428,7 @@ mod tests {
                 remaining_voters: Vec::new(),
                 source_id: ObjectId(132),
                 controller: PlayerId(0),
+                chain_root_targets: Vec::new(),
             },
         );
         crate::game::effects::vote::drain_active_vote_ballot(&mut vote, &mut Vec::new());
@@ -8273,6 +8342,7 @@ mod tests {
             win_effect: None,
             lose_effect: None,
             kind: PendingCoinFlipKind::Single,
+            chain_root_targets: Vec::new(),
         };
         let mut multiple_direct = serde_json::to_value(multiple_direct).expect("v1 serializes");
         multiple_direct["pending_coin_flip"] =
@@ -8292,6 +8362,7 @@ mod tests {
         buried_optional.waiting_for = WaitingFor::OptionalEffectChoice {
             player: PlayerId(0),
             source_id: ObjectId(151),
+            decision_subject_id: None,
             description: None,
             may_trigger_key: None,
             same_card_may_trigger_choice_available: false,
@@ -8302,6 +8373,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         }));
         buried_optional_frames.push_inner(continuation_frame(151));
         assert!(
@@ -8443,6 +8515,7 @@ mod tests {
             win_effect: None,
             lose_effect: None,
             kind: PendingCoinFlipKind::Single,
+            chain_root_targets: Vec::new(),
         }));
         assert!(
             serde_json::from_value::<ResolutionStateWire>(v2_fixture_with_frames(

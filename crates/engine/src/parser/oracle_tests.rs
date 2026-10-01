@@ -131,6 +131,234 @@ fn unsupported_ability_ir_lowering_preserves_generic_and_structural_payloads() {
     assert_eq!(structural.description.as_deref(), Some("unsupported line"));
 }
 
+/// CR 118.3 + CR 601.2h review follow-up (PR #9207): a composite mana-ability
+/// cost mixing an `Any`-type chosen-count `RemoveCounter` leaf with a typed
+/// (`OfType`) chosen-count leaf has no sound reservation model at runtime —
+/// `mana_abilities::advance_mana_ability_activation` refuses to activate it.
+/// The parser must not silently present this shape as an ordinary supported
+/// ability: `demote_unsupported_composite_counter_choice_costs` must demote
+/// its effect to `Effect::unimplemented`, keeping the coverage report and the
+/// runtime behavior in agreement. An ability with only ONE such leaf, or two
+/// leaves of the SAME kind (both `OfType` of the same type, or both `Any`),
+/// must be left untouched — those shapes remain fully supported.
+#[test]
+fn composite_counter_choice_cost_mixing_any_and_typed_leaves_is_demoted_to_unimplemented() {
+    fn mana_ability(cost: AbilityCost) -> AbilityDefinition {
+        AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Mana {
+                produced: crate::types::ability::ManaProduction::Fixed {
+                    colors: vec![crate::types::mana::ManaColor::Green],
+                    contribution: crate::types::ability::ManaContribution::Base,
+                },
+                restrictions: Vec::new(),
+                grants: Vec::new(),
+                expiry: None,
+                target: None,
+            },
+        )
+        .cost(cost)
+    }
+    fn remove_counter_leaf(count: u32, counter_type: CounterMatch) -> AbilityCost {
+        AbilityCost::RemoveCounter {
+            count,
+            counter_type,
+            target: None,
+            selection: crate::types::ability::CounterCostSelection::SingleObject,
+        }
+    }
+
+    let storage = CounterMatch::OfType(CounterType::Generic("storage".to_string()));
+    let charge = CounterMatch::OfType(CounterType::Generic("charge".to_string()));
+
+    let mut parsed = parse_oracle_text("", "Counter Choice Fixture", &[], &[], &[]);
+    // 0 — the shape under test: Any mixed with a typed leaf. Must be demoted.
+    parsed.abilities.push(mana_ability(AbilityCost::Composite {
+        costs: vec![
+            remove_counter_leaf(
+                crate::types::ability::REMOVE_COUNTER_COST_X,
+                CounterMatch::Any,
+            ),
+            remove_counter_leaf(
+                crate::types::ability::REMOVE_COUNTER_COST_ANY_NUMBER,
+                storage.clone(),
+            ),
+        ],
+    }));
+    // 1 — reach guard: a single Any leaf alone must NOT be demoted.
+    parsed.abilities.push(mana_ability(remove_counter_leaf(
+        crate::types::ability::REMOVE_COUNTER_COST_ANY_NUMBER,
+        CounterMatch::Any,
+    )));
+    // 2 — reach guard: a single typed leaf alone must NOT be demoted.
+    parsed.abilities.push(mana_ability(remove_counter_leaf(
+        crate::types::ability::REMOVE_COUNTER_COST_X,
+        storage.clone(),
+    )));
+    // 3 — reach guard: two SAME-type typed leaves (Saltcrusted-Steppe-adjacent
+    // shape from the sibling regression in mana_abilities.rs) must NOT be
+    // demoted — this composite has a sound exact reservation.
+    parsed.abilities.push(mana_ability(AbilityCost::Composite {
+        costs: vec![
+            remove_counter_leaf(
+                crate::types::ability::REMOVE_COUNTER_COST_X,
+                storage.clone(),
+            ),
+            remove_counter_leaf(
+                crate::types::ability::REMOVE_COUNTER_COST_ANY_NUMBER,
+                storage.clone(),
+            ),
+        ],
+    }));
+    // 4 — reach guard: two DIFFERENT-type typed leaves must NOT be demoted —
+    // no ambiguity, they draw from disjoint pools.
+    parsed.abilities.push(mana_ability(AbilityCost::Composite {
+        costs: vec![
+            remove_counter_leaf(crate::types::ability::REMOVE_COUNTER_COST_X, storage),
+            remove_counter_leaf(
+                crate::types::ability::REMOVE_COUNTER_COST_ANY_NUMBER,
+                charge,
+            ),
+        ],
+    }));
+    // 5 — reach guard: two Any leaves must NOT be demoted — an exact
+    // aggregate reservation is sound for this pair.
+    parsed.abilities.push(mana_ability(AbilityCost::Composite {
+        costs: vec![
+            remove_counter_leaf(
+                crate::types::ability::REMOVE_COUNTER_COST_X,
+                CounterMatch::Any,
+            ),
+            remove_counter_leaf(
+                crate::types::ability::REMOVE_COUNTER_COST_ANY_NUMBER,
+                CounterMatch::Any,
+            ),
+        ],
+    }));
+
+    demote_unsupported_composite_counter_choice_costs(&mut parsed);
+
+    assert!(
+        matches!(
+            parsed.abilities[0].effect.as_ref(),
+            Effect::Unimplemented { name, .. } if name == "counter_choice_cost_mixes_any_with_typed"
+        ),
+        "an Any-plus-typed composite must be demoted, got {:?}",
+        parsed.abilities[0].effect
+    );
+    for (index, label) in [
+        (1, "a lone Any leaf"),
+        (2, "a lone typed leaf"),
+        (3, "two same-type typed leaves"),
+        (4, "two different-type typed leaves"),
+        (5, "two Any leaves"),
+    ] {
+        assert!(
+            matches!(parsed.abilities[index].effect.as_ref(), Effect::Mana { .. }),
+            "{label} must NOT be demoted, got {:?}",
+            parsed.abilities[index].effect
+        );
+    }
+}
+
+/// Companion to the reach-guard matrix above, through the PRODUCTION pipeline
+/// rather than a hand-built `ParsedAbilities`: proves real Oracle text
+/// actually lowers to the mixed Any + typed `RemoveCounter` composite this
+/// demotion targets, and that `parse_oracle_text` — which runs
+/// `demote_unsupported_composite_counter_choice_costs` internally, alongside
+/// every other post-lowering demotion pass — retains the
+/// `Effect::unimplemented("counter_choice_cost_mixes_any_with_typed", ..)`
+/// marker on the resulting ability. The unit test above proves the demoter's
+/// OWN matching logic against six planted shapes without depending on cost
+/// parsing at all; this test is the missing link that a parser or lowering
+/// regression could otherwise leave real Oracle input silently "supported"
+/// while that unit test stays green, since it never calls `parse_oracle_cost`
+/// or `parse_oracle_pipeline`.
+///
+/// No real printed card uses this cost shape — it does not correspond to any
+/// class of Magic card, only to the synthetic combination the review
+/// identified as structurally ambiguous — so the Oracle text below is
+/// invented to exercise the parser on the two sub-costs, not transcribed
+/// from a printed card.
+#[test]
+fn oracle_text_mixing_any_and_typed_counter_choice_costs_parses_to_demoted_ability() {
+    let oracle = "{T}: Add {C}.\n\
+{T}, Remove X counters from ~, Remove any number of storage counters from ~: Add {C}.";
+    let parsed = parse_oracle_text(
+        oracle,
+        "Counter Choice Fixture Land",
+        &[],
+        &["Land".to_string()],
+        &[],
+    );
+
+    let mixed = parsed
+        .abilities
+        .iter()
+        .find(|ability| {
+            matches!(
+                &ability.cost,
+                Some(AbilityCost::Composite { costs })
+                    if costs.iter().any(|cost| matches!(cost, AbilityCost::RemoveCounter { .. }))
+            )
+        })
+        .expect("the second line's composite cost must parse as an activated ability");
+
+    // Confirm the parser actually built the shape under test — a lone-`Any`
+    // or lone-typed misparse of either clause would make the demotion
+    // assertion below vacuous.
+    match mixed.cost.as_ref().expect("composite cost") {
+        AbilityCost::Composite { costs } => {
+            assert!(
+                costs.iter().any(|cost| matches!(
+                    cost,
+                    AbilityCost::RemoveCounter {
+                        counter_type: CounterMatch::Any,
+                        target: None,
+                        ..
+                    }
+                )),
+                "expected an untyped self-RemoveCounter leaf, got {costs:?}"
+            );
+            assert!(
+                costs.iter().any(|cost| matches!(
+                    cost,
+                    AbilityCost::RemoveCounter {
+                        counter_type: CounterMatch::OfType(counter_type),
+                        target: None,
+                        ..
+                    } if *counter_type == CounterType::Generic("storage".to_string())
+                )),
+                "expected a storage-typed self-RemoveCounter leaf, got {costs:?}"
+            );
+        }
+        other => panic!("expected Composite cost, got {other:?}"),
+    }
+
+    assert!(
+        matches!(
+            mixed.effect.as_ref(),
+            Effect::Unimplemented { name, .. } if name == "counter_choice_cost_mixes_any_with_typed"
+        ),
+        "production parsing of the mixed Any+typed composite must demote to \
+         the shared strict-failure marker, got {:?}",
+        mixed.effect
+    );
+
+    // Reach guard: the sibling `{T}: Add {C}.` mana ability (a single `Tap`
+    // cost, no `RemoveCounter` at all) must be untouched by this pass.
+    let tap_only = parsed
+        .abilities
+        .iter()
+        .find(|ability| matches!(&ability.cost, Some(AbilityCost::Tap)))
+        .expect("the first line's plain tap ability must also parse");
+    assert!(
+        matches!(tap_only.effect.as_ref(), Effect::Mana { .. }),
+        "an unrelated tap-only mana ability must not be demoted, got {:?}",
+        tap_only.effect
+    );
+}
+
 /// A forced diagonal for CopyChosenHost provenance. Two eligible chooser gaps
 /// and two CopyChosen statics prove the document relation binds the first
 /// source-order pair exactly once; the later copy ability proves the transformed
@@ -4638,6 +4866,64 @@ fn chosen_type_cost_reducer_links_to_card_choose_clause() {
     );
 }
 
+/// CR 607.2d + CR 205.3: a persisted creature-type choice must realign the
+/// `SpellCast` trigger's spell filter, not only static cost reducers and Dig
+/// filters. The three cards below share the complete printed relation class.
+#[test]
+fn chosen_creature_type_spell_cast_trigger_filters_are_retargeted() {
+    let cases = [
+        (
+            "Reflections of Littjara",
+            &["Enchantment"] as &[&str],
+            &[],
+            "As this enchantment enters, choose a creature type.\nWhenever you cast a spell of the chosen type, copy that spell. (A copy of a permanent spell becomes a token.)",
+        ),
+        (
+            "Door of Destinies",
+            &["Artifact"] as &[&str],
+            &[],
+            "As this artifact enters, choose a creature type.\nWhenever you cast a spell of the chosen type, put a charge counter on this artifact.\nCreatures you control of the chosen type get +1/+1 for each charge counter on this artifact.",
+        ),
+        (
+            "Chronicle of Victory",
+            &["Legendary", "Artifact"] as &[&str],
+            &[],
+            "As Chronicle of Victory enters, choose a creature type.\nCreatures you control of the chosen type get +2/+2 and have first strike and trample.\nWhenever you cast a spell of the chosen type, draw a card.",
+        ),
+    ];
+
+    for (name, types, subtypes, oracle) in cases {
+        let parsed = parse(oracle, name, &[], types, subtypes);
+        let trigger = parsed
+            .triggers
+            .iter()
+            .find(|trigger| trigger.mode == TriggerMode::SpellCast)
+            .unwrap_or_else(|| panic!("{name} must parse its SpellCast trigger: {parsed:#?}"));
+        let valid_card = trigger
+            .valid_card
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} SpellCast trigger must retain its spell filter"));
+
+        assert!(
+            crate::game::filter::filter_contains_filter_prop(valid_card, &|prop| {
+                matches!(prop, FilterProp::IsChosenCreatureType)
+            }),
+            "{name} trigger must match the persisted chosen creature type: {trigger:#?}"
+        );
+        assert!(
+            !crate::game::filter::filter_contains_filter_prop(valid_card, &|prop| {
+                matches!(prop, FilterProp::IsChosenCardType)
+            }),
+            "{name} trigger must not retain a card-type discriminator: {trigger:#?}"
+        );
+        assert!(
+            parsed.parse_warnings.is_empty(),
+            "{name} must reach a complete parse, got warnings: {:?}",
+            parsed.parse_warnings
+        );
+    }
+}
+
 #[test]
 fn mindlock_orb_routes_to_static_search_prohibition() {
     let r = parse(
@@ -5877,7 +6163,9 @@ fn bhaal_myrkul_half_starting_life_static_has_typed_condition_no_dynamic_qty_war
                 assert!(matches!(
                     inner.as_ref(),
                     QuantityExpr::Ref {
-                        qty: QuantityRef::StartingLifeTotal
+                        qty: QuantityRef::StartingLifeTotal {
+                            player: PlayerScope::Controller,
+                        }
                     }
                 ));
             }
@@ -6508,6 +6796,23 @@ fn vazal_megalegendary_line_consumed_and_limit_extracted() {
     // static producer, the whole-line marker), not just the fallback's spelling.
     // Form (i) — "no `Unimplemented` at all" — is unavailable: Vazal's third line
     // legitimately carries one.
+    // Pin the precondition the negative below depends on. Measured by mutation, not
+    // argued: break the recognizer alone and the negative goes RED (the line falls
+    // through to a `static_structure` gap, which carries the text). But break the
+    // recognizer AND let a sibling line rule swallow the bare keyword first, and the
+    // negative goes GREEN while the copy-limit path is entirely dead -- consumed by
+    // the wrong authority, with nothing reported either way. This assertion is what
+    // separates those two worlds, so this row's green means "the intended consumer
+    // ran", not merely "nothing was reported".
+    //
+    // `deck_construction_copy_limit_sentence_positive_cases` also covers the
+    // recognizer, so the suite was never blind to this; what was missing is that THIS
+    // row could not stand on its own evidence.
+    assert!(
+        is_deck_construction_copy_limit_sentence("Megalegendary"),
+        "the recognizer that consumes this line must still accept it"
+    );
+
     const MEGALEGENDARY: &str = "megalegendary";
     let megalegendary_unimplemented = r.abilities.iter().any(|a| {
         a.effect
@@ -10216,7 +10521,10 @@ fn bound_by_moonsilver_sacrifice_another_attach_activated() {
         tf.properties
     );
 
-    let Effect::Attach { attachment, target } = ability.effect.as_ref() else {
+    let Effect::Attach {
+        attachment, target, ..
+    } = ability.effect.as_ref()
+    else {
         panic!("expected Attach effect, got {:?}", ability.effect);
     };
     assert_eq!(*attachment, TargetFilter::SelfRef);
@@ -11810,10 +12118,10 @@ fn full_throttle_parses_additional_combats_and_delayed_combat_trigger() {
     assert!(matches!(
         r.abilities[0].effect.as_ref(),
         Effect::AdditionalPhase {
-            after: Phase::PreCombatMain,
+            after,
             count: QuantityExpr::Fixed { value: 2 },
             ..
-        }
+        } if *after == crate::types::ability::ExtraPhaseAnchor::this_main_phase()
     ));
     assert!(matches!(
         r.abilities[1].effect.as_ref(),
@@ -19464,6 +19772,7 @@ fn glamdring_foe_hammer_equipped_power_cost_reduction_and_equip_parse() {
         amount: ManaCost::Cost { generic: 1, .. },
         spell_filter: Some(TargetFilter::Or { ref filters }),
         dynamic_count: Some(QuantityRef::PropertyAggregate(ref aggregate)),
+        ..
     } = &r.statics[0].mode
     else {
         panic!(
@@ -23575,6 +23884,7 @@ fn crumbling_sanctuary_parses_as_replacement_without_swallowed_clause() {
             },
             position: crate::types::ability::LibraryPosition::Top,
             face_down: false,
+            actor: crate::types::ability::LibraryInstructionActor::LibraryPlayer,
         }
     ));
 }
@@ -24689,6 +24999,7 @@ fn defiler_single_line_cost_reduction_parses_as_dedicated_static() {
             color,
             life_cost,
             mana_reduction,
+            reach,
         } => {
             assert_eq!(*color, ManaColor::Blue);
             assert_eq!(*life_cost, 2);
@@ -24698,6 +25009,14 @@ fn defiler_single_line_cost_reduction_parses_as_dedicated_static() {
                     shards: vec![ManaCostShard::Blue],
                     generic: 0,
                 }
+            );
+            // CR 118.7b/c/d: the printed rider ("This effect reduces only the
+            // amount of blue mana you pay") must be captured, not dropped —
+            // it is what stops the {U} reduction shaving generic mana off a
+            // blue permanent spell whose cost has no {U} pip.
+            assert_eq!(
+                *reach,
+                crate::types::statics::CostReductionReach::ColoredManaOnly
             );
         }
         other => panic!("expected DefilerCostReduction, got {other:?}"),
@@ -25285,6 +25604,109 @@ fn drizzt_dies_trigger_puts_difference_counters_gated_by_power_comparison() {
                 scope: ObjectScope::Source,
             },
         }
+    );
+}
+
+/// CR 208.1 + CR 608.2c: Shelinda, Yevon Acolyte — "put a +1/+1 counter on that
+/// creature if its power is less than ~'s power. Otherwise, put a +1/+1 counter
+/// on ~." The trailing "if" compares the entering creature's (EventSource)
+/// current power against the source's power. It must gate the first counter
+/// placement so the "Otherwise" clause binds as that clause's `else_ability`
+/// instead of degrading to an `Unimplemented("otherwise")` placeholder.
+#[test]
+fn shelinda_trailing_power_comparison_binds_otherwise_as_else_branch() {
+    use crate::types::counter::CounterType;
+
+    let r = parse(
+        "Lifelink\n\
+         Whenever another creature you control enters, put a +1/+1 counter on that creature if its power is less than Shelinda's power. Otherwise, put a +1/+1 counter on Shelinda.",
+        "Shelinda, Yevon Acolyte",
+        &[],
+        &["Creature"],
+        &["Human", "Cleric"],
+    );
+
+    let trigger = r
+        .triggers
+        .iter()
+        .find(|t| {
+            t.execute
+                .as_ref()
+                .is_some_and(|e| matches!(&*e.effect, Effect::PutCounter { .. }))
+        })
+        .unwrap_or_else(|| panic!("no ETB PutCounter trigger parsed: {r:#?}"));
+    let execute = trigger.execute.as_ref().expect("trigger has a body");
+    assert!(
+        !has_unimplemented(execute),
+        "trigger body must not contain an Unimplemented placeholder: {execute:#?}"
+    );
+
+    // If-branch: +1/+1 counter on the entering creature, gated by the comparison.
+    match &*execute.effect {
+        Effect::PutCounter {
+            counter_type,
+            target,
+            ..
+        } => {
+            assert_eq!(*counter_type, CounterType::Plus1Plus1);
+            assert_eq!(*target, TargetFilter::TriggeringSource);
+        }
+        other => panic!("if-branch must be PutCounter, got {other:?}"),
+    }
+    assert!(
+        execute.condition.is_some(),
+        "the trailing power comparison must gate the if-branch: {execute:#?}"
+    );
+
+    // Else-branch: +1/+1 counter on Shelinda herself.
+    let else_def = execute
+        .else_ability
+        .as_deref()
+        .unwrap_or_else(|| panic!("Otherwise must bind as else_ability: {execute:#?}"));
+    match &*else_def.effect {
+        Effect::PutCounter {
+            counter_type,
+            target,
+            ..
+        } => {
+            assert_eq!(*counter_type, CounterType::Plus1Plus1);
+            assert_eq!(*target, TargetFilter::SelfRef);
+        }
+        other => panic!("else-branch must be PutCounter on ~, got {other:?}"),
+    }
+}
+
+/// CR 208.1: Sage-Eye Avengers — "return target creature to its owner's hand
+/// if its power is less than this creature's power." Here the possessive "its"
+/// is the chosen TARGET, not the trigger event object. For an attack trigger the
+/// event object is Sage-Eye itself, so binding "its" to `EventSource` would
+/// compare Sage-Eye's power with its own — always false — and silently make the
+/// ability unusable. Neither the trigger nor its body may carry that binding.
+#[test]
+fn sage_eye_avengers_target_possessive_is_not_bound_to_the_event_object() {
+    let r = parse(
+        "Prowess\n\
+         Whenever this creature attacks, you may return target creature to its owner's hand if its power is less than this creature's power.",
+        "Sage-Eye Avengers",
+        &[],
+        &["Creature"],
+        &["Djinn", "Monk"],
+    );
+
+    let attack = r
+        .triggers
+        .iter()
+        .find(|t| {
+            t.execute
+                .as_ref()
+                .is_some_and(|e| matches!(&*e.effect, Effect::Bounce { .. }))
+        })
+        .unwrap_or_else(|| panic!("no attack Bounce trigger parsed: {r:#?}"));
+
+    let rendered = format!("{:?} {:?}", attack.condition, attack.execute);
+    assert!(
+        !rendered.contains("EventSource"),
+        "the target's possessive must not be bound to the attacking source: {rendered}"
     );
 }
 
@@ -28929,7 +29351,7 @@ fn census_variant_names(body: &str) -> Vec<String> {
 /// it.
 #[test]
 fn render_net_effect_carrier_census() {
-    const EFFECT_VARIANT_PIN: usize = 233;
+    const EFFECT_VARIANT_PIN: usize = 234;
     /// `(enum header, pinned variant count, the ONE variant the net destructures)`.
     const PAYLOAD_ENUM_PINS: &[(&str, usize, &str)] = &[
         ("pub enum CastingPermission {", 8, "ExileWithAltCost"),
@@ -29382,6 +29804,7 @@ fn render_net_reaches_every_nested_description_carrier() {
                 enters_with_counter: None,
                 enters_with_modifications: vec![granted("grant_casting_permission")],
                 mana_spend_permission: None,
+                cast_cost_modifier: None,
             },
             target: TargetFilter::Any,
             grantee: PermissionGrantee::AbilityController,
@@ -29625,6 +30048,7 @@ fn guard_walk_reaches_every_continuous_modification_carrier() {
                     enters_with_counter: None,
                     enters_with_modifications: vec![marked()],
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 },
                 target: TargetFilter::Any,
                 grantee: PermissionGrantee::AbilityController,
@@ -29877,7 +30301,7 @@ fn granted_cost_axis_is_not_walked_and_no_parse_shape_reaches_it() {
 
 /// CR 603.2 + CR 608.2c: Cyclops Gladiator (verbatim MTGJSON Oracle text) —
 /// the "if you do" continuation's damage-back amount must keep reading the
-/// TARGET creature's power (`ObjectScope::EventSource`, the "that creature"
+/// TARGET creature's power (`ObjectScope::Anaphoric`, the "that creature"
 /// established by the first sentence), never the attacking Cyclops's own
 /// power.
 ///
@@ -29895,7 +30319,7 @@ fn granted_cost_axis_is_not_walked_and_no_parse_shape_reaches_it() {
 /// predecessor (Galion's shape), not `Effect::DealDamage`, so it returns
 /// `None` here and control reached the (then-unconstrained) rebind, clearing
 /// `ctx.subject` to `None` and silently flipping the damage-back amount's
-/// possessive "its power" from the target's power (`EventSource`) to the
+/// possessive "its power" from the target's power to the
 /// Cyclops's own power (`Source`) — a real rules regression, not just a
 /// cosmetic parse-tree diff. The fix scopes the rebind to the bare
 /// possessive-pronoun base-P/T-set clause shape only
@@ -29967,7 +30391,7 @@ fn cyclops_gladiator_if_you_do_damage_back_reads_targets_power_not_sources() {
         *back_amount,
         QuantityExpr::Ref {
             qty: QuantityRef::Power {
-                scope: ObjectScope::EventSource,
+                scope: ObjectScope::Anaphoric,
             },
         },
         "the damage-back amount must read the TARGET creature's ('that \
@@ -30355,6 +30779,55 @@ fn printed_subject_of_a_choosing_sentence_becomes_the_target_chooser() {
     let _ = ControllerRef::Opponent;
 }
 
+/// CR 116.2a: the land-play fragment recognizer is a BUILDING BLOCK, so it is
+/// tested across its input range rather than on one card's spelling.
+///
+/// The recognizer decides whether the coordinated-permission delivery pass fires
+/// at all, so both directions matter: a form it wrongly rejects silently drops a
+/// card back to unsupported, and a form it wrongly accepts synthesizes a
+/// graveyard permission for a sentence that never granted one.
+#[test]
+fn refused_land_play_fragment_covers_the_phrase_class_and_stays_boundary_safe() {
+    use super::parse_refused_land_play_fragment;
+
+    // ACCEPTED: the axes this pass models — optional permission head, either
+    // number of the land noun.
+    for accepted in [
+        "play lands",
+        "play land",
+        "you may play lands",
+        "you may play land",
+    ] {
+        assert!(
+            parse_refused_land_play_fragment(accepted).is_ok(),
+            "{accepted:?} is in the modelled phrase class and must be recognized"
+        );
+    }
+
+    // REJECTED, and each for a reason worth keeping.
+    for rejected in [
+        // BOUNDARY: `all_consuming` is what stops a longer sentence that merely
+        // STARTS with the phrase from being treated as the bare refused fragment.
+        // Without it, "play lands from your hand" would wrongly deliver a
+        // GRAVEYARD permission.
+        "play lands from your hand",
+        "play lands and cast spells from your graveyard",
+        // WORD BOUNDARY: "landfall" starts with "land" but is a different word.
+        // This is the case a naive `starts_with` would accept.
+        "play landfall",
+        // A different verb is a different action (CR 601.2a casting vs CR 116.2a
+        // playing a land), so it must not reach the land-half recovery.
+        "cast lands",
+        // Trailing text after the noun is likewise not the bare fragment.
+        "play lands twice",
+        "",
+    ] {
+        assert!(
+            parse_refused_land_play_fragment(rejected).is_err(),
+            "{rejected:?} is outside the modelled class and must stay refused"
+        );
+    }
+}
 /// CR 118.12 + CR 118.12a: an "unless [a player] pays [cost]" modifier riding a clause that
 /// becomes a `ChooseOneOf` BRANCH must survive the branch lift.
 /// `oracle_effect::ability_definition_from_clause` used to copy `ParsedEffectClause`'s fields
@@ -30453,4 +30926,1118 @@ fn unless_pay_survives_the_choose_one_of_branch_lift() {
         resolved.unless_pay.is_some(),
         "the branch definition's modifier must reach the ResolvedAbility the runtime reads"
     );
+}
+
+// ─── Zenos yae Galvus phase-2 trigger test (2-C4) ─────────────────────────────
+
+/// CR 607.2d + CR 603.6c + CR 603.10a: POST-CHANGE control (`2-C4`). The Step 0
+/// baseline (`zenos_leaves_trigger_baseline_before_phase2`, captured failing
+/// before this update) pinned the measured base `TriggerMode::Unknown` /
+/// `valid_card: None`; after the U3 arm the subject is the remembered-object
+/// reader and the event lowers to a leaves-the-battlefield trigger, with the
+/// source required on the battlefield (`trigger_zones == [Battlefield]`) and the
+/// body still transforming the source.
+#[test]
+fn zenos_leaves_trigger_targets_the_chosen_creature() {
+    let def = crate::parser::oracle_trigger::parse_trigger_line(
+        "When the chosen creature leaves the battlefield, transform ~.",
+        "Zenos yae Galvus",
+    );
+    assert_eq!(
+        def.mode,
+        TriggerMode::LeavesBattlefield,
+        "the chosen-object subject must route to the LTB event"
+    );
+    assert_eq!(
+        def.valid_card,
+        Some(TargetFilter::ChosenCard),
+        "the subject must be the CR 607.2d remembered-object reader"
+    );
+    assert_eq!(
+        def.trigger_zones,
+        vec![crate::types::zones::Zone::Battlefield],
+        "the chosen-object LTB subject must stay battlefield-active"
+    );
+    let execute = def.execute.as_deref().expect("transform execute ability");
+    assert!(
+        matches!(
+            execute.effect.as_ref(),
+            Effect::Transform {
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "the trigger body must keep transforming the source, got {:?}",
+        execute.effect
+    );
+}
+
+/// CR 603.4 + CR 608.2c + CR 122.2: Bogardan Phoenix — "When this creature
+/// dies, exile it if it had a death counter on it. Otherwise, return it to the
+/// battlefield under your control and put a death counter on it."
+///
+/// The trailing `if` follows an INSTRUCTION, so CR 603.4 ("only applies to an
+/// `if` that immediately follows a trigger condition") does not reach it: it is
+/// CR 608.2c resolution text whose `Otherwise` is the paired else branch.
+/// Hoisting it onto the trigger envelope makes it the CR 603.4
+/// candidate-survival test, which is a live gameplay bug — a Phoenix that dies
+/// WITHOUT a death counter would not trigger at all.
+#[test]
+fn bogardan_phoenix_trailing_had_counter_otherwise_is_not_intervening_if() {
+    let r = parse(
+        "Flying\n\
+         When this creature dies, exile it if it had a death counter on it. Otherwise, return it to the battlefield under your control and put a death counter on it.",
+        "Bogardan Phoenix",
+        &[Keyword::Flying],
+        &["Creature"],
+        &["Phoenix"],
+    );
+
+    let dies = r
+        .triggers
+        .iter()
+        .find(|t| t.destination == Some(Zone::Graveyard))
+        .unwrap_or_else(|| panic!("no dies trigger parsed: {r:#?}"));
+    assert_eq!(
+        dies.condition, None,
+        "the trailing counter gate must NOT become the CR 603.4 intervening-if \
+         (that would stop the trigger firing with no counter): {dies:#?}"
+    );
+}
+
+/// CR 122.2 + CR 400.7 + CR 603.10 + CR 608.2h: the same clause instead binds at
+/// the effect level, where the `Otherwise` branch can attach to it as
+/// `else_ability`. CR 603.10 is the trigger's look-back that establishes the
+/// zone-change event; CR 608.2h is why the gate is answerable at RESOLUTION
+/// time, when the dying object is no longer in the zone it was expected to be
+/// in, so the effect reads its last known information.
+#[test]
+fn bogardan_phoenix_trailing_counter_condition_binds_otherwise_as_else_branch() {
+    use crate::types::counter::{CounterMatch, CounterType};
+
+    let r = parse(
+        "Flying\n\
+         When this creature dies, exile it if it had a death counter on it. Otherwise, return it to the battlefield under your control and put a death counter on it.",
+        "Bogardan Phoenix",
+        &[Keyword::Flying],
+        &["Creature"],
+        &["Phoenix"],
+    );
+
+    let dies = r
+        .triggers
+        .iter()
+        .find(|t| t.destination == Some(Zone::Graveyard))
+        .unwrap_or_else(|| panic!("no dies trigger parsed: {r:#?}"));
+    let execute = dies.execute.as_deref().expect("dies trigger has a body");
+    assert!(
+        !has_unimplemented(execute),
+        "the Otherwise must bind, not degrade to the honest fallback marker: {execute:#?}"
+    );
+
+    // If-branch: exile the dying Phoenix, gated on the LKI counter read.
+    assert!(
+        matches!(
+            execute.effect.as_ref(),
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                target: TargetFilter::TriggeringSource,
+                ..
+            }
+        ),
+        "if-branch must exile the event object, got {:?}",
+        execute.effect
+    );
+    assert_eq!(
+        execute.condition,
+        Some(AbilityCondition::ZoneChangeObjectMatchesFilter {
+            origin: Some(Zone::Battlefield),
+            destination: Zone::Graveyard,
+            filter: TargetFilter::Typed(TypedFilter::default().properties(vec![
+                FilterProp::Counters {
+                    counters: CounterMatch::OfType(CounterType::Generic("death".to_string())),
+                    comparator: Comparator::GE,
+                    count: QuantityExpr::Fixed { value: 1 },
+                }
+            ])),
+        }),
+        "the gate must read the zone-change event object's counters: {execute:#?}"
+    );
+
+    // Else-branch: return under your control, then add a death counter.
+    let else_def = execute
+        .else_ability
+        .as_deref()
+        .unwrap_or_else(|| panic!("Otherwise must bind as else_ability: {execute:#?}"));
+    assert!(
+        matches!(
+            else_def.effect.as_ref(),
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                ..
+            }
+        ),
+        "else-branch must return it to the battlefield, got {:?}",
+        else_def.effect
+    );
+    let counter = else_def
+        .sub_ability
+        .as_deref()
+        .unwrap_or_else(|| panic!("else-branch must chain the counter: {else_def:#?}"));
+    assert!(
+        matches!(
+            counter.effect.as_ref(),
+            Effect::PutCounter { counter_type, .. }
+                if *counter_type == CounterType::Generic("death".to_string())
+        ),
+        "else-branch must put a death counter, got {:?}",
+        counter.effect
+    );
+}
+
+/// CR 118.12 + CR 608.2c: Rent Is Due — "At the beginning of your end step, you
+/// may tap two untapped creatures and/or Treasures you control. If you do, draw
+/// a card. Otherwise, sacrifice this enchantment."
+///
+/// CR 118.12 prints this template verbatim. The `If you do` outcome gate is
+/// split off the chain text by the reflexive-payment recognizer and stamped on
+/// the chain ROOT, so the chunk loop sees no in-chain antecedent; the `Otherwise`
+/// must still bind to that root rather than degrade to the fallback marker.
+#[test]
+fn rent_is_due_if_you_do_binds_otherwise() {
+    let r = parse(
+        "At the beginning of your end step, you may tap two untapped creatures and/or Treasures you control. If you do, draw a card. Otherwise, sacrifice this enchantment.",
+        "Rent Is Due",
+        &[],
+        &["Enchantment"],
+        &[],
+    );
+
+    let end_step = r
+        .triggers
+        .iter()
+        .find(|t| t.phase == Some(crate::types::phase::Phase::End))
+        .unwrap_or_else(|| panic!("no end-step trigger parsed: {r:#?}"));
+    let execute = end_step.execute.as_deref().expect("trigger has a body");
+    assert!(
+        !has_unimplemented(execute),
+        "the Otherwise must bind to the outcome gate: {execute:#?}"
+    );
+
+    assert!(
+        matches!(execute.effect.as_ref(), Effect::PayCost { .. }),
+        "the optional tap is the parent instruction, got {:?}",
+        execute.effect
+    );
+    assert!(
+        execute.optional,
+        "the tap must stay declinable: {execute:#?}"
+    );
+
+    let draw = execute
+        .sub_ability
+        .as_deref()
+        .unwrap_or_else(|| panic!("the reflexive body must hang off the payment: {execute:#?}"));
+    assert!(
+        matches!(draw.effect.as_ref(), Effect::Draw { .. }),
+        "the paid branch draws, got {:?}",
+        draw.effect
+    );
+    assert_eq!(
+        draw.condition,
+        Some(AbilityCondition::EffectOutcome {
+            signal: crate::types::ability::EffectOutcomeSignal::OptionalEffectPerformed,
+        }),
+        "the paid branch keeps its CR 118.12 outcome gate: {draw:#?}"
+    );
+
+    let else_def = draw
+        .else_ability
+        .as_deref()
+        .unwrap_or_else(|| panic!("Otherwise must bind as the outcome gate's else: {draw:#?}"));
+    assert!(
+        matches!(
+            else_def.effect.as_ref(),
+            Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "the declined branch sacrifices the enchantment, got {:?}",
+        else_def.effect
+    );
+}
+
+/// CR 608.2c coverage honesty control, and the blast-radius guard for the
+/// CR 603.4 hoist suppression: Rose Room Treasurer — "Alliance — Whenever
+/// another creature you control enters, create a Treasure token if this is the
+/// first or second time this ability has resolved this turn. Otherwise, you may
+/// pay {X}. When you do, this creature deals X damage to any target."
+///
+/// Same SURFACE as Bogardan Phoenix (trailing `if` + `Otherwise`), so the hoist
+/// suppression applies to it too — but its antecedent condition ("the first or
+/// second time this ability has resolved this turn") is a genuine Mode-A parser
+/// gap, and its else branch contains a CR 603.12 reflexive trigger. Nothing here
+/// is supported, so the card must keep an honest `Effect::Unimplemented` marker
+/// rather than silently reporting as covered.
+#[test]
+fn rose_room_treasurer_otherwise_remains_fallback() {
+    let r = parse(
+        "Alliance — Whenever another creature you control enters, create a Treasure token if this is the first or second time this ability has resolved this turn. Otherwise, you may pay {X}. When you do, this creature deals X damage to any target.",
+        "Rose Room Treasurer",
+        &[],
+        &["Creature"],
+        &["Ogre", "Warrior"],
+    );
+
+    let alliance = r
+        .triggers
+        .iter()
+        .find(|t| t.execute.is_some())
+        .unwrap_or_else(|| panic!("no Alliance trigger parsed: {r:#?}"));
+    let execute = alliance.execute.as_deref().expect("trigger has a body");
+    assert!(
+        has_unimplemented(execute),
+        "an unparsed antecedent must keep the honest gap marker rather than \
+         binding an Otherwise it cannot evaluate: {execute:#?}"
+    );
+}
+
+/// CR 611.2 + CR 109.5: full-pipeline routing regression for Promise of
+/// Loyalty. Its second sentence matches the generic "can't attack" arm of
+/// `STATIC_CONTAINS_PATTERNS`, so at BASE_SHA Priority 7 claimed the WHOLE
+/// two-sentence line and emitted one degenerate
+/// `StaticDefinition { mode: CantAttack, affected: SelfRef, modifications: [] }`
+/// whose description was both sentences verbatim, with zero abilities and a
+/// swallowed-clause warning. The line is a resolving SPELL's one-shot chain,
+/// not a static on a permanent.
+///
+/// Revert-discriminating: removing the
+/// `oracle_effect::is_keeper_dispose_head` arm from
+/// `oracle_classifier::should_defer_spell_to_effect` puts `statics` back to one
+/// entry and `abilities` back to zero here.
+#[test]
+fn promise_of_loyalty_routes_to_the_effect_chain_not_a_whole_line_static() {
+    let parsed = parse_oracle_text(
+        "Each player puts a vow counter on a creature they control and sacrifices the rest. Each of those creatures can't attack you or planeswalkers you control for as long as it has a vow counter on it.",
+        "Promise of Loyalty",
+        &[],
+        &["Sorcery".to_string()],
+        &[],
+    );
+    assert!(
+        parsed.statics.is_empty(),
+        "the two-sentence line must not lower to a whole-line static: {:?}",
+        parsed.statics
+    );
+    assert_eq!(parsed.abilities.len(), 1);
+    assert!(
+        matches!(
+            parsed.abilities[0].effect.as_ref(),
+            Effect::ChooseAndSacrificeRest { .. }
+        ),
+        "the spell must resolve as a keeper-and-sacrifice chain, got {:?}",
+        parsed.abilities[0].effect
+    );
+    assert!(
+        parsed.parse_warnings.is_empty(),
+        "the swallowed-clause warning must clear: {:?}",
+        parsed.parse_warnings
+    );
+}
+
+/// The routing predicate is the recognizer's own head combinator INCLUDING its
+/// supported-combination gate, so the two cards the gate refuses keep the
+/// routing they had at BASE_SHA rather than being deferred into a recognizer
+/// that will not claim them.
+///
+/// Covetous Elegy's "up to two" keeper cardinality has no `KeeperConstraint`
+/// range variant (CR 609.3 clamping is not the same instruction), and Divine
+/// Reckoning's tail is CR 701.8a destroy rather than CR 701.21a sacrifice.
+/// Both parse to the same single `Effect::TargetOnly` head they did at
+/// BASE_SHA — regenerate with
+/// `jq -c '.["covetous elegy"] | {ab:(.abilities|length),
+/// st:((.static_abilities//[])|length), e0:.abilities[0].effect.type}'
+/// client/public/card-data.json`.
+///
+/// Both Oracle strings are the FULL printed text, verbatim from
+/// `jq -r '.["divine reckoning"].oracle_text' client/public/card-data.json` —
+/// including Divine Reckoning's flashback line, which is why that row passes
+/// the MTGJSON keyword name the card-data pipeline passes at
+/// `database/synthesis.rs`'s `parse_oracle_text` call.
+#[test]
+fn gate_refused_keeper_cards_keep_their_base_routing() {
+    for (name, oracle, keyword_names) in [
+        (
+            "Covetous Elegy",
+            "Each player chooses up to two creatures they control, then sacrifices the rest. Then you create a tapped Treasure token for each creature your opponents control.",
+            &[][..],
+        ),
+        (
+            "Divine Reckoning",
+            "Each player chooses a creature they control. Destroy the rest.\nFlashback {5}{W}{W} (You may cast this card from your graveyard for its flashback cost. Then exile it.)",
+            &["Flashback".to_string()][..],
+        ),
+    ] {
+        assert!(
+            !crate::parser::oracle_classifier::should_defer_spell_to_effect(
+                &oracle.to_lowercase()
+            ),
+            "{name} must not be deferred by the keeper-dispose arm"
+        );
+        let parsed = parse_oracle_text(oracle, name, keyword_names, &["Sorcery".to_string()], &[]);
+        assert!(parsed.statics.is_empty(), "{name}: {:?}", parsed.statics);
+        assert_eq!(parsed.abilities.len(), 1, "{name}");
+        assert!(
+            matches!(
+                parsed.abilities[0].effect.as_ref(),
+                Effect::TargetOnly { .. }
+            ),
+            "{name} must keep its BASE_SHA head, got {:?}",
+            parsed.abilities[0].effect
+        );
+    }
+}
+
+// --- RevealUntil pile-disposition / rest-shuffle regressions (PR #8929) ---
+// Every card text below is the printed Oracle text from MTGJSON AtomicCards.
+
+/// Effects of `def`'s `sub_ability` chain, head first.
+fn reveal_chain_defs(def: &AbilityDefinition) -> Vec<&AbilityDefinition> {
+    std::iter::successors(Some(def), |d| d.sub_ability.as_deref()).collect()
+}
+
+fn reveal_until_rest_order(defs: &[&AbilityDefinition]) -> crate::types::ability::DigRestOrder {
+    defs.iter()
+        .find_map(|d| match &*d.effect {
+            Effect::RevealUntil { rest_order, .. } => Some(*rest_order),
+            _ => None,
+        })
+        .expect("chain must contain a RevealUntil")
+}
+
+/// CR 701.24c + CR 608.2c: "then shuffle the rest into your library" lowers to
+/// a whole-library `Shuffle`, and the trailing "If that creature is a Demon"
+/// rider is kept after it (Aspiring Champion).
+#[test]
+fn aspiring_champion_keeps_demon_rider_after_rest_shuffle() {
+    let result = parse(
+        "Ruinous Ascension — When this creature deals combat damage to a player, sacrifice it. If you do, reveal cards from the top of your library until you reveal a creature card. Put that card onto the battlefield, then shuffle the rest into your library. If that creature is a Demon, it deals damage equal to its power to each opponent.",
+        "Aspiring Champion",
+        &[],
+        &["Creature"],
+        &["Human", "Rogue"],
+    );
+    let execute = result.triggers[0]
+        .execute
+        .as_deref()
+        .expect("trigger must have an execute chain");
+    let defs = reveal_chain_defs(execute);
+    let effects: Vec<&Effect> = defs.iter().map(|d| &*d.effect).collect();
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [
+                Effect::Sacrifice { .. },
+                Effect::RevealUntil {
+                    kept_destination: Zone::Battlefield,
+                    rest_destination: Zone::Library,
+                    ..
+                },
+                Effect::Shuffle {
+                    target: TargetFilter::Controller
+                },
+                Effect::DamageEachPlayer { .. },
+            ]
+        ),
+        "expected Sacrifice → RevealUntil → Shuffle → DamageEachPlayer, got {effects:?}"
+    );
+    assert!(
+        matches!(
+            defs[3].condition,
+            Some(AbilityCondition::TargetMatchesFilter { .. })
+        ),
+        "the damage rider stays gated on the revealed creature being a Demon, got {:?}",
+        defs[3].condition
+    );
+}
+
+/// CR 701.24c: Selvala's Stampede keeps the optional hand-to-battlefield put
+/// for each free vote after the rest pile is shuffled into the library.
+#[test]
+fn selvalas_stampede_keeps_free_vote_put_after_rest_shuffle() {
+    let result = parse(
+        "Council's dilemma — Starting with you, each player votes for wild or free. Reveal cards from the top of your library until you reveal a creature card for each wild vote. Put those creature cards onto the battlefield, then shuffle the rest into your library. You may put a permanent card from your hand onto the battlefield for each free vote.",
+        "Selvala's Stampede",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    let defs = reveal_chain_defs(&result.abilities[0]);
+    let shuffle_idx = defs
+        .iter()
+        .position(|d| {
+            matches!(
+                &*d.effect,
+                Effect::Shuffle {
+                    target: TargetFilter::Controller
+                }
+            )
+        })
+        .unwrap_or_else(|| panic!("expected a rest Shuffle, got {defs:?}"));
+    let put = defs
+        .get(shuffle_idx + 1)
+        .unwrap_or_else(|| panic!("expected the free-vote put after the Shuffle, got {defs:?}"));
+    assert!(
+        matches!(
+            &*put.effect,
+            Effect::ChangeZone {
+                origin: Some(Zone::Hand),
+                destination: Zone::Battlefield,
+                ..
+            }
+        ) && put.optional,
+        "expected optional hand → battlefield ChangeZone, got {put:?}"
+    );
+}
+
+/// CR 608.2c: an unparsed selection ("Choose one of the revealed creature
+/// cards") sits between the reveal and "put it onto the battlefield under your
+/// control". The pile-disposition lookback must not reach past it, so the
+/// battlefield move and the other-cards-to-graveyard instruction both survive
+/// as their own effects (Dance, Pathetic Marionette).
+#[test]
+fn dance_pathetic_marionette_keeps_battlefield_move_across_unparsed_choice() {
+    let result = parse(
+        "When you set this scheme in motion, each opponent reveals cards from the top of their library until they reveal a creature card. Choose one of the revealed creature cards and put it onto the battlefield under your control. Put all other cards revealed this way into their owners' graveyards.",
+        "Dance, Pathetic Marionette",
+        &[],
+        &["Scheme"],
+        &[],
+    );
+    let execute = result.triggers[0]
+        .execute
+        .as_deref()
+        .expect("trigger must have an execute chain");
+    let defs = reveal_chain_defs(execute);
+    let effects: Vec<&Effect> = defs.iter().map(|d| &*d.effect).collect();
+    assert!(
+        matches!(effects[0], Effect::RevealUntil { .. }),
+        "expected RevealUntil head, got {effects:?}"
+    );
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::ParentTarget,
+                enters_under: Some(ControllerRef::You),
+                ..
+            }
+        )),
+        "the chosen creature's battlefield move under your control must survive, got {effects:?}"
+    );
+    assert!(
+        effects.iter().any(|e| matches!(
+            e,
+            Effect::ChangeZoneAll {
+                destination: Zone::Graveyard,
+                ..
+            }
+        )),
+        "the other revealed cards' graveyard move must survive, got {effects:?}"
+    );
+}
+
+/// CR 701.24c + CR 608.2c: a subject-elided "then shuffles the rest into their
+/// library" shuffles the revealing player's library (the exiled creature's
+/// controller), not the caster's (Transmogrify, Blessed Reincarnation).
+#[test]
+fn reveal_until_third_person_rest_shuffle_binds_revealing_player() {
+    for (name, text) in [
+        (
+            "Transmogrify",
+            "Exile target creature. That creature's controller reveals cards from the top of their library until they reveal a creature card. That player puts that card onto the battlefield, then shuffles the rest into their library.",
+        ),
+        (
+            "Blessed Reincarnation",
+            "Exile target creature an opponent controls. That player reveals cards from the top of their library until a creature card is revealed. The player puts that card onto the battlefield, then shuffles the rest into their library.",
+        ),
+    ] {
+        let result = parse(text, name, &[], &["Instant"], &[]);
+        let defs = reveal_chain_defs(&result.abilities[0]);
+        assert!(
+            !def_chain_has_unimplemented(&result.abilities[0]),
+            "{name} must parse fully, got {defs:?}"
+        );
+        let effects: Vec<&Effect> = defs.iter().map(|d| &*d.effect).collect();
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    Effect::ChangeZone {
+                        destination: Zone::Exile,
+                        ..
+                    },
+                    Effect::RevealUntil {
+                        player: TargetFilter::ParentTargetController,
+                        kept_destination: Zone::Battlefield,
+                        ..
+                    },
+                    Effect::Shuffle {
+                        target: TargetFilter::ParentTargetController
+                    },
+                ]
+            ),
+            "{name}: expected exile → reveal → revealing player's shuffle, got {effects:?}"
+        );
+    }
+}
+
+/// CR 401.4: a rest clause separated from its reveal by parsed instructions
+/// keeps its printed ordering — "in a random order" randomizes (Sibylline
+/// Soothsayer) and "in any order" is the owner's choice (Fathom Trawl).
+#[test]
+fn reveal_until_rest_clause_after_intervening_instruction_keeps_printed_order() {
+    use crate::types::ability::DigRestOrder;
+    let sibylline = parse(
+        "Temporal Foresight — When this creature enters, reveal cards from the top of your library until you reveal a nonland card with mana value 3 or greater. Exile that card with three time counters on it. If it doesn't have suspend, it gains suspend. Put the rest of the revealed cards on the bottom of your library in a random order.",
+        "Sibylline Soothsayer",
+        &[],
+        &["Creature"],
+        &["Human", "Wizard"],
+    );
+    let execute = sibylline.triggers[0]
+        .execute
+        .as_deref()
+        .expect("trigger must have an execute chain");
+    assert_eq!(
+        reveal_until_rest_order(&reveal_chain_defs(execute)),
+        DigRestOrder::Random
+    );
+
+    let fathom_trawl = parse(
+        "Reveal cards from the top of your library until you reveal three nonland cards. Put the nonland cards revealed this way into your hand, then put the rest of the revealed cards on the bottom of your library in any order.",
+        "Fathom Trawl",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    assert_eq!(
+        reveal_until_rest_order(&reveal_chain_defs(&fathom_trawl.abilities[0])),
+        DigRestOrder::PlayerChoice
+    );
+}
+
+/// CR 614.6: in a draw replacement, "they draw a card" / "they mill a card"
+/// name the replaced draw's player — only card-movement slots bind to the
+/// revealed card (Chains of Mephistopheles).
+#[test]
+fn draw_replacement_player_slots_keep_player_referent() {
+    let result = parse(
+        "If a player would draw a card except the first one they draw in each of their draw steps, that player discards a card instead. If the player discards a card this way, they draw a card. If the player doesn't discard a card this way, they mill a card.",
+        "Chains of Mephistopheles",
+        &[],
+        &["Enchantment"],
+        &[],
+    );
+    let execute = result.replacements[0]
+        .execute
+        .as_deref()
+        .expect("replacement must have an execute chain");
+    for def in reveal_chain_defs(execute) {
+        match &*def.effect {
+            Effect::Draw { target, .. } | Effect::Mill { target, .. } => assert_ne!(
+                target,
+                &TargetFilter::LastRevealed,
+                "a player slot must not bind to the revealed card"
+            ),
+            _ => {}
+        }
+    }
+}
+
+/// CR 701.24c + CR 608.2c: Divergent Transformations contains an unmodelled per-creature
+/// resolution loop ("For each of those creatures, its controller reveals... then shuffles the rest...").
+/// The trailing shuffle must NOT be greedily absorbed as an unscoped controller shuffle;
+/// it must preserve the `unparsed_quantity` marker until the full class is implemented.
+#[test]
+fn divergent_transformations_retains_unparsed_quantity_marker_without_shuffle() {
+    let dt = parse(
+        "Undaunted (This spell costs {1} less to cast for each opponent.)\nExile two target creatures. For each of those creatures, its controller reveals cards from the top of their library until they reveal a creature card, puts that card onto the battlefield, then shuffles the rest into their library.",
+        "Divergent Transformations",
+        &[crate::types::keywords::Keyword::Undaunted],
+        &["Instant"],
+        &[],
+    );
+    let defs = reveal_chain_defs(&dt.abilities[0]);
+    assert!(
+        defs.iter().any(|d| matches!(
+            &*d.effect,
+            Effect::Unimplemented { name, .. } if name == "unparsed_quantity"
+        )),
+        "Divergent Transformations must retain the unparsed_quantity marker, got {defs:?}"
+    );
+    assert!(
+        !defs
+            .iter()
+            .any(|d| matches!(&*d.effect, Effect::Shuffle { .. })),
+        "Divergent Transformations must not emit an unmodelled Shuffle, got {defs:?}"
+    );
+}
+
+/// CR 701.24c + CR 608.2c: a subject-elided "then shuffles the rest into their
+/// library" names a rest pile only its antecedent defines. After an
+/// exile-until (Wand of Wonder: the exiled misses) or a hand choice
+/// (Worldpurge: the unchosen hand cards) that pile is NOT in the library, so a
+/// bare `Shuffle` would silently drop the move. Both keep the explicit
+/// `shuffle` gap until the rest-pile move is represented.
+#[test]
+fn third_person_rest_shuffle_without_library_rest_pile_stays_an_explicit_gap() {
+    for (name, oracle, types) in [
+        (
+            "Wand of Wonder",
+            "{4}, {T}: Roll a d20. Each opponent exiles cards from the top of their library until they exile an instant or sorcery card, then shuffles the rest into their library. You may cast up to X instant and/or sorcery spells from among cards exiled this way without paying their mana costs.\n1—9 | X is one.\n10—19 | X is two.\n20 | X is three.",
+            "Artifact",
+        ),
+        (
+            "Worldpurge",
+            "Return all permanents to their owners' hands. Each player chooses up to seven cards in their hand, then shuffles the rest into their library. Each player loses all unspent mana.",
+            "Sorcery",
+        ),
+    ] {
+        let parsed = parse(oracle, name, &[], &[types], &[]);
+        let defs = reveal_chain_defs(&parsed.abilities[0]);
+        assert!(
+            defs.iter().any(|d| matches!(
+                &*d.effect,
+                Effect::Unimplemented { name, description: Some(text) }
+                    if name == "shuffle" && text.contains("shuffles the rest")
+            )),
+            "{name} must keep the explicit `shuffle` gap, got {defs:?}"
+        );
+        assert!(
+            !defs
+                .iter()
+                .any(|d| matches!(&*d.effect, Effect::Shuffle { .. })),
+            "{name} must not claim a bare library Shuffle, got {defs:?}"
+        );
+    }
+}
+
+/// Printed Oracle text of M'Odo, the Gnarled Oracle (MTGJSON AtomicCards / Scryfall).
+const M_ODO_ORACLE: &str = "Eminence — {X}, Discard a card: Target player reveals cards from the top of their library until they reveal a creature card with converted mana cost X or less. Put that card onto the battlefield under your control, then that player shuffles the rest into their library. Activate this ability only if M'Odo, the Gnarled Oracle is on the battlefield or in the command zone.";
+
+/// CR 113.6b + CR 701.20a + CR 202.3 + CR 701.24c: M'Odo's printed Eminence
+/// ability parses clause by clause — `{X}` plus a discard cost; the TARGET
+/// player's reveal-until whose hit is a creature card with mana value X or less
+/// ("converted mana cost" is its unmodernized name), entering under the
+/// activator's control; that player's rest-shuffle; and the zone restriction
+/// "on the battlefield or in the command zone". No clause is left as a gap.
+#[test]
+fn m_odo_the_gnarled_oracle_parses_its_printed_eminence_ability() {
+    let parsed = parse(
+        M_ODO_ORACLE,
+        "M'Odo, the Gnarled Oracle",
+        &[],
+        &["Creature"],
+        &["Zombie", "Elf", "Wizard"],
+    );
+    assert_eq!(parsed.abilities.len(), 1, "{:#?}", parsed.abilities);
+    let ability = &parsed.abilities[0];
+    assert_eq!(ability.kind, AbilityKind::Activated);
+
+    // Cost: {X}, Discard a card.
+    let Some(AbilityCost::Composite { costs }) = &ability.cost else {
+        panic!(
+            "expected a composite {{X}} + discard cost, got {:?}",
+            ability.cost
+        );
+    };
+    assert!(
+        costs.iter().any(|c| matches!(
+            c,
+            AbilityCost::Mana {
+                cost: ManaCost::Cost { shards, generic: 0 },
+            } if shards == &vec![ManaCostShard::X]
+        )),
+        "cost must include {{X}}, got {costs:?}"
+    );
+    assert!(
+        costs.iter().any(|c| matches!(
+            c,
+            AbilityCost::Discard {
+                count: QuantityExpr::Fixed { value: 1 },
+                filter: None,
+                ..
+            }
+        )),
+        "cost must include discarding one card, got {costs:?}"
+    );
+
+    // Effect: target player reveals until a creature card with MV <= X; the hit
+    // enters under the activator's control; the rest return to that library.
+    let Effect::RevealUntil {
+        player,
+        filter,
+        kept_destination,
+        rest_destination,
+        enters_under,
+        ..
+    } = &*ability.effect
+    else {
+        panic!("expected RevealUntil, got {:?}", ability.effect);
+    };
+    assert_eq!(*player, TargetFilter::Player);
+    assert_eq!(*kept_destination, Zone::Battlefield);
+    assert_eq!(*rest_destination, Zone::Library);
+    assert_eq!(*enters_under, Some(ControllerRef::You));
+    let TargetFilter::Typed(typed) = filter else {
+        panic!("expected a typed creature filter, got {filter:?}");
+    };
+    assert_eq!(typed.type_filters, vec![TypeFilter::Creature]);
+    assert!(
+        typed.properties.contains(&FilterProp::Cmc {
+            comparator: Comparator::LE,
+            value: QuantityExpr::Ref {
+                qty: QuantityRef::Variable {
+                    name: "X".to_string()
+                },
+            },
+        }),
+        "the converted-mana-cost bound must survive as Cmc <= X, got {typed:?}"
+    );
+
+    // "then that player shuffles the rest into their library" — the revealing
+    // (targeted) player's library, not the activator's.
+    let sub = ability.sub_ability.as_deref().expect("rest-shuffle clause");
+    assert_eq!(
+        *sub.effect,
+        Effect::Shuffle {
+            target: TargetFilter::ParentTargetController
+        }
+    );
+    assert!(sub.sub_ability.is_none(), "no trailing gap: {sub:?}");
+
+    // Restriction: "on the battlefield or in the command zone".
+    assert_eq!(
+        ability.activation_restrictions,
+        vec![ActivationRestriction::RequiresCondition {
+            condition: Some(ParsedCondition::Or {
+                conditions: vec![
+                    ParsedCondition::SourceInZone {
+                        zone: Zone::Battlefield
+                    },
+                    ParsedCondition::SourceInZone {
+                        zone: Zone::Command
+                    },
+                ],
+            }),
+        }]
+    );
+}
+
+/// CR 608.2c + CR 701.24c: Choice of Fortunes — "Seek two cards. You may shuffle
+/// them into your library. If you do, seek two cards." The optional instruction
+/// moves the WHOLE sought set (the chain tracked set Seek publishes) into the
+/// library with one terminal shuffle; "If you do" gates the second seek.
+#[test]
+fn choice_of_fortunes_shuffles_the_sought_set_into_the_library() {
+    let parsed = parse(
+        "Seek two cards. You may shuffle them into your library. If you do, seek two cards.\nYou have no maximum hand size for the rest of the game.",
+        "Choice of Fortunes",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    let head = &parsed.abilities[0];
+    assert!(matches!(
+        &*head.effect,
+        Effect::Seek {
+            destination: Zone::Hand,
+            ..
+        }
+    ));
+    let optional = head.sub_ability.as_deref().expect("optional move");
+    assert!(optional.optional);
+    assert_eq!(
+        *optional.effect,
+        Effect::ChangeZoneAll {
+            origin: None,
+            destination: Zone::Library,
+            target: TargetFilter::TrackedSet {
+                id: crate::types::identifiers::TrackedSetId(0)
+            },
+            enters_under: None,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            enters_attacking: false,
+            enter_with_counters: vec![],
+            face_down_profile: None,
+            library_position: None,
+            library_shuffle: crate::types::ability::MassLibraryShuffleMode::TerminalShuffle,
+            random_order: false,
+        }
+    );
+    let shuffle = optional.sub_ability.as_deref().expect("terminal shuffle");
+    assert_eq!(
+        *shuffle.effect,
+        Effect::Shuffle {
+            target: TargetFilter::Controller
+        }
+    );
+    assert_eq!(shuffle.sub_link, SubAbilityLink::ContinuationStep);
+    let gated = shuffle.sub_ability.as_deref().expect("if-you-do seek");
+    assert!(matches!(&*gated.effect, Effect::Seek { .. }));
+    assert!(gated
+        .condition
+        .as_ref()
+        .is_some_and(AbilityCondition::is_optional_effect_performed));
+}
+
+/// CR 400.3 + CR 701.24c: an owner subject ("the owners of those cards" / "those
+/// permanents' owners") before "shuffle them into their libraries" moves the
+/// declared objects into their owners' libraries — not a bare shuffle.
+#[test]
+fn owner_subject_shuffle_them_into_their_libraries_moves_the_objects() {
+    let parsed = parse(
+        "Choose up to three target cards in graveyards. The owners of those cards shuffle them into their libraries. You gain 2 life.",
+        "Turn the Earth",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    let defs = reveal_chain_defs(&parsed.abilities[0]);
+    assert!(
+        defs.iter().any(|d| matches!(
+            &*d.effect,
+            Effect::ChangeZone {
+                destination: Zone::Library,
+                target: TargetFilter::ParentTarget,
+                owner_library: true,
+                ..
+            }
+        )),
+        "expected an owner-library move, got {defs:?}"
+    );
+    assert!(
+        !defs
+            .iter()
+            .any(|d| matches!(&*d.effect, Effect::Unimplemented { .. })),
+        "{defs:?}"
+    );
+}
+
+// ── "As ~ enters, <one-shot>" replacement arm (CR 614.1c + CR 603.6d) ─────────
+
+/// Tibalt, Cosmic Impostor (Kaldheim MDFC back face), verbatim Oracle text.
+const TIBALT_FULL: &str = "As Tibalt enters, you get an emblem with \"You may play cards exiled with Tibalt, Cosmic Impostor, and you may spend mana as though it were mana of any color to cast those spells.\"\n[+2]: Exile the top card of each player's library.\n[−3]: Exile target artifact or creature.\n[−8]: Exile all graveyards. Add {R}{R}{R}.";
+
+/// Positive twin shared by the gate-negative reach-guards below.
+const AS_ENTERS_LOSE_TWO: &str = "As ~ enters, you lose 2 life.";
+
+/// `line`, self-reference-normalized and lowercased, as the routing sites see it.
+fn normalized_lower_frame_line(line: &str, card_name: &str) -> String {
+    crate::parser::oracle_util::normalize_card_name_refs(line, card_name).to_lowercase()
+}
+
+/// SHAPE (CR 614.1c + CR 603.6d + CR 114.2): Tibalt's "As Tibalt enters" line is
+/// a mandatory `Moved` self-to-battlefield replacement whose execute creates the
+/// emblem hosting the persistent any-color exile-play permission — no static,
+/// no swallowed clause.
+#[test]
+fn tibalt_as_enters_emblem_parses_as_moved_self_replacement() {
+    let parsed = parse_oracle_text(
+        TIBALT_FULL,
+        "Tibalt, Cosmic Impostor",
+        &[],
+        &["Planeswalker".into()],
+        &["Tibalt".into()],
+    );
+    // Reach-guard: the three loyalty lines parsed.
+    assert_eq!(parsed.abilities.len(), 3, "{:?}", parsed.abilities);
+    assert!(parsed.statics.is_empty(), "{:?}", parsed.statics);
+    assert_eq!(parsed.replacements.len(), 1, "{:?}", parsed.replacements);
+    let repl = &parsed.replacements[0];
+    assert_eq!(repl.event, ReplacementEvent::Moved);
+    assert_eq!(repl.valid_card, Some(TargetFilter::SelfRef));
+    assert_eq!(repl.destination_zone, Some(Zone::Battlefield));
+    assert_eq!(repl.mode, ReplacementMode::Mandatory);
+    let execute = repl.execute.as_deref().expect("the replacement executes");
+    assert!(execute.sub_ability.is_none(), "{execute:?}");
+    let Effect::CreateEmblem { statics, triggers } = &*execute.effect else {
+        panic!("expected CreateEmblem, got {:?}", execute.effect);
+    };
+    assert!(triggers.is_empty(), "{triggers:?}");
+    assert_eq!(statics.len(), 1, "{statics:?}");
+    assert_eq!(
+        statics[0].mode,
+        StaticMode::ExileCastPermission {
+            frequency: CastFrequency::Unlimited,
+            play_mode: CardPlayMode::Play,
+            cost: crate::types::statics::ExileCastCost::PayNormalCost,
+            pool: crate::types::statics::ExileCardPool::Persistent,
+            timing: crate::types::statics::ExileCastTiming::AnyTime,
+            mana_spend_permission: Some(crate::types::ability::ManaSpendPermission::AnyColor),
+            grants_flash: false,
+            extra_cost: None,
+            enters_with_counter: None,
+            grantee: crate::types::statics::ExileCastGrantee::SourceController,
+        }
+    );
+    assert!(
+        !parsed
+            .parse_warnings
+            .iter()
+            .any(|warning| matches!(warning, OracleDiagnostic::SwallowedClause { .. })),
+        "{:?}",
+        parsed.parse_warnings
+    );
+}
+
+/// Gate negative (CR 614.12a): Phylactery Lich's as-enters body puts a counter
+/// on an artifact you control — an object effect outside the kind allowlist — so
+/// its frame line keeps its prior `replacement_structure` gap.
+#[test]
+fn phylactery_lich_as_enters_object_effect_body_keeps_prior_shape() {
+    let oracle = "Indestructible\nAs this creature enters, put a phylactery counter on an artifact you control.\nWhen you control no permanents with phylactery counters on them, sacrifice this creature.";
+    let line = "As this creature enters, put a phylactery counter on an artifact you control.";
+    let parsed = parse_oracle_text(
+        oracle,
+        "Phylactery Lich",
+        &["Indestructible".into()],
+        &["Creature".into()],
+        &["Zombie".into()],
+    );
+    assert!(
+        !parsed
+            .replacements
+            .iter()
+            .any(|repl| repl.event == ReplacementEvent::Moved),
+        "{:?}",
+        parsed.replacements
+    );
+    assert!(
+        parsed.abilities.iter().any(|ability| matches!(
+            &*ability.effect,
+            Effect::Unimplemented { name, .. } if name == "replacement_structure"
+        )),
+        "{:?}",
+        parsed.abilities
+    );
+    // Reach-guard: the frame is recognized and the arm itself declines the body,
+    // while the admitted twin is accepted.
+    assert!(is_as_self_enters_frame(&normalized_lower_frame_line(
+        line,
+        "Phylactery Lich"
+    )));
+    assert!(parse_as_enters_one_shot_replacement(line, "Phylactery Lich").is_none());
+    assert!(parse_as_enters_one_shot_replacement(AS_ENTERS_LOSE_TWO, "Phylactery Lich").is_some());
+}
+
+/// The static-shaped routing site runs before Priority 8. Static-shaped frame
+/// lines that a Priority-8 arm claims today (Thief of Blood's population
+/// counter removal, Arsenal Thresher's optional reveal) are declined by the
+/// gate and keep their Priority-8 replacement.
+#[test]
+fn static_shaped_as_enters_lines_keep_priority_eight_replacement() {
+    for (name, oracle, line, description, keywords, types, subtypes) in [
+        (
+            "Thief of Blood",
+            "Flying\nAs this creature enters, remove all counters from all permanents. This creature enters with a +1/+1 counter on it for each counter removed this way.",
+            "As this creature enters, remove all counters from all permanents. This creature enters with a +1/+1 counter on it for each counter removed this way.",
+            "As ~ enters, remove all counters from all permanents. ~ enters with a +1/+1 counter on it for each counter removed this way.",
+            vec!["Flying".to_string()],
+            vec!["Creature".to_string()],
+            vec!["Vampire".to_string()],
+        ),
+        (
+            "Arsenal Thresher",
+            "As this creature enters, you may reveal any number of other artifact cards from your hand. This creature enters with a +1/+1 counter on it for each card revealed this way.",
+            "As this creature enters, you may reveal any number of other artifact cards from your hand. This creature enters with a +1/+1 counter on it for each card revealed this way.",
+            "As ~ enters, you may reveal any number of other artifact cards from your hand. ~ enters with a +1/+1 counter on it for each card revealed this way.",
+            vec![],
+            vec!["Artifact".to_string(), "Creature".to_string()],
+            vec!["Construct".to_string()],
+        ),
+    ] {
+        let parsed = parse_oracle_text(oracle, name, &keywords, &types, &subtypes);
+        let moved: Vec<&ReplacementDefinition> = parsed
+            .replacements
+            .iter()
+            .filter(|repl| repl.event == ReplacementEvent::Moved)
+            .collect();
+        assert_eq!(moved.len(), 1, "{name}: {:?}", parsed.replacements);
+        assert_eq!(moved[0].description.as_deref(), Some(description), "{name}");
+        assert!(
+            matches!(
+                moved[0].execute.as_deref().map(|e| &*e.effect),
+                Some(Effect::PutCounter { .. })
+            ),
+            "{name}: {:?}",
+            moved[0].execute
+        );
+        // Reach-guard: the static-shaped routing site sees the frame and the gate declines the body.
+        assert!(
+            is_as_self_enters_frame(&normalized_lower_frame_line(line, name)),
+            "{name}"
+        );
+        assert!(
+            parse_as_enters_one_shot_replacement(line, name).is_none(),
+            "{name}"
+        );
+        assert!(parse_as_enters_one_shot_replacement(AS_ENTERS_LOSE_TWO, name).is_some());
+    }
+}
+
+/// Admitted class face (CR 614.1c + CR 603.6d + CR 119.3): Lich's "As this
+/// enchantment enters, you lose life equal to your life total." is a mandatory
+/// `Moved` self replacement losing the controller's life total.
+#[test]
+fn lich_as_enters_life_loss_parses_as_moved_self_replacement() {
+    let oracle = "As this enchantment enters, you lose life equal to your life total.\nYou don't lose the game for having 0 or less life.\nIf you would gain life, draw that many cards instead.\nWhenever you're dealt damage, sacrifice that many nontoken permanents. If you can't, you lose the game.\nWhen this enchantment is put into a graveyard from the battlefield, you lose the game.";
+    let parsed = parse_oracle_text(oracle, "Lich", &[], &["Enchantment".into()], &[]);
+    let moved: Vec<&ReplacementDefinition> = parsed
+        .replacements
+        .iter()
+        .filter(|repl| repl.event == ReplacementEvent::Moved)
+        .collect();
+    assert_eq!(moved.len(), 1, "{:?}", parsed.replacements);
+    let repl = moved[0];
+    assert_eq!(repl.valid_card, Some(TargetFilter::SelfRef));
+    assert_eq!(repl.destination_zone, Some(Zone::Battlefield));
+    assert_eq!(repl.mode, ReplacementMode::Mandatory);
+    assert_eq!(
+        repl.description.as_deref(),
+        Some("As ~ enters, you lose life equal to your life total.")
+    );
+    let execute = repl.execute.as_deref().expect("the replacement executes");
+    assert!(execute.sub_ability.is_none(), "{execute:?}");
+    assert_eq!(
+        *execute.effect,
+        Effect::LoseLife {
+            amount: QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: crate::types::ability::PlayerScope::Controller
+                }
+            },
+            target: Some(TargetFilter::Controller),
+        }
+    );
+    assert!(
+        !parsed.abilities.iter().any(|ability| ability
+            .description
+            .as_deref()
+            .is_some_and(|d| d == "As ~ enters, you lose life equal to your life total.")),
+        "the frame line is no longer an ability: {:?}",
+        parsed.abilities
+    );
+    // Reach-guards: Lich's other lines are unchanged.
+    assert!(parsed
+        .replacements
+        .iter()
+        .any(|repl| repl.event == ReplacementEvent::GainLife));
+    assert!(parsed
+        .statics
+        .iter()
+        .any(|def| matches!(def.mode, StaticMode::CantLoseTheGame)));
 }
