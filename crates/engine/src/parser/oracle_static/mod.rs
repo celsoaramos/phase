@@ -94,6 +94,7 @@ mod shared;
 mod static_helpers;
 mod type_change;
 
+pub(crate) use shared::add_property;
 pub(crate) use shared::parse_commander_subject_filter_prefix;
 pub(crate) use shared::peel_color_quality_prefix;
 
@@ -180,6 +181,7 @@ pub(crate) use shared::parse_continuous_subject_filter;
 pub(crate) use shared::parse_dynamic_x_clause;
 pub use shared::parse_static_line_multi;
 pub(crate) use shared::parse_subtype_or_list_insensitive_prefix;
+pub(crate) use shared::parse_targeting_bypass_tail;
 pub(crate) use shared::target_filter_is_your_graveyard;
 pub(crate) use shared::GrantedCastKeywordKind;
 pub(crate) use shared::{

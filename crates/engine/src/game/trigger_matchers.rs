@@ -987,7 +987,7 @@ fn count_matching_trigger_event_subjects(
         | GameEvent::Milled { object_id, .. }
         | GameEvent::SpellCast { object_id, .. }
         | GameEvent::TokenCreated { object_id, .. }
-        | GameEvent::CreatureDestroyed { object_id }
+        | GameEvent::CreatureDestroyed { object_id, .. }
         | GameEvent::Evolved { object_id }
         | GameEvent::PermanentSacrificed { object_id, .. }
         | GameEvent::ControllerChanged { object_id, .. }
@@ -2163,6 +2163,8 @@ pub(super) fn matching_block_events(
 ) -> Vec<GameEvent> {
     let source_id = source_event_subject_id(source_context);
     if let GameEvent::BlockersDeclared { assignments } = event {
+        let attacker_filter = combat_filter(trigger);
+        let mut emitted_blockers: Vec<ObjectId> = Vec::new();
         assignments
             .iter()
             .filter_map(|(blocker, attacker)| {
@@ -2179,13 +2181,25 @@ pub(super) fn matching_block_events(
                 // `combat_filter` excludes a spurious `TargetFilter::Player`
                 // surfaced by the effect-text lowering, which is never a real
                 // CR 509 attacker filter.
-                let attacker_matches = match combat_filter(trigger) {
+                let attacker_matches = match attacker_filter {
                     Some(filter) => {
                         target_filter_matches_object(state, *attacker, filter, source_context)
                     }
                     None => true,
                 };
-                attacker_matches.then_some(GameEvent::BlockersDeclared {
+                if !attacker_matches {
+                    return None;
+                }
+                // CR 509.3a: bare blocking triggers once for each blocker,
+                // even when that blocker is assigned multiple attackers.
+                if attacker_filter.is_none() {
+                    if emitted_blockers.contains(blocker) {
+                        return None;
+                    }
+                    emitted_blockers.push(*blocker);
+                }
+                // CR 509.3b: qualified blocking retains each attacker binding.
+                Some(GameEvent::BlockersDeclared {
                     assignments: vec![(*blocker, *attacker)],
                 })
             })
@@ -2764,7 +2778,7 @@ pub(super) fn match_destroyed(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::CreatureDestroyed { object_id } = event {
+    if let GameEvent::CreatureDestroyed { object_id, .. } = event {
         valid_card_matches(trigger, state, *object_id, source_context)
     } else {
         false
@@ -4389,8 +4403,11 @@ pub(super) fn matching_you_attack_pairs(
     if attacker_ids.is_empty() {
         return Vec::new();
     }
-    // CR 506.2: the active player is the attacking player; all attackers in
-    // a single AttackersDeclared batch share one controller.
+    // CR 506.2: the active player is the attacking player. Under shared team
+    // turns one combined declaration can hold several attacking players'
+    // creatures (CR 805.10a + CR 805.10b); the player-scoped gates below read
+    // the first attacker's controller, while the `Player` pass-through admits
+    // every attacking player.
     let Some(attacking_player) = attacker_ids
         .iter()
         .find_map(|id| state.objects.get(id).map(|o| o.controller))
@@ -4404,7 +4421,9 @@ pub(super) fn matching_you_attack_pairs(
         // attacking-player pass-through (any attacking player) and carries NO
         // attack-target narrowing — that lives solely in `attack_target_filter`.
         // Used by attachment-relation triggers ("enchanted by an Aura you control
-        // attack") whose enchanted/equipped attacker may be opponent-controlled.
+        // attack") whose enchanted/equipped attacker may be opponent-controlled,
+        // and (CR 603.2 + CR 506.2) by unscoped subject-led triggers ("whenever one
+        // or more creatures attack") that watch every attacking player.
         Some(TargetFilter::Player) => true,
         Some(_) => valid_player_matches(trigger, state, attacking_player, source_context),
         None => attacking_player == source_context.source_read(state).controller(),
@@ -10815,7 +10834,16 @@ mod tests {
             "Second Attacker".to_string(),
             Zone::Battlefield,
         );
-        let trigger = make_trigger(TriggerMode::Blocks).valid_card(TargetFilter::SelfRef);
+        for attacker in [first_attacker, second_attacker] {
+            state
+                .objects
+                .get_mut(&attacker)
+                .unwrap()
+                .card_types
+                .core_types = vec![CoreType::Creature];
+        }
+        let mut trigger = make_trigger(TriggerMode::Blocks).valid_card(TargetFilter::SelfRef);
+        trigger.valid_target = Some(TargetFilter::Typed(TypedFilter::creature()));
         let event = GameEvent::BlockersDeclared {
             assignments: vec![(blocker, first_attacker), (blocker, second_attacker)],
         };
@@ -10839,6 +10867,54 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // CR 509.3a: each blocker triggers once, preserving its first assignment.
+    #[test]
+    fn bare_block_events_preserve_first_assignment_order_and_object_identity() {
+        let mut state = setup();
+        let ids: Vec<_> = (1..=4)
+            .map(|n| {
+                create_object(
+                    &mut state,
+                    CardId(n),
+                    PlayerId(0),
+                    "Same name".to_string(),
+                    Zone::Battlefield,
+                )
+            })
+            .collect();
+        let trigger = make_trigger(TriggerMode::Blocks);
+        let context = test_trigger_source_context(&state, ids[0]);
+        let mut all_blockers = trigger.clone();
+        all_blockers.valid_card = Some(TargetFilter::Any);
+        let assignments = vec![
+            (ids[0], ids[2]),
+            (ids[1], ids[3]),
+            (ids[0], ids[3]),
+            (ids[1], ids[2]),
+        ];
+        for ordered in [assignments.clone(), assignments.into_iter().rev().collect()] {
+            let expected = vec![
+                GameEvent::BlockersDeclared {
+                    assignments: vec![ordered[0]],
+                },
+                GameEvent::BlockersDeclared {
+                    assignments: vec![ordered[1]],
+                },
+            ];
+            assert_eq!(
+                matching_block_events(
+                    &GameEvent::BlockersDeclared {
+                        assignments: ordered
+                    },
+                    &all_blockers,
+                    &context,
+                    &state,
+                ),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -11031,8 +11107,15 @@ mod tests {
             "Attacker".to_string(),
             Zone::Battlefield,
         );
+        let second_attacker = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Second attacker".to_string(),
+            Zone::Battlefield,
+        );
         let event = GameEvent::BlockersDeclared {
-            assignments: vec![(blocker, attacker)],
+            assignments: vec![(blocker, attacker), (blocker, second_attacker)],
         };
         let no_filter = make_trigger(TriggerMode::Blocks).valid_card(TargetFilter::SelfRef);
         let mut player_filter = make_trigger(TriggerMode::Blocks).valid_card(TargetFilter::SelfRef);
@@ -11044,6 +11127,7 @@ mod tests {
             &test_trigger_source_context(&state, blocker),
             &state,
         );
+        assert_eq!(baseline.len(), 1);
         // Reach guard: the block event genuinely matches for the no-filter case.
         assert!(
             !baseline.is_empty(),

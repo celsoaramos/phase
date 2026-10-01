@@ -97,6 +97,10 @@ mod tests {
         scope: SkipScope,
     ) -> ResolvedAbility {
         ResolvedAbility {
+            declares_chosen_group: None,
+            reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::SkipNextStep {
                 target: TargetFilter::Controller,
@@ -158,6 +162,7 @@ mod tests {
             repeat_until: None,
             replacement_applied: Default::default(),
             sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
+            target_reads: Default::default(),
             sibling_condition: crate::types::ability::SiblingCondition::Dependent,
             modal: None,
             mode_abilities: vec![],

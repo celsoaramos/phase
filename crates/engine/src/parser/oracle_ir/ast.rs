@@ -7,11 +7,11 @@ use crate::types::ability::{
     BounceSelection, CastingPermission, ChosenCounterCountCondition, ContinuousModification,
     ControlWindow, ControllerRef, CopyRetargetPermission, CounterAdjustment, CounterKindChooser,
     CounterKindDomain, CounterSourceRider, DigRestOrder, DoorLockOp, Duration, Effect, EffectScope,
-    FaceDownProfile, ForceBlockAttackerRef, GuardReading, LibraryPosition, ManaProduction,
-    ManaSpendRestriction, ManaTargetRole, ModalSelectionConstraint, OutsideGameSourcePool,
-    PlayerFilter, PtStat, PtValue, QuantityExpr, SearchDestinationSplit, SearchSelectionConstraint,
-    SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition, SubAbilityLink,
-    TargetFilter, ThisWayCause, UnloweredGuard,
+    FaceDownProfile, ForceBlockAttackerRef, GuardReading, LibraryInstructionActor, LibraryPosition,
+    ManaProduction, ManaSpendRestriction, ManaTargetRole, ModalSelectionConstraint,
+    OutsideGameSourcePool, PlayerFilter, PtStat, PtValue, QuantityExpr, SearchDestinationSplit,
+    SearchSelectionConstraint, SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition,
+    SubAbilityLink, TargetFilter, ThisWayCause, UnloweredGuard,
 };
 use crate::types::card_type::Supertype;
 use crate::types::counter::CounterType;
@@ -306,6 +306,31 @@ impl EntersUnderSpec {
     }
 }
 
+/// Grammatical number of an anaphoric pronoun that refers back to earlier
+/// instructions ("it" vs "they" / "those").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) enum AnaphorNumber {
+    /// "It" — the nearest antecedent instruction.
+    Singular,
+    /// "They" / "those" — every instruction of the preceding run.
+    Plural,
+}
+
+/// CR 608.2c: how a clause following a hand reveal refers to the card chosen
+/// from the revealed hand. The binding decides which chain-builder rules apply
+/// to the consumer (who it addresses, and how its object is re-bound).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) enum RevealChoiceBinding {
+    /// CR 608.2c: "choose a <type> card from it / from among them" — the consumer
+    /// names the choice itself over the revealed hand ("it") and is absorbed into
+    /// it (Kitesail Freebooter, Deep-Cavern Bat).
+    FromIt,
+    /// CR 608.2c: "<verb> a <type> card [they] revealed this way" — the consumer
+    /// acts on a card chosen from what the reveal showed, so its object is the
+    /// chosen card (Valki, God of Lies).
+    RevealedThisWay,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) enum ContinuationAst {
     SearchDestination {
@@ -325,6 +350,9 @@ pub(crate) enum ContinuationAst {
     RevealHandFilter {
         card_filter: Option<TargetFilter>,
         choice_optional: bool,
+        /// CR 608.2c: how the consuming clause refers to the card chosen from
+        /// the revealed hand.
+        binding: RevealChoiceBinding,
     },
     ManaRestriction {
         restrictions: Vec<ManaSpendRestriction>,
@@ -368,8 +396,10 @@ pub(crate) enum ContinuationAst {
     /// rather than lowering to `Effect::Unimplemented`.
     SelfCostKeywordCostClarification,
     /// CR 701.19c: "It can't be regenerated" / "They can't be regenerated" — sets
-    /// `cant_regenerate: true` on the preceding Destroy/DestroyAll effect.
-    CantRegenerate,
+    /// `cant_regenerate: true` on the preceding Destroy/DestroyAll effect(s).
+    /// `scope` says whether the pronoun names the nearest Destroy or every
+    /// Destroy of the preceding run (CR 608.2c).
+    CantRegenerate { scope: AnaphorNumber },
     /// CR 116.2c + CR 608.2c: "You may pay {W} to end this effect." — later text
     /// modifying the continuous effect an EARLIER clause of the same chain
     /// created (CR 608.2c: "later text may modify earlier text"). Stamps
@@ -1613,6 +1643,11 @@ pub(crate) enum ChooseImperativeAst {
         up_to: bool,
         /// CR 608.2d (override): `Random` for "choose ... at random".
         selection: crate::types::ability::CardSelectionMode,
+        /// CR 607.2a + CR 406.6 vs CR 608.2c: which pool the clause names — the
+        /// source's linked pile ("exiled with ~", `Direct` zone scan filtered by
+        /// linkage) or the chain's own exile output ("exiled this way", `Legacy`
+        /// tracked-set provenance).
+        candidate_source: crate::types::ability::ZoneChoiceCandidateSource,
     },
     /// "choose from among the permanents ... an artifact, a creature, ..." —
     /// multi-category selection where each player keeps one per type, then sacrifices the rest.
@@ -1674,8 +1709,19 @@ pub(crate) enum ChooseImperativeAst {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) enum PutImperativeAst {
+    /// CR 701.17a: "put the top <count> cards of <owner> library into <owner>
+    /// graveyard" — a mill whose owner and count are carried, never assumed.
     Mill {
-        count: u32,
+        count: QuantityExpr,
+        target: TargetFilter,
+    },
+    /// A put clause the engine cannot yet model (e.g. CR 404.1 "put the top
+    /// card of <possessive> graveyard …", a graveyard-sourced move it cannot
+    /// select); lowers to an honest `Effect::unimplemented` named `gap` and
+    /// carrying the printed clause.
+    Unimplemented {
+        gap: &'static str,
+        fragment: String,
     },
     ZoneChange {
         origin: Option<Zone>,
@@ -1921,6 +1967,8 @@ pub(crate) enum ZoneCounterImperativeAst {
         /// Oracle text terminates with "face down" (Necropotence / Bomat
         /// Courier / Asmodeus class).
         face_down: bool,
+        /// CR 608.2c: the player performing the exile instruction.
+        actor: LibraryInstructionActor,
     },
     Counter {
         target: TargetFilter,
@@ -3491,6 +3539,7 @@ mod duration_distribution_tests_7923 {
             amount: PreventionAmount::All,
             amount_dynamic: None,
             target: TargetFilter::Any,
+            recipient_scope: EffectScope::Single,
             scope: PreventionScope::AllDamage,
             damage_source_filter: None,
             prevention_duration,
