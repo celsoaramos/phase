@@ -14,9 +14,6 @@
     "branch": "card/martyr-of-sands"
   },
   {
-    "branch": "card/invasion-of-azgol"
-  },
-  {
     "branch": "card/brave-the-elements"
   },
   {
@@ -78,9 +75,6 @@
   },
   {
     "branch": "card/regenerate-all-mass"
-  },
-  {
-    "branch": "card/dtk-reveal-or-control"
   },
   {
     "branch": "card/mana-restriction-type-list"
