@@ -1227,7 +1227,7 @@ pub(crate) fn move_objects_simultaneously_then(
             // Synchronous completion (the common single-redirect path): run the
             // cleanup now, and surface a pause it raises to the enclosing caller.
             completion.map_or(BatchMoveResult::Done, |mut completion| {
-                crate::types::game_state::settle_dig_delivery_outcome(
+                crate::types::game_state::settle_batch_delivery_outcome(
                     &mut completion,
                     state,
                     &logical_zone_change_group,
@@ -1661,7 +1661,7 @@ pub(crate) fn drain_pending_batch_deliveries(state: &mut GameState, events: &mut
                     // prompt + fresh BatchDelivery frame, not via
                     // this return value. Witnessed by the compound double-pause
                     // test (miss batch redirect, then hit-delivery redirect).
-                    crate::types::game_state::settle_dig_delivery_outcome(
+                    crate::types::game_state::settle_batch_delivery_outcome(
                         &mut completion,
                         state,
                         &logical_zone_change_group,
@@ -3746,6 +3746,7 @@ pub(crate) fn deliver_replaced_zone_change(
         }
         if face_down_in_exile.is_face_down() && to == Zone::Exile {
             zones::mark_face_down_in_exile(state, events, object_id);
+            crate::game::exile_links::link_search_look(state, object_id, source_id);
         }
         // CR 730.3e: the survivor split (inside `move_to_zone` above) has consumed
         // any clause-2 routing override; clear it so it never leaks into a later
@@ -3929,6 +3930,13 @@ pub(crate) fn deliver_replaced_zone_change(
                     display_source: copy.display_source,
                     printed_ref: copy.printed_ref,
                     token_image_ref: copy.token_image_ref,
+                    // The recipient keeps its own base (Clone is a 0/0
+                    // Shapeshifter underneath), so it rides the source's
+                    // captured descriptor — or the legacy live-field search
+                    // when the source had none — exactly like the exact refs
+                    // above. Created copy-tokens never pass through here;
+                    // their descriptor is derived by the creation injectors.
+                    token_art: copy.token_art,
                     additional_modifications: copy.additional_modifications,
                     effect_kind: EffectKind::BecomeCopy,
                 };
@@ -4506,16 +4514,17 @@ fn execute_zone_move_with_applied_terminal(
             // planeswalker enters with 0 loyalty counters and dies immediately
             // to CR 704.5i. Ravenous (front-face cast-time) does not apply to an
             // effect-driven transformed entry, so only face counters are seeded.
+            // CR 714.3a: a back-face Saga's lore counter comes from its own
+            // replacement via the CR 614.12 projection
+            // (`replacement::stage_transformed_entry_projection`), not from
+            // this seeding.
             let intrinsic = match (enter_transformed, obj.back_face.as_ref()) {
-                (true, Some(back)) => {
-                    crate::game::printed_cards::intrinsic_entry_counters_for_face(
-                        back.printed_loyalty,
-                        back.loyalty,
-                        None,
-                        back.defense,
-                        &back.card_types,
-                    )
-                }
+                (true, Some(back)) => crate::game::printed_cards::intrinsic_face_entry_counters(
+                    back.printed_loyalty,
+                    back.loyalty,
+                    None,
+                    back.defense,
+                ),
                 _ => crate::game::printed_cards::intrinsic_etb_counters(obj, None),
             };
             if !intrinsic.is_empty() {

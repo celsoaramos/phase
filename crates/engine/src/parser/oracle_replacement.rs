@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::ops::ControlFlow;
 use std::str::FromStr;
 
 use crate::parser::oracle_nom::error::{oracle_err, OracleError, OracleResult};
@@ -38,8 +39,8 @@ use super::oracle_target::{
     parse_declared_damage_source_target, parse_target, parse_type_phrase_folding,
 };
 use super::oracle_util::{
-    first_sentence, normalize_card_name_refs, parse_count_expr, parse_number, parse_ordinal,
-    strip_after, strip_reminder_text, TextPair,
+    first_sentence, merge_or_filters, normalize_card_name_refs, parse_count_expr, parse_number,
+    parse_ordinal, strip_after, strip_reminder_text, TextPair,
 };
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, CastVariantPaid, ChoiceType, CombatDamageScope,
@@ -53,7 +54,8 @@ use crate::types::ability::{
     ReplacementPlayerScope, SourceExclusion, StaticCondition, StaticDefinition, TapStateChange,
     TargetFilter, TriggerDefinition, TypeFilter, TypedFilter,
 };
-use crate::types::ability::{CardPlayMode, CastingPermission};
+use crate::types::ability::{CardPlayMode, CastingPermission, PlayerScope};
+use crate::types::ability_visit::{visit_ability_def_scoped, ResolutionScope};
 use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::mana::{ManaColor, ManaCost, ManaType};
@@ -3366,7 +3368,7 @@ fn parse_clone_replacement(
 ///
 /// The verbs are leaf alternatives with no shared prefix, so each is scanned
 /// independently and the earliest match wins — this mirrors the earliest-match
-/// discipline used by `split_on_clone_source_zone` / `split_on_first_of`.
+/// discipline used by `split_on_clone_source_zone` / `become_copy_except::split_at_body_boundary`.
 fn find_copy_verb(norm_lower: &str) -> Option<(&str, &str, bool)> {
     let candidates: &[(&str, bool)] = &[
         ("enter tapped as a copy of ", true),
@@ -3429,8 +3431,9 @@ fn split_on_clone_source_zone(
         ),
     ];
     // Earliest-matching phrase wins — "in a graveyard" before "in any graveyard"
-    // when both appear; structurally equivalent to `split_on_first_of` but also
-    // returns the zone selector.
+    // when both appear; structurally equivalent to
+    // `become_copy_except::split_at_body_boundary` but also returns the zone
+    // selector.
     let mut best: Option<(usize, usize, Zone, Option<ControllerRef>)> = None;
     for (phrase, zone, owner_scope) in candidates {
         if let Ok((_, (before, _))) = nom_primitives::split_once_on(after_copy, phrase) {
@@ -7462,6 +7465,7 @@ pub(crate) fn parse_oneshot_damage_replacement(
             // creature") is intentionally left as `Any` here (unchanged), since
             // it takes `target_filter == None`.
             target: damage_target_filter_to_prevent_target(target_filter.as_ref()),
+            recipient_scope: crate::types::ability::EffectScope::Single,
             scope: combat_scope
                 .map(|_| crate::types::ability::PreventionScope::CombatDamage)
                 .unwrap_or(crate::types::ability::PreventionScope::AllDamage),
@@ -7625,6 +7629,7 @@ fn parse_oneshot_target_source_prevent(norm_lower: &str, ctx: &ParseContext) -> 
         // `Any` here means "no additional recipient scope" and is not consulted
         // on the source-scoped prevent path.
         target: TargetFilter::Any,
+        recipient_scope: crate::types::ability::EffectScope::Single,
         scope,
         damage_source_filter: Some(TargetFilter::And {
             filters: vec![
@@ -8632,6 +8637,21 @@ fn finish_damage_source_subject(subject: &str) -> Option<TargetFilter> {
         return Some(TargetFilter::SelfRef);
     }
 
+    // CR 614.1a: A disjunction of controlled damage-source subjects ("a red
+    // instant or sorcery spell you control or a red planeswalker you control")
+    // matches a source satisfying EITHER leg. Split only at the controller
+    // tail followed by an article, so an intra-phrase type "or" ("instant or
+    // sorcery") stays inside its leg; the tail recurses for 3+ legs.
+    if let Ok((_, (head, tail))) = nom_primitives::split_once_on(subject, " you control or ") {
+        if nom_primitives::parse_article.parse(tail).is_ok() {
+            let first_leg = &subject[..head.len() + " you control".len()];
+            return Some(merge_or_filters(
+                finish_damage_source_subject(first_leg)?,
+                finish_damage_source_subject(tail)?,
+            ));
+        }
+    }
+
     // Strip leading "a " or "an "
     let subject = nom_primitives::parse_article
         .parse(subject)
@@ -9248,17 +9268,32 @@ fn body_is_lifegain_negation(lower_body: &str) -> bool {
     combinator.parse(lower_body.trim()).is_ok()
 }
 
+/// CR 614.6 + CR 121.6: The predicate of a draw-suppression clause —
+/// `"skip[s] that/the draw"`. Single authority shared by the pure-skip body
+/// (`body_is_draw_skip`) and the compound "skips that draw and <effect>" body
+/// (`strip_leading_draw_skip_conjunct`). "that draw" and "the draw" are leaf
+/// variants of the same anaphor back to the replaced draw event.
+fn draw_skip_predicate(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        (
+            alt((tag("skips "), tag("skip "))),
+            alt((tag("that draw"), tag("the draw"))),
+        ),
+    )
+    .parse(input)
+}
+
 /// CR 614.6 + CR 121.6: Recognize a PURE draw-suppression replacement body
 /// "[subject] skip[s] that/the draw" (Living Conundrum). The optional subject
-/// prefix mirrors `body_is_lifegain_negation`; "that draw" and "the draw" are
-/// leaf variants of the same anaphor back to the replaced draw event.
+/// prefix mirrors `body_is_lifegain_negation`.
 ///
 /// `all_consuming` (modulo a trailing period) is load-bearing: a compound body
 /// that only *begins* with a skip and then adds a follow-on effect — Notion
-/// Thief / Hullbreacher's "that player skips that draw AND you draw a card" —
-/// must NOT collapse to a bare `Prevent`, which would drop the "you draw a card"
-/// execute (and the except-first-draw condition). Those compound bodies fall
-/// through to the normal `execute` path.
+/// Thief's "that player skips that draw AND you draw a card" — must NOT
+/// collapse to a bare `Prevent`, which would drop the "you draw a card"
+/// execute (and the except-first-draw condition). Those compound bodies are
+/// handled by `strip_leading_draw_skip_conjunct` and the normal `execute` path.
 fn body_is_draw_skip(lower_body: &str) -> bool {
     let subject = opt(alt((
         tag::<_, _, OracleError<'_>>("that player "),
@@ -9266,19 +9301,48 @@ fn body_is_draw_skip(lower_body: &str) -> bool {
         tag("you "),
         tag("they "),
     )));
-    let mut combinator = all_consuming(preceded(
-        subject,
-        value(
-            (),
-            (
-                alt((tag("skips "), tag("skip "))),
-                alt((tag("that draw"), tag("the draw"))),
-            ),
-        ),
-    ));
+    let mut combinator = all_consuming(preceded(subject, draw_skip_predicate));
     combinator
         .parse(lower_body.trim().trim_end_matches('.').trim_end())
         .is_ok()
+}
+
+/// CR 614.6 + CR 121.6: Strip the leading skip conjunct of a compound draw
+/// replacement body — `"that player skips that draw and <effect>"` (Notion
+/// Thief) — returning the `<effect>` remainder. The replacement itself is the
+/// skip (CR 614.6: the replaced draw never happens; the draw pipeline zeroes an
+/// opponent's draw whenever the replacement's `execute` substitutes for it), so
+/// the clause has no effect representation and is dropped rather than lowered
+/// to an `Unimplemented` no-op.
+///
+/// Anchored at both ends: the body must BEGIN with the mandatory subject
+/// (`that player` / `the player` / `they` — `you` is excluded, no printed card
+/// uses it and the caller's own draw is a rescale, not a substitution) and the
+/// anaphor must be followed immediately by the conjunction. The whole remainder
+/// is handed to `parse_effect_chain`, so anything it cannot lower stays an
+/// honest `Unimplemented`. `None` when the shape does not match or the
+/// remainder is empty.
+fn strip_leading_draw_skip_conjunct<'a>(
+    lower_body: &str,
+    original_body: &'a str,
+) -> Option<&'a str> {
+    let (_, rest) = nom_on_lower(original_body, lower_body, |input| {
+        value(
+            (),
+            (
+                alt((
+                    tag::<_, _, OracleError<'_>>("that player "),
+                    tag("the player "),
+                    tag("they "),
+                )),
+                draw_skip_predicate,
+                alt((tag(", and "), tag(" and "))),
+            ),
+        )
+        .parse(input)
+    })?;
+    let rest = rest.trim_start();
+    (!rest.is_empty()).then_some(rest)
 }
 
 /// CR 614.6 + CR 121.6 + CR 614.1a: Strip a leading optional draw-suppression
@@ -9436,6 +9500,10 @@ fn parse_draw_replacement(
         }
         return Some(def);
     }
+    // CR 614.1a: Player scope for draw replacements. Assigned before effect
+    // lowering because the compound-skip strip below is only meaningful for a
+    // scoped replacement (`valid_player` is `Some`).
+    apply_draw_player_scope(lower, &mut def);
     if let Some(e) = effect_text {
         // CR 614.1a + CR 614.6 + CR 121.6: "you may instead {effect}" makes
         // the draw replacement optional. The player is offered an
@@ -9445,7 +9513,19 @@ fn parse_draw_replacement(
         // draw-on-decline ability (which would double-draw on accept and
         // shadow the engine's native draw on decline). Strip the lead-in
         // before handing the remainder to `parse_effect_chain`.
-        let (optional_modal_present, effect_after_modal) = strip_optional_instead_lead_in(&e);
+        // CR 614.6 + CR 121.6: "that player skips that draw and {effect}"
+        // (Notion Thief) — the replacement is itself the skip, so drop that
+        // leading clause and lower only the substitute. Requires an explicit
+        // draw-player scope: an unscoped antecedent ("target player would
+        // draw", Plagiarize) has no replaced-player binding and stays whole.
+        let e_lower = e.to_lowercase();
+        let effect_after_skip = def
+            .valid_player
+            .as_ref()
+            .and_then(|_| strip_leading_draw_skip_conjunct(&e_lower, &e))
+            .unwrap_or(&e);
+        let (optional_modal_present, effect_after_modal) =
+            strip_optional_instead_lead_in(effect_after_skip);
         if optional_modal_present {
             def = def.mode(ReplacementMode::Optional { decline: None });
         }
@@ -9453,8 +9533,6 @@ fn parse_draw_replacement(
         rewrite_draw_replacement_execute_referents(&mut execute, effect_after_modal);
         def = def.execute(execute);
     }
-    // CR 614.1a: Player scope for draw replacements.
-    apply_draw_player_scope(lower, &mut def);
     // CR 614.1a: A parsed "As long as <state>" gate takes precedence — it is
     // the antecedent's own restriction, not a mid-clause "while" or
     // except-first exception.
@@ -9882,6 +9960,138 @@ fn turn_face_up_effect_is_self_resolving(ability: &AbilityDefinition) -> bool {
         current = def.sub_ability.as_deref();
     }
     true
+}
+
+/// CR 614.1c: the "As [this permanent] enters[ the battlefield], " template.
+/// " or is turned face up" (the dual counter arm) and "enters tapped, " fail the
+/// closing `", "` and stay out.
+fn parse_as_self_enters_frame(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        (tag("as ~ enters"), opt(tag(" the battlefield")), tag(", ")),
+    )
+    .parse(input)
+}
+
+/// CR 614.1c: does this (self-reference-normalized, lowercase) line open with the
+/// "As ~ enters[ the battlefield], " frame? The single recognizer the one-shot
+/// arm and both of its `oracle.rs` routing sites share.
+pub(crate) fn is_as_self_enters_frame(lower: &str) -> bool {
+    parse_as_self_enters_frame(lower).is_ok()
+}
+
+/// CR 614.1c + CR 603.6d: "As [this permanent] enters, <instruction>" is a
+/// replacement effect whose instruction happens as part of the event that puts
+/// the permanent onto the battlefield (the post-replacement drain, before SBAs,
+/// triggers or priority). CR 614.12: the permanent's own replacement applies to
+/// its own entry. Scoped by `as_enters_one_shot_is_admissible`.
+pub(crate) fn parse_as_enters_one_shot_replacement(
+    text: &str,
+    card_name: &str,
+) -> Option<ReplacementDefinition> {
+    let text = strip_reminder_text(text);
+    let normalized = replace_self_refs(&text, card_name);
+    let lower = normalized.to_lowercase();
+    let ((), body) = nom_on_lower(&normalized, &lower, parse_as_self_enters_frame)?;
+    // Punctuation cleanup on the pre-tokenized body (drop the sentence terminator).
+    let body = body.trim().trim_end_matches('.').trim();
+    if body.is_empty() {
+        return None;
+    }
+    let execute = parse_effect_chain(body, AbilityKind::Spell);
+    if !as_enters_one_shot_is_admissible(&execute) {
+        return None;
+    }
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::Moved)
+            .valid_card(TargetFilter::SelfRef)
+            .destination_zone(Zone::Battlefield)
+            .execute(execute)
+            .description(text.to_string()),
+    )
+}
+
+/// CR 614.1c + CR 603.6d: the instruction happens as part of the entry event,
+/// but the engine runs it in the post-entry drain, after the entrant is on the
+/// battlefield. Only kinds whose outcome cannot depend on that are admitted:
+/// life change for "you" (CR 119.3, CR 109.5) and "you get an emblem" with
+/// static abilities (CR 114.2). A population effect (it would include the
+/// entrant), a pending-entry modifier (applied after the entry it modifies) and
+/// any instruction or quantity that refers to an object are declined.
+///
+/// CR 614.12a: a choice made as a permanent enters belongs to the as-enters
+/// choice arms. No choice-bearing kind is admitted.
+///
+/// Allowlist: a kind is admitted only with a runtime test under the drain
+/// (`CreateEmblem`, `LoseLife`, `GainLife`). Unimplemented, conditional,
+/// optional and non-admitted bodies decline so coverage stays honest.
+fn as_enters_one_shot_is_admissible(execute: &AbilityDefinition) -> bool {
+    // Node leg: walk `execute` and its `sub_ability` chain.
+    let mut node = Some(execute);
+    while let Some(def) = node {
+        if def.condition.is_some()
+            || def.optional
+            || def.optional_player.is_some()
+            || def.optional_for.is_some()
+            || def.unless_pay.is_some()
+            || def.else_ability.is_some()
+            || def.player_scope.is_some()
+            || def.repeat_for.is_some()
+            || def.repeat_until.is_some()
+            || def.modal.is_some()
+            || !def.mode_abilities.is_empty()
+            || def.unlowered_guard.is_some()
+        {
+            return false;
+        }
+        node = def.sub_ability.as_deref();
+    }
+    // Kind leg + quantity leg: every own-resolution effect is admitted.
+    visit_ability_def_scoped(execute, ResolutionScope::OwnResolutionOnly, &mut |effect| {
+        if admitted_one_shot_effect(effect) {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
+        }
+    })
+    .is_continue()
+}
+
+/// The as-enters one-shot kind allowlist. CR 115.1: a replacement never goes on
+/// the stack, so its instruction declares no target. `Controller` is "you"
+/// (CR 109.5), and the drain resolves it from the context slot, never from the
+/// injected `Object(entrant)` target (`life.rs::resolve_life_loss_target`).
+/// The wildcard is the allowlist's soundness property: a new `Effect` kind is
+/// declined until it is deliberately admitted with its own drain runtime test.
+fn admitted_one_shot_effect(effect: &Effect) -> bool {
+    match effect {
+        Effect::LoseLife {
+            amount,
+            target: None | Some(TargetFilter::Controller),
+        } => amount_reads_only_controller_life(amount),
+        Effect::GainLife {
+            amount,
+            player: TargetFilter::Controller,
+        } => amount_reads_only_controller_life(amount),
+        // CR 114.2: "you get an emblem" — statics only; an emblem trigger could
+        // observe the entry it is created during.
+        Effect::CreateEmblem { triggers, .. } => triggers.is_empty(),
+        _ => false,
+    }
+}
+
+/// CR 119.3 + CR 109.5: only `Fixed` and "your life total". A player-axis ref
+/// such as party size, hand/graveyard size or battlefield entries this turn can
+/// count the entrant in the post-entry drain.
+fn amount_reads_only_controller_life(amount: &QuantityExpr) -> bool {
+    !amount.any_ref(&mut |r| {
+        !matches!(
+            r,
+            QuantityRef::LifeTotal {
+                player: PlayerScope::Controller
+            }
+        )
+    })
 }
 
 fn parse_untap_step_replacement(original_text: &str, lower: &str) -> Option<ReplacementDefinition> {
@@ -11674,7 +11884,7 @@ fn parse_cant_become_untapped_replacement(
 /// (the same subject-typing helper every other damage-source clause in this
 /// module already uses), which itself falls back to `parse_type_phrase_folding` — the
 /// SAME combinator that already resolves "unblocked creatures" / "unblocked
-/// attacking creatures" to `FilterProp::Unblocked` via
+/// attacking creatures" to `FilterProp::BlockStatus { Unblocked }` via
 /// `parse_combat_status_prefix` (`oracle_target.rs`), proven by the existing
 /// `parse_type_phrase_unblocked_attacking_creatures_you_control` test. This
 /// function adds NO new unblocked-detection — only the "by ... is dealt to"
@@ -13264,6 +13474,30 @@ fn rewrite_draw_replacement_execute_referents(def: &mut AbilityDefinition, text:
     rewrite_exile_would_be_drawn_card_to_exile_top(def, text);
     rewrite_reveal_top_player_to_post_replacement_target(def);
     rewrite_replacement_event_recipient_to_post_replacement_target(def);
+    rewrite_draw_replacement_card_to_last_revealed(def);
+}
+
+/// CR 614.6 + CR 608.2c: in a draw-replacement chain, "put that card / put it
+/// into …" moves the card the replacement revealed or looked at (Zur's Weirding,
+/// Enduring Renewal, Underrealm Lich), so a card-movement `ParentTarget` binds
+/// to the reveal ledger. Only card-movement slots are rebound: a player-slot
+/// `ParentTarget` ("they draw a card", "they mill a card" — Chains of
+/// Mephistopheles) names the replaced draw's player and must stay a player
+/// referent.
+fn rewrite_draw_replacement_card_to_last_revealed(def: &mut AbilityDefinition) {
+    if let Effect::ChangeZone { target, .. } | Effect::ChangeZoneAll { target, .. } =
+        &mut *def.effect
+    {
+        if matches!(target, TargetFilter::ParentTarget) {
+            *target = TargetFilter::LastRevealed;
+        }
+    }
+    if let Some(sub) = def.sub_ability.as_mut() {
+        rewrite_draw_replacement_card_to_last_revealed(sub);
+    }
+    if let Some(else_branch) = def.else_ability.as_mut() {
+        rewrite_draw_replacement_card_to_last_revealed(else_branch);
+    }
 }
 
 /// CR 121.1 + CR 614.6: "that player exiles that card instead" (Uba Mask) —
@@ -14147,6 +14381,7 @@ fn parse_unconditional_life_floor_to_zero_form(input: &str) -> OracleResult<'_, 
 mod tests {
     use super::*;
     use crate::parser::oracle::parse_oracle_text;
+    use crate::types::ability::AttackerBlockStatus;
     use crate::types::ability::{
         AbilityCondition, Comparator, ControllerRef, CountScope, QuantityExpr,
         QuantityModification, QuantityRef, ReplacementCondition, RestrictionExpiry, ShieldKind,
@@ -21256,6 +21491,27 @@ mod tests {
         assert_eq!(def.combat_scope, None); // all damage
     }
 
+    /// CR 614.1a: a "<A> you control or <B> you control" damage-source subject
+    /// yields an `Or` of both typed legs rather than dropping the filter.
+    #[test]
+    fn damage_source_disjunction_of_controlled_subjects_is_or() {
+        for text in [
+            "If a red instant or sorcery spell you control or a red planeswalker you control would deal damage to a permanent or player, it deals that much damage plus 2 to that permanent or player instead.",
+            "If a creature you control or a planeswalker you control would deal damage to a permanent or player, it deals that much damage plus 1 to that permanent or player instead.",
+        ] {
+            let def = parse_replacement_line(text, "Test").unwrap();
+            let Some(TargetFilter::Or { filters }) = def.damage_source_filter else {
+                panic!("expected Or source filter for {text}");
+            };
+            // A leg with its own type-"or" ("instant or sorcery") flattens into
+            // the disjunction, so 2+ legs total.
+            assert!(filters.len() >= 2);
+            assert!(filters
+                .iter()
+                .all(|f| matches!(f, TargetFilter::Typed(tf) if tf.controller == Some(ControllerRef::You))));
+        }
+    }
+
     #[test]
     fn uncivil_unrest_double_damage_parses_creature_source_filter() {
         let def = parse_replacement_line(
@@ -23534,7 +23790,9 @@ mod tests {
         );
         match &def.damage_source_filter {
             Some(TargetFilter::Typed(tf)) => assert!(
-                tf.properties.contains(&FilterProp::Unblocked),
+                tf.properties.contains(&FilterProp::BlockStatus {
+                    status: AttackerBlockStatus::Unblocked
+                }),
                 "expected Unblocked property, got {:?}",
                 tf.properties
             ),
@@ -23565,7 +23823,9 @@ mod tests {
         );
         match &def.damage_source_filter {
             Some(TargetFilter::Typed(tf)) => {
-                assert!(tf.properties.contains(&FilterProp::Unblocked))
+                assert!(tf.properties.contains(&FilterProp::BlockStatus {
+                    status: AttackerBlockStatus::Unblocked
+                }))
             }
             other => panic!("expected a Typed damage_source_filter with Unblocked, got {other:?}"),
         }
@@ -25148,6 +25408,122 @@ mod tests {
         );
     }
 
+    fn assert_no_unimplemented_in_chain(mut node: Option<&AbilityDefinition>) {
+        while let Some(def) = node {
+            assert!(
+                !matches!(&*def.effect, Effect::Unimplemented { .. }),
+                "unexpected Unimplemented in chain: {:?}",
+                def.effect
+            );
+            node = def.sub_ability.as_deref();
+        }
+    }
+
+    fn chain_has_unimplemented(mut node: Option<&AbilityDefinition>) -> bool {
+        while let Some(def) = node {
+            if matches!(&*def.effect, Effect::Unimplemented { .. }) {
+                return true;
+            }
+            node = def.sub_ability.as_deref();
+        }
+        false
+    }
+
+    const NOTION_THIEF_ANTECEDENT: &str =
+        "If an opponent would draw a card except the first one they draw in each of their draw steps, ";
+
+    /// Reach guard shared by the hostile rows: the verbatim Notion Thief text
+    /// takes the compound-skip strip path (clean `Draw` head, no gap marker).
+    fn assert_notion_thief_strip_fires() {
+        let def = parse_replacement_line(
+            &format!(
+                "{NOTION_THIEF_ANTECEDENT}instead that player skips that draw and you draw a card."
+            ),
+            "Notion Thief",
+        )
+        .expect("Notion Thief parses");
+        assert_no_unimplemented_in_chain(def.execute.as_deref());
+        assert!(matches!(
+            &*def.execute.as_ref().unwrap().effect,
+            Effect::Draw { .. }
+        ));
+    }
+
+    /// Plagiarize ("target player" antecedent has no draw-player scope) must
+    /// never collapse to a clean Draw head: the skip clause is not stripped.
+    #[test]
+    fn compound_draw_skip_refuses_unscoped_plagiarize_antecedent() {
+        assert_notion_thief_strip_fires();
+        let text = "Until end of turn, if target player would draw a card, instead that player skips that draw and you draw a card.";
+        match parse_replacement_line(text, "Plagiarize") {
+            None => {}
+            Some(def) => assert!(
+                chain_has_unimplemented(def.execute.as_deref()),
+                "Plagiarize must keep an Unimplemented marker, got {:?}",
+                def.execute
+            ),
+        }
+    }
+
+    /// Hostile rows: every non-matching shape keeps an honest gap marker (or a
+    /// condition), never a clean unconditioned Draw.
+    #[test]
+    fn compound_draw_skip_declines_hostile_shapes() {
+        assert_notion_thief_strip_fires();
+        // Pure skip is unchanged: Prevent, no execute.
+        let pure = parse_replacement_line(
+            &format!("{NOTION_THIEF_ANTECEDENT}instead that player skips that draw."),
+            "Synthetic",
+        )
+        .expect("pure skip parses");
+        assert_eq!(
+            pure.quantity_modification,
+            Some(QuantityModification::Prevent)
+        );
+        assert!(pure.execute.is_none());
+
+        // Not stripped: empty remainder, wrong anaphor, trailing position,
+        // "you" subject — each keeps an honest `Unimplemented` gap marker.
+        for body in [
+            "instead that player skips that draw and",
+            "instead that player skips that drawn card and you draw a card.",
+            "instead that player skips that draw twice and you draw a card.",
+            "instead you draw a card and that player skips that draw.",
+            "instead you skip that draw and you draw a card.",
+        ] {
+            let text = format!("{NOTION_THIEF_ANTECEDENT}{body}");
+            let def = parse_replacement_line(&text, "Synthetic")
+                .unwrap_or_else(|| panic!("{body:?} should still parse as a Draw replacement"));
+            assert!(
+                chain_has_unimplemented(def.execute.as_deref()),
+                "{body:?} must keep an Unimplemented marker, got {:?}",
+                def.execute
+            );
+        }
+
+        // The optional modal is not the mandatory compound: fails closed.
+        assert!(parse_replacement_line(
+            &format!(
+                "{NOTION_THIEF_ANTECEDENT}instead you may skip that draw and you draw a card."
+            ),
+            "Synthetic",
+        )
+        .is_none());
+
+        // Remainder carries a rider: the "unless" must not be dropped — it
+        // survives as a condition on the substitute Draw.
+        let text = format!(
+            "{NOTION_THIEF_ANTECEDENT}instead that player skips that draw and you draw a card unless you control a creature."
+        );
+        let def = parse_replacement_line(&text, "Synthetic").expect("unless variant parses");
+        let execute = def.execute.as_deref().expect("execute present");
+        assert!(
+            execute.condition.is_some(),
+            "the unless clause must survive as a condition: {:?}",
+            def.execute
+        );
+    }
+
     /// CR 614.1a + CR 121.1: Opponent draw replacements with the shared
     /// except-first-draw-in-draw-step clause (Notion Thief / Hullbreacher class).
     #[test]
@@ -25166,10 +25542,20 @@ mod tests {
             notion_thief.condition,
             Some(ReplacementCondition::ExceptFirstDrawInDrawStep)
         );
+        assert_no_unimplemented_in_chain(notion_thief.execute.as_deref());
+        let execute = notion_thief.execute.as_deref().expect("execute present");
         assert!(
-            notion_thief.execute.is_some(),
-            "replacement execute chain must be present"
+            matches!(
+                &*execute.effect,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                }
+            ),
+            "the skip clause is the replacement itself; execute is just the controller's draw, got {:?}",
+            execute.effect
         );
+        assert!(execute.sub_ability.is_none());
 
         let hullbreacher = parse_replacement_line(
             "If an opponent would draw a card except the first one they draw in each of their draw steps, instead you create a Treasure token.",
@@ -26424,6 +26810,281 @@ mod tests {
                 .any(|a| matches!(&*a.effect, Effect::Unimplemented { .. })),
             "the fail-closed line must surface as Effect::Unimplemented, got {:?}",
             card.abilities
+        );
+    }
+
+    // ── "As ~ enters, <one-shot>" (CR 614.1c + CR 603.6d) ──────────────────
+
+    /// Positive twins for the one-shot arm's gate negatives.
+    const P_LOSE: &str = "As ~ enters, you lose 2 life.";
+    const P_GAIN: &str = "As ~ enters, you gain 3 life.";
+    const P_EMBLEM: &str =
+        "As ~ enters, you get an emblem with \"Creatures you control get +1/+1.\"";
+    const P_LIFE_TOTAL: &str = "As ~ enters, you lose life equal to your life total.";
+
+    fn one_shot(text: &str) -> Option<ReplacementDefinition> {
+        parse_as_enters_one_shot_replacement(text, "Test Card")
+    }
+
+    /// Parse the body after the "As ~ enters, " frame the way the arm does.
+    fn one_shot_body(text: &str) -> AbilityDefinition {
+        let lower = text.to_lowercase();
+        let ((), body) = nom_on_lower(text, &lower, parse_as_self_enters_frame)
+            .expect("the negative must open the frame");
+        parse_effect_chain(body.trim().trim_end_matches('.').trim(), AbilityKind::Spell)
+    }
+
+    /// Assert that `negative` declines while `twin` (same frame, admitted body)
+    /// is accepted, and return the negative body's parse for the leg assertion.
+    fn assert_declined_with_twin(negative: &str, twin: &str) -> AbilityDefinition {
+        assert!(
+            one_shot(twin).is_some(),
+            "positive twin {twin:?} must be admitted"
+        );
+        assert!(
+            one_shot(negative).is_none(),
+            "negative {negative:?} must be declined"
+        );
+        let body = one_shot_body(negative);
+        assert!(
+            !matches!(*body.effect, Effect::Unimplemented { .. }),
+            "the negative body must parse (the gate leg is what declines it): {body:?}"
+        );
+        body
+    }
+
+    /// CR 614.1c: the frame is "As ~ enters[ the battlefield], "; the dual
+    /// face-up counter frame, "enters tapped", triggers and other objects'
+    /// entries stay out.
+    #[test]
+    fn as_self_enters_frame_recognizes_only_the_bare_self_frame() {
+        assert!(is_as_self_enters_frame("as ~ enters, you lose 2 life."));
+        assert!(is_as_self_enters_frame(
+            "as ~ enters the battlefield, you lose 2 life."
+        ));
+        assert!(!is_as_self_enters_frame(
+            "as ~ enters or is turned face up, put a +1/+1 counter on it."
+        ));
+        assert!(!is_as_self_enters_frame(
+            "as ~ enters tapped, you lose 2 life."
+        ));
+        assert!(!is_as_self_enters_frame("when ~ enters, you lose 2 life."));
+        assert!(!is_as_self_enters_frame(
+            "as a creature enters, you lose 2 life."
+        ));
+    }
+
+    /// CR 614.1c + CR 603.6d + CR 119.3: the admitted kinds build a mandatory
+    /// `Moved` self-to-battlefield replacement whose execute is the body.
+    #[test]
+    fn as_enters_one_shot_admits_player_scoped_life_and_statics_only_emblem() {
+        for text in [P_LOSE, P_GAIN, P_EMBLEM, P_LIFE_TOTAL] {
+            let def = one_shot(text).unwrap_or_else(|| panic!("{text:?} must be admitted"));
+            assert_eq!(def.event, ReplacementEvent::Moved);
+            assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+            assert_eq!(def.destination_zone, Some(Zone::Battlefield));
+            assert_eq!(def.mode, ReplacementMode::Mandatory);
+            assert_eq!(def.description.as_deref(), Some(text));
+            assert!(def.execute.is_some(), "{text:?} carries its execute");
+        }
+        let def = one_shot("As ~ enters the battlefield, you lose 2 life.")
+            .expect("the long frame is admitted too");
+        assert!(matches!(
+            *def.execute.expect("the long frame executes").effect,
+            Effect::LoseLife { .. }
+        ));
+    }
+
+    /// Population: "destroy all creatures" would include the entrant in
+    /// the post-entry drain.
+    #[test]
+    fn as_enters_one_shot_declines_population_destroy() {
+        let body = assert_declined_with_twin("As ~ enters, destroy all creatures.", P_LOSE);
+        assert!(
+            matches!(*body.effect, Effect::DestroyAll { .. }),
+            "{body:?}"
+        );
+    }
+
+    /// Population: a counter on each creature you control would include
+    /// the entrant.
+    #[test]
+    fn as_enters_one_shot_declines_population_counters() {
+        let body = assert_declined_with_twin(
+            "As ~ enters, put a +1/+1 counter on each creature you control.",
+            P_GAIN,
+        );
+        assert!(
+            matches!(*body.effect, Effect::PutCounterAll { .. }),
+            "{body:?}"
+        );
+    }
+
+    /// Target: CR 115.1 — a replacement declares no target.
+    #[test]
+    fn as_enters_one_shot_declines_targeted_body() {
+        let body = assert_declined_with_twin("As ~ enters, destroy target artifact.", P_LOSE);
+        assert!(
+            matches!(
+                &*body.effect,
+                Effect::Destroy {
+                    target: TargetFilter::Typed(_),
+                    ..
+                }
+            ),
+            "{body:?}"
+        );
+    }
+
+    /// Entrant: a modification of the entering permanent belongs to the
+    /// counters / enters-with arms.
+    #[test]
+    fn as_enters_one_shot_declines_entrant_modification() {
+        let body = assert_declined_with_twin("As ~ enters, put a +1/+1 counter on it.", P_LOSE);
+        assert!(
+            matches!(
+                &*body.effect,
+                Effect::PutCounter {
+                    target: TargetFilter::SelfRef,
+                    ..
+                }
+            ),
+            "{body:?}"
+        );
+    }
+
+    /// Non-admitted player kinds: draw and token creation have no drain
+    /// runtime test, so they stay declined.
+    #[test]
+    fn as_enters_one_shot_declines_unadmitted_player_kinds() {
+        let draw = assert_declined_with_twin("As ~ enters, draw a card.", P_EMBLEM);
+        assert!(matches!(*draw.effect, Effect::Draw { .. }), "{draw:?}");
+        let token = assert_declined_with_twin(
+            "As ~ enters, create a 1/1 white Soldier creature token.",
+            P_EMBLEM,
+        );
+        assert!(matches!(*token.effect, Effect::Token { .. }), "{token:?}");
+    }
+
+    /// Choice: CR 614.12a — as-enters choices belong to the choice arms.
+    #[test]
+    fn as_enters_one_shot_declines_choice() {
+        let body = assert_declined_with_twin("As ~ enters, choose a color.", P_LOSE);
+        assert!(matches!(*body.effect, Effect::Choose { .. }), "{body:?}");
+    }
+
+    /// Node leg: a conditional body declines.
+    #[test]
+    fn as_enters_one_shot_declines_conditional_body() {
+        let body = assert_declined_with_twin(
+            "As ~ enters, if you control a Forest, you lose 2 life.",
+            P_LOSE,
+        );
+        assert!(matches!(*body.effect, Effect::LoseLife { .. }), "{body:?}");
+        assert!(body.condition.is_some(), "{body:?}");
+    }
+
+    /// Node leg: an optional body declines.
+    #[test]
+    fn as_enters_one_shot_declines_optional_body() {
+        let body = assert_declined_with_twin("As ~ enters, you may gain 3 life.", P_GAIN);
+        assert!(matches!(*body.effect, Effect::GainLife { .. }), "{body:?}");
+        assert!(body.optional, "{body:?}");
+    }
+
+    /// Player scope: only "you" is admitted (CR 109.5).
+    #[test]
+    fn as_enters_one_shot_declines_other_players() {
+        let body = assert_declined_with_twin("As ~ enters, each opponent loses 2 life.", P_LOSE);
+        let Effect::LoseLife { target, .. } = &*body.effect else {
+            panic!("expected LoseLife, got {body:?}");
+        };
+        assert!(
+            body.player_scope.is_some() || !matches!(target, None | Some(TargetFilter::Controller)),
+            "{body:?}"
+        );
+    }
+
+    /// Quantity leg, population read: an object count could count the
+    /// entrant in the post-entry drain.
+    #[test]
+    fn as_enters_one_shot_declines_object_count_amount() {
+        let body = assert_declined_with_twin(
+            "As ~ enters, you lose life equal to the number of creatures you control.",
+            P_LIFE_TOTAL,
+        );
+        let Effect::LoseLife { amount, .. } = &*body.effect else {
+            panic!("expected LoseLife, got {body:?}");
+        };
+        assert!(
+            amount.any_ref(&mut |r| matches!(r, QuantityRef::ObjectCount { .. })),
+            "{body:?}"
+        );
+    }
+
+    /// Emblem trigger: an emblem trigger could observe the entry it is
+    /// created during.
+    #[test]
+    fn as_enters_one_shot_declines_emblem_with_trigger() {
+        let body = assert_declined_with_twin(
+            "As ~ enters, you get an emblem with \"Whenever a creature you control enters, you gain 1 life.\"",
+            P_EMBLEM,
+        );
+        let Effect::CreateEmblem { triggers, .. } = &*body.effect else {
+            panic!("expected CreateEmblem, got {body:?}");
+        };
+        assert_eq!(triggers.len(), 1, "{body:?}");
+    }
+
+    /// Unimplemented body: Working Stiff (verbatim) stays an honest gap.
+    #[test]
+    fn as_enters_one_shot_declines_unimplemented_body() {
+        assert!(one_shot(P_LOSE).is_some(), "positive twin must be admitted");
+        assert!(
+            parse_as_enters_one_shot_replacement(
+                "As this creature enters, straighten your arms.",
+                "Working Stiff"
+            )
+            .is_none(),
+            "an unimplemented body must be declined"
+        );
+        let body = one_shot_body("As ~ enters, straighten your arms.");
+        let effects = {
+            let mut effects = vec![&*body.effect];
+            let mut current = body.sub_ability.as_deref();
+            while let Some(sub) = current {
+                effects.push(&*sub.effect);
+                current = sub.sub_ability.as_deref();
+            }
+            effects
+        };
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Unimplemented { .. })),
+            "{body:?}"
+        );
+    }
+
+    /// Quantity leg, entry-sensitive player-axis read: hand size can
+    /// change with the entry (a card entering from its owner's hand).
+    #[test]
+    fn as_enters_one_shot_declines_hand_size_amount() {
+        let body = assert_declined_with_twin(
+            "As ~ enters, you lose life equal to the number of cards in your hand.",
+            P_LIFE_TOTAL,
+        );
+        let Effect::LoseLife { amount, .. } = &*body.effect else {
+            panic!("expected LoseLife, got {body:?}");
+        };
+        assert!(
+            amount.any_ref(&mut |r| matches!(
+                r,
+                QuantityRef::HandSize {
+                    player: PlayerScope::Controller
+                }
+            )),
+            "{body:?}"
         );
     }
 }

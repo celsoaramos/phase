@@ -291,6 +291,40 @@ impl CastFrequency {
     }
 }
 
+/// CR 109.5 + CR 404.1: Whose graveyards a `GraveyardCastPermission` reaches.
+///
+/// CR 404.1 gives each player their own graveyard, and CR 109.5 makes "your"
+/// the permission holder's. "From your graveyard" (Lurrus, Karador, Yawgmoth's
+/// Will) reaches only the caster's own graveyard; "from any graveyard" (The
+/// Great Work) reaches every player's.
+///
+/// An axis of its own rather than a reading of `StaticDefinition.affected`:
+/// most printed permissions lower their "your graveyard" pool with no
+/// controller on the filter, so the filter alone cannot tell the two pools
+/// apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum GraveyardPermissionPool {
+    /// "From your graveyard": only cards the caster owns.
+    #[default]
+    OwnGraveyard,
+    /// "From any graveyard": cards in every player's graveyard.
+    AnyGraveyard,
+}
+
+impl GraveyardPermissionPool {
+    pub fn is_own_graveyard(&self) -> bool {
+        matches!(self, GraveyardPermissionPool::OwnGraveyard)
+    }
+
+    /// Whether a graveyard card owned by `card_owner` is in this pool for `caster`.
+    pub fn admits(self, card_owner: PlayerId, caster: PlayerId) -> bool {
+        match self {
+            GraveyardPermissionPool::OwnGraveyard => card_owner == caster,
+            GraveyardPermissionPool::AnyGraveyard => true,
+        }
+    }
+}
+
 impl fmt::Display for CastFrequency {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1334,6 +1368,18 @@ pub enum StaticMode {
         /// "abilities **of** <subject>" forms, whose scope lives in `affected`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activator: Option<PlayerFilter>,
+        /// CR 115.9b + CR 602.2b: optional "that targets <filter>" gate for
+        /// activated-ability cost modifiers. This is evaluated against the
+        /// activation's committed targets, not against the ability source.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        targets: Option<TargetFilter>,
+        /// CR 118.7 + CR 602.2b: how often qualifying activations can use this
+        /// adjustment. `None` = unlimited; `Some(OncePerTurn)` applies only to
+        /// the turn's first activation that satisfies every gate of this
+        /// modifier, read from the turn's activation journal (CR 611.3a: an
+        /// activation made before the modifier's source existed still counts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frequency: Option<CastFrequency>,
     },
     /// CR 116.2 + CR 118.7a: Modifies the generic mana cost of a *special action*
     /// (plot per CR 116.2k / 702.170, unlock per CR 116.2m / 709.5e), in the
@@ -1493,7 +1539,7 @@ pub enum StaticMode {
         who: ProhibitionScope,
     },
     /// CR 604.2 + CR 305.1: Static ability granting permission to play/cast
-    /// matching cards from owner's graveyard.
+    /// matching cards from the graveyards its `pool` names.
     GraveyardCastPermission {
         /// CR 601.2a: Per-turn cast frequency. `OncePerTurn` = "once during each of
         /// your turns" (Lurrus, Karador). `Unlimited` = no per-turn cap (Conduit).
@@ -1524,6 +1570,28 @@ pub enum StaticMode {
         /// `Effect::CastFromZone.enters_with_counter`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         enters_with_counter: Option<super::counter::CounterType>,
+        /// CR 118.9b: "An effect that allows you to cast a spell may require a
+        /// certain alternative cost to be paid." The casting method this
+        /// permission restricts the cast to ("You may cast this card from your
+        /// graveyard using its blitz ability.": Sabin, Master Monk; Tenacious
+        /// Underdog; Detective's Phoenix with bestow). `None` (default) leaves
+        /// the method open, including the printed cost. Separate from
+        /// `StaticDefinition.affected`, which only selects cards.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        required_cast_keyword: Option<super::keywords::KeywordKind>,
+        /// CR 109.5 + CR 404.1: whose graveyards the permission reaches.
+        /// `OwnGraveyard` (default) is "from your graveyard"; `AnyGraveyard` is
+        /// "from any graveyard" (The Great Work). Read by
+        /// `casting::GraveyardPermissionSource::admits_card`. The land surface
+        /// (`casting::graveyard_lands_playable_by_permission`) walks only the
+        /// player's own graveyard; the parser builds `AnyGraveyard` only for a
+        /// `Cast` permission, and the play-mode cross-graveyard printings
+        /// (Shaman's Trance, Coram, the Undertaker) are not lowered to it.
+        #[serde(
+            default,
+            skip_serializing_if = "GraveyardPermissionPool::is_own_graveyard"
+        )]
+        pool: GraveyardPermissionPool,
     },
     /// CR 401.5 + CR 118.9 + CR 601.2a: Static ability granting permission to
     /// play/cast the top card of the controller's library when it matches
@@ -2156,7 +2224,9 @@ pub enum StaticMode {
     },
     /// CR 609.4b: "You may spend mana as though it were mana of any color" /
     /// "You may spend mana of any type to cast [filtered] spells." Allows the
-    /// controller to pay colored mana costs with mana of any type or color.
+    /// controller to pay colored mana costs with mana of any color — and, when
+    /// `concession` is `AnyTypeOrColor` ("mana of any type", CR 118.14), a
+    /// colorless (`{C}`) requirement too.
     ///
     /// `spell_filter` is the leaf parameterization of the spell-class axis (same
     /// CR 609.4b section, so a field, not a sibling variant):
@@ -2167,18 +2237,27 @@ pub enum StaticMode {
     ///   filter (Vizier of the Menagerie: "creature spells"). The concession is
     ///   re-derived against the spell object at spend time and never applies to
     ///   non-spell payments. Consulted by
-    ///   `casting::player_can_spend_as_any_color_for_optional_spell`.
+    ///   `casting::player_mana_spend_permission_for_optional_spell`.
     /// - `activation_source_filter: Some(filter)` — scoped to activated abilities
     ///   whose source permanent matches the filter (Agatha's Soul Cauldron /
     ///   Joiner Adept: "to activate abilities of creatures you control"). The
     ///   concession is re-derived against the activating permanent at spend time
     ///   and never applies to spell casts or effect payments. Consulted by
-    ///   `static_abilities::player_can_spend_as_any_color_for_activation_source`.
+    ///   `static_abilities::player_mana_spend_permission_for_activation_source`.
+    ///
+    /// `concession` is the printed word after "mana of any": "color" →
+    /// `AnyColor` (the default, omitted on the wire), "type" → `AnyTypeOrColor`
+    /// (Vizier of the Menagerie).
     SpendManaAsAnyColor {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spell_filter: Option<TargetFilter>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activation_source_filter: Option<TargetFilter>,
+        #[serde(
+            default,
+            skip_serializing_if = "crate::types::ability::ManaSpendPermission::is_any_color"
+        )]
+        concession: crate::types::ability::ManaSpendPermission,
     },
     /// CR 107.4f: "For each {C} in a cost, you may pay 2 life rather than pay
     /// that mana." Player-scope payment substitution; the indicated color may
@@ -2921,6 +3000,8 @@ impl Hash for StaticMode {
                 play_mode,
                 graveyard_destination_replacement,
                 extra_cost,
+                required_cast_keyword,
+                pool,
                 // `CounterType` derives Hash but is collision-safe to skip: the
                 // enters-with rider never distinguishes two otherwise-equal
                 // permissions in the interned set (mirrors `extra_cost` below).
@@ -2929,6 +3010,8 @@ impl Hash for StaticMode {
                 frequency.hash(state);
                 play_mode.hash(state);
                 graveyard_destination_replacement.hash(state);
+                required_cast_keyword.hash(state);
+                pool.hash(state);
                 // `AbilityCost` (inside `CastExtraCost`) lacks `Hash` — hash the
                 // mode marker only (mirrors the `alt_cost` treatment) so the
                 // alternative/additional shapes don't collide.
@@ -3317,12 +3400,16 @@ impl fmt::Display for StaticMode {
                 play_mode,
                 graveyard_destination_replacement,
                 extra_cost,
+                pool,
                 // CR 122.1: the enters-with counter payload rides on serde, not
                 // the Display round-trip (mirrors `extra_cost`); FromStr
                 // defaults it to None.
                 ..
             } => {
                 write!(f, "GraveyardCastPermission({play_mode},{frequency}")?;
+                if matches!(pool, GraveyardPermissionPool::AnyGraveyard) {
+                    write!(f, ",pool=any_graveyard")?;
+                }
                 if matches!(graveyard_destination_replacement, Some(Zone::Exile)) {
                     write!(f, ",exile_on_graveyard")?;
                 }
@@ -3710,6 +3797,8 @@ impl FromStr for StaticMode {
                             // compact signature form (as with dynamic_count /
                             // exemption); reconstitutes to the no-gate default here.
                             activator: None,
+                            targets: None,
+                            frequency: None,
                         }
                     } else {
                         StaticMode::Other(s.to_string())
@@ -3828,6 +3917,8 @@ impl FromStr for StaticMode {
                 graveyard_destination_replacement: None,
                 extra_cost: None,
                 enters_with_counter: None,
+                required_cast_keyword: None,
+                pool: GraveyardPermissionPool::OwnGraveyard,
             },
             s if s.starts_with("GraveyardCastPermission(") => {
                 let inner = s
@@ -3847,6 +3938,12 @@ impl FromStr for StaticMode {
                         // to None.
                         extra_cost: None,
                         enters_with_counter: None,
+                        required_cast_keyword: None,
+                        pool: if rest.contains(&"pool=any_graveyard") {
+                            GraveyardPermissionPool::AnyGraveyard
+                        } else {
+                            GraveyardPermissionPool::OwnGraveyard
+                        },
                     }
                 } else {
                     StaticMode::GraveyardCastPermission {
@@ -3855,6 +3952,8 @@ impl FromStr for StaticMode {
                         graveyard_destination_replacement: None,
                         extra_cost: None,
                         enters_with_counter: None,
+                        required_cast_keyword: None,
+                        pool: GraveyardPermissionPool::OwnGraveyard,
                     }
                 }
             }
@@ -4947,6 +5046,8 @@ mod tests {
                 graveyard_destination_replacement: None,
                 extra_cost: None,
                 enters_with_counter: None,
+                required_cast_keyword: None,
+                pool: GraveyardPermissionPool::OwnGraveyard,
             },
             StaticMode::GraveyardCastPermission {
                 frequency: CastFrequency::Unlimited,
@@ -4954,6 +5055,17 @@ mod tests {
                 graveyard_destination_replacement: None,
                 extra_cost: None,
                 enters_with_counter: None,
+                required_cast_keyword: None,
+                pool: GraveyardPermissionPool::OwnGraveyard,
+            },
+            StaticMode::GraveyardCastPermission {
+                frequency: CastFrequency::Unlimited,
+                play_mode: CardPlayMode::Cast,
+                graveyard_destination_replacement: Some(Zone::Exile),
+                extra_cost: None,
+                enters_with_counter: None,
+                required_cast_keyword: None,
+                pool: GraveyardPermissionPool::AnyGraveyard,
             },
             // CR 601.2f: Festival of Embers — graveyard cast with an additional
             // pay-life cost. NOTE: `extra_cost`-bearing variants are NOT in this
@@ -5146,6 +5258,8 @@ mod tests {
                     mode: CastCostMode::Additional,
                 }),
                 enters_with_counter: None,
+                required_cast_keyword: None,
+                pool: GraveyardPermissionPool::OwnGraveyard,
             },
             StaticMode::ExileCastPermission {
                 frequency: CastFrequency::Unlimited,
@@ -5319,6 +5433,7 @@ mod tests {
         let board_wide = StaticMode::SpendManaAsAnyColor {
             spell_filter: None,
             activation_source_filter: None,
+            concession: crate::types::ability::ManaSpendPermission::AnyColor,
         };
         let json = serde_json::to_string(&board_wide).unwrap();
         assert_eq!(
@@ -5333,10 +5448,29 @@ mod tests {
         let filtered = StaticMode::SpendManaAsAnyColor {
             spell_filter: Some(TargetFilter::Typed(TypedFilter::creature())),
             activation_source_filter: None,
+            concession: crate::types::ability::ManaSpendPermission::AnyTypeOrColor,
         };
         let json = serde_json::to_string(&filtered).unwrap();
+        assert!(
+            json.contains(r#""concession":"AnyTypeOrColor""#),
+            "a non-default concession is written: {json}"
+        );
         let back: StaticMode = serde_json::from_str(&json).unwrap();
         assert_eq!(back, filtered, "the spell-filtered shape must round-trip");
+
+        // (b2) a payload written before `concession` existed reads as the
+        // any-color default it always meant.
+        let pre_concession = json.replace(r#","concession":"AnyTypeOrColor""#, "");
+        assert_ne!(pre_concession, json);
+        let back: StaticMode = serde_json::from_str(&pre_concession).unwrap();
+        assert_eq!(
+            back,
+            StaticMode::SpendManaAsAnyColor {
+                spell_filter: Some(TargetFilter::Typed(TypedFilter::creature())),
+                activation_source_filter: None,
+                concession: crate::types::ability::ManaSpendPermission::AnyColor,
+            }
+        );
 
         // (c) legacy bare string downgrades to Other through the fwd-compat path.
         #[derive(serde::Deserialize, PartialEq, Debug)]
