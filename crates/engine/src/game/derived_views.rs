@@ -16,10 +16,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::analysis::resource::ResourceAxis;
-use crate::game::ability_utils::flatten_targets_in_chain;
+use crate::game::ability_utils::declared_targets_in_chain;
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::game_object::{AttachTarget, DisplaySource};
-use crate::game::stack::{effective_stack_ability, stack_display_groups, StackDisplayGroup};
+use crate::game::stack::{
+    effective_stack_ability, stack_display_groups, stack_display_groups_revealing,
+    stack_revealed_card_names, StackDisplayGroup,
+};
 use crate::types::ability::{
     ContinuousModification, Duration, GameRestriction, KeywordAction, ProhibitedActivity,
     RestrictionExpiry, RestrictionPlayerScope, TargetFilter, TargetRef,
@@ -757,6 +760,19 @@ pub struct DerivedViews {
     /// paid cast facts, and public trigger context. Empty when the stack is empty.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub stack_entry_details: HashMap<ObjectId, StackEntryDisplay>,
+
+    /// CR 701.20a: the cards each stack entry keeps revealed ("If revealing a
+    /// card causes a triggered ability to trigger, the card remains revealed
+    /// until that triggered ability leaves the stack"), by name, keyed by the
+    /// public stack entry id. Built from the authoritative lease map, so it
+    /// disappears when the lease ends.
+    ///
+    /// CR 401.2: deliberately unindexed. A leased card that sits in a library
+    /// stays a hidden object in the projected state, because naming that
+    /// object would disclose its library position; this map is the only place
+    /// its public identity appears, with no object id attached.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stack_revealed_cards: BTreeMap<ObjectId, Vec<String>>,
 
     /// CR 702.40a: the public number of copies the current Storm trigger will
     /// create, or that a newly cast Storm spell would create when no Storm
@@ -1534,6 +1550,7 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
         views.stack_display_groups = stack_display_groups(state);
         views.stack_entry_details = stack_entry_details(state);
     }
+    views.stack_revealed_cards = stack_revealed_card_names(state);
 
     // CR 303.4 + CR 702.5: Walk the battlefield once and bucket Player-host
     // attachments by their host PlayerId. Object-host attachments are skipped
@@ -2158,6 +2175,14 @@ pub fn derive_filtered_views(
     // display projection even when a viewer-safe state intentionally omits raw
     // combat records unrelated to rendering.
     views.blocker_assignment_pairs = blocker_assignment_pairs(authoritative_state);
+    // CR 701.20a: the viewer copy carries no lease map (it is a position
+    // channel), so the public presentation is rebuilt from rules state, and
+    // the stack grouping keeps entries with different reveals apart.
+    views.stack_revealed_cards = stack_revealed_card_names(authoritative_state);
+    if !filtered_state.stack.is_empty() {
+        views.stack_display_groups =
+            stack_display_groups_revealing(filtered_state, &views.stack_revealed_cards);
+    }
     views
 }
 
@@ -2913,7 +2938,7 @@ fn stack_entry_targets(state: &GameState, entry: &StackEntry) -> Vec<StackTarget
         StackEntryKind::KeywordAction { action } => keyword_action_targets(action),
         _ => effective_stack_ability(state, entry)
             .ability
-            .map(flatten_targets_in_chain)
+            .map(declared_targets_in_chain)
             .unwrap_or_default(),
     };
     targets
@@ -3348,6 +3373,75 @@ mod tests {
         // Selects the dungeon half of `Undercity // The Initiative`.
         assert_eq!(room.card.face_name, "Undercity");
         assert_eq!(room.rooms.len(), 9);
+    }
+
+    /// The experimental 19-room dungeon projects the same shape the map panel
+    /// reads: card identity for the art hook, the whole room graph, and one
+    /// marker per room. Pinned separately from the generic marker-table tests
+    /// because the badge renders `room_count` ("room 8 of 19") and the popover
+    /// indexes `rooms` by the marker's room — a short or misordered graph here
+    /// misplaces the marker with no other failure.
+    #[test]
+    fn dungeon_rooms_projects_baldurs_gate_wilderness_with_all_19_rooms() {
+        use crate::game::dungeon::{DungeonId, DungeonProgress};
+
+        let mut state = GameState::new_two_player(42);
+        state.dungeon_progress.insert(
+            PlayerId(0),
+            DungeonProgress {
+                current_dungeon: Some(DungeonId::BaldursGateWilderness),
+                current_room: 7,
+                ..Default::default()
+            },
+        );
+
+        let views = derive_views(&state, None);
+        let room = views
+            .dungeon_rooms
+            .get(&PlayerId(0))
+            .expect("venturing player is projected");
+
+        assert_eq!(room.dungeon, DungeonId::BaldursGateWilderness);
+        assert_eq!(room.dungeon_name, "Baldur's Gate Wilderness");
+        assert_eq!(room.room.index, 7);
+        assert_eq!(room.room.name, "Grymforge");
+        assert_eq!(
+            room.room.text,
+            "For each opponent, goad up to one target creature that player controls."
+        );
+        assert_eq!(room.room_count, 19);
+
+        // `layout: "normal"`, so the card table carries it by oracle id (the
+        // Undercity token-table fallback is not this dungeon's path).
+        assert_eq!(room.card.oracle_id, "06b9590d-01bf-4fae-9837-352c9e04267a");
+        assert_eq!(
+            room.card.scryfall_id,
+            "a9d56324-8293-4500-a9ad-fed351ccf966"
+        );
+        assert_eq!(room.card.face_name, "Baldur's Gate Wilderness");
+
+        assert_eq!(
+            room.rooms.len(),
+            19,
+            "the whole graph ships, not just the current room"
+        );
+        // CR 309.5a: Grymforge (index 7) leads to Last Light Inn and
+        // Reithwin Tollhouse.
+        let current = &room.rooms[7];
+        assert_eq!(current.room.name, "Grymforge");
+        assert_eq!(current.next_rooms, vec![9, 10]);
+        // The card's bottom row holds three terminal rooms (CR 309.5).
+        for bottommost in [16, 17, 18] {
+            assert!(
+                room.rooms[bottommost].next_rooms.is_empty(),
+                "room {bottommost} is terminal on the printed card"
+            );
+        }
+        assert_eq!(room.rooms[18].room.name, "Temple of Bhaal");
+        // Every room carries a marker inside the card face.
+        for node in &room.rooms {
+            assert!(node.marker.x_permille <= 1000 && node.marker.y_permille <= 1000);
+        }
     }
 
     /// CR 309.7: a completed dungeon leaves a `current_dungeon: None` entry
@@ -4035,6 +4129,7 @@ mod tests {
                 display_source: DisplaySource::Card,
                 printed_ref: None,
                 token_image_ref: None,
+                token_art: None,
             }],
             None,
         );
@@ -4048,6 +4143,7 @@ mod tests {
                 display_source: DisplaySource::Card,
                 printed_ref: None,
                 token_image_ref: None,
+                token_art: None,
             }],
             None,
         );
@@ -4122,6 +4218,7 @@ mod tests {
                 display_source: DisplaySource::Card,
                 printed_ref: None,
                 token_image_ref: None,
+                token_art: None,
             }],
             None,
             crate::types::game_state::TransientContinuousEffectBindings {
@@ -4219,6 +4316,7 @@ mod tests {
                 display_source: DisplaySource::Card,
                 printed_ref: None,
                 token_image_ref: None,
+                token_art: None,
             }],
             None,
         );
@@ -4261,6 +4359,7 @@ mod tests {
                 display_source: DisplaySource::Card,
                 printed_ref: None,
                 token_image_ref: None,
+                token_art: None,
             }],
             None,
         );

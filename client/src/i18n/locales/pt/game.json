@@ -808,6 +808,7 @@
     "titleTargets": "Alvos: {{targets}}",
     "titlePaid": "Pago: {{paid}}",
     "titleContext": "Contexto: {{context}}",
+    "revealedCards": "Revelada: {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}} de mana",
     "paidColorsSpent": "{{count}} cores",
@@ -1347,6 +1348,8 @@
     },
     "config": {
       "startingLife": "Vida Inicial",
+      "experimentalDungeons": "Masmorras experimentais",
+      "experimentalDungeonsHelp": "Oferecer Baldur's Gate Wilderness nas opções de masmorra e ao tomar a iniciativa. Experimental e não oficial.",
       "players": "Jogadores",
       "whoGoesFirst": "Quem Começa",
       "firstPlayer": {
@@ -1382,6 +1385,7 @@
       "target": "Alvo",
       "return": "Devolver",
       "discard": "Descartar",
+      "reveal": "Revelar",
       "evidence": "Evidência",
       "manifest": "Manifestar",
       "untap": "Desvirar",
@@ -2004,7 +2008,11 @@
   },
   "zoneOpponentChooser": {
     "title": "Escolher oponente",
-    "subtitle": "Escolha qual oponente faz a escolha."
+    "subtitle": "Escolha qual oponente faz a escolha.",
+    "orderTitle": "Escolher próximo jogador",
+    "orderSubtitle": "Escolha para quem fazer a próxima seleção.",
+    "substituteTitle": "Escolher jogador",
+    "substituteSubtitle": "Escolha quem faz esta escolha."
   },
   "pileOpponent": {
     "title": "Choose Opponent",
@@ -2272,6 +2280,12 @@
     "dontAskAgain": "Não perguntar novamente neste jogo",
     "dontAskAgainForSameCard": "Usar esta escolha para cada cópia desta carta neste jogo"
   },
+  "keywordDetail": {
+    "selfManaCost": "seu custo de mana",
+    "selfManaValue": "seu valor de mana",
+    "manaCostReduced": "seu custo de mana reduzido em {{reduction}}",
+    "spliceOnto": "em {{subtype}} {{cost}}"
+  },
   "resolutionOptionalPayment": {
     "title": "Escolha um pagamento opcional",
     "pay": "Pagar {{cost}}",
@@ -2289,7 +2303,8 @@
       "zoneExile": "o exílio",
       "zoneHand": "sua mão",
       "discard": "Descarte {{count}} {{cards}}",
-      "exile": "Exile {{count}} {{cards}} de {{zone}}"
+      "exile": "Exile {{count}} {{cards}} de {{zone}}",
+      "reveal": "Revele {{count}} {{cards}} de {{zone}}"
     }
   },
   "topOrBottom": {
