@@ -8623,6 +8623,7 @@ source_card_names = [
     "Invocation of Saint Traft",
     "Luminarch Ascension",
     "Moonsilver Spear",
+    "Ob Nixilis, the Ascended",
     "Saint Traft and Rem Karolus",
     "Seraphic Greatsword",
     "Sigil of the Empty Throne",
@@ -17912,6 +17913,11 @@ subtypes = ["Goblin"]
 supertypes = []
 colors = ["Red"]
 keywords = []
+
+[[token.source_card_refs]]
+card_name = "Goblin Rabblemaster"
+scryfall_oracle_id = "24661b81-6bee-4ad8-b3ab-53cb65005c51"
+scryfall_id = "cba7f673-4dde-4165-80ef-be3ad967a6a6"
 
 [[token.source_card_refs]]
 card_name = "Sling-Gang Lieutenant"
@@ -101107,6 +101113,7 @@ source_card_names = [
     "Visions of Ruin",
     "Volatile Fault",
     "Vraska, Relic Seeker",
+    "Vraska, the Cutting Glare",
     "Wanted Scoundrels",
     "Warren Soultrader",
     "Widespread Thieving",
@@ -139205,6 +139212,11 @@ scryfall_oracle_id = "da93264e-4e04-401a-9809-e4e1056cf604"
 scryfall_id = "5e1c14a0-cd68-45fc-a127-422ca6113048"
 
 [[token.source_card_refs]]
+card_name = "Shadrix Silverquill"
+scryfall_oracle_id = "2143f413-7baa-4fd6-a7ca-32f52bfa553f"
+scryfall_id = "cf3e5f36-b024-4342-846d-2cf1d4965ca1"
+
+[[token.source_card_refs]]
 card_name = "Fain, the Broker"
 scryfall_oracle_id = "31b990e3-9bad-4b0a-a9d5-f5b9ed2ad0b0"
 scryfall_id = "f5829ea0-1f41-46ba-a5e6-b7bd7051a591"
@@ -152495,9 +152507,11 @@ source_card_names = [
     "Day of the Dragons",
     "Death by Dragons",
     "Draconic Disciple",
+    "Draconic Visitor",
     "Dragon Roost",
     "Dragonkin Berserker",
     "Dragonmaster Outcast",
+    "Kiora of Fire and Ashes",
     "Lathliss, Dragon Queen",
     "Loot Dispute",
     "Rite of the Dragoncaller",
@@ -173295,6 +173309,11 @@ keywords = ["Decayed"]
 [[token.source_card_refs]]
 card_name = "Wilhelt, the Rotcleaver"
 scryfall_oracle_id = "eada96a1-4964-4ad0-b0e3-2df08d6ae188"
+scryfall_id = "a90a9691-b131-44e9-b39a-c68ef10b18d3"
+
+[[token.source_card_refs]]
+card_name = "Wilhelt, the Rotcleaver"
+scryfall_oracle_id = "eada96a1-4964-4ad0-b0e3-2df08d6ae188"
 scryfall_id = "82471687-46fa-4ccf-a792-180db0a5dd22"
 
 [[token.source_card_refs]]
@@ -175206,6 +175225,7 @@ source_card_names = [
     "Visions of Ruin",
     "Volatile Fault",
     "Vraska, Relic Seeker",
+    "Vraska, the Cutting Glare",
     "Wanted Scoundrels",
     "Warren Soultrader",
     "Widespread Thieving",
@@ -185151,6 +185171,11 @@ card_name = "Field of the Dead"
 scryfall_oracle_id = "aa959340-c869-4caa-92c7-572bd8d23eef"
 scryfall_id = "0b7acd81-1fcb-4758-95f4-e64cb696c9d2"
 
+[[token.source_card_refs]]
+card_name = "Varina, Lich Queen"
+scryfall_oracle_id = "9859fbca-60c3-4a57-a377-51b56f03894f"
+scryfall_id = "9ad062ce-9ab3-4d40-8ec7-ce95e8ce318f"
+
 [token.token_image_ref]
 scryfall_id = "8150833a-9c83-4d00-ae2f-470088700fdb"
 scryfall_oracle_id = "ddc8c973-c31e-463f-be45-f3fa7d632362"
@@ -188390,9 +188415,12 @@ source_card_names = [
     "Pia Nalaar",
     "Pia Nalaar, Consul of Revival",
     "Pia and Kiran Nalaar",
+    "Pia, Determined Rebuilder",
     "Rangers' Aetherhive",
     "Retrofitter Foundry",
+    "Saheeli, Consul of Oversight",
     "Saheeli, Filigree Master",
+    "Saheeli, Jewel of Avishkar",
     "Sai, Master Thopterist",
     "Stridehangar Automaton",
     "Surveillance Monitor",
@@ -195294,6 +195322,11 @@ scryfall_id = "b2d1219f-fadb-4427-8627-e5aef3589600"
 [[token.source_card_refs]]
 card_name = "Swan Song"
 scryfall_oracle_id = "8ddfc283-c9b4-41a5-af88-cf0068e986cc"
+scryfall_id = "6c156edc-bc88-431c-901b-fda8d4804d20"
+
+[[token.source_card_refs]]
+card_name = "Swan Song"
+scryfall_oracle_id = "8ddfc283-c9b4-41a5-af88-cf0068e986cc"
 scryfall_id = "40fc6412-df1c-4bfa-842b-8c3a6f14e19d"
 
 [[token.source_card_refs]]
@@ -198213,6 +198246,7 @@ source_card_names = [
     "Visions of Ruin",
     "Volatile Fault",
     "Vraska, Relic Seeker",
+    "Vraska, the Cutting Glare",
     "Wanted Scoundrels",
     "Warren Soultrader",
     "Widespread Thieving",
@@ -205391,6 +205425,7 @@ source_card_names = [
     "Visions of Ruin",
     "Volatile Fault",
     "Vraska, Relic Seeker",
+    "Vraska, the Cutting Glare",
     "Wanted Scoundrels",
     "Warren Soultrader",
     "Widespread Thieving",
@@ -223232,9 +223267,12 @@ source_card_names = [
     "Pia Nalaar",
     "Pia Nalaar, Consul of Revival",
     "Pia and Kiran Nalaar",
+    "Pia, Determined Rebuilder",
     "Rangers' Aetherhive",
     "Retrofitter Foundry",
+    "Saheeli, Consul of Oversight",
     "Saheeli, Filigree Master",
+    "Saheeli, Jewel of Avishkar",
     "Sai, Master Thopterist",
     "Stridehangar Automaton",
     "Surveillance Monitor",

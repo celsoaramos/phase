@@ -2324,6 +2324,7 @@ fn an_ordinary_permanent_copying_a_room_gains_its_door_gated_form() {
             display_source: crate::game::game_object::DisplaySource::Card,
             printed_ref: None,
             token_image_ref: None,
+            token_art: None,
         }],
         None,
     );
@@ -2433,6 +2434,7 @@ fn a_room_under_a_copy_effect_shows_the_copied_rooms_halves() {
             display_source: crate::game::game_object::DisplaySource::Card,
             printed_ref: None,
             token_image_ref: None,
+            token_art: None,
         }],
         None,
     );
@@ -2495,6 +2497,7 @@ fn a_copy_of_an_already_copied_room_snapshots_the_copied_halves() {
             display_source: crate::game::game_object::DisplaySource::Card,
             printed_ref: None,
             token_image_ref: None,
+            token_art: None,
         }],
         None,
     );
@@ -2550,6 +2553,7 @@ fn a_set_name_exception_survives_the_room_name_derivation() {
                 display_source: crate::game::game_object::DisplaySource::Card,
                 printed_ref: None,
                 token_image_ref: None,
+                token_art: None,
             },
             // CR 707.9b: the "except its name is X" rider follows CopyValues
             // within the same effect, exactly as production installs it.
@@ -2612,6 +2616,7 @@ fn a_set_name_exception_survives_the_room_name_derivation() {
             display_source: crate::game::game_object::DisplaySource::Card,
             printed_ref: None,
             token_image_ref: None,
+            token_art: None,
         }],
         None,
     );
@@ -2635,6 +2640,7 @@ fn a_set_name_exception_survives_the_room_name_derivation() {
             display_source: crate::game::game_object::DisplaySource::Card,
             printed_ref: None,
             token_image_ref: None,
+            token_art: None,
         }],
         None,
     );
@@ -2997,6 +3003,8 @@ fn a_room_cast_from_the_graveyard_offers_the_face_choice_per_cast() {
                 graveyard_destination_replacement: None,
                 extra_cost: None,
                 enters_with_counter: None,
+                required_cast_keyword: None,
+                pool: crate::types::statics::GraveyardPermissionPool::OwnGraveyard,
             })
             .affected(TargetFilter::Any),
         );
@@ -11701,6 +11709,8 @@ fn grant_graveyard_creature_cast_and_bury(
                 graveyard_destination_replacement: None,
                 extra_cost: None,
                 enters_with_counter: None,
+                required_cast_keyword: None,
+                pool: crate::types::statics::GraveyardPermissionPool::OwnGraveyard,
             })
             .affected(TargetFilter::Typed(
                 TypedFilter::creature().controller(ControllerRef::You),
@@ -12888,6 +12898,8 @@ fn a_reversed_activation_discards_its_lifecycle_frame() {
                 dynamic_count: None,
                 exemption: ActivationExemption::None,
                 activator: None,
+                targets: None,
+                frequency: None,
             })
             .affected(TargetFilter::Typed(
                 TypedFilter::creature().controller(ControllerRef::You),
