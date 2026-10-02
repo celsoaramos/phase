@@ -33911,6 +33911,7 @@ impl ResolvedAbility {
             | Effect::SeparateIntoPiles { .. }
             | Effect::SwitchPT { .. }
             | Effect::CopySpell { .. }
+            | Effect::CreateCardCopyByName { .. }
             | Effect::EpicCopy { .. }
             | Effect::CastCopyOfCard { .. }
             | Effect::CopyTokenOf { .. }
