@@ -6000,7 +6000,7 @@ fn prop_is_arrival_invariant(prop: &crate::types::ability::FilterProp) -> bool {
         | FilterProp::Blocking
         | FilterProp::BlockingSource
         | FilterProp::CombatRelation { .. }
-        | FilterProp::Unblocked
+        | FilterProp::BlockStatus { .. }
         // CR 506.5 + CR 506.3b: an arriving attacker ends a pre-existing creature's
         // "attacking alone".
         | FilterProp::AttackingAlone
@@ -8218,6 +8218,7 @@ fn project_out_resources(state: &GameState) -> GameState {
     s.created_tokens_this_turn.clear();
     s.players_who_created_token_this_turn.clear();
     s.sacrificed_permanents_this_turn.clear();
+    s.creatures_exploited_this_turn.clear();
     s.players_who_sacrificed_artifact_this_turn.clear();
     s.counter_added_this_turn.clear();
     s.player_actions_this_turn.clear();

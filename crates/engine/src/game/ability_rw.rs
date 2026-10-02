@@ -104,10 +104,10 @@ use crate::types::ability::FilterProp;
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, AttachCardinality, AttachSelection, AttackedYouScope,
     CardTypeSetSource, ContinuousModification, ControllerRef, Duration, Effect, GuessSubject,
-    KeeperConstraint, ModalChoice, MultiTargetSpec, ObjectProperty, ObjectScope, PlayerFilter,
-    PlayerScope, QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole, RepeatContinuation,
-    ReplacementDefinition, ResolvedAbility, StaticCondition, StaticDefinition, TargetFilter,
-    TriggerCondition, TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter,
+    KeeperConstraint, ModalChoice, MultiTargetSpec, NameStickerSet, ObjectProperty, ObjectScope,
+    PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole,
+    RepeatContinuation, ReplacementDefinition, ResolvedAbility, StaticCondition, StaticDefinition,
+    TargetFilter, TriggerCondition, TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter,
     ZoneChoiceCandidateSource, ZoneRef,
 };
 use crate::types::game_state::TargetSelectionConstraint;
@@ -1894,6 +1894,7 @@ fn legacy_trigger_condition(x: &TriggerCondition) -> bool {
             conditions.iter().any(legacy_trigger_condition)
         }
         TriggerCondition::Not { condition } => legacy_trigger_condition(condition),
+        TriggerCondition::EventTime { condition } => legacy_trigger_condition(condition),
         TriggerCondition::GainedLife { .. }
         | TriggerCondition::LostLife
         | TriggerCondition::LostLifeLastTurn
@@ -1992,6 +1993,7 @@ fn legacy_ability_condition(x: &AbilityCondition) -> bool {
             conditions.iter().any(legacy_ability_condition)
         }
         AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn
+        | AbilityCondition::TriggerEventTargetExploitedBySource
         | AbilityCondition::ObjectsShareQuality { .. }
         | AbilityCondition::TargetMatchesFilter { .. }
         | AbilityCondition::SourceMatchesFilter { .. }
@@ -2174,6 +2176,10 @@ fn legacy_quantity_ref(x: &QuantityRef) -> bool {
         | QuantityRef::ObjectManaValue { scope, .. }
         | QuantityRef::ObjectColorCount { scope, .. }
         | QuantityRef::ObjectNameWordCount { scope, .. }
+        | QuantityRef::NameStickerLetterCount {
+            stickers: NameStickerSet::OnObject { scope },
+            letters: _,
+        }
         | QuantityRef::ObjectTypelineComponentCount { scope, .. }
         | QuantityRef::ManaSymbolsInManaCost { scope, .. } => legacy_object_scope(scope),
         QuantityRef::HandSize { .. }
@@ -2210,6 +2216,11 @@ fn legacy_quantity_ref(x: &QuantityRef) -> bool {
         | QuantityRef::TrackedSetSize
         | QuantityRef::FilteredTrackedSetSize { .. }
         | QuantityRef::ExiledFromHandThisResolution
+        // CR 608.2c: the resolution's placed-sticker record, not a frozen tag.
+        | QuantityRef::NameStickerLetterCount {
+            stickers: NameStickerSet::ThatSticker,
+            letters: _,
+        }
         | QuantityRef::PreviousEffectAmount { .. }
         | QuantityRef::PreviousEffectCount
         | QuantityRef::TurnsTaken
@@ -2506,7 +2517,7 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::Blocking
         | FilterProp::BlockingSource
         | FilterProp::CombatRelation { .. }
-        | FilterProp::Unblocked
+        | FilterProp::BlockStatus { .. }
         | FilterProp::AttackingAlone
         | FilterProp::BlockingAlone
         | FilterProp::Tapped
@@ -2799,7 +2810,7 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::Blocking
         | FilterProp::BlockingSource
         | FilterProp::CombatRelation { .. }
-        | FilterProp::Unblocked
+        | FilterProp::BlockStatus { .. }
         | FilterProp::AttackingAlone
         | FilterProp::BlockingAlone
         | FilterProp::Tapped
@@ -3117,11 +3128,13 @@ fn legacy_effect(x: &Effect) -> bool {
         | Effect::ExtraTurn { target, count }
         | Effect::SkipNextTurn { target, count }
         | Effect::SkipNextStep { target, count, .. }
-        | Effect::AdditionalPhase { target, count, .. }
         | Effect::GrantExtraLoyaltyActivations {
             amount: count,
             target,
         } => legacy_quantity_expr(count) || legacy_target_filter(target),
+        Effect::AdditionalPhase {
+            recipient, count, ..
+        } => legacy_quantity_expr(count) || legacy_target_filter(recipient.as_target_filter()),
         // CR 701.58a: `object_source` (Some) names already-chosen objects to cloak —
         // an `Option<TargetFilter>` that can nest a frozen event-context tag, so it is
         // walked here (the shared `{ target, count }` group above cannot).
@@ -4167,6 +4180,7 @@ fn walk_ability(
         target_incarnations: _, // CR 400.7 pins on the referents, no read/write effect
         selected_target_incarnations: _, // CR 400.7 selected-target pins, no read/write effect
         illegal_target_slots: _, // CR 608.2b resolution legality stamp, no read/write effect
+        illegal_local_target_slots: _, // CR 608.2b node-local legality stamp, no read/write effect
         controller: _,
         original_controller: _,
         scoped_player: _,
@@ -4207,6 +4221,7 @@ fn walk_ability(
         target_selection_mode: _,
         chosen_players: _,
         sub_link: _,
+        target_reads: _, // origin of `Target` reads; the reads are profiled on condition/effect
         sibling_condition: _, // replication marker, no read/write effect
         replacement_applied: _,
         parent_target_missing_reason: _,
@@ -4340,6 +4355,7 @@ fn walk_definition(
         forward_result: _,
         target_selection_mode: _,
         sub_link: _,
+        target_reads: _, // origin of `Target` reads; the reads are profiled on condition/effect
         iteration_kind_binding: _,
         sibling_condition: _,
         // Parser scratch, not runtime state: `parse_oracle_pipeline` settles every
@@ -5793,6 +5809,7 @@ fn rw_effect(
         Effect::PreventDamage {
             amount_dynamic,
             target: _,
+            recipient_scope: _,
             damage_source_filter: _,
             prevention_duration: _,
             amount: _,
@@ -6007,11 +6024,12 @@ fn rw_effect(
             p.merge(rw_duration(duration));
             (p, None)
         }
-        // §L14 (CR 500.8): an additional phase/step is a turn-structure write.
+        // §L14 (CR 500.8 + CR 500.9 + CR 500.10): added phases and steps,
+        // including steps after phases, are turn-structure writes.
         Effect::AdditionalPhase {
-            target: _,
+            recipient: _,
             count,
-            phase: _,
+            segment: _,
             after: _,
             followed_by: _,
             attacker_restriction,
@@ -6430,6 +6448,14 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
         | QuantityRef::ObjectManaValue { scope, .. }
         | QuantityRef::ObjectColorCount { scope, .. }
         | QuantityRef::ObjectNameWordCount { scope, .. }
+        // CR 123.6d: the scoped object's name stickers — the same object-read
+        // proxy as `ObjectNameWordCount`. Sticker writers (`PutSticker` →
+        // `ext_write(StateKind::Other)`, `ApplySticker` → conservative) conflict
+        // with every read, so a same-event sticker write still orders against it.
+        | QuantityRef::NameStickerLetterCount {
+            stickers: NameStickerSet::OnObject { scope },
+            letters: _,
+        }
         | QuantityRef::ObjectTypelineComponentCount { scope, .. }
         | QuantityRef::ManaSymbolsInManaCost { scope, .. } => {
             read_object_scope(scope, StateKind::ObjectPt)
@@ -6503,6 +6529,10 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
         // Resolution-local / turn- / commander-scoped: no per-source binding
         // (member-invariant under uniformity).
         QuantityRef::ExiledFromHandThisResolution
+        | QuantityRef::NameStickerLetterCount {
+            stickers: NameStickerSet::ThatSticker,
+            letters: _,
+        }
         | QuantityRef::PreviousEffectAmount { .. }
         | QuantityRef::PreviousEffectCount
         | QuantityRef::TurnsTaken
@@ -6607,9 +6637,10 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
 
 fn rw_ability_condition(x: &AbilityCondition) -> RwProfile {
     match x {
-        // CR 608.2c + CR 603.3b: the damage record is frozen at the trigger
-        // event; a sibling cannot alter whether this source dealt that damage.
-        AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn => frozen_source_read(),
+        // CR 608.2c + CR 603.3b: the damage/exploit record is frozen at the trigger
+        // event; a sibling cannot alter whether this source dealt that damage or exploited that creature.
+        AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn
+        | AbilityCondition::TriggerEventTargetExploitedBySource => frozen_source_read(),
         AbilityCondition::QuantityCheck {
             lhs,
             rhs,
@@ -6877,6 +6908,7 @@ fn rw_trigger_condition(x: &TriggerCondition) -> RwProfile {
             p
         }
         TriggerCondition::Not { condition } => rw_trigger_condition(condition),
+        TriggerCondition::EventTime { condition } => rw_trigger_condition(condition),
         TriggerCondition::AttackersDeclaredCount { .. } => RwProfile::empty(),
         TriggerCondition::Descended
         | TriggerCondition::EchoDue
@@ -7317,9 +7349,9 @@ fn rw_controller_ref(x: &ControllerRef) -> RwProfile {
 mod tests {
     use super::*;
     use crate::types::ability::{
-        AbilityKind, AggregateFunction, ChoiceType, Comparator, CountScope, PropertyAggregate,
-        PtValue, ReciprocalZoneChoiceRole, TargetSelectionMode, ZoneChoiceCandidateSource,
-        ZoneChoiceChooser, ZoneOwner,
+        AbilityKind, AggregateFunction, ChoiceType, Comparator, CountScope, LetterQuery,
+        PropertyAggregate, PtValue, ReciprocalZoneChoiceRole, TargetSelectionMode,
+        ZoneChoiceCandidateSource, ZoneChoiceChooser, ZoneOwner,
     };
 
     use crate::game::test_fixtures::mana_fixture_roles;
@@ -7954,6 +7986,10 @@ mod tests {
             QuantityRef::TurnsTaken,
             QuantityRef::DungeonsCompleted,
             QuantityRef::ExiledFromHandThisResolution,
+            QuantityRef::NameStickerLetterCount {
+                stickers: NameStickerSet::ThatSticker,
+                letters: LetterQuery::UniqueVowels,
+            },
         ] {
             assert!(
                 !rw_quantity_ref(&r).reads_member_bound,
@@ -9128,8 +9164,10 @@ mod tests {
     fn l14_extra_turn_and_phase_are_turn_structure_not_other() {
         // AdditionalPhase is likewise a TurnStructure write, never `Other`.
         let ap = ability_rw_profile(&ra(Effect::AdditionalPhase {
-            target: TargetFilter::Controller,
-            phase: crate::types::phase::Phase::PostCombatMain,
+            recipient: crate::types::ability::ExtraPhaseRecipient::Controller,
+            segment: crate::types::phase::TurnSegment::Phase(
+                crate::types::phase::PhaseGroup::PostcombatMain,
+            ),
             after: crate::types::ability::ExtraPhaseAnchor::ThisPhase { named: None },
             followed_by: vec![],
             count: qfix(1),
