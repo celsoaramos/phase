@@ -33,7 +33,7 @@ use crate::types::mana::{ManaCost, ManaSpellGrant};
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 use crate::types::replacements::ReplacementEvent;
-use crate::types::statics::{CastFrequency, StaticMode};
+use crate::types::statics::{CastFrequency, GraveyardPermissionPool, StaticMode};
 use crate::types::triggers::TriggerMode;
 use crate::types::zones::Zone;
 
@@ -67,6 +67,9 @@ use super::oracle_condition::parse_restriction_condition;
 use super::oracle_cost::{parse_oracle_cost, parse_single_cost, try_parse_cost_reduction};
 use super::oracle_dispatch::{dispatch_line_nom, NomDispatchIr};
 use super::oracle_effect::gap_diagnosis;
+use super::oracle_effect::imperative::{
+    PREVENT_DEALT_BY_TARGET_GAP, PREVENT_RECIPIENT_TARGET_ROLE_GAP,
+};
 use super::oracle_effect::sequence::try_parse_same_is_true_continuation;
 use super::oracle_effect::{
     ability_chain_grants_chosen_color_keyword, lower_ability_ir, parse_ability_ir_standalone,
@@ -2346,6 +2349,18 @@ fn deliver_coordinated_graveyard_permission_in_ability(def: &mut AbilityDefiniti
             .as_deref()
             .filter(|_| sentence_is_fully_modelled)
             .and_then(|sub| match &*sub.effect {
+                // CR 601.3 + CR 611.2c: "cast spells from your graveyard" now
+                // lowers on its own to the graveyard permission
+                // (`oracle_effect::try_parse_class_wide_graveyard_cast_grant`);
+                // widen that grant to the land half as well. Only a plain grant
+                // is widened: a rider already folded into it would be lost.
+                effect @ Effect::GenericEffect {
+                    duration: Some(window),
+                    ..
+                } => plain_own_graveyard_cast_grant_filter(effect).and_then(|target| {
+                    coordinated_graveyard_permission(target)
+                        .map(|permission| (window.clone(), permission))
+                }),
                 Effect::CastFromZone {
                     target, duration, ..
                 } => duration
@@ -2362,21 +2377,12 @@ fn deliver_coordinated_graveyard_permission_in_ability(def: &mut AbilityDefiniti
                     .and_then(|window| {
                         coordinated_graveyard_permission(target)
                             .map(|permission| (window.clone(), permission))
-                    })
-                    .map(|(window, permission)| Effect::GenericEffect {
-                        static_abilities: vec![StaticDefinition::continuous()
-                            .affected(TargetFilter::Controller)
-                            .modifications(vec![ContinuousModification::GrantStaticAbility {
-                                definition: Box::new(permission),
-                            }])],
-                        // CR 611.2a: one stated window scopes both halves;
-                        // `layers::prune_end_of_turn_effects` ends it at cleanup
-                        // (CR 514.2).
-                        duration: Some(window),
-                        target: Some(TargetFilter::Controller),
-                        end_cost: None,
                     }),
                 _ => None,
+            })
+            // CR 611.2a: one stated window scopes both halves.
+            .map(|(window, permission)| {
+                crate::parser::oracle_effect::graveyard_permission_grant(permission, Some(window))
             });
 
         if let Some(effect) = recovered {
@@ -2458,6 +2464,38 @@ fn parse_graveyard_anchor_sentence_tail(input: &str) -> OracleResult<'_, &str> {
     take_till(|c: char| c == '.').parse(rest)
 }
 
+/// CR 601.3: the card filter of a plain "cast <class> spells from your
+/// graveyard" permission grant — unlimited, cast-only, own graveyard, no rider —
+/// or `None` for any other effect.
+fn plain_own_graveyard_cast_grant_filter(effect: &Effect) -> Option<&TargetFilter> {
+    if !crate::parser::oracle_ir::ast::is_graveyard_permission_grant(effect) {
+        return None;
+    }
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = effect
+    else {
+        return None;
+    };
+    let [ContinuousModification::GrantStaticAbility { definition }] =
+        static_abilities.first()?.modifications.as_slice()
+    else {
+        return None;
+    };
+    match &definition.mode {
+        StaticMode::GraveyardCastPermission {
+            frequency: CastFrequency::Unlimited,
+            play_mode: CardPlayMode::Cast,
+            graveyard_destination_replacement: None,
+            extra_cost: None,
+            enters_with_counter: None,
+            required_cast_keyword: None,
+            pool: GraveyardPermissionPool::OwnGraveyard,
+        } => definition.affected.as_ref(),
+        _ => None,
+    }
+}
+
 /// CR 116.2a + CR 601.2a: build the two-part permission from the cast half of the
 /// sentence -- the land axis and the card axis under ONE grant, because the
 /// printed sentence is one permission naming two actions.
@@ -2515,6 +2553,7 @@ fn coordinated_graveyard_permission(cast_target: &TargetFilter) -> Option<Static
             extra_cost: None,
             enters_with_counter: None,
             required_cast_keyword: None,
+            pool: GraveyardPermissionPool::OwnGraveyard,
         })
         // CR 611.2c: class-wide and re-evaluated live, so cards that reach the
         // graveyard later this turn are covered.
@@ -6972,6 +7011,7 @@ fn parse_normalized_oracle_ir(
                     amount: PreventionAmount::All,
                     amount_dynamic: None,
                     target: TargetFilter::Any,
+                    recipient_scope: EffectScope::Single,
                     scope: PreventionScope::AllDamage,
                     damage_source_filter: Some(TargetFilter::Typed(source_filter)),
                     prevention_duration: None,
@@ -7028,7 +7068,14 @@ fn parse_normalized_oracle_ir(
             // again in `ability_ir_at` repeats one computation rather than
             // performing two different ones.
             let ir = parse_ability_ir_with_context(&line, AbilityKind::Spell, &mut ctx);
-            if !has_unimplemented(&lower_ability_ir(&ir)) {
+            let lowered = lower_ability_ir(&ir);
+            // A prevention with a target role this route cannot bind faithfully
+            // stays here as its gap: falling through would let Priority 8 read it
+            // as a blanket, card-wide prevention replacement.
+            let is_held_prevent_gap = any_unimplemented(&lowered, &|name| {
+                name == PREVENT_DEALT_BY_TARGET_GAP || name == PREVENT_RECIPIENT_TARGET_ROLE_GAP
+            });
+            if !has_unimplemented(&lowered) || is_held_prevent_gap {
                 emitter.ability_ir_at(item_line, ir);
                 i += 1;
                 continue;
@@ -12100,7 +12147,14 @@ pub(super) fn lower_unsupported_node(
 /// and wildcard-free, a newly added definition-carrying `Effect` variant is now
 /// a compile error there rather than a silent miss here.
 pub(super) fn has_unimplemented(def: &AbilityDefinition) -> bool {
-    if matches!(*def.effect, Effect::Unimplemented { .. }) {
+    any_unimplemented(def, &|_| true)
+}
+
+/// True when any `Effect::Unimplemented` reachable from `def` (root, nested
+/// definitions, `sub_ability`, `else_ability`) has a gap `name` accepted by
+/// `matches_name`. `has_unimplemented` is the accept-everything instance.
+fn any_unimplemented(def: &AbilityDefinition, matches_name: &dyn Fn(&str) -> bool) -> bool {
+    if matches!(&*def.effect, Effect::Unimplemented { name, .. } if matches_name(name)) {
         return true;
     }
     // `||` rather than `|=`: once a nested failure is found the remaining
@@ -12108,11 +12162,18 @@ pub(super) fn has_unimplemented(def: &AbilityDefinition) -> bool {
     // walk the `.any()`/`||` chain it replaced was.
     let mut nested_has_unimplemented = false;
     def.effect.for_each_nested_definition(&mut |_, nested| {
-        nested_has_unimplemented = nested_has_unimplemented || has_unimplemented(nested);
+        nested_has_unimplemented =
+            nested_has_unimplemented || any_unimplemented(nested, matches_name);
     });
     nested_has_unimplemented
-        || def.sub_ability.as_deref().is_some_and(has_unimplemented)
-        || def.else_ability.as_deref().is_some_and(has_unimplemented)
+        || def
+            .sub_ability
+            .as_deref()
+            .is_some_and(|d| any_unimplemented(d, matches_name))
+        || def
+            .else_ability
+            .as_deref()
+            .is_some_and(|d| any_unimplemented(d, matches_name))
 }
 
 /// Parse an activated-ability effect chain with self-reference fallback.

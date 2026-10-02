@@ -16101,7 +16101,7 @@ fn snuff_out_alt_cost_paid_resolves_destroy_on_chosen_target() {
         "Snuff Out should have destroyed the target creature on resolution"
     );
     assert!(events.iter().any(
-        |e| matches!(e, GameEvent::CreatureDestroyed { object_id } if *object_id == target_id)
+        |e| matches!(e, GameEvent::CreatureDestroyed { object_id, .. } if *object_id == target_id)
     ));
 }
 
@@ -24683,7 +24683,7 @@ fn pay_and_push_emits_targeting_events_for_chained_spell_targets() {
     // declaration continuation, so reproduce its event before paying costs.
     emit_targeting_events(
         &state,
-        &flatten_targets_in_chain(&ability),
+        &crate::game::ability_utils::flatten_targets_in_chain(&ability),
         object_id,
         PlayerId(0),
         &mut events,
@@ -31819,6 +31819,7 @@ fn chosen_muldrotha_variant_requests_and_consumes_permanent_type_slot() {
                 extra_cost: None,
                 enters_with_counter: None,
                 required_cast_keyword: None,
+                pool: crate::types::statics::GraveyardPermissionPool::OwnGraveyard,
             })
             .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Permanent))),
         );
@@ -31966,6 +31967,7 @@ fn muldrotha_and_graveyard_artifact_creature(state: &mut GameState) -> (ObjectId
                 extra_cost: None,
                 enters_with_counter: None,
                 required_cast_keyword: None,
+                pool: crate::types::statics::GraveyardPermissionPool::OwnGraveyard,
             })
             .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Permanent))),
         );
@@ -60622,6 +60624,7 @@ fn an_activation_journal_row_round_trips() {
         activator: PlayerId(0),
         source,
         source_lki: state.objects[&source].snapshot_public_characteristics(),
+        source_zone: crate::types::zones::Zone::Battlefield,
         ability_tag: Some(crate::types::ability::AbilityTag::Boast),
         is_loyalty_ability: true,
         targets: vec![
