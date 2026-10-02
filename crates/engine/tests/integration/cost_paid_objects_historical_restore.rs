@@ -22,7 +22,7 @@
 //!     that question at all. A historical record must fail CLOSED there rather
 //!     than invent an incarnation it never carried.
 //!
-//! `CostPaidObjectRecord::LegacyMembership` is exactly that distinction. Both
+//! `CostPaidObjectRecord::MembershipOnly` is exactly that distinction. Both
 //! tests below drive it through the production `PersistedGameState` boundary
 //! with a hand-authored historical payload and then through the production
 //! continuation that consumes it — a current-schema round trip cannot

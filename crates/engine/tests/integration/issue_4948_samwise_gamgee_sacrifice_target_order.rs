@@ -22,7 +22,7 @@
 //! at each non-self Sacrifice/Discard/Exile cost-payment site). Samwise
 //! sacrifices THREE Foods, so only one of the three was ever excluded — the
 //! other two remained legal. The fix generalizes this to a
-//! `Vec<CostPaidObjectSnapshot>` (`cost_paid_objects`, via the new
+//! `Vec<CostPaidObjectSnapshot>` (`cost_paid_objects`, via
 //! `ResolvedAbility::add_cost_paid_objects_recursive`), populated
 //! alongside the existing singular stamp at all three non-self cost-payment
 //! sites (`handle_sacrifice_for_cost`, `handle_discard_for_cost`,

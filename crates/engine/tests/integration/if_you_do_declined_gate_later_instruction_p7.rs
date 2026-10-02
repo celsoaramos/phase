@@ -15,6 +15,7 @@
 //! corpus does not reach.
 
 use engine::game::combat::{build_declare_attackers_waiting_for, AttackTarget};
+use engine::game::effects::resolve_ability_chain;
 use engine::game::game_object::BackFaceData;
 use engine::game::keywords::has_keyword;
 use engine::game::layers::evaluate_layers;
@@ -22,10 +23,14 @@ use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::specialize::SpecializeFaceMap;
 use engine::game::static_abilities::{check_static_ability, StaticCheckContext};
 use engine::game::triggers::drain_order_triggers_with_identity;
-use engine::types::ability::{ContinuousModification, EffectKind, TargetFilter, TargetRef};
+use engine::types::ability::{
+    AbilityCondition, AbilityCost, ContinuousModification, Effect, EffectKind, QuantityExpr,
+    RepeatContinuation, ResolvedAbility, SubAbilityLink, TargetFilter, TargetRef,
+    UnlessPayModifier,
+};
 use engine::types::actions::GameAction;
 use engine::types::card_type::{CardType, CoreType};
-use engine::types::events::GameEvent;
+use engine::types::events::{GameEvent, PlayerActionKind};
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
@@ -604,7 +609,7 @@ fn assert_no_maximum_hand_size_emblem(runner: &GameRunner) {
 }
 
 /// J-2g: declined, there is no shuffle and no second seek, and the player still
-/// gets the "no maximum hand size" emblem.
+/// gets the "no maximum hand size" emblem while leaving the first two sought cards in hand.
 #[test]
 fn choice_of_fortunes_declined_still_creates_the_emblem() {
     let (runner, events) = choice_of_fortunes(false);
@@ -613,23 +618,109 @@ fn choice_of_fortunes_declined_still_creates_the_emblem() {
         vec![EffectKind::Seek, EffectKind::CreateEmblem]
     );
     assert_no_maximum_hand_size_emblem(&runner);
+
+    // Declined path leaves the two sought cards in hand
+    let p0_hand = &runner.state().players[P0.0 as usize].hand;
+    assert_eq!(p0_hand.len(), 2, "P0 hand should retain the 2 sought cards");
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            GameEvent::PlayerPerformedAction {
+                action: PlayerActionKind::ShuffledLibrary,
+                ..
+            }
+        )),
+        "no shuffle event on declined path"
+    );
 }
 
-/// J-2g′: accepted, every instruction happens. GREEN AT BASE: reach guard of
-/// J-2g; preservation only.
+/// J-2g′: accepted — CR 608.2c + CR 701.24c: "You may shuffle them into your
+/// library" moves BOTH cards the first seek put into hand back into the library
+/// and shuffles it, and only then does "If you do, seek two cards" run.
 #[test]
 fn choice_of_fortunes_accepted_seeks_twice_and_creates_the_emblem() {
     let (runner, events) = choice_of_fortunes(true);
-    assert_eq!(
-        resolved(&events),
-        vec![
-            EffectKind::Seek,
-            EffectKind::Shuffle,
-            EffectKind::Seek,
-            EffectKind::CreateEmblem
-        ]
-    );
     assert_no_maximum_hand_size_emblem(&runner);
+
+    let moves = |from: Zone, to: Zone| -> Vec<(usize, ObjectId)> {
+        events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                GameEvent::ZoneChanged {
+                    object_id,
+                    from: Some(f),
+                    to: t,
+                    ..
+                } if *f == from && *t == to => Some((index, *object_id)),
+                _ => None,
+            })
+            .collect()
+    };
+    let sought = moves(Zone::Library, Zone::Hand);
+    assert_eq!(sought.len(), 4, "two seeks of two cards each: {events:?}");
+    let (first_seek, second_seek) = sought.split_at(2);
+
+    // Both first-seek cards leave the hand for the library.
+    let returned = moves(Zone::Hand, Zone::Library);
+    let mut returned_ids: Vec<ObjectId> = returned.iter().map(|(_, id)| *id).collect();
+    let mut first_ids: Vec<ObjectId> = first_seek.iter().map(|(_, id)| *id).collect();
+    returned_ids.sort();
+    first_ids.sort();
+    assert_eq!(
+        returned_ids, first_ids,
+        "exactly the two first-seek cards return to the library"
+    );
+    assert!(
+        !returned_ids
+            .iter()
+            .any(|id| runner.state().objects[id].name == "Choice of Fortunes"),
+        "the resolving spell is never the moved object"
+    );
+
+    // Then P0's library is shuffled, then the second seek runs.
+    let last_return = returned.iter().map(|(index, _)| *index).max().unwrap();
+    let shuffle = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                GameEvent::PlayerPerformedAction {
+                    player_id,
+                    action: PlayerActionKind::ShuffledLibrary,
+                    ..
+                } if *player_id == P0
+            )
+        })
+        .expect("P0's library is shuffled");
+    assert!(last_return < shuffle, "the cards move before the shuffle");
+    // CR 701.24a: one shuffle for the whole set, not one per moved card.
+    let shuffles = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                GameEvent::PlayerPerformedAction {
+                    action: PlayerActionKind::ShuffledLibrary,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(shuffles, 1, "{events:?}");
+    assert!(
+        second_seek.iter().all(|(index, _)| shuffle < *index),
+        "the second seek runs after the shuffle"
+    );
+
+    // Final state: the second seek's two cards are the hand; the library holds
+    // the other four of the six.
+    let state = runner.state();
+    assert_eq!(state.players[P0.0 as usize].hand.len(), 2);
+    assert_eq!(state.players[P0.0 as usize].library.len(), 4);
+    for (_, id) in second_seek {
+        assert_eq!(state.objects[id].zone, Zone::Hand);
+    }
 }
 
 /// J-3 (a): declined, the gate's doubling is skipped, and both later
@@ -741,6 +832,17 @@ fn syn_exile_that_declined_resolves_nothing() {
 /// declined gate, so the Goblin sentence is skipped with it: declined, nothing
 /// happens (the base reading), never a Goblin without haste. GREEN AT BASE;
 /// red under M-11b (the coupling disabled: a Goblin without haste; measured).
+///
+/// KNOWN-BAD (phase 7F; residue #35). The Oracle reading, declined: "If you
+/// do" governs only "draw a card" (CR 118.12), and the next two sentences are
+/// independent instructions followed in the order written, "It" naming the
+/// Goblin they create (CR 608.2c): one Goblin with haste, and no card drawn.
+/// Measured at phase 7F's base: no Goblin, no haste, the library still holds
+/// two cards, and no effect resolves. The engine falls back to the base reading
+/// because phase 7's declined-gate audit refuses the rider "It gains haste",
+/// and the producer-rider coupling then drops the Goblin sentence with it
+/// (integration review 2 measured two independent causes of the refusal, the
+/// `LastCreated` referent and the keyword grant; a lead).
 #[test]
 fn syn_rider_declined_creates_no_goblin_without_its_rider() {
     let board = combat_board("SynRider", SYN_RIDER, false);
@@ -948,10 +1050,6 @@ fn loyal_unicorn(with_commander: bool) -> (bool, bool, bool, Vec<EffectKind>) {
                 drain_order_triggers_with_identity(runner.state_mut());
                 continue;
             }
-            // The engine asks for a creature for the prevention instruction.
-            WaitingFor::TriggerTargetSelection { .. } => runner.act(GameAction::ChooseTarget {
-                target: Some(TargetRef::Object(c1)),
-            }),
             WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
             WaitingFor::Priority { .. } => runner.act(GameAction::PassPriority),
             other => panic!("unexpected wait {other:?}"),
@@ -1003,8 +1101,10 @@ fn loyal_unicorn(with_commander: bool) -> (bool, bool, bool, Vec<EffectKind>) {
 /// J-6 (c): Loyal Unicorn's intervening "if" (CR 603.4) is not an "if you do"
 /// gate. With a commander, combat damage to every creature its controller
 /// controls is prevented and the other creatures gain vigilance.
-/// GREEN AT BASE, NON-DISCRIMINATING: there is no `OptionalEffectPerformed`
-/// gate, so the declined walk is unreachable.
+/// RED AT BASE: the "creatures you control" recipient names no target
+/// (CR 115.10a), but at base the trigger raised a spurious
+/// `TriggerTargetSelection` prompt that `loyal_unicorn` no longer answers, so
+/// the helper panics on the unexpected wait.
 #[test]
 fn loyal_unicorn_with_commander_prevents_combat_damage_and_grants_vigilance() {
     let (c1_survived, c3_survived, vigilance, kinds) = loyal_unicorn(true);
@@ -1016,8 +1116,9 @@ fn loyal_unicorn_with_commander_prevents_combat_damage_and_grants_vigilance() {
     assert!(vigilance);
 }
 
-/// J-6 (c): without a commander, nothing happens. GREEN AT BASE,
-/// NON-DISCRIMINATING, as above.
+/// J-6 (c): without a commander, nothing happens. The negative sibling of the
+/// test above: the trigger never fires, so the prompt it once raised is never
+/// reached and this stays green at base.
 #[test]
 fn loyal_unicorn_without_commander_does_nothing() {
     let (c1_survived, c3_survived, vigilance, kinds) = loyal_unicorn(false);
@@ -1047,4 +1148,113 @@ fn iroh_declined_creates_no_ally() {
     assert!(!resolved(&events).contains(&EffectKind::Token));
     assert!(tokens_named(&runner, "Ally").is_empty());
     assert_eq!(runner.state().objects[&c1].controller, P0);
+}
+
+/// JF-2 (phase 7F), KNOWN-BAD. The board has no card behind it and is built
+/// from typed ability nodes rather than text: an optional head, then an "if you
+/// do" gate that gains 1 life and carries a repeat, then an independent
+/// instruction that gains 3 life. The Oracle reading, declined: the gated
+/// process, its repeat included, does not happen (CR 118.12), and the
+/// independent instruction resolves once, in the order written (CR 608.2c):
+/// life +3, with no choice to repeat. The engine does not reduce a declined
+/// gate whose repeat would repeat or re-prompt the later instruction. It falls
+/// back to the base reading, which resolves nothing after the gate: life +0, no
+/// repeat choice, and the game continues. That is not the Oracle reading;
+/// residue #36 records it. Each repeat case is red at base, the `repeat_until`
+/// cases under M-F1 and the counted "unless" case under M-F2. The control (no
+/// repeat) is GREEN AT BASE: the reach guard showing that the decline keeps the
+/// independent instruction on this board, red under M-F4.
+#[test]
+fn a_declined_gate_that_would_repeat_its_later_instructions_resolves_nothing_after_it() {
+    fn declined(repeat: fn(&mut ResolvedAbility)) -> (i32, &'static str) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let source = scenario.add_creature(P0, "Source", 1, 1).id();
+        let mut runner = scenario.build();
+        let gain_life = |amount: i32| {
+            ResolvedAbility::new(
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: amount },
+                    player: TargetFilter::Controller,
+                },
+                vec![],
+                source,
+                P0,
+            )
+        };
+        let mut later = gain_life(3);
+        later.sub_link = SubAbilityLink::SequentialSibling;
+        let mut gate = gain_life(1);
+        gate.condition = Some(AbilityCondition::effect_performed());
+        repeat(&mut gate);
+        let mut head = gain_life(0);
+        head.optional = true;
+        let head = head.sub_ability(gate.sub_ability(later));
+        let life = runner.life(P0);
+        resolve_ability_chain(runner.state_mut(), &head, &mut Vec::new(), 0)
+            .expect("the chain starts resolving");
+        assert!(
+            matches!(
+                runner.state().waiting_for,
+                WaitingFor::OptionalEffectChoice { .. }
+            ),
+            "reach guard: the optional action is offered, got {:?}",
+            runner.state().waiting_for
+        );
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: false })
+            .expect("the decline is accepted");
+        let waiting = match runner.state().waiting_for {
+            WaitingFor::Priority { .. } => "priority",
+            WaitingFor::RepeatDecision { .. } => "repeat choice",
+            WaitingFor::GameOver { .. } => "game over",
+            _ => "other",
+        };
+        (runner.life(P0) - life, waiting)
+    }
+    type Case = (&'static str, fn(&mut ResolvedAbility));
+    let cases: [Case; 5] = [
+        ("no repeat", |_| {}),
+        ("while", |gate| {
+            gate.repeat_until = Some(RepeatContinuation::WhileCondition {
+                condition: Box::new(AbilityCondition::IsYourTurn),
+                max_iterations: Some(2),
+            })
+        }),
+        ("controller choice", |gate| {
+            gate.repeat_until = Some(RepeatContinuation::ControllerChoice)
+        }),
+        ("until stop", |gate| {
+            gate.repeat_until = Some(RepeatContinuation::UntilStopConditions {
+                stop_on_put_to_hand: false,
+                stop_on_duplicate_exiled_names: false,
+            })
+        }),
+        ("counted unless", |gate| {
+            gate.repeat_for = Some(QuantityExpr::Fixed { value: 2 });
+            gate.unless_pay = Some(UnlessPayModifier {
+                cost: AbilityCost::PayLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                },
+                payer: TargetFilter::Controller,
+            });
+        }),
+    ];
+    let readings: Vec<(&str, i32, &str)> = cases
+        .into_iter()
+        .map(|(label, repeat)| {
+            let (life, waiting) = declined(repeat);
+            (label, life, waiting)
+        })
+        .collect();
+    assert_eq!(
+        readings,
+        vec![
+            ("no repeat", 3, "priority"),
+            ("while", 0, "priority"),
+            ("controller choice", 0, "priority"),
+            ("until stop", 0, "priority"),
+            ("counted unless", 0, "priority"),
+        ]
+    );
 }

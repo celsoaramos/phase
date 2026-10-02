@@ -12,10 +12,10 @@ use crate::game::quantity::{
     resolve_quantity_with_targets,
 };
 use crate::types::ability::{
-    CardTypeSetSource, CastManaSpentMetric, ChoiceValue, ChosenAttribute, CombatRelation,
-    CombatRelationSubject, ControllerRef, CountScope, FilterProp, Parity, ParitySource,
-    PlayerFilter, PtStat, PtValueScope, QuantityExpr, QuantityRef, ResolvedAbility, SharedQuality,
-    SharedQualityRelation, TargetFilter, TargetRef, TypeFilter, TypedFilter,
+    AttackerBlockStatus, CardTypeSetSource, CastManaSpentMetric, ChoiceValue, ChosenAttribute,
+    CombatRelation, CombatRelationSubject, ControllerRef, CountScope, FilterProp, Parity,
+    ParitySource, PlayerFilter, PtStat, PtValueScope, QuantityExpr, QuantityRef, ResolvedAbility,
+    SharedQuality, SharedQualityRelation, TargetFilter, TargetRef, TypeFilter, TypedFilter,
 };
 use crate::types::card::CardFace;
 use crate::types::card_type::{CoreType, Supertype};
@@ -286,7 +286,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::Blocking
         | FilterProp::BlockingSource
         | FilterProp::CombatRelation { .. }
-        | FilterProp::Unblocked
+        | FilterProp::BlockStatus { .. }
         | FilterProp::AttackingAlone
         | FilterProp::BlockingAlone
         | FilterProp::Tapped
@@ -747,7 +747,7 @@ fn filter_prop_characteristic_reads_at(prop: &FilterProp, depth: u32) -> Charact
         | FilterProp::Blocking
         | FilterProp::BlockingSource
         | FilterProp::CombatRelation { .. }
-        | FilterProp::Unblocked
+        | FilterProp::BlockStatus { .. }
         | FilterProp::AttackingAlone
         | FilterProp::BlockingAlone
         | FilterProp::Tapped
@@ -960,7 +960,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::Blocking
         | FilterProp::BlockingSource
         | FilterProp::CombatRelation { .. }
-        | FilterProp::Unblocked
+        | FilterProp::BlockStatus { .. }
         | FilterProp::AttackingAlone
         | FilterProp::BlockingAlone
         | FilterProp::Tapped
@@ -1814,7 +1814,7 @@ pub(crate) fn filter_prop_contains(
         | FilterProp::Blocking
         | FilterProp::BlockingSource
         | FilterProp::CombatRelation { .. }
-        | FilterProp::Unblocked
+        | FilterProp::BlockStatus { .. }
         | FilterProp::AttackingAlone
         | FilterProp::BlockingAlone
         | FilterProp::Tapped
@@ -2064,7 +2064,7 @@ fn filter_prop_contains_filter_prop(
             | FilterProp::Blocking
             | FilterProp::BlockingSource
             | FilterProp::CombatRelation { .. }
-            | FilterProp::Unblocked
+            | FilterProp::BlockStatus { .. }
             | FilterProp::AttackingAlone
             | FilterProp::BlockingAlone
             | FilterProp::Tapped
@@ -2281,7 +2281,7 @@ fn quantity_ref_contains_filter_prop(
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::GraveyardSize { .. }
         | QuantityRef::LifeAboveStarting
-        | QuantityRef::StartingLifeTotal
+        | QuantityRef::StartingLifeTotal { .. }
         | QuantityRef::TriggeringDiscoverValue
         | QuantityRef::TriggeringScryLookCount
         | QuantityRef::TriggeringScryBottomCount
@@ -2296,6 +2296,7 @@ fn quantity_ref_contains_filter_prop(
         | QuantityRef::ObjectManaValue { .. }
         | QuantityRef::ObjectColorCount { .. }
         | QuantityRef::ObjectNameWordCount { .. }
+        | QuantityRef::NameStickerLetterCount { .. }
         | QuantityRef::ObjectTypelineComponentCount { .. }
         | QuantityRef::ManaSymbolsInManaCost { .. }
         | QuantityRef::SelfManaValue
@@ -2524,7 +2525,7 @@ fn rewrite_filter_prop(
         | FilterProp::Blocking
         | FilterProp::BlockingSource
         | FilterProp::CombatRelation { .. }
-        | FilterProp::Unblocked
+        | FilterProp::BlockStatus { .. }
         | FilterProp::AttackingAlone
         | FilterProp::BlockingAlone
         | FilterProp::Tapped
@@ -2752,7 +2753,7 @@ fn rewrite_quantity_ref_filter_props(
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::GraveyardSize { .. }
         | QuantityRef::LifeAboveStarting
-        | QuantityRef::StartingLifeTotal
+        | QuantityRef::StartingLifeTotal { .. }
         | QuantityRef::TriggeringDiscoverValue
         | QuantityRef::TriggeringScryLookCount
         | QuantityRef::TriggeringScryBottomCount
@@ -2767,6 +2768,7 @@ fn rewrite_quantity_ref_filter_props(
         | QuantityRef::ObjectManaValue { .. }
         | QuantityRef::ObjectColorCount { .. }
         | QuantityRef::ObjectNameWordCount { .. }
+        | QuantityRef::NameStickerLetterCount { .. }
         | QuantityRef::ObjectTypelineComponentCount { .. }
         | QuantityRef::ManaSymbolsInManaCost { .. }
         | QuantityRef::SelfManaValue
@@ -2989,6 +2991,26 @@ pub fn last_revealed_library_ids_matching(
             state.objects.get(id).is_some_and(|obj| {
                 obj.zone == Zone::Library && matches_target_filter(state, *id, &looked_filter, ctx)
             })
+        })
+        .collect()
+}
+
+/// Cards from `last_revealed_ids` matching a filter, without restricting to a specific zone.
+pub fn last_revealed_ids_matching(
+    state: &GameState,
+    filter: &TargetFilter,
+    ctx: &FilterContext<'_>,
+) -> Vec<ObjectId> {
+    let looked_filter = remap_exiled_by_source_for_looked_cards(filter);
+    state
+        .last_revealed_ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            state
+                .objects
+                .get(id)
+                .is_some_and(|_obj| matches_target_filter(state, *id, &looked_filter, ctx))
         })
         .collect()
 }
@@ -4059,6 +4081,7 @@ pub(crate) fn matches_target_filter_on_event_snapshot(
         snapshot.zone,
     );
     object.controller = snapshot.controller;
+    object.incarnation = snapshot.identity.incarnation;
     object.power = snapshot.power;
     object.toughness = snapshot.toughness;
     object.base_power = snapshot.base_power;
@@ -6222,7 +6245,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         // insensitive per the same convention used by the live-object path.
         // Approach of the Second Sun's "you've cast another spell named
         // {LITERAL} this game" relies on this against the game-scope history.
-        FilterProp::Named { name } => record.name.eq_ignore_ascii_case(name),
+        FilterProp::Named { name } => card_names_match(&record.name, name),
         // SpellCastRecord carries no modal field — conservative gap (CR 700.2
         // evaluated on the live stack object, not the snapshot).
         FilterProp::Modal => false,
@@ -6235,7 +6258,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::Blocking
         | FilterProp::BlockingSource
         | FilterProp::CombatRelation { .. }
-        | FilterProp::Unblocked
+        | FilterProp::BlockStatus { .. }
         | FilterProp::AttackingAlone
         | FilterProp::BlockingAlone
         | FilterProp::Tapped
@@ -6438,6 +6461,9 @@ fn object_matches_trigger_source(
     source_id: ObjectId,
     trigger_source: Option<&TriggerSourceContext>,
 ) -> bool {
+    // CR 400.7 + CR 608.2h: a live candidate matches only the source's exact
+    // incarnation in its expected zone. A latched source cannot identify a
+    // later object that reused the same storage id.
     trigger_source.map_or(object_id == source_id, |context| {
         matches!(
             context.source_read(state),
@@ -6625,28 +6651,84 @@ fn combat_relation_subject_id(
     }
 }
 
+/// CR 400.7 + CR 608.2h: The exact incarnation `subject` names. A triggered
+/// source is named by the identity its trigger captured — for a
+/// leaves-the-battlefield trigger, the incarnation that left (CR 603.10a). An
+/// activated ability carries no trigger identity, so it falls to the
+/// incarnation stamped onto it when it reached the stack
+/// (CR 113.7a's "last known information" for a source that has since left the
+/// zone it was expected to be in). Only when neither is available does this
+/// fall to the live object at the referenced id; an object that left and
+/// returned is a new object (CR 400.7) and finds nothing its predecessor
+/// recorded. `ParentTarget` prefers the incarnation pinned when it was chosen.
+fn combat_relation_subject_ref(
+    state: &GameState,
+    subject: CombatRelationSubject,
+    source: &SourceContext<'_>,
+) -> Option<ObjectIncarnationRef> {
+    let live = |id: ObjectId| {
+        state
+            .objects
+            .get(&id)
+            .map(ObjectIncarnationRef::from_object)
+    };
+    match subject {
+        CombatRelationSubject::Source => source
+            .trigger_source
+            .map(|context| context.identity.reference)
+            .or_else(|| {
+                source
+                    .ability
+                    .and_then(|ability| ability.source_incarnation)
+                    .map(|incarnation| ObjectIncarnationRef::of(source.id, incarnation))
+            })
+            .or_else(|| live(source.id)),
+        CombatRelationSubject::ParentTarget => {
+            let ability = source.ability?;
+            let id = first_object_target(ability)?;
+            ability
+                .target_incarnations
+                .iter()
+                .chain(&ability.selected_target_incarnations)
+                .find(|pin| pin.object_id == id)
+                .copied()
+                .or_else(|| live(id))
+        }
+    }
+}
+
 fn matches_combat_relation(
     state: &GameState,
     object_id: ObjectId,
+    candidate: ObjectIncarnationRef,
     relation: CombatRelation,
     subject: CombatRelationSubject,
     source: &SourceContext<'_>,
 ) -> bool {
-    let Some(subject_id) = combat_relation_subject_id(subject, source) else {
-        return false;
-    };
     match relation {
-        CombatRelation::BlockingOrBlockedBy => state.combat.as_ref().is_some_and(|combat| {
-            let candidate_blocks_subject = combat
-                .blocker_to_attacker
-                .get(&object_id)
-                .is_some_and(|attackers| attackers.contains(&subject_id));
-            let subject_blocks_candidate = combat
-                .blocker_to_attacker
-                .get(&subject_id)
-                .is_some_and(|attackers| attackers.contains(&object_id));
-            candidate_blocks_subject || subject_blocks_candidate
-        }),
+        CombatRelation::BlockingOrBlockedBy => {
+            let Some(subject_id) = combat_relation_subject_id(subject, source) else {
+                return false;
+            };
+            state.combat.as_ref().is_some_and(|combat| {
+                let candidate_blocks_subject = combat
+                    .blocker_to_attacker
+                    .get(&object_id)
+                    .is_some_and(|attackers| attackers.contains(&subject_id));
+                let subject_blocks_candidate = combat
+                    .blocker_to_attacker
+                    .get(&subject_id)
+                    .is_some_and(|attackers| attackers.contains(&object_id));
+                candidate_blocks_subject || subject_blocks_candidate
+            })
+        }
+        // CR 509.1g + CR 400.7: answered from the block-history ledgers, which
+        // CR 506.4 does not prune, by the exact subject and candidate
+        // incarnations.
+        CombatRelation::BlockedBySubject { scope } => {
+            combat_relation_subject_ref(state, subject, source)
+                .is_some_and(|blocker| state.creature_blocked_attacker(blocker, candidate, scope))
+        }
     }
 }
 
@@ -6931,12 +7013,19 @@ fn matches_filter_prop(
                 .get(&object_id)
                 .is_some_and(|attackers| attackers.contains(&source.id))
         }),
-        FilterProp::CombatRelation { relation, subject } => {
-            matches_combat_relation(state, object_id, *relation, *subject, source)
+        FilterProp::CombatRelation { relation, subject } => matches_combat_relation(
+            state,
+            object_id,
+            ObjectIncarnationRef::from_object(obj),
+            *relation,
+            *subject,
+            source,
+        ),
+        // CR 509.1h: blocked/unblocked reads the permanent `blocked` flag, not the
+        // current blocker list, so a blocked attacker stays blocked after its blockers leave.
+        FilterProp::BlockStatus { status } => {
+            combat::attacker_block_status(state, object_id) == Some(*status)
         }
-        // CR 509.1h: Unblocked = attacking creature that was never assigned blockers.
-        // unblocked_attackers checks the permanent `blocked` flag, not the current blocker list.
-        FilterProp::Unblocked => combat::unblocked_attackers(state).contains(&object_id),
         // CR 506.5: sole attacker / sole blocker against live combat. Look-back
         // callers route through the zone-change snapshot arm instead.
         FilterProp::AttackingAlone => combat::attacking_alone(state, object_id),
@@ -7091,13 +7180,13 @@ fn matches_filter_prop(
         // non-self-referential "counts as named" card appears, this may need a
         // source-filter check.
         FilterProp::Named { name } => {
-            obj.name.eq_ignore_ascii_case(name)
+            card_names_match(&obj.name, name)
                 || obj.static_definitions.iter_all().any(|sd| {
                     // Only count the alias if the static's active_zones include
                     // the object's current zone (or active_zones is empty = always).
                     if let StaticMode::CountsAsNamed { name: alias } = &sd.mode {
                         (sd.active_zones.is_empty() || sd.active_zones.contains(&obj.zone))
-                            && alias.eq_ignore_ascii_case(name)
+                            && card_names_match(alias, name)
                     } else {
                         false
                     }
@@ -7112,13 +7201,14 @@ fn matches_filter_prop(
         // (e.g., the seed was just exiled by the preceding effect).
         FilterProp::SameNameAsParentTarget => parent_target_name(state, source.ability)
             .is_some_and(|name| obj.name.eq_ignore_ascii_case(&name)),
-        FilterProp::SameNameAsExiledBySource => state.exile_links.iter().any(|link| {
-            link.source_id == source.id
-                && state
+        FilterProp::SameNameAsExiledBySource => {
+            crate::game::exile_links::live_links_for_source(state, source.id).any(|link| {
+                state
                     .objects
                     .get(&link.exiled_id)
                     .is_some_and(|exiled| obj.name.eq_ignore_ascii_case(&exiled.name))
-        }),
+            })
+        }
         // CR 201.2 + CR 201.2a: Matches if `obj.name` equals the name of any
         // permanent on the battlefield (optionally narrowed by controller).
         // Name comparison is case-insensitive per `FilterProp::Named` /
@@ -7667,11 +7757,31 @@ fn matches_filter_prop(
         // haste-folding `has_summoning_sickness`).
         FilterProp::ControlledContinuouslySinceTurnBegan => !obj.summoning_sick,
         FilterProp::ZoneChangedThisTurn { from, to } => {
-            state.zone_changes_this_turn.iter().any(|record| {
-                record.object_id == object_id
-                    && from.is_none_or(|zone| record.from_zone == Some(zone))
-                    && to.is_none_or(|zone| record.to_zone == zone)
-            })
+            // CR 400.7: an object that changes zones becomes a NEW object. This
+            // engine models that by resetting per-zone state rather than by
+            // reminting the `ObjectId`, so `zone_changes_this_turn` accumulates
+            // every hop an object made this turn under one id.
+            //
+            // The phrase this predicate serves — "cards in your graveyard that
+            // were put there from <zone> this turn" — asks how the object came
+            // to be where it IS, so only its MOST RECENT move describes the
+            // current incarnation. Scanning every record instead conflates prior
+            // incarnations, and that is wrong in both directions: Faith's Reward
+            // ("return all permanent cards in your graveyard that were put there
+            // from the battlefield this turn") would return a card that reached
+            // the graveyard from the battlefield earlier in the turn but is now
+            // there from somewhere else (over-permissive, grants what the rules
+            // forbid), while the negated form (Banon, the Returners' Leader)
+            // would exclude that same card (under-permissive).
+            state
+                .zone_changes_this_turn
+                .iter()
+                .rev()
+                .find(|record| record.object_id == object_id)
+                .is_some_and(|record| {
+                    from.is_none_or(|zone| record.from_zone == Some(zone))
+                        && to.is_none_or(|zone| record.to_zone == zone)
+                })
         }
         // CR 508.1a: Creature was declared as an attacker this turn (board-wide,
         // any defender). CR 508.6 + CR 508.1b: when `defender` is `Some`, scope to
@@ -7847,6 +7957,20 @@ pub(crate) fn object_has_no_abilities(obj: &GameObject) -> bool {
         && obj.static_definitions.is_empty()
 }
 
+/// CR 201.2a: objects with a common name have the same name. The Oracle parser
+/// stores names lowercased as whole strings, so compare using the same Unicode
+/// normalization. Character-by-character lowercasing misses contextual forms
+/// such as Greek final sigma, and inside `Not` that miss becomes a false "not
+/// named" match. Single authority for every
+/// `FilterProp::Named` arm (live object, spell-cast record, zone-change record).
+pub(crate) fn card_names_match(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a.to_lowercase() == b.to_lowercase()
+    }
+}
+
 /// CR 603.10: Evaluate a `FilterProp` against a zone-change event snapshot.
 ///
 /// Properties fall into four groups:
@@ -7897,7 +8021,7 @@ fn zone_change_record_matches_property(
             !zone_change_record_matches_property(&FilterProp::Historic, state, record, source)
         }
         // CR 201.2: Name match (case-insensitive) on the event-time object.
-        FilterProp::Named { name } => record.name.eq_ignore_ascii_case(name),
+        FilterProp::Named { name } => card_names_match(&record.name, name),
         // CR 208 + CR 208.4b: Power/toughness metric threshold on the
         // event-time object. A `None` value (non-creature in some zones) treats
         // as 0, matching live-state behavior. The zone-change snapshot captures
@@ -8065,13 +8189,14 @@ fn zone_change_record_matches_property(
         // target (parent target). Mirrors the live-object evaluator.
         FilterProp::SameNameAsParentTarget => parent_target_name(state, source.ability)
             .is_some_and(|name| record.name.eq_ignore_ascii_case(&name)),
-        FilterProp::SameNameAsExiledBySource => state.exile_links.iter().any(|link| {
-            link.source_id == source.id
-                && state
+        FilterProp::SameNameAsExiledBySource => {
+            crate::game::exile_links::live_links_for_source(state, source.id).any(|link| {
+                state
                     .objects
                     .get(&link.exiled_id)
                     .is_some_and(|exiled| record.name.eq_ignore_ascii_case(&exiled.name))
-        }),
+            })
+        }
 
         // -------- Group 3: combat snapshot state --------
         // CR 508.1k / CR 509.1g / CR 509.1h: Combat state as of the zone change.
@@ -8090,11 +8215,37 @@ fn zone_change_record_matches_property(
         }
         FilterProp::Blocking => record.combat_status.blocking,
         // `ZoneChangeCombatStatus` snapshots role, not the blocker-to-attacker
-        // relation. Source-relative blocker checks require live combat state.
-        FilterProp::BlockingSource | FilterProp::CombatRelation { .. } => false,
-        FilterProp::Unblocked => {
-            record.combat_status.attacking && !record.combat_status.blocked
-        }
+        // relation, and this predicate reads live `combat.blocker_to_attacker`.
+        FilterProp::BlockingSource => false,
+        FilterProp::CombatRelation { relation, subject } => match relation {
+            // CR 506.4: the live map is pruned when either creature leaves
+            // combat, so there is nothing for a departed record to match.
+            CombatRelation::BlockingOrBlockedBy => false,
+            // CR 509.1g + CR 608.2i: answered from the same block-history
+            // ledgers as the live leg, through GameState::creature_blocked_attacker.
+            // CR 400.7: the record's exact departing incarnation is its own
+            // pre-change authority; a record without one fails closed.
+            CombatRelation::BlockedBySubject { scope } => {
+                let Some(candidate) = record
+                    .trigger_source_context()
+                    .map(|context| context.identity.reference)
+                else {
+                    return false;
+                };
+                combat_relation_subject_ref(state, *subject, source).is_some_and(|blocker| {
+                    state.creature_blocked_attacker(blocker, candidate, *scope)
+                })
+            }
+        },
+        // CR 509.1h: blocked/unblocked as of the zone change.
+        FilterProp::BlockStatus { status } => match status {
+            AttackerBlockStatus::Blocked => {
+                record.combat_status.attacking && record.combat_status.blocked
+            }
+            AttackerBlockStatus::Unblocked => {
+                record.combat_status.attacking && !record.combat_status.blocked
+            }
+        },
         // CR 506.5 + CR 603.10a: sole-attacker / sole-blocker status as of the
         // zone change, captured by `capture_combat_status` before combat removal.
         FilterProp::AttackingAlone => record.combat_status.attacking_alone,
@@ -9327,10 +9478,10 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, AggregateFunction, AttachmentKind, ChosenAttribute,
-        Comparator, ControllerRef, DamageKindFilter, Effect, FilterProp, ManaContribution,
-        ManaProduction, PlayerScope, QuantityExpr, QuantityRef, ReplacementDefinition,
-        ResolvedAbility, StaticDefinition, TargetFilter, TargetRef, TriggerDefinition, TypeFilter,
-        TypedFilter,
+        CombatHistoryScope, Comparator, ControllerRef, DamageKindFilter, Effect, FilterProp,
+        ManaContribution, ManaProduction, PlayerScope, QuantityExpr, QuantityRef,
+        ReplacementDefinition, ResolvedAbility, StaticDefinition, TargetFilter, TargetRef,
+        TriggerDefinition, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::events::GameEvent;
@@ -12412,6 +12563,161 @@ mod tests {
             &filter,
             &ctx
         ));
+    }
+
+    /// U1: `combat_relation_subject_ref`'s `ParentTarget` arm prefers a pinned
+    /// incarnation over the live object, and `target_incarnations` (the
+    /// delayed-trigger referent pin) over `selected_target_incarnations` when
+    /// both are populated. This path is production-unreachable today — no
+    /// parser emits `BlockedBySubject { subject: ParentTarget, .. }` — so it is
+    /// exercised only here.
+    #[test]
+    fn parent_target_subject_prefers_the_selected_pin_over_the_live_object() {
+        let mut state = setup();
+        let source = add_creature(&mut state, PlayerId(0), "Source");
+        let blocker = add_creature(&mut state, PlayerId(1), "Blocker");
+        let attacker = add_creature(&mut state, PlayerId(0), "Attacker");
+
+        let blocked_at = ObjectIncarnationRef::from_object(&state.objects[&blocker]);
+        let attacker_ref = ObjectIncarnationRef::from_object(&state.objects[&attacker]);
+        state
+            .creature_blocked_attackers_this_turn
+            .insert(crate::game::combat::BlockHistoryPair {
+                blocker: blocked_at,
+                attacker: attacker_ref,
+            });
+
+        // Bump the blocker past the recorded incarnation.
+        state.objects.get_mut(&blocker).unwrap().bump_incarnation();
+        assert_ne!(
+            ObjectIncarnationRef::from_object(&state.objects[&blocker]),
+            blocked_at,
+            "reach guard: the live object must have moved past the recorded incarnation"
+        );
+
+        let filter = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+            FilterProp::CombatRelation {
+                relation: CombatRelation::BlockedBySubject {
+                    scope: CombatHistoryScope::ThisTurn,
+                },
+                subject: CombatRelationSubject::ParentTarget,
+            },
+        ]));
+        let ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 0 },
+                target: TargetFilter::Controller,
+            },
+            vec![TargetRef::Object(blocker)],
+            source,
+            PlayerId(0),
+        );
+
+        // With the selected-target pin, the parent target's recorded
+        // incarnation is used and the block is found.
+        let mut pinned = ability.clone();
+        pinned.selected_target_incarnations = vec![blocked_at];
+        let ctx = FilterContext::from_ability(&pinned);
+        assert!(
+            crate::game::filter::matches_target_filter(&state, attacker, &filter, &ctx),
+            "with the selected-target pin, the parent target's recorded incarnation must be found"
+        );
+
+        // Without any pin, the live (bumped) incarnation is used and nothing matches.
+        let unpinned = ability.clone();
+        let ctx = FilterContext::from_ability(&unpinned);
+        assert!(
+            !crate::game::filter::matches_target_filter(&state, attacker, &filter, &ctx),
+            "without a pin, the live (bumped) blocker incarnation must not match its predecessor's block"
+        );
+
+        // (a) When both pin lists are populated with DIFFERENT incarnations,
+        // `target_incarnations` (the delayed-trigger referent) must be
+        // preferred over `selected_target_incarnations`.
+        let live_incarnation = ObjectIncarnationRef::from_object(&state.objects[&blocker]);
+        let mut both_pinned = ability.clone();
+        both_pinned.target_incarnations = vec![blocked_at];
+        both_pinned.selected_target_incarnations = vec![live_incarnation];
+        let ctx = FilterContext::from_ability(&both_pinned);
+        assert!(
+            crate::game::filter::matches_target_filter(&state, attacker, &filter, &ctx),
+            "target_incarnations must be preferred over selected_target_incarnations"
+        );
+
+        // (b) With no pins at all and the live object left at the recorded
+        // incarnation, the fallback to the live object finds the block.
+        state.objects.get_mut(&blocker).unwrap().incarnation = blocked_at.incarnation;
+        let ctx = FilterContext::from_ability(&unpinned);
+        assert!(
+            crate::game::filter::matches_target_filter(&state, attacker, &filter, &ctx),
+            "with no pin, the live object at its recorded incarnation must be found via fallback"
+        );
+    }
+
+    /// T12c (E15): `matches_target_filter_on_event_snapshot` must answer
+    /// `BlockedBySubject` from the SNAPSHOT's own captured incarnation, not the
+    /// live object's — otherwise a live object bumped past the snapshot (blink,
+    /// re-entry) would silently override the event-time fact the snapshot exists
+    /// to freeze. The snapshot's incarnation is pinned NON-zero, because
+    /// `GameObject::new` defaults `incarnation: 0` and a zero-incarnation
+    /// snapshot would make a dropped `E15` assignment invisible.
+    #[test]
+    fn event_snapshot_answers_from_its_captured_identity_not_the_live_object() {
+        let mut state = setup();
+        let blocker = add_creature(&mut state, PlayerId(1), "Blocker");
+        let attacker = add_creature(&mut state, PlayerId(0), "Attacker");
+
+        // Bump the attacker to a non-zero incarnation, then capture the snapshot
+        // at that incarnation.
+        state
+            .objects
+            .get_mut(&attacker)
+            .expect("attacker is live")
+            .bump_incarnation();
+        let snapshot = state
+            .capture_connive_subject(attacker)
+            .expect("a live object must capture a snapshot")
+            .snapshot;
+        assert_ne!(
+            snapshot.identity.incarnation, 0,
+            "reach guard: the snapshot's own incarnation must be non-zero"
+        );
+
+        // The ledger records the SNAPSHOT's incarnation.
+        state
+            .creature_blocked_attackers_this_turn
+            .insert(combat::BlockHistoryPair {
+                blocker: ObjectIncarnationRef::from_object(&state.objects[&blocker]),
+                attacker: snapshot.identity,
+            });
+
+        // The LIVE object then moves further — a real re-entry would land here
+        // too — so the live incarnation now disagrees with the snapshot's.
+        state
+            .objects
+            .get_mut(&attacker)
+            .expect("attacker is live")
+            .bump_incarnation();
+        assert_ne!(
+            state.objects[&attacker].incarnation, snapshot.identity.incarnation,
+            "reach guard: the live object must have moved past the snapshot's incarnation"
+        );
+
+        let ctx = FilterContext::from_source_with_controller(blocker, PlayerId(1));
+        let filter = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+            FilterProp::CombatRelation {
+                relation: CombatRelation::BlockedBySubject {
+                    scope: CombatHistoryScope::ThisTurn,
+                },
+                subject: CombatRelationSubject::Source,
+            },
+        ]));
+
+        assert!(
+            matches_target_filter_on_event_snapshot(&state, &snapshot, &filter, &ctx),
+            "the snapshot's own captured incarnation must match the ledger, \
+             regardless of where the live object has since moved"
+        );
     }
 
     #[test]
@@ -16808,7 +17114,9 @@ mod tests {
             &source_ctx,
         ));
         assert!(zone_change_record_matches_property(
-            &FilterProp::Unblocked,
+            &FilterProp::BlockStatus {
+                status: AttackerBlockStatus::Unblocked,
+            },
             &state,
             &attacking_record,
             &source_ctx,
@@ -18216,7 +18524,7 @@ mod characteristic_read_classification_tests {
             | FilterProp::Blocking
             | FilterProp::BlockingSource
             | FilterProp::CombatRelation { .. }
-            | FilterProp::Unblocked
+            | FilterProp::BlockStatus { .. }
             | FilterProp::AttackingAlone
             | FilterProp::BlockingAlone
             | FilterProp::Tapped
