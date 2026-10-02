@@ -7754,6 +7754,7 @@ mod tests {
                 amount: PreventionAmount::All,
                 amount_dynamic: None,
                 target: TargetFilter::Any,
+                recipient_scope: engine::types::ability::EffectScope::Single,
                 scope,
                 damage_source_filter: Some(TargetFilter::Typed(
                     TypedFilter::default().properties(vec![FilterProp::IsChosenColor]),
