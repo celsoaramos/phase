@@ -1132,6 +1132,7 @@ mod tests {
                     amount: PreventionAmount::Next(2),
                     amount_dynamic: None,
                     target: TargetFilter::Any,
+                    recipient_scope: engine::types::ability::EffectScope::Single,
                     scope: PreventionScope::AllDamage,
                     damage_source_filter: None,
                     prevention_duration: None,
