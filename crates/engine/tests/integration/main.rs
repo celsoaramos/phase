@@ -1354,6 +1354,7 @@ mod surveillance_phantasm_scry_or_surveil;
 mod swallow_optional_you_may;
 mod swans_prevention_followup;
 mod swarm_combat_witness;
+mod talaras_battalion_cast_another;
 mod tales_of_the_ancestors_catch_up_draw;
 mod talon_gates_from_hand_activation;
 mod tap_cost_another_self_exclusion;
