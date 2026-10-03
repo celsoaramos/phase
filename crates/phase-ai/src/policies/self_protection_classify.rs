@@ -79,6 +79,38 @@ pub(crate) fn combat_step_allows_protection(state: &GameState) -> bool {
     )
 }
 
+/// CR 615.1a: a prevention shield only matters against damage that is actually
+/// coming — a damage spell or ability on the stack aimed at the AI or its
+/// permanents, or a combat the AI is in (it is being attacked, or one of its
+/// creatures is attacking or blocking). The broader `any_immediate_threat`
+/// (low life, board pressure on the opponent's turn) is right for a lasting
+/// grant, but a "prevent the next N damage this turn" cast before any damage
+/// exists is a wasted card: reported from play, the AI cast Swift Maneuver on
+/// turn 1 and again with nothing attacking.
+pub(crate) fn prevention_has_incoming_damage(state: &GameState, ai_player: PlayerId) -> bool {
+    if any_stack_targets_ai_or_ai_permanent(state, ai_player)
+        || any_stack_has_untargeted_mass_threat(state, ai_player)
+    {
+        return true;
+    }
+    combat_step_allows_protection(state) && ai_is_in_combat(state, ai_player)
+}
+
+fn ai_is_in_combat(state: &GameState, ai_player: PlayerId) -> bool {
+    let Some(combat) = &state.combat else {
+        return false;
+    };
+    let controlled_by_ai = |id: &ObjectId| {
+        state
+            .objects
+            .get(id)
+            .is_some_and(|object| object.controller == ai_player)
+    };
+    combat.attackers.iter().any(|attacker| {
+        attacker.defending_player == ai_player || controlled_by_ai(&attacker.object_id)
+    }) || combat.blocker_to_attacker.keys().any(controlled_by_ai)
+}
+
 /// Effect-signature classifier: returns true when an `Effect` represents
 /// "save yourself / your permanents."
 pub(crate) fn is_self_protection_effect(effect: &Effect) -> bool {
