@@ -1318,6 +1318,51 @@ fn validate_keep_on_top_selection(
 /// empty, which let a filtered dig that matched zero cards accept arbitrary
 /// object ids — moving cards the effect never looked at into the chooser's hand,
 /// or inserting foreign ids into the library and corrupting its order.
+/// The single authority on whether a `WaitingFor::DigChoice` keep-selection is
+/// legal: cardinality, then membership. Shared by the resolution handler below
+/// and by `AiDecisionContract::contains_action`, so the AI contract accepts
+/// exactly the selections this handler accepts — not only the first
+/// `SELECTION_CANDIDATE_CAP` lexicographic combinations the enumerator issues.
+pub(crate) fn validate_dig_choice(
+    kept: &[ObjectId],
+    looked_at: &[ObjectId],
+    selectable: &[ObjectId],
+    keep_count: usize,
+    up_to: bool,
+) -> Result<(), EngineError> {
+    if up_to {
+        if kept.len() > keep_count {
+            return Err(EngineError::InvalidAction(format!(
+                "Must select at most {} cards, got {}",
+                keep_count,
+                kept.len()
+            )));
+        }
+    } else {
+        // CR 609.3 + CR 101.3: a dig whose filter (or a short library) leaves
+        // fewer selectable cards than `keep_count` must keep as many as
+        // possible, not reject every selection. Without the clamp no legal
+        // action exists in that state — `validate_dig_selection` below requires
+        // every kept id to be in `selectable_cards` while this gate demands more
+        // ids than it holds — softlocking every controller. Matches the clamp
+        // the candidate enumerator (`ai_support/candidates.rs`'s
+        // `WaitingFor::DigChoice` arm) and `cheap_reject_candidate`'s own
+        // `WaitingFor::DigChoice` arm already apply.
+        let required = keep_count.min(selectable.len());
+        if kept.len() != required {
+            return Err(EngineError::InvalidAction(format!(
+                "Must select exactly {} cards, got {}",
+                required,
+                kept.len()
+            )));
+        }
+    }
+    // CR 401.2 + CR 608.2c: the keep-selection must be unique, drawn from the
+    // cards actually looked at, and (when the dig has a filter) from the
+    // filter-matching subset.
+    validate_dig_selection(kept, looked_at, selectable)
+}
+
 fn validate_dig_selection(
     kept: &[ObjectId],
     looked_at: &[ObjectId],
@@ -4439,41 +4484,7 @@ pub(super) fn handle_resolution_choice(
             },
             GameAction::SelectCards { cards: kept },
         ) => {
-            if up_to {
-                if kept.len() > keep_count {
-                    return Err(EngineError::InvalidAction(format!(
-                        "Must select at most {} cards, got {}",
-                        keep_count,
-                        kept.len()
-                    )));
-                }
-            } else {
-                // CR 609.3 + CR 101.3: a dig whose filter (or a short library)
-                // leaves fewer selectable cards than `keep_count` must keep as
-                // many as possible, not reject every selection. Without the
-                // clamp no legal action exists in that state —
-                // `validate_dig_selection` below requires every kept id to be in
-                // `selectable_cards` while this gate demands more ids than it
-                // holds — softlocking every controller. Matches the clamp the
-                // candidate enumerator (`ai_support/candidates.rs`'s
-                // `WaitingFor::DigChoice` arm) and `cheap_reject_candidate`'s own
-                // `WaitingFor::DigChoice` arm already apply.
-                let required = keep_count.min(selectable_cards.len());
-                if kept.len() != required {
-                    return Err(EngineError::InvalidAction(format!(
-                        "Must select exactly {} cards, got {}",
-                        required,
-                        kept.len()
-                    )));
-                }
-            }
-
-            // CR 401.2 + CR 608.2c: the keep-selection must be unique, drawn from
-            // the cards actually looked at, and (when the dig has a filter) from
-            // the filter-matching subset. The previous check skipped filter/look-
-            // at validation entirely whenever `selectable_cards` was empty, so a
-            // filtered dig that matched nothing accepted arbitrary object ids.
-            validate_dig_selection(&kept, &cards, &selectable_cards)?;
+            validate_dig_choice(&kept, &cards, &selectable_cards, keep_count, up_to)?;
 
             let mut unkept: Vec<_> = cards
                 .iter()
