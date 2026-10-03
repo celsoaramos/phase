@@ -1455,6 +1455,47 @@ fn strong_ai_holds_attack_into_animatable_manland_weak_ai_swings() {
     }
 }
 
+/// Field report (Magic Finder, engine v0.99): every upkeep the AI animated its
+/// Rakdos Keyrune by tapping the Keyrune itself for {B} plus a Mountain for {R}.
+/// The Keyrune was its only black source, so the 3/1 ended up tapped — it could
+/// neither attack nor block (CR 508.1a / CR 509.1a) — and the turn's mana was
+/// spent on nothing. The man-land guard only looked at lands; a non-land
+/// self-animating permanent must get the same "would leave the source tapped"
+/// veto.
+#[test]
+fn does_not_animate_keyrune_into_a_tapped_creature() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::Upkeep);
+    let keyrune = scenario
+        .add_artifact_from_oracle(
+            P0,
+            "Rakdos Keyrune",
+            "{T}: Add {B} or {R}.\n{B}{R}: Rakdos Keyrune becomes a 3/1 black and red Devil artifact creature with first strike until end of turn.",
+        )
+        .id();
+    for _ in 0..3 {
+        scenario.add_basic_land(P0, engine::types::mana::ManaColor::Red);
+    }
+    // Something to draw — an empty library makes passing look like a loss to
+    // the lookahead (CR 704.5b), which would swamp the decision under test.
+    for _ in 0..5 {
+        scenario.add_card_to_library_top(P0, "Mountain");
+        scenario.add_card_to_library_top(P1, "Mountain");
+    }
+
+    let runner = scenario.build();
+
+    for (diff, action) in ai_choose_at_all_difficulties(runner.state()) {
+        assert!(
+            !matches!(
+                action,
+                GameAction::ActivateAbility { source_id, .. } if source_id == keyrune
+            ),
+            "{diff:?}: animating the Keyrune would tap it for its own {{B}}, got {action:?}"
+        );
+    }
+}
+
 // ── Board Development ────────────────────────────────────────────────────
 
 #[test]

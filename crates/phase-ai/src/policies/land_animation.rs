@@ -1,8 +1,10 @@
 //! Land Animation Timing Policy
 //!
-//! Evaluates when to animate man-lands like Lumbering Falls. Prevents the AI from
-//! animating lands every turn regardless of strategic value, considering mana needs,
-//! color requirements, and combat value.
+//! Evaluates when to animate man-lands like Lumbering Falls — and the same
+//! self-animating shape on non-land permanents (Keyrunes such as Rakdos Keyrune,
+//! which is also its controller's mana source). Prevents the AI from animating
+//! every turn regardless of strategic value, considering mana needs, color
+//! requirements, and combat value.
 
 use engine::game::game_object;
 use engine::types::ability::{Effect, ManaProduction};
@@ -19,16 +21,6 @@ use crate::features::DeckFeatures;
 
 /// Penalty for animating a land when mana is needed for other spells.
 const MANA_NEEDED_PENALTY: f64 = -2.0;
-
-/// Penalty for animating a land that ends up tapped (no combat value). Sits at
-/// the bottom of the critical band (`-CRITICAL_MAX`) — the strongest finite
-/// discouragement the score contract allows. Issue #5473: this was a raw -100.0
-/// sentinel that bypassed the band helpers and tripped the registry's
-/// critical-band assert once scaled by `activation` (turn_only, up to 1.3x).
-///
-/// Note: pinned at the critical ceiling, this branch is inert to `activation()`
-/// tuning — `-CRITICAL_MAX × any activation` re-bands back to `-CRITICAL_MAX`.
-const TAPPED_LAND_PENALTY: f64 = -super::registry::CRITICAL_MAX;
 
 /// Bonus for animating when sufficient alternative mana sources exist.
 const SUFFICIENT_MANA_BONUS: f64 = 0.3;
@@ -73,11 +65,18 @@ impl TacticalPolicy for LandAnimationPolicy {
             };
         };
 
-        // Check if this is a land
-        if !obj.card_types.core_types.contains(&CoreType::Land) {
+        // Lands (man-lands) and non-creature, non-planeswalker permanents that
+        // animate themselves (Keyrunes). Planeswalkers are excluded: their
+        // "becomes a creature" abilities are loyalty-costed (Gideon) and this
+        // policy's mana heuristics don't apply to them. An already-animated
+        // non-land creature has nothing left to decide here.
+        let core = &obj.card_types.core_types;
+        let animatable = core.contains(&CoreType::Land)
+            || !(core.contains(&CoreType::Creature) || core.contains(&CoreType::Planeswalker));
+        if !animatable {
             return PolicyVerdict::Score {
                 delta: 0.0,
-                reason: PolicyReason::new("land_animation_not_land"),
+                reason: PolicyReason::new("land_animation_not_animatable"),
             };
         }
 
@@ -110,13 +109,13 @@ impl TacticalPolicy for LandAnimationPolicy {
             *ability_index,
             ability_def,
         ) {
-            // Route the critical penalty through the band helper (CR-equivalent
-            // score contract) rather than a raw Score literal so the delta stays
-            // clamped to the critical band before `activation` scaling.
-            return PolicyVerdict::critical(
-                TAPPED_LAND_PENALTY,
-                PolicyReason::new("land_animation_tapped"),
-            );
+            // Hard veto, not a score: an animation that leaves the source
+            // tapped has no combat value and burns the turn's mana. A critical
+            // penalty was not enough — at search difficulties the tactical
+            // signal is weighted 0.1 at the root, and the board evaluation of
+            // the temporary creature outbid it (Rakdos Keyrune tapping itself
+            // for {B} every upkeep, Medium+).
+            return PolicyVerdict::reject(PolicyReason::new("land_animation_tapped"));
         }
 
         // Check if this is the only source of a critical color
@@ -380,10 +379,9 @@ mod tests {
     }
 
     fn reason_kind(verdict: &PolicyVerdict) -> &str {
-        let PolicyVerdict::Score { reason, .. } = verdict else {
-            panic!("expected score verdict");
-        };
-        reason.kind
+        match verdict {
+            PolicyVerdict::Score { reason, .. } | PolicyVerdict::Reject { reason } => reason.kind,
+        }
     }
 
     /// {1}{W}{B} animation ability (mana value 3), mirroring Shambling Vent.
@@ -428,10 +426,7 @@ mod tests {
 
         let verdict = policy_verdict(&state, source_id);
         assert_eq!(reason_kind(&verdict), "land_animation_tapped");
-        let PolicyVerdict::Score { delta, .. } = verdict else {
-            panic!("expected score verdict");
-        };
-        assert_eq!(delta, TAPPED_LAND_PENALTY);
+        assert!(matches!(verdict, PolicyVerdict::Reject { .. }));
     }
 
     #[test]
@@ -486,6 +481,68 @@ mod tests {
 
         let verdict = policy_verdict(&state, source_id);
         assert_eq!(reason_kind(&verdict), "land_animation_tapped");
+    }
+
+    /// A non-land permanent with an animation ability — the Keyrune shape.
+    fn permanent_with_ability(
+        state: &mut GameState,
+        core_type: CoreType,
+        ability: AbilityDefinition,
+    ) -> ObjectId {
+        let id = land_with_ability(state, ability);
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.clear();
+        obj.card_types.core_types.push(core_type);
+        id
+    }
+
+    #[test]
+    fn keyrune_animation_forcing_self_tap_is_penalized() {
+        // Rakdos Keyrune failure mode: an artifact that is its controller's only
+        // black source animates for {B}{R}. Paying {B} taps the Keyrune itself,
+        // leaving a tapped 3/1 that can neither attack nor block (CR 508.1a /
+        // CR 509.1a) — and the turn's mana is gone.
+        let mut state = GameState::new_two_player(42);
+        let source_id = permanent_with_ability(
+            &mut state,
+            CoreType::Artifact,
+            animate_ability_with_mana_cost(),
+        );
+        mana_land(&mut state, ManaColor::White);
+        mana_land(&mut state, ManaColor::White);
+        mana_land(&mut state, ManaColor::Green);
+
+        let verdict = policy_verdict(&state, source_id);
+        assert_eq!(reason_kind(&verdict), "land_animation_tapped");
+    }
+
+    #[test]
+    fn keyrune_animation_paid_by_other_sources_is_scored() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = permanent_with_ability(
+            &mut state,
+            CoreType::Artifact,
+            animate_ability_with_mana_cost(),
+        );
+        mana_land(&mut state, ManaColor::White);
+        mana_land(&mut state, ManaColor::Black);
+        mana_land(&mut state, ManaColor::White);
+
+        let verdict = policy_verdict(&state, source_id);
+        assert_eq!(reason_kind(&verdict), "land_animation_score");
+    }
+
+    #[test]
+    fn creature_and_planeswalker_sources_are_not_judged() {
+        for core_type in [CoreType::Creature, CoreType::Planeswalker] {
+            let mut state = GameState::new_two_player(42);
+            let source_id =
+                permanent_with_ability(&mut state, core_type, animate_ability_with_mana_cost());
+            assert_score(
+                policy_verdict(&state, source_id),
+                "land_animation_not_animatable",
+            );
+        }
     }
 
     #[test]
