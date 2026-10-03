@@ -76,11 +76,13 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +28: the v99 GraveyardCastPermission pool (from any graveyard).
 // +29: the v100 additional-phase segment and recipient parse bump.
 // +30: the v101 mana-ability activation kind and departed-source LKI.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 30;
+// +31: v102 adds the tagged SharedCardTypes quantity.
+// +32: v103 removes FormatConfig.allow_experimental_dungeons for the format-derived dungeon pool.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 32;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
-const EXPECTED_LOBBY_PROTOCOL_VERSION = 14;
+const EXPECTED_LOBBY_PROTOCOL_VERSION = 15;
 // The capability FLOOR for correlated tournament settlement — a different kind
 // of number from the other version constants here, and the reason it is pinned
 // separately. Those track a surface's current version; this one is frozen at the
@@ -131,7 +133,9 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +28: wire 82 moves with full-game v100 for the additional-phase segment and
 // recipient.
 // +29: wire 83 moves with full-game v101 for the mana-ability activation kind.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 29;
+// +30: wire 84 moves with full-game v102 for SharedCardTypes.
+// +31: wire 85 moves with full-game v103 for the format-derived dungeon pool.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 31;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse

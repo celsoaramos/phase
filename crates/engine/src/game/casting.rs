@@ -12708,8 +12708,16 @@ fn collect_battlefield_cost_modifiers(
                 let qty_expr = crate::types::ability::QuantityExpr::Ref {
                     qty: qty_ref.clone(),
                 };
-                super::quantity::resolve_quantity(state, &qty_expr, source_controller, bf_id).max(0)
-                    as u32
+                // CR 205.2a + CR 607.2a: thread the spell as the `SharedCardTypes`
+                // intersection subject while `bf_id` remains the exile-link anchor.
+                super::quantity::resolve_quantity_with_spell(
+                    state,
+                    &qty_expr,
+                    source_controller,
+                    bf_id,
+                    spell_id,
+                )
+                .max(0) as u32
             } else {
                 1
             };
@@ -20739,25 +20747,14 @@ fn can_pay_with_spell_tap_payments(
     else {
         return false;
     };
-    let fused = state.pending_cast.as_ref().is_some_and(|pending| {
-        pending.object_id == source_id && pending.casting_variant == CastingVariant::Fuse
-    });
-    can_pay_with_tap_payment_mode(
-        state,
-        player,
-        mode,
-        spell_has_delve_payment_for(state, player, source_id, fused),
-        cost,
-        ctx,
-        permissions,
-    )
+    can_pay_with_tap_payment_mode(state, player, source_id, mode, cost, ctx, permissions)
 }
 
 fn can_pay_with_tap_payment_mode(
     state: &GameState,
     player: PlayerId,
+    spell_id: ObjectId,
     mode: ConvokeMode,
-    has_delve: bool,
     cost: &crate::types::mana::ManaCost,
     ctx: Option<&PaymentContext<'_>>,
     permissions: crate::types::mana::CostPermissionContext,
@@ -20765,13 +20762,17 @@ fn can_pay_with_tap_payment_mode(
     let Some(player_data) = state.players.iter().find(|p| p.id == player) else {
         return false;
     };
+    let fused = state.pending_cast.as_ref().is_some_and(|pending| {
+        pending.object_id == spell_id && pending.casting_variant == CastingVariant::Fuse
+    });
+    let has_delve = spell_has_delve_payment_for(state, player, spell_id, fused);
 
     let mut payment_pool = player_data.mana_pool.clone();
     if has_delve && mode != ConvokeMode::Delve {
         // CR 702.66a: Delve's generic-only contributions compose with the
         // primary Convoke/Improvise/Waterbend payment channel.
-        for (&object_id, obj) in &state.objects {
-            if obj.is_delve_eligible(player) {
+        for &object_id in state.objects.keys() {
+            if state.is_delve_fuel_for(player, spell_id, object_id) {
                 payment_pool.add(crate::types::mana::ManaUnit::convoke_payment(
                     crate::types::mana::ManaType::Colorless,
                     object_id,
@@ -20836,8 +20837,8 @@ fn can_pay_with_tap_payment_mode(
             // one generic mana. Model each as a generic-only colorless unit, exactly
             // like Improvise, so a spell castable only with delve is offered.
             let mut pool = payment_pool;
-            for (&object_id, obj) in &state.objects {
-                if obj.is_delve_eligible(player) {
+            for &object_id in state.objects.keys() {
+                if state.is_delve_fuel_for(player, spell_id, object_id) {
                     pool.add(crate::types::mana::ManaUnit::convoke_payment(
                         crate::types::mana::ManaType::Colorless,
                         object_id,
@@ -21180,14 +21181,11 @@ fn feasibly_payable_with_tap_payment_mode_in_context(
         player,
         mana_spend_permission,
     );
-    let fused = simulated.pending_cast.as_ref().is_some_and(|pending| {
-        pending.object_id == source_id && pending.casting_variant == CastingVariant::Fuse
-    });
     can_pay_with_tap_payment_mode(
         simulated,
         player,
+        source_id,
         tap_payment_mode,
-        spell_has_delve_payment_for(simulated, player, source_id, fused),
         cost,
         ctx,
         permissions,
@@ -22256,17 +22254,16 @@ fn cleanup_unused_convoke_payments(
         obj.convoked_creatures = spent_convoked_sources;
     }
 
-    for object_id in unused_sources {
-        if let Some(obj) = state.objects.get_mut(&object_id) {
+    for object_id in &unused_sources {
+        if let Some(obj) = state.objects.get_mut(object_id) {
             obj.tapped = false;
         }
     }
 
     if let Some(player_data) = state.players.iter_mut().find(|p| p.id == player) {
-        player_data
-            .mana_pool
-            .mana
-            .retain(|unit| !unit.is_convoke_payment());
+        player_data.mana_pool.mana.retain(|unit| {
+            !(unit.is_convoke_payment() && unused_sources.contains(&unit.source_id))
+        });
     }
 }
 
@@ -27573,56 +27570,13 @@ pub fn handle_cancel_cast(
             obj.tapped = false;
         }
     }
-    let caster = pending.ability.controller;
-    let delved_cards: Vec<ObjectId> = state
-        .players
-        .get(caster.0 as usize)
-        .map(|player| {
-            player
-                .mana_pool
-                .mana
-                .iter()
-                .filter(|unit| unit.is_convoke_payment())
-                .map(|unit| unit.source_id)
-                .filter(|&id| {
-                    state
-                        .objects
-                        .get(&id)
-                        .is_some_and(|obj| obj.zone == Zone::Exile)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    for object_id in &delved_cards {
-        if state
-            .objects
-            .get(object_id)
-            .is_some_and(|obj| obj.zone == Zone::Exile)
-        {
-            super::zones::restore_after_rollback(state, *object_id, Zone::Graveyard, _events);
-        }
-    }
-    if !delved_cards.is_empty() {
-        state.exile_links.retain(|link| {
-            !(link.source_id == pending.object_id && delved_cards.contains(&link.exiled_id))
-        });
-        if let Some(exiled) = state
-            .cards_exiled_with_source_this_turn
-            .get_mut(&pending.object_id)
-        {
-            exiled.retain(|id| !delved_cards.contains(id));
-            if exiled.is_empty() {
-                state
-                    .cards_exiled_with_source_this_turn
-                    .remove(&pending.object_id);
-            }
-        }
-    }
+    // CR 733.1: a cancel drops the cast's delve and convoke markers; a terminal
+    // cancel passes a fresh `PendingCast`, so drop them all.
     for player in &mut state.players {
-        player.mana_pool.mana.retain(|unit| {
-            !(unit.is_convoke_payment() && convoked_creatures.contains(&unit.source_id))
-                && !(unit.is_convoke_payment() && delved_cards.contains(&unit.source_id))
-        });
+        player
+            .mana_pool
+            .mana
+            .retain(|unit| !unit.is_convoke_payment());
     }
     if let Some(obj) = state.objects.get_mut(&pending.object_id) {
         obj.convoked_creatures.clear();
@@ -28384,6 +28338,7 @@ fn quantity_ref_reads_target_object(qty: &QuantityRef, read: TargetRead) -> bool
             card_type_set_source_reads_chosen_target(aggregate.source(), read)
         }
         QuantityRef::DistinctCardTypes { source }
+        | QuantityRef::SharedCardTypes { source }
         | QuantityRef::DistinctSubtypes { source, .. }
         | QuantityRef::DistinctColorsAmong { source } => {
             card_type_set_source_reads_chosen_target(source, read)
