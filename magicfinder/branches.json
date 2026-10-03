@@ -145,5 +145,8 @@
   },
   {
     "branch": "card/ai-animate-upkeep"
+  },
+  {
+    "branch": "card/cast-only-if-cast-another"
   }
 ]
