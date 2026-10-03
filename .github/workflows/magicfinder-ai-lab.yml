@@ -1,0 +1,92 @@
+name: MagicFinder — laboratório da IA
+
+# Medição A/B da IA do motor com o banco de cartas COMPLETO (2026-10-03).
+# Push numa branch `ai-lab/**` → compila o `ai-ladder` da própria branch e roda,
+# em paralelo, cada linha de `magicfinder-lab/runs.txt` (`nome | argumentos`).
+# O resultado de cada linha sai no resumo do run e como artefato JSON.
+# Não publica nada: nenhum segredo de escrita é usado.
+on:
+  push:
+    branches: ['ai-lab/**']
+  workflow_dispatch:
+
+concurrency:
+  group: mf-ai-lab-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  RUST_MIN_STACK: 16777216
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      runs: ${{ steps.runs.outputs.runs }}
+    steps:
+      - name: Liberar disco
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; df -h /
+      - uses: actions/checkout@v4
+      - name: Linhas de runs.txt
+        id: runs
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json
+          rows = []
+          for line in open('magicfinder-lab/runs.txt'):
+              line = line.strip()
+              if not line or line.startswith('#'):
+                  continue
+              name, args = [p.strip() for p in line.split('|', 1)]
+              rows.append({'name': name, 'args': args})
+          print('runs=' + json.dumps(rows))
+          EOF
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with: { shared-key: mf-ai-lab }
+      - name: Card-data do motor servido (manifesto do R2), senão gerar
+        env:
+          R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+        run: |
+          mkdir -p lab-data
+          if [ -n "$R2_PUBLIC_BASE" ]; then
+            url=$(curl -fsSL "$R2_PUBLIC_BASE/engine/manifest.json" | python3 -c 'import json,sys; m=json.load(sys.stdin); c=m.get("current",m); print(c.get("cards") or c.get("cardData") or "")' || true)
+            if [ -n "$url" ]; then curl -fsSL --compressed "$url" -o lab-data/card-data.json || rm -f lab-data/card-data.json; fi
+          fi
+          if [ ! -s lab-data/card-data.json ]; then
+            ./scripts/gen-card-data.sh
+            cp client/public/card-data.json lab-data/card-data.json
+          fi
+          ls -la lab-data
+      - name: Compilar ai-ladder
+        run: cargo build --profile server-release -p phase-ai --features tune --bin ai-ladder
+      - name: Teste do ai-ladder
+        run: cargo test --profile server-release -p phase-ai --features tune --bin ai-ladder
+      - run: cp target/server-release/ai-ladder lab-data/
+      - uses: actions/upload-artifact@v4
+        with: { name: lab-bin, path: lab-data, retention-days: 3, if-no-files-found: error }
+
+  run:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        run: ${{ fromJson(needs.build.outputs.runs) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: lab-bin, path: lab-data }
+      - name: ${{ matrix.run.name }}
+        run: |
+          chmod +x lab-data/ai-ladder
+          ./lab-data/ai-ladder lab-data ${{ matrix.run.args }} --json "out-${{ matrix.run.name }}.json" | tee table.md
+          { echo "### ${{ matrix.run.name }}"; echo; echo '`${{ matrix.run.args }}`'; echo; cat table.md; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with: { name: 'out-${{ matrix.run.name }}', path: 'out-${{ matrix.run.name }}.json', retention-days: 30 }

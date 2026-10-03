@@ -2464,6 +2464,27 @@ pub fn score_candidates(
     scored
 }
 
+/// MagicFinder lab (`ai-ladder --probe`): for every root candidate, the
+/// rung-0 leaf the search evaluates, split into evaluation terms.
+pub fn lab_explain_root(
+    state: &GameState,
+    ai_player: PlayerId,
+    config: &AiConfig,
+    session: &Arc<AiSession>,
+) -> Vec<(GameAction, String)> {
+    let ctx = build_decision_context_for_semantic_owner(state, ai_player);
+    let policies = PolicyRegistry::shared();
+    let context = build_ai_context_with_session(state, ai_player, config, Arc::clone(session));
+    let services = PlannerServices::with_deadline(ai_player, config, policies, context, None);
+    ctx.candidates
+        .iter()
+        .filter_map(|c| {
+            let sim = crate::planner::apply_candidate(state, c)?;
+            Some((c.action.clone(), services.lab_describe_leaf(&sim)))
+        })
+        .collect()
+}
+
 /// Score a stateless parallel-worker sample.
 ///
 /// A certified Pact root carries an opaque reducer receipt that must remain in
@@ -3240,6 +3261,25 @@ fn score_candidates_core(
         return vec![(action, 1.0)];
     }
 
+    // `StrategicConfig::archetype_profile_everywhere`: the deck's archetype
+    // modulates the profile for EVERY decision, as it already did for combat.
+    // Without it the tactical policies read the raw preset, so a control deck
+    // and an aggro deck share one `interaction_patience` outside combat.
+    let strategic_config;
+    let config = if config.strategic.archetype_profile_everywhere {
+        let strategy = session
+            .strategy
+            .get(&ai_player)
+            .cloned()
+            .unwrap_or_default();
+        let mut modulated = config.clone();
+        modulated.profile = modulated.profile.with_strategy(&strategy);
+        strategic_config = modulated;
+        &strategic_config
+    } else {
+        config
+    };
+
     // The scored path may be called for a named owner while another owner is
     // also pending. Reuse that owner's exact engine-issued domain throughout;
     // the generic context picks the first pending owner and can make a valid
@@ -3271,7 +3311,13 @@ fn score_candidates_core(
             // the same reason the declarations themselves do.
             | WaitingFor::CombatTaxPayment { .. }
     ) {
-        let effective_profile = config.profile.with_strategy(&services.context.strategy);
+        // Already modulated above when the profile applies everywhere — applying
+        // `with_strategy` twice would square the archetype multipliers.
+        let effective_profile = if config.strategic.archetype_profile_everywhere {
+            config.profile.clone()
+        } else {
+            config.profile.with_strategy(&services.context.strategy)
+        };
         if let Some(action) = deterministic_combat_choice(
             state,
             ai_player,

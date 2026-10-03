@@ -1,0 +1,13 @@
+# nome | argumentos do ai-ladder (o banco de cartas é passado pelo workflow)
+# Espelhos do duel_suite: isolam a habilidade da IA (mesmo deck dos dois lados).
+# A = candidato, B = referência. Sementes pareadas: cada semente joga 2x, trocando o assento.
+vh-mf-vs-vh | --a veryhard:wasm,mf=1 --b veryhard:wasm,mf=0 --matchups blue-mirror,red-mirror,green-mirror,affinity-mirror,elves-mirror --games 40
+vhmf-vs-medium | --a veryhard:wasm,mf=1 --b medium:wasm --matchups blue-mirror,red-mirror,green-mirror,affinity-mirror,elves-mirror --games 40
+vh-vs-medium | --a veryhard:wasm --b medium:wasm --matchups blue-mirror,red-mirror,green-mirror,affinity-mirror,elves-mirror --games 40
+hard-mf-vs-hard | --a hard:wasm,mf=1 --b hard:wasm,mf=0 --matchups blue-mirror,red-mirror,green-mirror,affinity-mirror,elves-mirror --games 40
+medium-mf-vs-medium | --a medium:wasm,mf=1 --b medium:wasm,mf=0 --matchups blue-mirror,red-mirror,green-mirror,affinity-mirror,elves-mirror --games 40
+vh-gate-only | --a veryhard:wasm,gate=1 --b veryhard:wasm --matchups blue-mirror,red-mirror,elves-mirror --games 40
+vh-stack-only | --a veryhard:wasm,stack=1 --b veryhard:wasm --matchups blue-mirror,red-mirror,elves-mirror --games 40
+vh-strategy-only | --a veryhard:wasm,strategy=1 --b veryhard:wasm --matchups blue-mirror,red-mirror,elves-mirror --games 40
+# Os desafiantes do MagicFinder (os decks que o jogador enfrenta na /mesa/bot).
+challengers-vh-mf | --decks magicfinder-lab/challengers.json --a veryhard:wasm,mf=1 --b veryhard:wasm,mf=0 --matchups night-vs-fury,stomp-vs-dawn,sky-vs-night,fury-vs-stomp,kitchen-vs-dawn --games 40

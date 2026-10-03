@@ -1065,6 +1065,76 @@ impl<'a> PlannerServices<'a> {
         tactical + synergy + zones + card_adv + self.threat_adjustment(state)
     }
 
+    /// Probability the AI's spell on the stack gets countered, as this leaf sees
+    /// it: zero when no opponent has two mana open (the cheapest hard counter),
+    /// otherwise the threat model's counterspell probability.
+    fn live_counter_risk(&self, state: &GameState) -> f64 {
+        let Some(threat) = &self.context.opponent_threat else {
+            return 0.0;
+        };
+        let any_open = players::opponents(state, self.ai_player)
+            .iter()
+            .any(|&opp| crate::zone_eval::available_mana(state, opp) >= 2);
+        if any_open {
+            threat.probabilities.counterspell.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// `StrategicConfig::stack_spell_credit`: the position where the AI's own
+    /// spells resolve, assuming the opponent lets them.
+    ///
+    /// `quiesce` stops as soon as the player with priority has any non-pass
+    /// option, so a leaf right after casting a creature into a deck with
+    /// instants is "card gone from hand, creature not on the battlefield" —
+    /// worth about a card less than passing. Every permanent spell paid that
+    /// tax (measured: Air Elemental scored -7 at rung 0 against +1.3 for pass).
+    /// Only applies when the stack holds ONLY the AI's spells and the opponent is
+    /// the one to act: an opposing object on the stack, or a decision of the AI
+    /// itself, is a real decision point and stays one.
+    fn resolve_own_stack(&self, quiesced: &GameState) -> Option<GameState> {
+        if quiesced.stack.is_empty()
+            || !quiesced
+                .stack
+                .iter()
+                .all(|e| e.controller == self.ai_player)
+        {
+            return None;
+        }
+        match quiesced.waiting_for {
+            WaitingFor::Priority { player } if player != self.ai_player => {}
+            _ => return None,
+        }
+        let mut sim = quiesced.clone();
+        for _ in 0..12 {
+            if sim.stack.is_empty() || self.deadline.expired() {
+                break;
+            }
+            if !matches!(sim.waiting_for, WaitingFor::Priority { .. }) {
+                let next = self.quiesce(&sim);
+                if next.stack.len() == sim.stack.len()
+                    && std::mem::discriminant(&next.waiting_for)
+                        == std::mem::discriminant(&sim.waiting_for)
+                {
+                    break;
+                }
+                sim = next;
+                continue;
+            }
+            if apply_as_current_for_simulation(
+                &mut sim,
+                engine::types::actions::GameAction::PassPriority,
+            )
+            .is_err()
+            {
+                return None;
+            }
+        }
+        crate::lab_counters::bump(&crate::lab_counters::STACK_CREDITS, true);
+        Some(self.quiesce(&sim))
+    }
+
     /// Adjust evaluation based on opponent threat probabilities.
     /// Penalizes positions where the AI is vulnerable to likely opponent threats:
     /// tapping out against counterspells, or overextending into board wipes.
@@ -1079,7 +1149,20 @@ impl<'a> PlannerServices<'a> {
 
         // Penalize tapping out when opponent likely has countermagic.
         let ai_mana = crate::zone_eval::available_mana(state, self.ai_player);
-        if ai_mana <= 1 && probs.counterspell > 0.3 {
+        // `StrategicConfig::counter_risk_gate`: tapping out only risks a counter
+        // while the AI's spell is still on the stack and someone can pay for it.
+        let counter_live = !self.config.strategic.counter_risk_gate
+            || (state.stack.iter().any(|e| {
+                e.controller == self.ai_player
+                    && matches!(
+                        e.kind,
+                        engine::types::game_state::StackEntryKind::Spell { .. }
+                    )
+            }) && self.live_counter_risk(state) > 0.0);
+        if !counter_live && ai_mana <= 1 && probs.counterspell > 0.3 {
+            crate::lab_counters::bump(&crate::lab_counters::GATE_BLOCKS, true);
+        }
+        if counter_live && ai_mana <= 1 && probs.counterspell > 0.3 {
             adjustment += penalties.threat_counter_tapout_penalty * probs.counterspell;
         }
 
@@ -1202,6 +1285,46 @@ impl<'a> PlannerServices<'a> {
         sim
     }
 
+    /// MagicFinder lab: describe the rung-0 leaf of `state` (after quiescence)
+    /// and the parts of `evaluate_with_strategy`, to find which term flips a
+    /// root decision. Not used by any decision path.
+    pub fn lab_describe_leaf(&self, state: &GameState) -> String {
+        let leaf = if state.stack.is_empty() {
+            state.clone()
+        } else {
+            self.quiesce(state)
+        };
+        let weights = self.context.adjusted_weights.for_turn(leaf.turn_number);
+        let tactical = evaluate_state(&leaf, self.ai_player, weights);
+        let synergy = self
+            .context
+            .synergy_graph()
+            .board_synergy_bonus(&leaf, self.ai_player)
+            * weights.synergy;
+        let zones = crate::zone_eval::zone_bonus(
+            &leaf,
+            self.ai_player,
+            self.context.deck_profile.archetype,
+        ) * weights.zone_quality;
+        let card_adv =
+            crate::card_advantage::differential(&leaf, self.ai_player) * weights.card_advantage;
+        let threat = self.threat_adjustment(&leaf);
+        let stack_credit = match self.resolve_own_stack(&leaf) {
+            Some(resolved) => evaluate_state(&resolved, self.ai_player, weights) - tactical,
+            None => 0.0,
+        };
+        let me = &leaf.players[self.ai_player.0 as usize];
+        let wf = format!("{:?}", leaf.waiting_for);
+        let wf: String = wf.chars().take(60).collect();
+        format!(
+            "stack {} hand {} myMana {} | tac {:.2} syn {:.2} zone {:.2} cadv {:.2} threat {:.2} stk {:.2} | wait {}",
+            leaf.stack.len(),
+            me.hand.len(),
+            crate::zone_eval::available_mana(&leaf, self.ai_player),
+            tactical, synergy, zones, card_adv, threat, stack_credit, wf
+        )
+    }
+
     /// Evaluate a leaf state with quiescence: if the stack is non-empty and only
     /// forced passes remain, resolve through them before evaluating.
     /// Once the wall-clock deadline is blown, skip quiescence — the cached
@@ -1212,7 +1335,15 @@ impl<'a> PlannerServices<'a> {
             return self.evaluate_state_cached(state);
         }
         let quiesced = self.quiesce(state);
-        self.evaluate_state_cached(&quiesced)
+        let stalled = self.evaluate_state_cached(&quiesced);
+        if self.config.strategic.stack_spell_credit {
+            if let Some(resolved) = self.resolve_own_stack(&quiesced) {
+                let p = self.live_counter_risk(&quiesced);
+                let value = self.evaluate_state_cached(&resolved);
+                return (1.0 - p) * value + p * stalled;
+            }
+        }
+        stalled
     }
 
     /// Evaluate a leaf state for utility with quiescence.
@@ -1223,7 +1354,16 @@ impl<'a> PlannerServices<'a> {
         }
         let quiesced = self.quiesce(state);
         let value = self.evaluate_for_planner(&quiesced);
-        self.reduce_utility(&quiesced, &value)
+        let stalled = self.reduce_utility(&quiesced, &value);
+        if self.config.strategic.stack_spell_credit {
+            if let Some(resolved) = self.resolve_own_stack(&quiesced) {
+                let p = self.live_counter_risk(&quiesced);
+                let value = self.evaluate_for_planner(&resolved);
+                let resolved_utility = self.reduce_utility(&resolved, &value);
+                return (1.0 - p) * resolved_utility + p * stalled;
+            }
+        }
+        stalled
     }
 
     pub fn tactical_score(

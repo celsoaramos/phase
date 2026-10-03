@@ -1369,11 +1369,18 @@ pub struct StrategicConfig {
     /// preset profile, so a control deck and an aggro deck share the same
     /// `interaction_patience` outside combat.
     pub archetype_profile_everywhere: bool,
-    /// Race-aware casting: when the AI is not under pressure, value committing
-    /// a threat by the turns of clock it adds instead of only by the risk that
-    /// it dies to removal (the depth-2 horizon effect measured in the blue
-    /// mirror, docs/mesa-ia-dificuldade-medicao-2026-09.md in MagicFinder).
-    pub clock_awareness: bool,
+    /// The leaf's tap-out-into-countermagic penalty (`threat_adjustment`) only
+    /// applies while a spell of the AI is actually on the stack AND an opponent
+    /// has the mana open to counter it. Ungated, every tapped-out leaf paid
+    /// ~-1.3 against a blue deck even after the creature had resolved, or with
+    /// the opponent tapped out — a flat tax on casting anything.
+    pub counter_risk_gate: bool,
+    /// Credit the AI's own creature spells still on the stack at a leaf.
+    /// Quiescence stops with the spell on the stack whenever either player has
+    /// an instant, and that leaf had already lost the card from hand without
+    /// gaining it on the battlefield, so "cast" scored below "pass" by about a
+    /// card. The credit is the battlefield value discounted by the counter risk.
+    pub stack_spell_credit: bool,
 }
 
 impl Default for AiConfig {

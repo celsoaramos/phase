@@ -13,7 +13,7 @@
 //!
 //! SPEC is `difficulty[:native|wasm][,key=value...]`. Keys override single fields
 //! on top of the preset (`temp`, `patience`, `risk`, `stabilize`, `search=0|1`,
-//! `depth`, `strategy=0|1`, `clock=0|1`) — so a code change gated behind a config
+//! `depth`, `strategy=0|1`, `gate=0|1`, `stack=0|1`, `mf=0|1` = all three) — so a code change gated behind a config
 //! field can be A/B'd in ONE binary against the same seeds.
 //!
 //! `--decks` adds named decks (`{"name": ["4 Card", "Card", ...]}`); a matchup
@@ -77,7 +77,16 @@ fn parse_spec(spec: &str) -> Result<Side, String> {
             "search" => config.search.enabled = num()? != 0.0,
             "depth" => config.search.max_depth = num()? as u32,
             "strategy" => config.strategic.archetype_profile_everywhere = num()? != 0.0,
-            "clock" => config.strategic.clock_awareness = num()? != 0.0,
+            "gate" => config.strategic.counter_risk_gate = num()? != 0.0,
+            "stack" => config.strategic.stack_spell_credit = num()? != 0.0,
+            "mf" => {
+                let on = num()? != 0.0;
+                config.strategic = phase_ai::config::StrategicConfig {
+                    archetype_profile_everywhere: on,
+                    counter_risk_gate: on,
+                    stack_spell_credit: on,
+                }
+            }
             other => return Err(format!("unknown override key '{other}'")),
         }
     }
@@ -148,7 +157,9 @@ struct Profile {
 fn snapshot(state: &GameState) -> Profile {
     let mut p = Profile::default();
     for id in state.battlefield.iter() {
-        let Some(obj) = state.objects.get(id) else { continue };
+        let Some(obj) = state.objects.get(id) else {
+            continue;
+        };
         let seat = obj.controller.0 as usize;
         if seat > 1 {
             continue;
@@ -173,14 +184,23 @@ struct GameOut {
     panicked: bool,
 }
 
-fn run_game(payload: &DeckPayload, db: &CardDatabase, seed: u64, p0: &AiConfig, p1: &AiConfig) -> GameOut {
+fn run_game(
+    payload: &DeckPayload,
+    db: &CardDatabase,
+    seed: u64,
+    p0: &AiConfig,
+    p1: &AiConfig,
+) -> GameOut {
     let mut state = GameState::new_two_player(seed);
     load_and_hydrate_decks(&mut state, payload, Some(db));
     let _ = start_game_skip_mulligan(&mut state);
     let players: HashSet<PlayerId> = [PlayerId(0), PlayerId(1)].into_iter().collect();
     let configs: HashMap<PlayerId, AiConfig> = [
         (PlayerId(0), p0.clone().into_measurement(seed)),
-        (PlayerId(1), p1.clone().into_measurement(seed.wrapping_add(1))),
+        (
+            PlayerId(1),
+            p1.clone().into_measurement(seed.wrapping_add(1)),
+        ),
     ]
     .into_iter()
     .collect();
@@ -189,17 +209,32 @@ fn run_game(payload: &DeckPayload, db: &CardDatabase, seed: u64, p0: &AiConfig, 
     let mut last_alive = snapshot(&state);
     loop {
         if let WaitingFor::GameOver { winner } = &state.waiting_for {
-            return GameOut { winner: *winner, turns: state.turn_number, last_alive, panicked: false };
+            return GameOut {
+                winner: *winner,
+                turns: state.turn_number,
+                last_alive,
+                panicked: false,
+            };
         }
         if state.turn_number >= MAX_TURNS {
-            return GameOut { winner: None, turns: state.turn_number, last_alive, panicked: false };
+            return GameOut {
+                winner: None,
+                turns: state.turn_number,
+                last_alive,
+                panicked: false,
+            };
         }
         let step = std::panic::catch_unwind(AssertUnwindSafe(|| {
             run_ai_actions(&mut state, &players, &configs, &mut rng, &session)
         }));
         match step {
             Ok(results) if results.is_empty() => {
-                return GameOut { winner: None, turns: state.turn_number, last_alive, panicked: false }
+                return GameOut {
+                    winner: None,
+                    turns: state.turn_number,
+                    last_alive,
+                    panicked: false,
+                }
             }
             Ok(_) => {
                 if !matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
@@ -207,10 +242,144 @@ fn run_game(payload: &DeckPayload, db: &CardDatabase, seed: u64, p0: &AiConfig, 
                 }
             }
             Err(_) => {
-                return GameOut { winner: None, turns: state.turn_number, last_alive, panicked: true }
+                return GameOut {
+                    winner: None,
+                    turns: state.turn_number,
+                    last_alive,
+                    panicked: true,
+                }
             }
         }
     }
+}
+
+/// `--probe N`: play N games with side B in both seats, and at every main-phase
+/// priority of seat 0 with an empty stack where a creature spell is castable,
+/// print how side A and side B would score "cast the creature" vs "pass".
+/// This is how to find WHICH layer flips a decision, instead of guessing.
+fn run_probe(
+    payload: &DeckPayload,
+    db: &CardDatabase,
+    seed: u64,
+    games: usize,
+    a: &Side,
+    b: &Side,
+) {
+    use engine::types::actions::GameAction;
+    use engine::types::phase::Phase;
+    let mut agree = 0usize;
+    let mut a_casts = 0usize;
+    let mut b_casts = 0usize;
+    let mut spots = 0usize;
+    for g in 0..games {
+        let game_seed = seed.wrapping_add(g as u64);
+        let mut state = GameState::new_two_player(game_seed);
+        load_and_hydrate_decks(&mut state, payload, Some(db));
+        let _ = start_game_skip_mulligan(&mut state);
+        let players: HashSet<PlayerId> = [PlayerId(0), PlayerId(1)].into_iter().collect();
+        let configs: HashMap<PlayerId, AiConfig> = [
+            (PlayerId(0), b.config.clone().into_measurement(game_seed)),
+            (
+                PlayerId(1),
+                b.config.clone().into_measurement(game_seed.wrapping_add(1)),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(game_seed);
+        let session = phase_ai::session::AiSession::arc_from_game(&state);
+        let mut guard = 0;
+        while guard < 4000
+            && !matches!(state.waiting_for, WaitingFor::GameOver { .. })
+            && state.turn_number < MAX_TURNS
+        {
+            guard += 1;
+            let main = matches!(state.phase, Phase::PreCombatMain | Phase::PostCombatMain);
+            if main
+                && state.stack.is_empty()
+                && matches!(state.waiting_for, WaitingFor::Priority { player } if player == PlayerId(0))
+            {
+                let score = |cfg: &AiConfig| {
+                    phase_ai::search::score_candidates_for_parallel_worker(
+                        &state,
+                        PlayerId(0),
+                        &cfg.clone().into_measurement(game_seed),
+                        Some(&session),
+                    )
+                };
+                let sa = score(&a.config);
+                let creature_cast = |act: &GameAction| match act {
+                    GameAction::CastSpell { object_id, .. } => state
+                        .objects
+                        .get(object_id)
+                        .is_some_and(|o| o.card_types.core_types.contains(&CoreType::Creature)),
+                    _ => false,
+                };
+                if sa.iter().any(|(act, _)| creature_cast(act)) {
+                    let sb = score(&b.config);
+                    let best = |v: &[(GameAction, f64)]| {
+                        v.iter().cloned().max_by(|x, y| x.1.total_cmp(&y.1))
+                    };
+                    let pick = |v: &[(GameAction, f64)], f: &dyn Fn(&GameAction) -> bool| {
+                        v.iter()
+                            .filter(|(x, _)| f(x))
+                            .map(|(_, s)| *s)
+                            .fold(f64::NEG_INFINITY, f64::max)
+                    };
+                    let is_pass = |x: &GameAction| matches!(x, GameAction::PassPriority);
+                    let (ca, pa) = (pick(&sa, &creature_cast), pick(&sa, &is_pass));
+                    let (cb, pb) = (pick(&sb, &creature_cast), pick(&sb, &is_pass));
+                    let a_top = best(&sa).map(|x| creature_cast(&x.0)).unwrap_or(false);
+                    let b_top = best(&sb).map(|x| creature_cast(&x.0)).unwrap_or(false);
+                    spots += 1;
+                    a_casts += a_top as usize;
+                    b_casts += b_top as usize;
+                    agree += (a_top == b_top) as usize;
+                    let name = sa
+                        .iter()
+                        .find(|(x, _)| creature_cast(x))
+                        .and_then(|(x, _)| match x {
+                            GameAction::CastSpell { object_id, .. } => {
+                                state.objects.get(object_id).map(|o| o.name.clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    if std::env::var("LAB_EXPLAIN").is_ok() && !a_top {
+                        let rows = phase_ai::search::lab_explain_root(
+                            &state,
+                            PlayerId(0),
+                            &a.config.clone().into_measurement(game_seed),
+                            &session,
+                        );
+                        for (act, desc) in rows {
+                            if creature_cast(&act) || is_pass(&act) {
+                                println!(
+                                    "    {:<5} {desc}",
+                                    if is_pass(&act) { "PASS" } else { "CAST" }
+                                );
+                            }
+                        }
+                    }
+                    println!(
+                        "g{g} t{} {:?} {name:<22} A cast {ca:>8.3} pass {pa:>8.3} top={} | B cast {cb:>8.3} pass {pb:>8.3} top={}",
+                        state.turn_number, state.phase, if a_top {"CAST"} else {"other"}, if b_top {"CAST"} else {"other"}
+                    );
+                }
+            }
+            let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                phase_ai::auto_play::run_ai_actions_bounded(
+                    &mut state, &players, &configs, &mut rng, &session, 1,
+                )
+            }));
+            match r {
+                Ok(res) if res.is_empty() => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }
+    println!("spots {spots}: A tops a creature cast {a_casts}, B {b_casts}, agree {agree}");
 }
 
 /// Two-sided exact sign test (binomial, p = 0.5) on decided games.
@@ -257,6 +426,7 @@ fn main() {
     let mut seed = 1000u64;
     let mut decks_path: Option<PathBuf> = None;
     let mut json_out: Option<PathBuf> = None;
+    let mut probe: usize = 0;
     let mut i = 0;
     while i < args.len() {
         let take = |i: &mut usize| -> String {
@@ -274,8 +444,16 @@ fn main() {
             "--seed" => seed = take(&mut i).parse().expect("--seed"),
             "--decks" => decks_path = Some(PathBuf::from(take(&mut i))),
             "--json" => json_out = Some(PathBuf::from(take(&mut i))),
+            "--probe" => probe = take(&mut i).parse().expect("--probe"),
             "-h" | "--help" => {
-                eprintln!("{}", include_str!("ai_ladder.rs").lines().take(20).collect::<Vec<_>>().join("\n"));
+                eprintln!(
+                    "{}",
+                    include_str!("ai_ladder.rs")
+                        .lines()
+                        .take(20)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
                 return;
             }
             other if other.starts_with("--") => {
@@ -287,7 +465,11 @@ fn main() {
         i += 1;
     }
     let data = data.unwrap_or_else(|| PathBuf::from("client/public"));
-    let card_path = if data.is_dir() { data.join("card-data.json") } else { data };
+    let card_path = if data.is_dir() {
+        data.join("card-data.json")
+    } else {
+        data
+    };
     let db = CardDatabase::from_export(&card_path).unwrap_or_else(|e| {
         eprintln!("cannot load {}: {e}", card_path.display());
         std::process::exit(1)
@@ -306,7 +488,11 @@ fn main() {
         std::process::exit(2)
     });
 
-    let ids: Vec<String> = matchups.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let ids: Vec<String> = matchups
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     let payloads: Vec<(String, DeckPayload)> = ids
         .iter()
         .map(|id| {
@@ -318,7 +504,14 @@ fn main() {
         })
         .collect();
 
-    eprintln!("A = {}\nB = {}\n{} games per matchup (paired seeds)", side_a.label, side_b.label, games);
+    if probe > 0 {
+        run_probe(&payloads[0].1, &db, seed, probe, &side_a, &side_b);
+        return;
+    }
+    eprintln!(
+        "A = {}\nB = {}\n{} games per matchup (paired seeds)",
+        side_a.label, side_b.label, games
+    );
     let pairs = games.div_ceil(2);
     let started = std::time::Instant::now();
 
@@ -368,9 +561,16 @@ fn main() {
         let g = t.games.max(1) as f64;
         println!(
             "| {id} | {} | {} | {} | {:.1}% | {:.3} | {:.1} | {:.1} × {:.1} | {:.1} × {:.1} |",
-            t.a, t.b, t.draws, 100.0 * t.a as f64 / decided as f64, sign_test(t.a, t.b),
-            t.turns as f64 / g, t.a_creatures as f64 / g, t.b_creatures as f64 / g,
-            t.a_lands as f64 / g, t.b_lands as f64 / g,
+            t.a,
+            t.b,
+            t.draws,
+            100.0 * t.a as f64 / decided as f64,
+            sign_test(t.a, t.b),
+            t.turns as f64 / g,
+            t.a_creatures as f64 / g,
+            t.b_creatures as f64 / g,
+            t.a_lands as f64 / g,
+            t.b_lands as f64 / g,
         );
         rows.push(serde_json::json!({
             "matchup": id, "a": t.a, "b": t.b, "draws": t.draws, "panics": t.panics,
@@ -386,9 +586,20 @@ fn main() {
     let decided = (total.a + total.b).max(1);
     println!(
         "| **total** | {} | {} | {} | {:.1}% | {:.3} | | | |",
-        total.a, total.b, total.draws, 100.0 * total.a as f64 / decided as f64, sign_test(total.a, total.b)
+        total.a,
+        total.b,
+        total.draws,
+        100.0 * total.a as f64 / decided as f64,
+        sign_test(total.a, total.b)
     );
-    eprintln!("{} games in {:.1}s ({} panics)", results.len(), started.elapsed().as_secs_f64(), total.panics);
+    let [evals, credits, blocks] = phase_ai::lab_counters::snapshot();
+    eprintln!("lab counters: leaf evals (stack-credit side) {evals}, stack credits {credits}, counter-gate blocks {blocks}");
+    eprintln!(
+        "{} games in {:.1}s ({} panics)",
+        results.len(),
+        started.elapsed().as_secs_f64(),
+        total.panics
+    );
     if let Some(path) = json_out {
         let doc = serde_json::json!({
             "a": side_a.label, "b": side_b.label, "games_per_matchup": pairs * 2, "seed": seed,
