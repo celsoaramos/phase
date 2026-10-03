@@ -1,0 +1,423 @@
+//! ai-ladder — head-to-head ladder measurement with a DIFFERENT AI config per side.
+//!
+//! `ai-duel` puts the same config in both seats, so it measures deck × deck at a
+//! fixed difficulty. This binary measures config × config: every seed is played
+//! twice, once with side A in seat 0 and once in seat 1 (paired seeds), so deck
+//! and seat advantage cancel and what is left is the difference between the two
+//! configs.
+//!
+//! ```text
+//! ai-ladder <data-dir> --a veryhard:wasm --b medium:wasm \
+//!     --matchups blue-mirror,red-mirror --games 40 [--decks decks.json] [--json out.json]
+//! ```
+//!
+//! SPEC is `difficulty[:native|wasm][,key=value...]`. Keys override single fields
+//! on top of the preset (`temp`, `patience`, `risk`, `stabilize`, `search=0|1`,
+//! `depth`, `strategy=0|1`, `clock=0|1`) — so a code change gated behind a config
+//! field can be A/B'd in ONE binary against the same seeds.
+//!
+//! `--decks` adds named decks (`{"name": ["4 Card", "Card", ...]}`); a matchup
+//! `x-vs-y` whose sides are both deck names uses them instead of the duel suite.
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
+
+use rayon::prelude::*;
+
+use phase_ai::auto_play::run_ai_actions;
+use phase_ai::config::{create_config_for_players, AiConfig, AiDifficulty, Platform};
+use phase_ai::duel_suite::{all_matchups, resolve_deck_ref};
+
+use engine::database::CardDatabase;
+use engine::game::deck_loading::{
+    load_and_hydrate_decks, resolve_deck_list, DeckList, DeckPayload, PlayerDeckList,
+};
+use engine::game::engine::start_game_skip_mulligan;
+use engine::types::card_type::CoreType;
+use engine::types::game_state::{GameState, WaitingFor};
+use engine::types::player::PlayerId;
+
+const MAX_TURNS: u32 = 60;
+
+struct Side {
+    label: String,
+    config: AiConfig,
+}
+
+fn parse_spec(spec: &str) -> Result<Side, String> {
+    let mut parts = spec.split(',');
+    let head = parts.next().unwrap_or("medium");
+    let (diff, platform) = match head.split_once(':') {
+        Some((d, p)) => (d, p),
+        None => (head, "wasm"),
+    };
+    let platform = match platform {
+        "native" => Platform::Native,
+        "wasm" => Platform::Wasm,
+        other => return Err(format!("unknown platform '{other}'")),
+    };
+    let mut config = create_config_for_players(AiDifficulty::from_label(diff), platform, 2);
+    for kv in parts {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| format!("override '{kv}' is not key=value"))?;
+        let num = || -> Result<f64, String> {
+            v.parse::<f64>()
+                .map_err(|_| format!("override '{kv}': '{v}' is not a number"))
+        };
+        match k {
+            "temp" => config.temperature = num()?,
+            "patience" => config.profile.interaction_patience = num()?,
+            "risk" => config.profile.risk_tolerance = num()?,
+            "stabilize" => config.profile.stabilize_bias = num()?,
+            "search" => config.search.enabled = num()? != 0.0,
+            "depth" => config.search.max_depth = num()? as u32,
+            "strategy" => config.strategic.archetype_profile_everywhere = num()? != 0.0,
+            "clock" => config.strategic.clock_awareness = num()? != 0.0,
+            other => return Err(format!("unknown override key '{other}'")),
+        }
+    }
+    Ok(Side {
+        label: spec.to_string(),
+        config,
+    })
+}
+
+fn expand_deck(lines: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in lines {
+        let line = line.trim();
+        match line.split_once(' ') {
+            Some((n, name)) if n.parse::<usize>().is_ok() => {
+                for _ in 0..n.parse::<usize>().unwrap() {
+                    out.push(name.trim().to_string());
+                }
+            }
+            _ => out.push(line.to_string()),
+        }
+    }
+    out
+}
+
+fn payload_for(
+    db: &CardDatabase,
+    id: &str,
+    decks: &HashMap<String, Vec<String>>,
+) -> Result<DeckPayload, String> {
+    let (p0, p1) = if let Some(spec) = all_matchups().iter().find(|m| m.id == id) {
+        (
+            resolve_deck_ref(&spec.p0).map_err(|e| format!("{id} p0: {e}"))?,
+            resolve_deck_ref(&spec.p1).map_err(|e| format!("{id} p1: {e}"))?,
+        )
+    } else {
+        let (a, b) = id
+            .split_once("-vs-")
+            .ok_or_else(|| format!("unknown matchup '{id}'"))?;
+        let get = |n: &str| {
+            decks
+                .get(n)
+                .map(|d| expand_deck(d))
+                .ok_or_else(|| format!("matchup '{id}': deck '{n}' not in --decks"))
+        };
+        (get(a)?, get(b)?)
+    };
+    let list = DeckList {
+        player: PlayerDeckList {
+            main_deck: p0,
+            ..Default::default()
+        },
+        opponent: PlayerDeckList {
+            main_deck: p1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    Ok(resolve_deck_list(db, &list))
+}
+
+#[derive(Default, Clone, Copy)]
+struct Profile {
+    creatures: [u32; 2],
+    lands: [u32; 2],
+}
+
+fn snapshot(state: &GameState) -> Profile {
+    let mut p = Profile::default();
+    for id in state.battlefield.iter() {
+        let Some(obj) = state.objects.get(id) else { continue };
+        let seat = obj.controller.0 as usize;
+        if seat > 1 {
+            continue;
+        }
+        let types = &obj.card_types.core_types;
+        if types.contains(&CoreType::Creature) {
+            p.creatures[seat] += 1;
+        }
+        if types.contains(&CoreType::Land) {
+            p.lands[seat] += 1;
+        }
+    }
+    p
+}
+
+struct GameOut {
+    winner: Option<PlayerId>,
+    turns: u32,
+    /// Board at the last batch boundary where both players were still alive —
+    /// the end-of-game board reads as zero for whoever just died.
+    last_alive: Profile,
+    panicked: bool,
+}
+
+fn run_game(payload: &DeckPayload, db: &CardDatabase, seed: u64, p0: &AiConfig, p1: &AiConfig) -> GameOut {
+    let mut state = GameState::new_two_player(seed);
+    load_and_hydrate_decks(&mut state, payload, Some(db));
+    let _ = start_game_skip_mulligan(&mut state);
+    let players: HashSet<PlayerId> = [PlayerId(0), PlayerId(1)].into_iter().collect();
+    let configs: HashMap<PlayerId, AiConfig> = [
+        (PlayerId(0), p0.clone().into_measurement(seed)),
+        (PlayerId(1), p1.clone().into_measurement(seed.wrapping_add(1))),
+    ]
+    .into_iter()
+    .collect();
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed);
+    let session = phase_ai::session::AiSession::arc_from_game(&state);
+    let mut last_alive = snapshot(&state);
+    loop {
+        if let WaitingFor::GameOver { winner } = &state.waiting_for {
+            return GameOut { winner: *winner, turns: state.turn_number, last_alive, panicked: false };
+        }
+        if state.turn_number >= MAX_TURNS {
+            return GameOut { winner: None, turns: state.turn_number, last_alive, panicked: false };
+        }
+        let step = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            run_ai_actions(&mut state, &players, &configs, &mut rng, &session)
+        }));
+        match step {
+            Ok(results) if results.is_empty() => {
+                return GameOut { winner: None, turns: state.turn_number, last_alive, panicked: false }
+            }
+            Ok(_) => {
+                if !matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
+                    last_alive = snapshot(&state);
+                }
+            }
+            Err(_) => {
+                return GameOut { winner: None, turns: state.turn_number, last_alive, panicked: true }
+            }
+        }
+    }
+}
+
+/// Two-sided exact sign test (binomial, p = 0.5) on decided games.
+fn sign_test(a: usize, b: usize) -> f64 {
+    let n = a + b;
+    if n == 0 {
+        return 1.0;
+    }
+    let k = a.min(b);
+    // P(X <= k) with X ~ Bin(n, 0.5), computed in log space.
+    let ln_half_n = -(n as f64) * std::f64::consts::LN_2;
+    let mut ln_c = 0.0f64; // ln C(n, 0)
+    let mut tail = 0.0f64;
+    for i in 0..=k {
+        if i > 0 {
+            ln_c += ((n - i + 1) as f64).ln() - (i as f64).ln();
+        }
+        tail += (ln_c + ln_half_n).exp();
+    }
+    (2.0 * tail).min(1.0)
+}
+
+#[derive(Default)]
+struct Tally {
+    a: usize,
+    b: usize,
+    draws: usize,
+    panics: usize,
+    turns: u64,
+    a_creatures: u64,
+    b_creatures: u64,
+    a_lands: u64,
+    b_lands: u64,
+    games: usize,
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut data: Option<PathBuf> = None;
+    let mut a_spec = "veryhard:wasm".to_string();
+    let mut b_spec = "medium:wasm".to_string();
+    let mut matchups = "blue-mirror".to_string();
+    let mut games = 20usize;
+    let mut seed = 1000u64;
+    let mut decks_path: Option<PathBuf> = None;
+    let mut json_out: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let take = |i: &mut usize| -> String {
+            *i += 1;
+            args.get(*i).cloned().unwrap_or_else(|| {
+                eprintln!("missing value for {}", args[*i - 1]);
+                std::process::exit(2)
+            })
+        };
+        match args[i].as_str() {
+            "--a" => a_spec = take(&mut i),
+            "--b" => b_spec = take(&mut i),
+            "--matchups" => matchups = take(&mut i),
+            "--games" => games = take(&mut i).parse().expect("--games"),
+            "--seed" => seed = take(&mut i).parse().expect("--seed"),
+            "--decks" => decks_path = Some(PathBuf::from(take(&mut i))),
+            "--json" => json_out = Some(PathBuf::from(take(&mut i))),
+            "-h" | "--help" => {
+                eprintln!("{}", include_str!("ai_ladder.rs").lines().take(20).collect::<Vec<_>>().join("\n"));
+                return;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag {other}");
+                std::process::exit(2);
+            }
+            other => data = Some(PathBuf::from(other)),
+        }
+        i += 1;
+    }
+    let data = data.unwrap_or_else(|| PathBuf::from("client/public"));
+    let card_path = if data.is_dir() { data.join("card-data.json") } else { data };
+    let db = CardDatabase::from_export(&card_path).unwrap_or_else(|e| {
+        eprintln!("cannot load {}: {e}", card_path.display());
+        std::process::exit(1)
+    });
+    let decks: HashMap<String, Vec<String>> = match &decks_path {
+        Some(p) => serde_json::from_str(&std::fs::read_to_string(p).expect("read --decks"))
+            .expect("--decks must be {name: [lines]}"),
+        None => HashMap::new(),
+    };
+    let side_a = parse_spec(&a_spec).unwrap_or_else(|e| {
+        eprintln!("--a: {e}");
+        std::process::exit(2)
+    });
+    let side_b = parse_spec(&b_spec).unwrap_or_else(|e| {
+        eprintln!("--b: {e}");
+        std::process::exit(2)
+    });
+
+    let ids: Vec<String> = matchups.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let payloads: Vec<(String, DeckPayload)> = ids
+        .iter()
+        .map(|id| {
+            let p = payload_for(&db, id, &decks).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(2)
+            });
+            (id.clone(), p)
+        })
+        .collect();
+
+    eprintln!("A = {}\nB = {}\n{} games per matchup (paired seeds)", side_a.label, side_b.label, games);
+    let pairs = games.div_ceil(2);
+    let started = std::time::Instant::now();
+
+    // (matchup index, seed index, a_is_p0)
+    let tasks: Vec<(usize, usize, bool)> = (0..payloads.len())
+        .flat_map(|m| (0..pairs).flat_map(move |s| [(m, s, true), (m, s, false)]))
+        .collect();
+    let results: Vec<(usize, bool, GameOut)> = tasks
+        .par_iter()
+        .map(|&(m, s, a_is_p0)| {
+            let game_seed = seed.wrapping_add(m as u64 * 100_000).wrapping_add(s as u64);
+            let (p0, p1) = if a_is_p0 {
+                (&side_a.config, &side_b.config)
+            } else {
+                (&side_b.config, &side_a.config)
+            };
+            (m, a_is_p0, run_game(&payloads[m].1, &db, game_seed, p0, p1))
+        })
+        .collect();
+
+    let mut tallies: Vec<Tally> = (0..payloads.len()).map(|_| Tally::default()).collect();
+    for (m, a_is_p0, out) in &results {
+        let t = &mut tallies[*m];
+        let (a_seat, b_seat) = if *a_is_p0 { (0, 1) } else { (1, 0) };
+        t.games += 1;
+        t.turns += out.turns as u64;
+        t.a_creatures += out.last_alive.creatures[a_seat] as u64;
+        t.b_creatures += out.last_alive.creatures[b_seat] as u64;
+        t.a_lands += out.last_alive.lands[a_seat] as u64;
+        t.b_lands += out.last_alive.lands[b_seat] as u64;
+        if out.panicked {
+            t.panics += 1;
+        }
+        match out.winner {
+            Some(PlayerId(w)) if w as usize == a_seat => t.a += 1,
+            Some(_) => t.b += 1,
+            None => t.draws += 1,
+        }
+    }
+
+    println!("| matchup | A | B | draws | A% | p | turns | creat A×B | lands A×B |");
+    println!("|---|---|---|---|---|---|---|---|---|");
+    let mut total = Tally::default();
+    let mut rows = Vec::new();
+    for ((id, _), t) in payloads.iter().zip(&tallies) {
+        let decided = (t.a + t.b).max(1);
+        let g = t.games.max(1) as f64;
+        println!(
+            "| {id} | {} | {} | {} | {:.1}% | {:.3} | {:.1} | {:.1} × {:.1} | {:.1} × {:.1} |",
+            t.a, t.b, t.draws, 100.0 * t.a as f64 / decided as f64, sign_test(t.a, t.b),
+            t.turns as f64 / g, t.a_creatures as f64 / g, t.b_creatures as f64 / g,
+            t.a_lands as f64 / g, t.b_lands as f64 / g,
+        );
+        rows.push(serde_json::json!({
+            "matchup": id, "a": t.a, "b": t.b, "draws": t.draws, "panics": t.panics,
+            "p": sign_test(t.a, t.b),
+            "avg_turns": t.turns as f64 / g,
+            "creatures": [t.a_creatures as f64 / g, t.b_creatures as f64 / g],
+        }));
+        total.a += t.a;
+        total.b += t.b;
+        total.draws += t.draws;
+        total.panics += t.panics;
+    }
+    let decided = (total.a + total.b).max(1);
+    println!(
+        "| **total** | {} | {} | {} | {:.1}% | {:.3} | | | |",
+        total.a, total.b, total.draws, 100.0 * total.a as f64 / decided as f64, sign_test(total.a, total.b)
+    );
+    eprintln!("{} games in {:.1}s ({} panics)", results.len(), started.elapsed().as_secs_f64(), total.panics);
+    if let Some(path) = json_out {
+        let doc = serde_json::json!({
+            "a": side_a.label, "b": side_b.label, "games_per_matchup": pairs * 2, "seed": seed,
+            "rows": rows,
+            "total": {"a": total.a, "b": total.b, "draws": total.draws, "p": sign_test(total.a, total.b)},
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).expect("write --json");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_test_is_symmetric_and_bounded() {
+        assert!((sign_test(10, 10) - 1.0).abs() < 1e-9);
+        assert!((sign_test(3, 7) - sign_test(7, 3)).abs() < 1e-12);
+        // 1 x 39: overwhelming.
+        assert!(sign_test(1, 39) < 1e-9);
+        // 10 x 30 ≈ 0.0022 (the kitchen × fury number in the MagicFinder notes).
+        let p = sign_test(10, 30);
+        assert!(p > 0.001 && p < 0.003, "{p}");
+    }
+
+    #[test]
+    fn expand_deck_reads_counts() {
+        let d = expand_deck(&["4 Island".into(), "Ponder".into(), "2 Man-o'-War".into()]);
+        assert_eq!(d.len(), 7);
+        assert_eq!(d.iter().filter(|n| *n == "Island").count(), 4);
+    }
+}

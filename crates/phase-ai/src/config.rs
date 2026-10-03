@@ -1355,6 +1355,25 @@ pub struct AiConfig {
     pub execution_mode: ExecutionMode,
     /// Number of players in the game (used for search budget scaling).
     pub player_count: u8,
+    /// MagicFinder strategic-play switches. Default OFF on every preset so a
+    /// change is A/B-measured (`ai-ladder`, same seeds, one binary) before any
+    /// preset turns it on.
+    pub strategic: StrategicConfig,
+}
+
+/// Strategic-play switches layered on top of a difficulty preset.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StrategicConfig {
+    /// Apply the deck-archetype `StrategyProfile` (`AiProfile::with_strategy`)
+    /// to EVERY decision, not only combat. Without it the policies read the raw
+    /// preset profile, so a control deck and an aggro deck share the same
+    /// `interaction_patience` outside combat.
+    pub archetype_profile_everywhere: bool,
+    /// Race-aware casting: when the AI is not under pressure, value committing
+    /// a threat by the turns of clock it adds instead of only by the risk that
+    /// it dies to removal (the depth-2 horizon effect measured in the blue
+    /// mirror, docs/mesa-ia-dificuldade-medicao-2026-09.md in MagicFinder).
+    pub clock_awareness: bool,
 }
 
 impl Default for AiConfig {
@@ -1566,6 +1585,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
         policy_penalties: PolicyPenalties::default(),
         execution_mode: ExecutionMode::Interactive,
         player_count: 2,
+        strategic: StrategicConfig::default(),
     };
 
     // WASM platform constraints: reduce search budgets. AI computation runs in
