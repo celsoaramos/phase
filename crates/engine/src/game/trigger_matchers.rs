@@ -753,6 +753,35 @@ fn player_matches_filter(
             trigger_controller,
             source_event_subject_id(source_context),
         ),
+        // CR 608.2b + CR 608.2c: the two leaves a delayed condition's slot
+        // binder writes into a player-axis filter slot
+        // (`effects::delayed_trigger::bind_parent_slots_from_root`): a declared
+        // player slot bound to that one player, and a slot with no referent —
+        // an illegal target, whose information "fails to determine" — bound to
+        // the leaf that matches nothing. Both are load-bearing for the same
+        // reason as the arm above — the fallback below is fail-OPEN, and
+        // without them a dead slot would match every player (PR #8881).
+        TargetFilter::SpecificPlayer { id } => *id == player_id,
+        TargetFilter::None => false,
+        // The binder leaves those leaves under the boolean shape the condition
+        // was written in (`Not { slot }`, `Or { slot, slot }`, `And { … }`), so
+        // the shape has to be evaluated here rather than fall through to the
+        // wildcard — `Not { SpecificPlayer }` is "every player but that one",
+        // not "every player". Each member is judged by this same function, so a
+        // member the fallback does not describe still reads as the wildcard it
+        // reads as at top level. No printed trigger carries a `Not` or `And`
+        // in a player-axis slot, and every member of the printed `Or`s there
+        // ("a player or planeswalker", "an opponent or a battle") is a `Player`
+        // leaf, an opponent leaf or a bare type leaf that reads as the
+        // wildcard, so they match exactly as they did through the fallback
+        // (PR #8881).
+        TargetFilter::Not { filter } => !player_matches_filter(filter, state, player_id, source_context),
+        TargetFilter::Or { filters } => filters
+            .iter()
+            .any(|filter| player_matches_filter(filter, state, player_id, source_context)),
+        TargetFilter::And { filters } => filters
+            .iter()
+            .all(|filter| player_matches_filter(filter, state, player_id, source_context)),
         _ => true,
     }
 }
@@ -958,7 +987,7 @@ fn count_matching_trigger_event_subjects(
         | GameEvent::Milled { object_id, .. }
         | GameEvent::SpellCast { object_id, .. }
         | GameEvent::TokenCreated { object_id, .. }
-        | GameEvent::CreatureDestroyed { object_id }
+        | GameEvent::CreatureDestroyed { object_id, .. }
         | GameEvent::Evolved { object_id }
         | GameEvent::PermanentSacrificed { object_id, .. }
         | GameEvent::ControllerChanged { object_id, .. }
@@ -970,6 +999,8 @@ fn count_matching_trigger_event_subjects(
         // Unstable Host/Augment combine also makes the surviving Host permanent
         // the observable subject for generic object-scoped event helpers.
         GameEvent::Augmented { merged_id, .. } => count_one(*merged_id),
+        // CR 701.42a: the melded permanent is the event's subject.
+        GameEvent::Melded { object_id, .. } => count_one(*object_id),
         GameEvent::ContraptionAssembled { object_id, .. } => count_one(*object_id),
         GameEvent::ContraptionCranked { contraption_id, .. } => count_one(*contraption_id),
         // Object target events yield the affected object as subject. Player
@@ -1082,6 +1113,9 @@ fn count_matching_trigger_event_subjects(
         | GameEvent::CityBlessingGained { .. }
         | GameEvent::EnduringStoryGained { .. }
         | GameEvent::DieRolled { .. }
+        // CR 706.6: an ignored (dropped) die carries no object subject and is
+        // never a rules roll.
+        | GameEvent::DieRollIgnored { .. }
         | GameEvent::CoinFlipped { .. }
         | GameEvent::RingTemptsYou { .. }
         | GameEvent::RoomEntered { .. }
@@ -2128,6 +2162,8 @@ pub(super) fn matching_block_events(
 ) -> Vec<GameEvent> {
     let source_id = source_event_subject_id(source_context);
     if let GameEvent::BlockersDeclared { assignments } = event {
+        let attacker_filter = combat_filter(trigger);
+        let mut emitted_blockers: Vec<ObjectId> = Vec::new();
         assignments
             .iter()
             .filter_map(|(blocker, attacker)| {
@@ -2144,13 +2180,25 @@ pub(super) fn matching_block_events(
                 // `combat_filter` excludes a spurious `TargetFilter::Player`
                 // surfaced by the effect-text lowering, which is never a real
                 // CR 509 attacker filter.
-                let attacker_matches = match combat_filter(trigger) {
+                let attacker_matches = match attacker_filter {
                     Some(filter) => {
                         target_filter_matches_object(state, *attacker, filter, source_context)
                     }
                     None => true,
                 };
-                attacker_matches.then_some(GameEvent::BlockersDeclared {
+                if !attacker_matches {
+                    return None;
+                }
+                // CR 509.3a: bare blocking triggers once for each blocker,
+                // even when that blocker is assigned multiple attackers.
+                if attacker_filter.is_none() {
+                    if emitted_blockers.contains(blocker) {
+                        return None;
+                    }
+                    emitted_blockers.push(*blocker);
+                }
+                // CR 509.3b: qualified blocking retains each attacker binding.
+                Some(GameEvent::BlockersDeclared {
                     assignments: vec![(*blocker, *attacker)],
                 })
             })
@@ -2502,7 +2550,10 @@ pub(super) fn match_life_gained(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::LifeChanged { player_id, amount } = event {
+    if let GameEvent::LifeChanged {
+        player_id, amount, ..
+    } = event
+    {
         if *amount <= 0 {
             return false;
         }
@@ -2533,7 +2584,10 @@ pub(super) fn match_life_lost(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::LifeChanged { player_id, amount } = event {
+    if let GameEvent::LifeChanged {
+        player_id, amount, ..
+    } = event
+    {
         if *amount >= 0 {
             return false;
         }
@@ -2554,7 +2608,10 @@ pub(super) fn match_life_changed(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::LifeChanged { player_id, amount } = event {
+    if let GameEvent::LifeChanged {
+        player_id, amount, ..
+    } = event
+    {
         if *amount == 0 {
             return false;
         }
@@ -2681,7 +2738,37 @@ pub(super) fn match_sacrificed(
     // already be in the graveyard with its granted characteristics pruned (CR 400.7), or
     // — for a token (CR 111.7) — have ceased to exist and been removed from
     // `state.objects` by a prior SBA pass.
-    valid_card_matches_with_lki(trigger, state, *object_id, source_context)
+    if valid_card_matches_with_lki(trigger, state, *object_id, source_context) {
+        return true;
+    }
+    // CR 603.10a + CR 400.7: the sacrificed permanent's OWN "when you sacrifice
+    // ~" trigger (Carrot Cake). The source context is the departed battlefield
+    // incarnation, while the live object is already a new graveyard object, so a
+    // `SelfRef` filter answered against the live object can never hold. When the
+    // trigger's source IS the sacrificed object, answer the filter against its
+    // battlefield departure record — the same look-back authority the ceased
+    // (token) arm of `subject_filter_matches_with_lki` uses.
+    if source_event_subject_id(source_context) != *object_id {
+        return false;
+    }
+    // Bind to the departure row of THIS incarnation (the one the source context
+    // was latched from), not merely the latest move of the id: the graveyard card
+    // may already have moved again within the same batch.
+    let Some(filter) = trigger.valid_card.as_ref() else {
+        return false;
+    };
+    let Some(record) = state.zone_changes_this_turn.iter().rev().find(|change| {
+        change.object_id == *object_id
+            && change.from_zone == Some(Zone::Battlefield)
+            && change
+                .trigger_source_context
+                .as_ref()
+                .is_some_and(|ctx| ctx.identity.reference == source_context.identity.reference)
+    }) else {
+        return false;
+    };
+    let ctx = super::filter::FilterContext::from_trigger_source(source_context);
+    super::filter::matches_target_filter_on_zone_change_record(state, record, filter, &ctx)
 }
 
 pub(super) fn match_destroyed(
@@ -2690,7 +2777,7 @@ pub(super) fn match_destroyed(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::CreatureDestroyed { object_id } = event {
+    if let GameEvent::CreatureDestroyed { object_id, .. } = event {
         valid_card_matches(trigger, state, *object_id, source_context)
     } else {
         false
@@ -4315,8 +4402,11 @@ pub(super) fn matching_you_attack_pairs(
     if attacker_ids.is_empty() {
         return Vec::new();
     }
-    // CR 506.2: the active player is the attacking player; all attackers in
-    // a single AttackersDeclared batch share one controller.
+    // CR 506.2: the active player is the attacking player. Under shared team
+    // turns one combined declaration can hold several attacking players'
+    // creatures (CR 805.10a + CR 805.10b); the player-scoped gates below read
+    // the first attacker's controller, while the `Player` pass-through admits
+    // every attacking player.
     let Some(attacking_player) = attacker_ids
         .iter()
         .find_map(|id| state.objects.get(id).map(|o| o.controller))
@@ -4330,7 +4420,9 @@ pub(super) fn matching_you_attack_pairs(
         // attacking-player pass-through (any attacking player) and carries NO
         // attack-target narrowing — that lives solely in `attack_target_filter`.
         // Used by attachment-relation triggers ("enchanted by an Aura you control
-        // attack") whose enchanted/equipped attacker may be opponent-controlled.
+        // attack") whose enchanted/equipped attacker may be opponent-controlled,
+        // and (CR 603.2 + CR 506.2) by unscoped subject-led triggers ("whenever one
+        // or more creatures attack") that watch every attacking player.
         Some(TargetFilter::Player) => true,
         Some(_) => valid_player_matches(trigger, state, attacking_player, source_context),
         None => attacking_player == source_context.source_read(state).controller(),
@@ -4931,13 +5023,15 @@ pub(super) fn match_keyword_ability_activated(
     }
 }
 
-/// CR 602.1 + CR 603.2 + CR 605.1a: Matches when any player activates an
-/// activated ability that uses the stack (which by CR 605.3b excludes mana
-/// abilities). Player scope is filtered via `trigger.valid_target` (e.g.
-/// "an opponent" → `ControllerRef::Opponent` filter against the activating
-/// player); when no `valid_target` is set, the trigger fires for every player
-/// (Burning-Tree Shaman). Source-object filtering rides on `valid_card`
-/// (reserved for future patterns like "an ability of an artifact source").
+/// CR 602.2b + CR 603.2 + CR 605.3: Matches when any player activates an
+/// activated ability — stack-using abilities and mana abilities alike (CR 605.3);
+/// a "that isn't a mana ability" qualifier is the trigger's
+/// `TriggerCondition::ActivatedAbilityIsNonMana`, checked against the event's
+/// `kind`. Player scope is filtered via `trigger.valid_target` (e.g. "an
+/// opponent" → `ControllerRef::Opponent` against the activating player); when no
+/// `valid_target` is set, the trigger fires for every player (Burning-Tree
+/// Shaman). The activated source is filtered by `valid_card` through
+/// [`activated_source_matches`].
 pub(super) fn match_ability_activated(
     event: &GameEvent,
     trigger: &TriggerDefinition,
@@ -4947,15 +5041,103 @@ pub(super) fn match_ability_activated(
     let GameEvent::AbilityActivated {
         player_id,
         source_id: activated_id,
+        departed_source_lki,
+        trigger_state,
         ..
     } = event
     else {
         return false;
     };
+    // CR 603.10 + CR 603.2c: a mana activation's triggers were collected at its
+    // boundary, and an ability triggers only once per occurrence; every later
+    // collector (live scan, cost ledger, delayed match) refuses it.
+    if !trigger_state.is_pending() {
+        return false;
+    }
     if !valid_player_matches(trigger, state, *player_id, source_context) {
         return false;
     }
-    valid_card_matches(trigger, state, *activated_id, source_context)
+    activated_source_matches(
+        trigger,
+        state,
+        *activated_id,
+        *player_id,
+        departed_source_lki.as_deref(),
+        source_context,
+    )
+}
+
+/// CR 113.7 + CR 602.2a + CR 603.10: Does the source of an activated ability
+/// match the trigger's `valid_card`?
+///
+/// * "they" / "that player" in the source phrase ("an artifact they control")
+///   is the activating player (CR 602.2a), bound from the EVENT by lowering
+///   `ControllerRef::TriggeringPlayer` to `ControllerRef::SpecificPlayer` —
+///   never from `state.current_trigger_event`, which can name an enclosing
+///   trigger when a mana ability is activated mid-resolution.
+/// * A source a cost moved off the battlefield (a sacrificed Treasure) answers
+///   from its last known information (CR 113.7 + CR 113.7a): characteristics and
+///   controller. Its attachment relationships are NOT carried over: after all
+///   costs are paid, nothing is attached to an object that left, so an "ability
+///   of equipped creature" trigger does not fire when the creature was
+///   sacrificed to pay the cost (Illusionist's Bracers ruling). The snapshot is
+///   copied, so the event itself keeps its full record.
+fn activated_source_matches(
+    trigger: &TriggerDefinition,
+    state: &GameState,
+    activated_id: ObjectId,
+    activator: PlayerId,
+    departed_source_lki: Option<&crate::types::game_state::LKISnapshot>,
+    source_context: &TriggerSourceContext,
+) -> bool {
+    let Some(filter) = &trigger.valid_card else {
+        return true;
+    };
+    let filter = bind_triggering_player_controller(filter, activator);
+    match departed_source_lki {
+        Some(lki) => {
+            let mut post_cost = lki.clone();
+            post_cost.attachments.clear();
+            let ctx = super::filter::FilterContext::from_trigger_source(source_context);
+            super::filter::matches_target_filter_on_departed_battlefield_lki(
+                state,
+                activated_id,
+                &post_cost,
+                &filter,
+                &ctx,
+            )
+        }
+        None => target_filter_matches_object(state, activated_id, &filter, source_context),
+    }
+}
+
+/// CR 109.4 + CR 602.2a: Lower a filter's `ControllerRef::TriggeringPlayer` to
+/// the concrete player the triggering event names (the documented lowered form,
+/// `ControllerRef::SpecificPlayer`). Distributes through `Or` / `And` / `Not`.
+fn bind_triggering_player_controller(filter: &TargetFilter, player: PlayerId) -> TargetFilter {
+    match filter {
+        TargetFilter::Typed(typed) if typed.controller == Some(ControllerRef::TriggeringPlayer) => {
+            let mut typed = typed.clone();
+            typed.controller = Some(ControllerRef::SpecificPlayer { id: player });
+            TargetFilter::Typed(typed)
+        }
+        TargetFilter::Or { filters } => TargetFilter::Or {
+            filters: filters
+                .iter()
+                .map(|filter| bind_triggering_player_controller(filter, player))
+                .collect(),
+        },
+        TargetFilter::And { filters } => TargetFilter::And {
+            filters: filters
+                .iter()
+                .map(|filter| bind_triggering_player_controller(filter, player))
+                .collect(),
+        },
+        TargetFilter::Not { filter } => TargetFilter::Not {
+            filter: Box::new(bind_triggering_player_controller(filter, player)),
+        },
+        other => other.clone(),
+    }
 }
 
 /// CR 606.2 + CR 109.5 + CR 603.2: Matches when a player activates a loyalty
@@ -4975,10 +5157,15 @@ pub(super) fn match_loyalty_ability_activated(
         player_id,
         source_id: activated_id,
         kind: crate::types::events::ActivatedAbilityKind::Loyalty,
+        trigger_state,
+        ..
     } = event
     else {
         return false;
     };
+    if !trigger_state.is_pending() {
+        return false;
+    }
     // CR 109.5: "you" = the controller of the trigger source.
     if source_context.source_read(state).controller() != *player_id {
         return false;
@@ -7296,6 +7483,8 @@ mod tests {
                 player_id: PlayerId(1),
                 source_id: activated,
                 kind: crate::types::events::ActivatedAbilityKind::Normal,
+                departed_source_lki: None,
+                trigger_state: crate::types::events::ActivationTriggerState::Pending,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7307,6 +7496,8 @@ mod tests {
                 player_id: PlayerId(0),
                 source_id: activated,
                 kind: crate::types::events::ActivatedAbilityKind::Normal,
+                departed_source_lki: None,
+                trigger_state: crate::types::events::ActivationTriggerState::Pending,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7345,6 +7536,8 @@ mod tests {
                 player_id: PlayerId(1),
                 source_id: activated,
                 kind: crate::types::events::ActivatedAbilityKind::Normal,
+                departed_source_lki: None,
+                trigger_state: crate::types::events::ActivationTriggerState::Pending,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7356,11 +7549,69 @@ mod tests {
                 player_id: PlayerId(0),
                 source_id: activated,
                 kind: crate::types::events::ActivatedAbilityKind::Normal,
+                departed_source_lki: None,
+                trigger_state: crate::types::events::ActivationTriggerState::Pending,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
             &state
         ));
+    }
+
+    /// CR 603.10: an activation already observed at its boundary is refused by
+    /// every later collector; a legacy event without the field decodes as
+    /// `Pending` and is observed once.
+    #[test]
+    fn ability_activation_collected_at_its_boundary_is_not_matched_again() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Elrond".to_string(),
+            Zone::Battlefield,
+        );
+        let activated = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Dork".to_string(),
+            Zone::Battlefield,
+        );
+        let trigger = make_trigger(TriggerMode::AbilityActivated);
+        let context = test_trigger_source_context(&state, source);
+        for observers in [
+            crate::types::events::ActivationObservers::Unbound,
+            crate::types::events::ActivationObservers::Bound,
+        ] {
+            let collected = GameEvent::AbilityActivated {
+                player_id: PlayerId(0),
+                source_id: activated,
+                kind: crate::types::events::ActivatedAbilityKind::Mana,
+                departed_source_lki: None,
+                trigger_state:
+                    crate::types::events::ActivationTriggerState::CollectedAtActivation {
+                        observers,
+                    },
+            };
+            assert!(!match_ability_activated(
+                &collected, &trigger, &context, &state
+            ));
+            // The state survives a serialization round trip.
+            let restored: GameEvent =
+                serde_json::from_value(serde_json::to_value(&collected).unwrap()).unwrap();
+            assert_eq!(restored, collected);
+            assert!(!match_ability_activated(
+                &restored, &trigger, &context, &state
+            ));
+        }
+        // A legacy event (no field) is Pending and matches.
+        let legacy: GameEvent = serde_json::from_value(serde_json::json!({
+            "type": "AbilityActivated",
+            "data": { "player_id": 0, "source_id": activated.0, "kind": "Mana" }
+        }))
+        .unwrap();
+        assert!(match_ability_activated(&legacy, &trigger, &context, &state));
     }
 
     #[test]
@@ -7436,6 +7687,8 @@ mod tests {
                 player_id: PlayerId(0),
                 source_id: chandra,
                 kind: crate::types::events::ActivatedAbilityKind::Loyalty,
+                departed_source_lki: None,
+                trigger_state: crate::types::events::ActivationTriggerState::Pending,
             },
             &trigger,
             &test_trigger_source_context(&state, regulator),
@@ -7465,6 +7718,8 @@ mod tests {
                 player_id: PlayerId(0),
                 source_id: planeswalker,
                 kind: crate::types::events::ActivatedAbilityKind::Loyalty,
+                departed_source_lki: None,
+                trigger_state: crate::types::events::ActivationTriggerState::Pending,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7475,6 +7730,8 @@ mod tests {
                 player_id: PlayerId(0),
                 source_id: planeswalker,
                 kind: crate::types::events::ActivatedAbilityKind::Normal,
+                departed_source_lki: None,
+                trigger_state: crate::types::events::ActivationTriggerState::Pending,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7504,6 +7761,8 @@ mod tests {
                 player_id: PlayerId(0),
                 source_id: jace,
                 kind: crate::types::events::ActivatedAbilityKind::Loyalty,
+                departed_source_lki: None,
+                trigger_state: crate::types::events::ActivationTriggerState::Pending,
             },
             &trigger,
             &test_trigger_source_context(&state, regulator),
@@ -7535,6 +7794,8 @@ mod tests {
                 player_id: PlayerId(0),
                 source_id: chandra,
                 kind: crate::types::events::ActivatedAbilityKind::Normal,
+                departed_source_lki: None,
+                trigger_state: crate::types::events::ActivationTriggerState::Pending,
             },
             &trigger,
             &test_trigger_source_context(&state, regulator),
@@ -7567,6 +7828,8 @@ mod tests {
                 player_id: PlayerId(1),
                 source_id: chandra,
                 kind: crate::types::events::ActivatedAbilityKind::Loyalty,
+                departed_source_lki: None,
+                trigger_state: crate::types::events::ActivationTriggerState::Pending,
             },
             &trigger,
             &test_trigger_source_context(&state, regulator),
@@ -7600,6 +7863,8 @@ mod tests {
                 player_id: PlayerId(0),
                 source_id: host,
                 kind: crate::types::events::ActivatedAbilityKind::Loyalty,
+                departed_source_lki: None,
+                trigger_state: crate::types::events::ActivationTriggerState::Pending,
             },
             &trigger,
             &test_trigger_source_context(&state, talent),
@@ -7611,6 +7876,8 @@ mod tests {
                 player_id: PlayerId(0),
                 source_id: other,
                 kind: crate::types::events::ActivatedAbilityKind::Loyalty,
+                departed_source_lki: None,
+                trigger_state: crate::types::events::ActivationTriggerState::Pending,
             },
             &trigger,
             &test_trigger_source_context(&state, talent),
@@ -10559,6 +10826,7 @@ mod tests {
         let event = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(match_life_gained(
             &event,
@@ -10570,6 +10838,7 @@ mod tests {
         let loss_event = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(!match_life_gained(
             &loss_event,
@@ -10586,6 +10855,7 @@ mod tests {
         let event = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(match_life_lost(
             &event,
@@ -10597,6 +10867,7 @@ mod tests {
         let gain_event = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(!match_life_lost(
             &gain_event,
@@ -10617,6 +10888,7 @@ mod tests {
         let loss_one = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -1,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(match_life_lost(
             &loss_one,
@@ -10628,6 +10900,7 @@ mod tests {
         let loss_two = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -2,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(!match_life_lost(
             &loss_two,
@@ -10647,6 +10920,7 @@ mod tests {
         let loss_two = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -2,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(!match_life_lost(
             &loss_two,
@@ -10658,6 +10932,7 @@ mod tests {
         let loss_four = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -4,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(match_life_lost(
             &loss_four,
@@ -10733,7 +11008,16 @@ mod tests {
             "Second Attacker".to_string(),
             Zone::Battlefield,
         );
-        let trigger = make_trigger(TriggerMode::Blocks).valid_card(TargetFilter::SelfRef);
+        for attacker in [first_attacker, second_attacker] {
+            state
+                .objects
+                .get_mut(&attacker)
+                .unwrap()
+                .card_types
+                .core_types = vec![CoreType::Creature];
+        }
+        let mut trigger = make_trigger(TriggerMode::Blocks).valid_card(TargetFilter::SelfRef);
+        trigger.valid_target = Some(TargetFilter::Typed(TypedFilter::creature()));
         let event = GameEvent::BlockersDeclared {
             assignments: vec![(blocker, first_attacker), (blocker, second_attacker)],
         };
@@ -10757,6 +11041,54 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // CR 509.3a: each blocker triggers once, preserving its first assignment.
+    #[test]
+    fn bare_block_events_preserve_first_assignment_order_and_object_identity() {
+        let mut state = setup();
+        let ids: Vec<_> = (1..=4)
+            .map(|n| {
+                create_object(
+                    &mut state,
+                    CardId(n),
+                    PlayerId(0),
+                    "Same name".to_string(),
+                    Zone::Battlefield,
+                )
+            })
+            .collect();
+        let trigger = make_trigger(TriggerMode::Blocks);
+        let context = test_trigger_source_context(&state, ids[0]);
+        let mut all_blockers = trigger.clone();
+        all_blockers.valid_card = Some(TargetFilter::Any);
+        let assignments = vec![
+            (ids[0], ids[2]),
+            (ids[1], ids[3]),
+            (ids[0], ids[3]),
+            (ids[1], ids[2]),
+        ];
+        for ordered in [assignments.clone(), assignments.into_iter().rev().collect()] {
+            let expected = vec![
+                GameEvent::BlockersDeclared {
+                    assignments: vec![ordered[0]],
+                },
+                GameEvent::BlockersDeclared {
+                    assignments: vec![ordered[1]],
+                },
+            ];
+            assert_eq!(
+                matching_block_events(
+                    &GameEvent::BlockersDeclared {
+                        assignments: ordered
+                    },
+                    &all_blockers,
+                    &context,
+                    &state,
+                ),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -10949,8 +11281,15 @@ mod tests {
             "Attacker".to_string(),
             Zone::Battlefield,
         );
+        let second_attacker = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Second attacker".to_string(),
+            Zone::Battlefield,
+        );
         let event = GameEvent::BlockersDeclared {
-            assignments: vec![(blocker, attacker)],
+            assignments: vec![(blocker, attacker), (blocker, second_attacker)],
         };
         let no_filter = make_trigger(TriggerMode::Blocks).valid_card(TargetFilter::SelfRef);
         let mut player_filter = make_trigger(TriggerMode::Blocks).valid_card(TargetFilter::SelfRef);
@@ -10962,6 +11301,7 @@ mod tests {
             &test_trigger_source_context(&state, blocker),
             &state,
         );
+        assert_eq!(baseline.len(), 1);
         // Reach guard: the block event genuinely matches for the no-filter case.
         assert!(
             !baseline.is_empty(),
@@ -15194,6 +15534,104 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    /// CR 608.2b + CR 608.2c: the player-axis leaves a delayed condition's
+    /// slot binder can write into `valid_target` — `SpecificPlayer` for a bound
+    /// player slot, `None` for a slot with no referent. The match ends in
+    /// `_ => true`, so without their arms a dead slot would admit every player.
+    ///
+    /// Revert-failing: delete either arm and its negative assertion flips.
+    #[test]
+    fn player_axis_specific_player_and_none_leaves_do_not_fall_open() {
+        let mut state = setup();
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Graveyard,
+        );
+        let context = test_trigger_source_context(&state, source_id);
+        let mut specific = TriggerDefinition::new(TriggerMode::ChangesController);
+        specific.valid_target = Some(TargetFilter::SpecificPlayer { id: PlayerId(1) });
+        assert!(
+            valid_player_matches(&specific, &state, PlayerId(1), &context),
+            "a bound player slot matches that player"
+        );
+        assert!(
+            !valid_player_matches(&specific, &state, PlayerId(0), &context),
+            "a bound player slot matches no other player"
+        );
+        let mut dead = TriggerDefinition::new(TriggerMode::ChangesController);
+        dead.valid_target = Some(TargetFilter::None);
+        assert!(
+            !valid_player_matches(&dead, &state, PlayerId(0), &context)
+                && !valid_player_matches(&dead, &state, PlayerId(1), &context),
+            "a slot with no referent matches no player"
+        );
+    }
+
+    /// CR 608.2c ("read the whole text"): the slot binder keeps a bound leaf
+    /// under the boolean shape the condition was written in, so `Not`, `Or`
+    /// and `And` over bound leaves must be evaluated on the player axis — a
+    /// `Not { SpecificPlayer }` that fell through to the wildcard would admit
+    /// the one player it names. Three players, so a multi-live `Or` has a
+    /// player outside it.
+    ///
+    /// Revert-failing: drop any of the three arms and that shape's negative
+    /// assertion flips.
+    #[test]
+    fn player_axis_bound_leaves_keep_their_boolean_shape() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Graveyard,
+        );
+        let context = test_trigger_source_context(&state, source_id);
+        let matches = |filter: TargetFilter, player: PlayerId| {
+            let mut trigger = TriggerDefinition::new(TriggerMode::ChangesController);
+            trigger.valid_target = Some(filter);
+            valid_player_matches(&trigger, &state, player, &context)
+        };
+        let bound = |id: PlayerId| TargetFilter::SpecificPlayer { id };
+        let not_bound = TargetFilter::Not {
+            filter: Box::new(bound(PlayerId(1))),
+        };
+        assert!(
+            !matches(not_bound.clone(), PlayerId(1)),
+            "`Not` over a bound player slot excludes that player"
+        );
+        assert!(
+            matches(not_bound, PlayerId(0)),
+            "`Not` over a bound player slot admits every other player"
+        );
+        let either_bound = TargetFilter::Or {
+            filters: vec![bound(PlayerId(1)), bound(PlayerId(2))],
+        };
+        assert!(
+            matches(either_bound.clone(), PlayerId(1))
+                && matches(either_bound.clone(), PlayerId(2)),
+            "`Or` over two live bound slots admits both players"
+        );
+        assert!(
+            !matches(either_bound, PlayerId(0)),
+            "`Or` over two live bound slots admits no third player"
+        );
+        let bound_and_any_player = TargetFilter::And {
+            filters: vec![bound(PlayerId(1)), TargetFilter::Player],
+        };
+        assert!(
+            !matches(bound_and_any_player.clone(), PlayerId(0)),
+            "`And` over a bound slot excludes a player the slot does not name"
+        );
+        assert!(
+            matches(bound_and_any_player, PlayerId(1)),
+            "`And` over a bound slot admits the player every member admits"
+        );
+    }
+
     #[test]
     fn player_matches_target_filter_you() {
         let filter = TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::You));
@@ -17073,6 +17511,7 @@ mod tests {
             .expect("the fixture's real battlefield departure emits a record");
         GameEvent::CreatureExploited {
             exploiter,
+            exploiter_incarnation: None,
             sacrificed,
             record,
         }
@@ -17395,6 +17834,7 @@ mod tests {
             .expect("the self-sacrifice fixture emits a departure record");
         let event = GameEvent::CreatureExploited {
             exploiter: source,
+            exploiter_incarnation: None,
             sacrificed: source,
             record,
         };
@@ -17481,6 +17921,7 @@ mod tests {
             .expect("the token self-sacrifice fixture emits a departure record");
         let event = GameEvent::CreatureExploited {
             exploiter: token,
+            exploiter_incarnation: None,
             sacrificed: token,
             record,
         };

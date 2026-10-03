@@ -236,7 +236,9 @@ pub(crate) fn structurally_valid_tap_for_convoke_payment(
     };
 
     match mode {
-        ConvokeMode::Delve => obj.is_delve_eligible(*player) && *mana_type == ManaType::Colorless,
+        ConvokeMode::Delve => {
+            state.is_delve_selectable(*player, *object_id) && *mana_type == ManaType::Colorless
+        }
         ConvokeMode::Convoke => {
             if !obj.is_convoke_eligible(*player) {
                 return false;
@@ -370,6 +372,31 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
         // simulation filter never fires a known-rejected action.
         (WaitingFor::OrderTriggers { triggers, .. }, GameAction::OrderTriggers { order }) => {
             !crate::game::triggers::is_valid_permutation(order, triggers.len())
+        }
+        // CR 601.2b + CR 601.2f: same strict-permutation check the engine
+        // handler enforces, plus the announcement's legality against the
+        // prompt's own hybrid symbols (CR 107.4e).
+        (
+            WaitingFor::OrderCostReductions {
+                reductions,
+                hybrid_symbols,
+                ..
+            },
+            GameAction::OrderCostReductions {
+                order,
+                hybrid_announcement,
+            },
+        ) => {
+            !crate::game::triggers::is_valid_permutation(order, reductions.len())
+                || (!hybrid_announcement.is_empty()
+                    && (hybrid_announcement.len() != hybrid_symbols.len()
+                        || hybrid_announcement.iter().zip(hybrid_symbols).any(
+                            |(announced, symbol)| {
+                                !symbol
+                                    .announceable_halves()
+                                    .is_some_and(|halves| halves.contains(announced))
+                            },
+                        )))
         }
         (
             WaitingFor::CopyTargetChoice { valid_targets, .. },
@@ -841,6 +868,16 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
             selection_mismatch(chosen, selectable_cards, exact)
                 || (*up_to && chosen.len() > *keep_count)
         }
+        // CR 401.2 + CR 401.4 + CR 608.2c: the response is a full ARRANGEMENT
+        // of the fixed remainder pile, not a subset of it — the leading
+        // `top_count` entries take the library top and the rest take the
+        // bottom. So the legality gate is "exactly the whole pile, no
+        // duplicates", the same gate the sibling `RippleBottomOrder`
+        // permutation uses.
+        (
+            WaitingFor::DigRestSplitChoice { cards, .. },
+            GameAction::SelectCards { cards: chosen },
+        ) => selection_mismatch(chosen, cards, Some(cards.len())),
         (
             WaitingFor::CollectEvidenceChoice {
                 player: _, cards, ..
@@ -1020,6 +1057,7 @@ fn resolve_mana_option_for_trigger_probe(
     option: &mana_sources::ManaSourceOption,
 ) -> bool {
     let mut probe = state.clone();
+    let deferred_before = probe.deferred_triggers.len();
     let mut events = Vec::new();
 
     for (trigger_ref, override_value) in &option.taps_for_mana_overrides {
@@ -1082,7 +1120,7 @@ fn resolve_mana_option_for_trigger_probe(
         });
     }
 
-    triggers::events_would_queue_non_mana_trigger(&mut probe, &events)
+    triggers::simulated_action_would_queue_non_mana_trigger(&mut probe, deferred_before, &events)
 }
 
 fn activate_mana_action_would_queue_non_mana_trigger(
@@ -1120,6 +1158,7 @@ fn activate_mana_action_would_queue_non_mana_trigger(
         return false;
     };
     let mut probe = state.clone();
+    let deferred_before = probe.deferred_triggers.len();
     let mut events = Vec::new();
     if mana_abilities::resolve_mana_ability(
         &mut probe,
@@ -1133,7 +1172,7 @@ fn activate_mana_action_would_queue_non_mana_trigger(
     {
         return false;
     }
-    triggers::events_would_queue_non_mana_trigger(&mut probe, &events)
+    triggers::simulated_action_would_queue_non_mana_trigger(&mut probe, deferred_before, &events)
 }
 
 fn tap_land_action_would_queue_non_mana_trigger(
@@ -1285,6 +1324,7 @@ fn classify_flat_priority_action(action: &GameAction) -> FlatPriorityActionClass
         | GameAction::ChooseReplacement { .. }
         | GameAction::ChooseEntryController { .. }
         | GameAction::OrderTriggers { .. }
+        | GameAction::OrderCostReductions { .. }
         | GameAction::CancelCast
         | GameAction::Equip { .. }
         | GameAction::CrewVehicle { .. }
@@ -2311,6 +2351,15 @@ pub fn flat_priority_actions_with_probe(
 /// flat `actions` list; auto-pass consumes the flat list, while board
 /// interaction consumes the grouped map.
 pub fn legal_actions_full(state: &GameState) -> LegalActionsFull {
+    // CR 601.2h + CR 608.2c: enumerate against the replayed payment shadow so
+    // the live choice remains actionable while canonical resources stay staged.
+    let payment_projected;
+    let state = if state.payment_transaction.is_some() {
+        payment_projected = crate::game::payment_transaction::project(state);
+        &payment_projected
+    } else {
+        state
+    };
     let priority_probe_storage;
     let flushed_storage;
     let (state, priority_probe) = match &state.waiting_for {

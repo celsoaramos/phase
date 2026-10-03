@@ -229,8 +229,12 @@ fn peel_inner(text: String, mut ctx: ClauseContext) -> (String, ClauseContext) {
     }
 
     // Repeat-for: "for each [qty], " leading prefix (CR 608.2c: the instruction is
-    // followed as written, once per counted iteration).
-    if ctx.repeat_for.is_none() {
+    // followed as written, once per counted iteration). CR 102.2: "for each
+    // opponent, choose … that player controls" is a per-opponent choice, not a
+    // repeat count, and keeps its prefix.
+    if ctx.repeat_for.is_none()
+        && !super::oracle_effect::is_for_each_opponent_choose_controlled(&text.to_lowercase())
+    {
         let (qty, rest) = peel_for_each_prefix(&text);
         if qty.is_some() {
             ctx.repeat_for = qty;
@@ -469,8 +473,9 @@ fn is_specialized_duration_carrier(text_lower: &str) -> bool {
         value((), tag("they may cast ")),
         // CR 601.2f — "the next [type] spell you cast this turn ..."
         // next-spell limiter (cost reduction, keyword grant). The
-        // specialized parser at `oracle_effect/mod.rs:571` requires
-        // "this turn" to be present in the input.
+        // specialized parser `oracle_effect::try_parse_grant_next_spell_ability`
+        // requires "this turn" (via `parse_next_spell_subject`) to be present
+        // in the input.
         value((), tag("the next ")),
         // CR 305.2 — "play an additional land this turn" / "play <n> additional
         // lands this turn" (Escape to the Wilds). `try_parse_additional_land_this_turn`

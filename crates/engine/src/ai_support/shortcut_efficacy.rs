@@ -634,6 +634,13 @@ fn ability_window_reach(def: &AbilityDefinition) -> WindowReach {
         // Display strings only.
         description: _,
         target_prompt: _,
+        // Definition-local target identity; the walked effects carry the reads.
+        declares_chosen_group: _,
+        reads_chosen_group: _,
+        // The producer and reader are already walked through their effects;
+        // these IDs only bind an earlier instruction to the delayed body.
+        declares_return_result: _,
+        reads_return_result: _,
         // Activation gates: when, from which zone, with which mana, and under
         // which keyword this ability may be activated. NOT player-free, and the
         // earlier "no player reference" claim here was simply false: an
@@ -656,7 +663,16 @@ fn ability_window_reach(def: &AbilityDefinition) -> WindowReach {
         forward_result: _,
         target_selection_mode: _,
         sub_link: _,
+        target_reads: _, // TargetReadOrigin: which announcement `Target` reads name
         sibling_condition: _,
+        // Parser scratch, not runtime state: `parse_oracle_pipeline` settles every
+        // deferred guard verdict before it hands a tree out, so this is `None` on
+        // every tree that pipeline produces — which is every tree a runtime walker
+        // sees. (NOT a universal claim about the field: `parse_effect_chain` outside
+        // the pipeline leaves marks intact, and no runtime path reaches such a tree.
+        // See `types::ability::UnloweredGuard`.)
+        unlowered_guard: _,
+        face_down_in_exile: _,
     } = def;
 
     let mut acc = effect_window_reach(effect);
