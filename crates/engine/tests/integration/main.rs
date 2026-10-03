@@ -1346,6 +1346,7 @@ mod swallow_optional_you_may;
 mod swans_prevention_followup;
 mod swarm_combat_witness;
 mod tales_of_the_ancestors_catch_up_draw;
+mod talaras_battalion_cast_another;
 mod talon_gates_from_hand_activation;
 mod tap_cost_another_self_exclusion;
 mod target_choice_kind_7692;
