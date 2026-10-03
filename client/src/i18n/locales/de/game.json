@@ -808,6 +808,7 @@
     "titleTargets": "Ziele: {{targets}}",
     "titlePaid": "Bezahlt: {{paid}}",
     "titleContext": "Kontext: {{context}}",
+    "revealedCards": "Aufgedeckt: {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}} Mana",
     "paidColorsSpent": "{{count}} Farben",
@@ -1347,8 +1348,6 @@
     },
     "config": {
       "startingLife": "Startleben",
-      "experimentalDungeons": "Experimentelle Dungeons",
-      "experimentalDungeonsHelp": "Baldur's Gate Wilderness bei Dungeon-Optionen und Initiative anbieten. Experimentell und inoffiziell.",
       "players": "Spieler",
       "whoGoesFirst": "Wer beginnt",
       "firstPlayer": {
@@ -1384,6 +1383,7 @@
       "target": "Ziel",
       "return": "Zurückgeben",
       "discard": "Abwerfen",
+      "reveal": "Vorzeigen",
       "evidence": "Beweise",
       "manifest": "Manifestieren",
       "untap": "Enttappen",
@@ -2006,7 +2006,11 @@
   },
   "zoneOpponentChooser": {
     "title": "Gegner wählen",
-    "subtitle": "Wähle, welcher Gegner die Wahl trifft."
+    "subtitle": "Wähle, welcher Gegner die Wahl trifft.",
+    "orderTitle": "Nächsten Spieler wählen",
+    "orderSubtitle": "Wähle, für wen du als Nächstes auswählst.",
+    "substituteTitle": "Spieler wählen",
+    "substituteSubtitle": "Wähle, wer diese Wahl trifft."
   },
   "pileOpponent": {
     "title": "Choose Opponent",
@@ -2297,7 +2301,8 @@
       "zoneExile": "dem Exil",
       "zoneHand": "deiner Hand",
       "discard": "Wirf {{count}} {{cards}} ab",
-      "exile": "Schicke {{count}} {{cards}} aus {{zone}} ins Exil"
+      "exile": "Schicke {{count}} {{cards}} aus {{zone}} ins Exil",
+      "reveal": "Zeige {{count}} {{cards}} aus {{zone}} vor"
     }
   },
   "topOrBottom": {

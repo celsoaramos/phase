@@ -808,6 +808,7 @@
     "titleTargets": "Bersagli: {{targets}}",
     "titlePaid": "Pagato: {{paid}}",
     "titleContext": "Contesto: {{context}}",
+    "revealedCards": "Rivelata: {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}} mana",
     "paidColorsSpent": "{{count}} colori",
@@ -1347,8 +1348,6 @@
     },
     "config": {
       "startingLife": "Punti vita iniziali",
-      "experimentalDungeons": "Dungeon sperimentali",
-      "experimentalDungeonsHelp": "Offri Baldur's Gate Wilderness nelle opzioni del dungeon e quando prendi l'iniziativa. Sperimentale e non ufficiale.",
       "players": "Giocatori",
       "whoGoesFirst": "Chi inizia",
       "firstPlayer": {
@@ -1384,6 +1383,7 @@
       "target": "Bersaglio",
       "return": "Restituisci",
       "discard": "Scarta",
+      "reveal": "Rivela",
       "evidence": "Prove",
       "manifest": "Manifesta",
       "untap": "Stappa",
@@ -2006,7 +2006,11 @@
   },
   "zoneOpponentChooser": {
     "title": "Scegli avversario",
-    "subtitle": "Scegli quale avversario effettua la scelta."
+    "subtitle": "Scegli quale avversario effettua la scelta.",
+    "orderTitle": "Scegli il giocatore successivo",
+    "orderSubtitle": "Scegli per chi effettuare la prossima selezione.",
+    "substituteTitle": "Scegli giocatore",
+    "substituteSubtitle": "Scegli chi effettua questa scelta."
   },
   "pileOpponent": {
     "title": "Choose Opponent",
@@ -2297,7 +2301,8 @@
       "zoneExile": "l’esilio",
       "zoneHand": "la tua mano",
       "discard": "Scarta {{count}} {{cards}}",
-      "exile": "Esilia {{count}} {{cards}} da {{zone}}"
+      "exile": "Esilia {{count}} {{cards}} da {{zone}}",
+      "reveal": "Rivela {{count}} {{cards}} da {{zone}}"
     }
   },
   "topOrBottom": {

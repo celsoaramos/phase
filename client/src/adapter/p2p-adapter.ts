@@ -239,6 +239,9 @@ class NativeP2PBridge {
   private readonly pendingFaults = new Map<number, { id: number; revision: number; message: string }>();
   private gameCode: string | null = null;
   private fullKey: FullSessionKey | null = null;
+  /** Clients still in their pregame handshake; `dispose()` releases them. */
+  private readonly pending = new Set<WebSocketAdapter>();
+  private disposed = false;
 
   constructor(
     private readonly hostDeckData: DeckListPayload,
@@ -290,6 +293,8 @@ class NativeP2PBridge {
       },
     );
     const initialSlots = host.waitForPlayerSlots();
+    // `dispose()` can reject the slot wait while `attachClient` is still pending.
+    void initialSlots.catch(() => {});
     const attachment = await this.attachClient(host);
     await initialSlots;
     if (attachment.playerId !== 0) {
@@ -326,6 +331,8 @@ class NativeP2PBridge {
       },
     );
     const hostSlots = this.clientFor(0).waitForPlayerSlots();
+    // `dispose()` can reject the slot wait while `attachClient` is still pending.
+    void hostSlots.catch(() => {});
     const attachment = await this.attachClient(guest);
     await hostSlots;
     if (attachment.playerId !== p2pPlayerId) {
@@ -343,8 +350,11 @@ class NativeP2PBridge {
     const host = this.clientFor(0);
     const started = new Promise<NativeViewerUpdate>((resolve) => this.startWaiters.push(resolve));
     const waits = [...this.clients.values()].map((client) => client.waitForGameStarted());
+    const all = Promise.all(waits);
+    // `dispose()` can reject the waits while the Start round trip is still pending.
+    void all.catch(() => {});
     await host.sendSeatMutation({ type: "Start" });
-    await Promise.all(waits);
+    await all;
     const hostUpdate = await started;
     return { events: hostUpdate.events, log_entries: hostUpdate.logEntries };
   }
@@ -413,6 +423,8 @@ class NativeP2PBridge {
   }
 
   dispose(): void {
+    this.disposed = true;
+    for (const client of this.pending) client.dispose();
     for (const client of this.clients.values()) client.dispose();
     this.clients.clear();
     this.playerTokens.clear();
@@ -421,8 +433,14 @@ class NativeP2PBridge {
   }
 
   private async attachClient(client: WebSocketAdapter): Promise<NativeSessionAttachment> {
+    if (this.disposed) {
+      // `dispose()` already ran, so it will never release this client.
+      client.dispose();
+      throw new AdapterError("P2P_ERROR", "Native bridge disposed during attachment", true);
+    }
     client.onEvent((event) => {
       if (event.type === "sessionAttached") {
+        if (this.disposed) return;
         // Register the exact authenticated seat before GameStarted/reconnect
         // can release a local state frame. This membership is the barrier's
         // recipient set for every following revision.
@@ -465,7 +483,11 @@ class NativeP2PBridge {
         for (const resolve of this.startWaiters.splice(0)) resolve(hostUpdate);
       }
     });
-    const attachment = await client.initializePregame();
+    this.pending.add(client);
+    const attachment = await client.initializePregame().finally(() => this.pending.delete(client));
+    if (this.disposed) {
+      throw new AdapterError("P2P_ERROR", "Native bridge disposed during attachment", true);
+    }
     this.clients.set(attachment.playerId, client);
     this.playerTokens.set(attachment.playerId, attachment.playerToken);
     return attachment;
@@ -732,7 +754,6 @@ function defaultSeatState(playerCount: number, formatConfig?: FormatConfig): Sea
       default_deck_copy_limit: { type: "UpTo", data: 4 },
       uses_commander: false,
       allow_debug_actions: false,
-      allow_experimental_dungeons: false,
     },
     gameStarted: false,
   };
@@ -937,6 +958,8 @@ export class P2PHostAdapter implements EngineAdapter {
    * from already-eliminated guests without a WASM round-trip.
    */
   private eliminatedSeats = new Set<PlayerId>();
+  // Temporary admission fence, never persisted as gameplay elimination.
+  private concedingSeats = new Set<PlayerId>();
   private gameRunState: GameRunState = "running";
   /** Monotonic authority revision for WASM hosts; native hosts replace this
    * with the local phase-server's revision before fan-out. */
@@ -2411,6 +2434,9 @@ export class P2PHostAdapter implements EngineAdapter {
     if (!this.ownsAuthority()) {
       throw new AdapterError("P2P_ERROR", "Host session superseded", true);
     }
+    if (this.concedingSeats.has(actor)) {
+      throw new AdapterError("P2P_PAUSED", "Player departure is in progress", true);
+    }
     if (this.gameRunState !== "running") {
       throw new AdapterError(
         "P2P_PAUSED",
@@ -2435,6 +2461,9 @@ export class P2PHostAdapter implements EngineAdapter {
     this.assertNotDisposed();
     if (!this.ownsAuthority()) {
       throw new AdapterError("P2P_ERROR", "Host session superseded", true);
+    }
+    if (this.concedingSeats.has(actor)) {
+      throw new AdapterError("P2P_PAUSED", "Player departure is in progress", true);
     }
     if (this.gameRunState !== "running") {
       throw new AdapterError(
@@ -3044,7 +3073,8 @@ export class P2PHostAdapter implements EngineAdapter {
 
   async sendConcede(): Promise<void> {
     if (!this.ownsAuthority()) return;
-    await this.concedePlayer(0, "Host conceded", "conceded");
+    const outcome = await this.concedePlayer(0, "Host conceded", "conceded");
+    if (outcome !== "committed" && outcome !== "unknown") return;
     for (const [, s] of this.guestSessions) {
       void this.send(s, { type: "player_conceded", playerId: 0, reason: "Host conceded" });
     }
@@ -3088,6 +3118,7 @@ export class P2PHostAdapter implements EngineAdapter {
       if (timer !== null) clearTimeout(timer);
     }
     this.disconnectedSeats.clear();
+    this.concedingSeats.clear();
     for (const session of this.pendingReconnectSessions.values()) {
       session.close();
     }
@@ -3213,6 +3244,10 @@ export class P2PHostAdapter implements EngineAdapter {
     }
     if (msg.authority && !hasExactP2PAuthority(msg.authority, this.authority)) {
       if (session) this.rejectSuperseded(session);
+      return;
+    }
+    if (this.concedingSeats.has(pid) && (msg.type === "action" || msg.type === "interaction")) {
+      void this.send(sourceSession, { type: "action_failed", message: "Player departure is in progress" });
       return;
     }
     switch (msg.type) {
@@ -3407,7 +3442,8 @@ export class P2PHostAdapter implements EngineAdapter {
       case "concede": {
         // CR 104.3a: Any player may concede at any time. Route through the
         // engine action so the seat is properly eliminated (CR 800.4a).
-        await this.concedePlayer(pid, "Player conceded", "conceded");
+        const outcome = await this.concedePlayer(pid, "Player conceded", "conceded");
+        if (outcome !== "committed" && outcome !== "unknown") break;
         // Notify remaining guests with the "conceded" wire variant (not
         // "kicked") so their log entries read correctly.
         for (const [otherPid, s] of this.guestSessions) {
@@ -3567,6 +3603,12 @@ export class P2PHostAdapter implements EngineAdapter {
       return;
     }
 
+    if (this.concedingSeats.has(pid)) {
+      // A normal close permits retry with the same token after non-commit.
+      session.close("Player departure is in progress");
+      return;
+    }
+
     if (this.pendingReconnectSessions.has(pid)) {
       void this.send(session, { type: "reconnect_rejected", reason: "Reconnect already in progress" });
       session.close("Reconnect already in progress");
@@ -3606,8 +3648,8 @@ export class P2PHostAdapter implements EngineAdapter {
         this.failPendingReconnect(pid, session, "Reconnect acknowledgement could not be delivered");
         return;
       }
-      this.seedGuestEntry(pid, handoff.revision);
       if (this.pendingReconnectSessions.get(pid) !== session || !this.ownsAuthority()) return;
+      this.seedGuestEntry(pid, handoff.revision);
 
       if (this.deliveredNativeAiDriverFault !== null) {
         const faultDelivered = await this.send(session, {
@@ -3728,27 +3770,33 @@ export class P2PHostAdapter implements EngineAdapter {
     pid: PlayerId,
     reason: string,
     origin: "kick" | "conceded",
-  ): Promise<void> {
-    if (!this.ownsAuthority()) return;
-    // Cancel any active grace timer for this seat. `timer` may be null if the
-    // host already called `holdForReconnect`.
-    const grace = this.disconnectedSeats.get(pid);
-    if (grace) {
-      if (grace.timer !== null) clearTimeout(grace.timer);
-      this.disconnectedSeats.delete(pid);
-    }
-    this.closePendingReconnect(pid, "Player conceded");
-    // Remove the session for self-concede / grace-expiry paths. (The kick
-    // path removes its own session before calling concedePlayer so it can
-    // send the `kick` wire message first; double-deletion is a no-op here.)
-    const session = this.guestSessions.get(pid);
-    if (session) {
-      this.guestSessions.delete(pid);
-      try { session.close("Player conceded"); } catch { /* best-effort */ }
-    }
-    this.eliminatedSeats.add(pid);
-    this.saveSession();
+  ): Promise<"committed" | "definite_non_commit" | "unknown" | "in_progress" | "inactive"> {
+    if (this.disposed || !this.ownsAuthority()) return "inactive";
+    if (this.concedingSeats.has(pid)) return "in_progress";
+    this.concedingSeats.add(pid);
+    const retire = () => {
+      // Cancel any active grace timer for this seat. `timer` may be null if the
+      // host already called `holdForReconnect`.
+      const grace = this.disconnectedSeats.get(pid);
+      if (grace) {
+        if (grace.timer !== null) clearTimeout(grace.timer);
+        this.disconnectedSeats.delete(pid);
+      }
+      this.closePendingReconnect(pid, "Player conceded");
+      // Remove the session for self-concede / grace-expiry paths. (The kick
+      // path removes its own session before calling concedePlayer so it can
+      // send the `kick` wire message first; double-deletion is a no-op here.)
+      const session = this.guestSessions.get(pid);
+      if (session) {
+        this.guestSessions.delete(pid);
+        try { session.close("Player conceded"); } catch { /* best-effort */ }
+      }
+      this.eliminatedSeats.add(pid);
+      this.saveSession();
+    };
+    let committed = false;
     try {
+      this.closePendingReconnect(pid, "Player departure is in progress");
       const concedeAction = {
         type: "Concede",
         data: { player_id: pid },
@@ -3759,6 +3807,9 @@ export class P2PHostAdapter implements EngineAdapter {
       const transition = await this.applyBrowserMutation(() => this.nativeBridge
         ? this.nativeBridge.submitAction(concedeAction, pid)
         : this.wasm.submitAction(concedeAction, pid));
+      if (this.disposed || !this.ownsAuthority()) return "inactive";
+      committed = true;
+      retire();
       // Both host emissions precede the fan-out: the concession has applied,
       // and a guest link failure must not hide it from the host's own screen
       // (#7924). Order between them is unchanged — state, then the notice.
@@ -3772,10 +3823,29 @@ export class P2PHostAdapter implements EngineAdapter {
       await this.runAiLoop();
       void this.persistAuthoritativeState();
     } catch (err) {
+      if (this.disposed || !this.ownsAuthority()) return "inactive";
       console.error("[P2PHost] concedePlayer failed:", err);
+      if (!committed) {
+        if (
+          err instanceof AdapterError
+          && (
+            err.code === AdapterErrorCode.ACTION_NOT_SENT
+            || isActionRejection(err.rejection)
+          )
+        ) {
+          this.resumeIfUnblocked();
+          return "definite_non_commit";
+        }
+        // Preserve the pre-existing retirement policy for an unknown result;
+        // this slice cannot reconcile whether a sent Action committed.
+        retire();
+      }
+    } finally {
+      this.concedingSeats.delete(pid);
     }
     // A concession may clear the final outstanding reconnect reservation.
     this.resumeIfUnblocked();
+    return committed ? "committed" : "unknown";
   }
 
   // ────────────────────────────────────────────────────────────────────────
@@ -3788,6 +3858,7 @@ export class P2PHostAdapter implements EngineAdapter {
    */
   async kickPlayer(pid: PlayerId, reason: string = "Kicked by host"): Promise<void> {
     if (!this.ownsAuthority()) return;
+    if (this.concedingSeats.has(pid)) return;
     const token = this.playerTokens.get(pid);
     if (token) this.kickedTokens.add(token);
     this.closePendingReconnect(pid, "Kicked");
@@ -3804,7 +3875,8 @@ export class P2PHostAdapter implements EngineAdapter {
       try { session.close("Kicked"); } catch { /* best-effort */ }
       this.guestSessions.delete(pid);
     }
-    await this.concedePlayer(pid, reason, "kick");
+    const outcome = await this.concedePlayer(pid, reason, "kick");
+    if (outcome !== "committed" && outcome !== "unknown") return;
     // Broadcast kick to remaining guests (concedePlayer emits playerKicked
     // locally; remaining peers need the wire message).
     for (const [otherPid, s] of this.guestSessions) {
@@ -3820,7 +3892,8 @@ export class P2PHostAdapter implements EngineAdapter {
   async concedeDisconnected(pid: PlayerId): Promise<void> {
     if (!this.ownsAuthority()) return;
     const reason = "Host continued without reconnecting player";
-    await this.concedePlayer(pid, reason, "conceded");
+    const outcome = await this.concedePlayer(pid, reason, "conceded");
+    if (outcome !== "committed" && outcome !== "unknown") return;
     for (const [otherPid, s] of this.guestSessions) {
       if (otherPid === pid) continue;
       void this.send(s, { type: "player_conceded", playerId: pid, reason });

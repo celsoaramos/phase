@@ -808,6 +808,7 @@
     "titleTargets": "Objetivos: {{targets}}",
     "titlePaid": "Pagado: {{paid}}",
     "titleContext": "Contexto: {{context}}",
+    "revealedCards": "Revelada: {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}} de maná",
     "paidColorsSpent": "{{count}} colores",
@@ -1347,8 +1348,6 @@
     },
     "config": {
       "startingLife": "Vida inicial",
-      "experimentalDungeons": "Mazmorras experimentales",
-      "experimentalDungeonsHelp": "Ofrecer Baldur's Gate Wilderness en las opciones de mazmorra y al tomar la iniciativa. Experimental y no oficial.",
       "players": "Jugadores",
       "whoGoesFirst": "Quién empieza",
       "firstPlayer": {
@@ -1384,6 +1383,7 @@
       "target": "Objetivo",
       "return": "Devolver",
       "discard": "Descartar",
+      "reveal": "Mostrar",
       "evidence": "Prueba",
       "manifest": "Manifestar",
       "untap": "Enderezar",
@@ -2006,7 +2006,11 @@
   },
   "zoneOpponentChooser": {
     "title": "Elegir oponente",
-    "subtitle": "Elige qué oponente hace la elección."
+    "subtitle": "Elige qué oponente hace la elección.",
+    "orderTitle": "Elegir siguiente jugador",
+    "orderSubtitle": "Elige para quién harás la siguiente selección.",
+    "substituteTitle": "Elegir jugador",
+    "substituteSubtitle": "Elige quién hace esta elección."
   },
   "pileOpponent": {
     "title": "Choose Opponent",
@@ -2297,7 +2301,8 @@
       "zoneExile": "el exilio",
       "zoneHand": "tu mano",
       "discard": "Descarta {{count}} {{cards}}",
-      "exile": "Exilia {{count}} {{cards}} de {{zone}}"
+      "exile": "Exilia {{count}} {{cards}} de {{zone}}",
+      "reveal": "Muestra {{count}} {{cards}} de {{zone}}"
     }
   },
   "topOrBottom": {

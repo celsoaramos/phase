@@ -16,13 +16,13 @@ use crate::game::filter::{
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
     ActivationManaPaymentRestriction, ActivationRestriction, AdditionalCost, CardPlayMode,
-    CastTimingPermission, CastingPermission, CastingRestriction, ChoiceType, ChosenSubtypeKind,
-    ContinuousModification, ControllerRef, CostReduction, CounterSourceRider, DamageRedirectTarget,
-    DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp, GuardReading,
-    ManaProduction, ModalChoice, ParsedCondition, PlayerFilter, QuantityExpr, QuantityRef,
-    ReplacementDefinition, ReplacementMode, SolveCondition, SpellCastingOption, StaticCondition,
-    StaticDefinition, TapStateChange, TargetFilter, TriggerCondition, TriggerDefinition,
-    TypeFilter, TypedFilter, UnloweredGuard, VoteSubject,
+    CastManaSpentMetric, CastTimingPermission, CastingPermission, CastingRestriction, ChoiceType,
+    ChosenSubtypeKind, ContinuousModification, ControllerRef, CostReduction, CounterSourceRider,
+    DamageRedirectTarget, DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp,
+    GuardReading, ManaProduction, ModalChoice, ParsedCondition, PlayerFilter, QuantityExpr,
+    QuantityRef, ReplacementDefinition, ReplacementMode, SolveCondition, SpellCastingOption,
+    StaticCondition, StaticDefinition, TapStateChange, TargetFilter, TriggerCondition,
+    TriggerDefinition, TypeFilter, TypedFilter, UnloweredGuard, VoteSubject,
 };
 use crate::types::ability_visit::{visit_ability_def_scoped, ResolutionScope};
 use crate::types::card::DraftEffect;
@@ -33,7 +33,7 @@ use crate::types::mana::{ManaCost, ManaSpellGrant};
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 use crate::types::replacements::ReplacementEvent;
-use crate::types::statics::{CastFrequency, StaticMode};
+use crate::types::statics::{CastFrequency, GraveyardPermissionPool, StaticMode};
 use crate::types::triggers::TriggerMode;
 use crate::types::zones::Zone;
 
@@ -67,6 +67,9 @@ use super::oracle_condition::parse_restriction_condition;
 use super::oracle_cost::{parse_oracle_cost, parse_single_cost, try_parse_cost_reduction};
 use super::oracle_dispatch::{dispatch_line_nom, NomDispatchIr};
 use super::oracle_effect::gap_diagnosis;
+use super::oracle_effect::imperative::{
+    PREVENT_DEALT_BY_TARGET_GAP, PREVENT_RECIPIENT_TARGET_ROLE_GAP,
+};
 use super::oracle_effect::sequence::try_parse_same_is_true_continuation;
 use super::oracle_effect::{
     ability_chain_grants_chosen_color_keyword, lower_ability_ir, parse_ability_ir_standalone,
@@ -109,11 +112,12 @@ use super::oracle_modal::{
     strip_flavor_word_with_name, AnchorModeIr, OracleBlockIr, FLAVOR_WORD_COST_LABEL_MAX_WORDS,
 };
 use super::oracle_replacement::{
-    find_copy_verb_present, lower_as_enters_becomes_choice_modal,
+    find_copy_verb_present, is_as_self_enters_frame, lower_as_enters_becomes_choice_modal,
     lower_as_enters_or_face_up_counters, lower_replacement_ir,
-    parse_bidirectional_damage_prevention, parse_oneshot_damage_replacement,
-    parse_replacement_line, parse_replacement_line_ir, parse_whenever_you_cast_enters_with_outcome,
-    parse_windowed_graveyard_redirect_install, CastEntersWithOutcome,
+    parse_as_enters_one_shot_replacement, parse_bidirectional_damage_prevention,
+    parse_oneshot_damage_replacement, parse_replacement_line, parse_replacement_line_ir,
+    parse_whenever_you_cast_enters_with_outcome, parse_windowed_graveyard_redirect_install,
+    CastEntersWithOutcome,
 };
 use super::oracle_saga::{is_saga_chapter, parse_saga_chapters};
 use super::oracle_spacecraft::parse_spacecraft_threshold_lines;
@@ -514,6 +518,26 @@ fn try_parse_mulligan_time_ability(line: &str, lower: &str) -> Option<AbilityIr>
     ir.shell.optional = true;
     ir.shell.description = Some(line.to_string());
     Some(ir)
+}
+
+/// CR 614.1c + CR 603.6d: emit the "As ~ enters, <one-shot>" replacement for
+/// `line` when the gated arm accepts it. Shared by the two routing sites (the
+/// Priority-7 static-shaped reroute and the post-Priority-8 last resort).
+fn emit_as_enters_one_shot(
+    emitter: &mut DocEmitter<'_>,
+    item_line: usize,
+    line: &str,
+    card_name: &str,
+) -> bool {
+    let Some(definition) = parse_as_enters_one_shot_replacement(line, card_name) else {
+        return false;
+    };
+    emitter.emit_at(
+        item_line,
+        OracleNodeIr::Replacement(ReplacementIr::from_definition(line, definition)),
+        OuterRoute::Replacement,
+    );
+    true
 }
 
 fn try_parse_opening_hand_reveal_delayed_trigger(
@@ -1785,6 +1809,11 @@ fn quantity_ref_uses_filter_prop(qty: &QuantityRef, pred: &impl Fn(&FilterProp) 
         | QuantityRef::ControlledByEachPlayer { filter, .. }
         | QuantityRef::DistinctCounterKindsAmong { filter }
         | QuantityRef::EnteredThisTurn { filter }
+        | QuantityRef::SacrificedThisTurn { filter, .. }
+        | QuantityRef::ZoneChangeCountThisTurn { filter, .. }
+        | QuantityRef::ZoneChangeAggregateThisTurn { filter, .. }
+        | QuantityRef::CounterAddedThisTurn { target: filter, .. }
+        | QuantityRef::TokensCreatedThisTurn { filter, .. }
         // CR 608.2i: the look-back sibling carries a `TargetFilter` too, and this
         // predicate's question ("does any `TargetFilter` reachable from this
         // quantity use `pred`?") is variant-agnostic — so it must recurse rather
@@ -1792,10 +1821,36 @@ fn quantity_ref_uses_filter_prop(qty: &QuantityRef, pred: &impl Fn(&FilterProp) 
         | QuantityRef::BattlefieldEntriesThisTurn { filter, .. } => {
             target_filter_uses_filter_prop(filter, pred)
         }
+        QuantityRef::TargetObjectManaValue { filter }
+        | QuantityRef::FilteredTrackedSetSize { filter, .. } => {
+            target_filter_uses_filter_prop(filter, pred)
+        }
+        QuantityRef::ZoneCardCount { filter, .. }
+        | QuantityRef::SpellsCastThisTurn { filter, .. }
+        | QuantityRef::SpellsCastBeforeTriggeringSpell { filter, .. }
+        | QuantityRef::AttackedThisTurn { filter, .. }
+        | QuantityRef::SpellsCastThisGame { filter, .. } => filter
+            .as_ref()
+            .is_some_and(|filter| target_filter_uses_filter_prop(filter, pred)),
+        // CR 120.4: damage history has independent source and recipient filters;
+        // both are reachable from the quantity and must be inspected.
+        QuantityRef::DamageDealtThisTurn { source, target, .. } => {
+            target_filter_uses_filter_prop(source, pred)
+                || target_filter_uses_filter_prop(target, pred)
+        }
+        QuantityRef::ManaSpentToCast { metric, .. } => match metric {
+            CastManaSpentMetric::FromSource { source_filter } => {
+                target_filter_uses_filter_prop(source_filter, pred)
+            }
+            CastManaSpentMetric::Total
+            | CastManaSpentMetric::DistinctColors
+            | CastManaSpentMetric::OfColor { .. } => false,
+        },
         // CR 109.2: the three distinct-characteristic counts embed their filters
         // through the shared population enum; recurse over it so a union member
         // or a journal's narrowing filter is not dropped.
         QuantityRef::DistinctCardTypes { source }
+        | QuantityRef::SharedCardTypes { source }
         | QuantityRef::DistinctSubtypes { source, .. }
         | QuantityRef::DistinctColorsAmong { source } => {
             characteristic_source_uses_filter_prop(source, pred)
@@ -1803,7 +1858,73 @@ fn quantity_ref_uses_filter_prop(qty: &QuantityRef, pred: &impl Fn(&FilterProp) 
         QuantityRef::PropertyAggregate(aggregate) => {
             characteristic_source_uses_filter_prop(aggregate.source(), pred)
         }
-        _ => false,
+        QuantityRef::PlayerCount { filter } | QuantityRef::EventContextPlayerCount { filter } => {
+            player_filter_uses_filter_prop(filter, pred)
+        }
+        QuantityRef::HandSize { .. }
+        | QuantityRef::LifeTotal { .. }
+        | QuantityRef::GraveyardSize { .. }
+        | QuantityRef::LifeAboveStarting
+        | QuantityRef::StartingLifeTotal { .. }
+        | QuantityRef::TriggeringDiscoverValue
+        | QuantityRef::TriggeringScryLookCount
+        | QuantityRef::TriggeringScryBottomCount
+        | QuantityRef::CountersOn { .. }
+        | QuantityRef::PlayerCounter { .. }
+        | QuantityRef::TargetControllerCounter { .. }
+        | QuantityRef::Variable { .. }
+        | QuantityRef::Power { .. }
+        | QuantityRef::BasePower { .. }
+        | QuantityRef::Intensity { .. }
+        | QuantityRef::Toughness { .. }
+        | QuantityRef::ObjectManaValue { .. }
+        | QuantityRef::ObjectColorCount { .. }
+        | QuantityRef::ObjectNameWordCount { .. }
+        | QuantityRef::NameStickerLetterCount { .. }
+        | QuantityRef::ObjectTypelineComponentCount { .. }
+        | QuantityRef::ManaSymbolsInManaCost { .. }
+        | QuantityRef::SelfManaValue
+        | QuantityRef::TargetZoneCardCount { .. }
+        | QuantityRef::Devotion { .. }
+        | QuantityRef::CardsExiledBySource
+        | QuantityRef::ExiledCardPower { .. }
+        | QuantityRef::BasicLandTypeCount { .. }
+        | QuantityRef::TrackedSetSize
+        | QuantityRef::ExiledFromHandThisResolution
+        | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousEffectCount
+        | QuantityRef::LifeLostThisTurn { .. }
+        | QuantityRef::PartySize { .. }
+        | QuantityRef::UnspentMana { .. }
+        | QuantityRef::Speed { .. }
+        | QuantityRef::AttachmentsOnLeavingObject { .. }
+        | QuantityRef::EventContextAmount
+        | QuantityRef::EventContextSourceCostX
+        | QuantityRef::EventContextSourceModesChosen
+        | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::BendTypesThisTurn
+        | QuantityRef::LifeGainedThisTurn { .. }
+        | QuantityRef::CardsDrawnThisTurn { .. }
+        | QuantityRef::LandsPlayedThisTurn { .. }
+        | QuantityRef::TurnsTaken
+        | QuantityRef::ChosenNumber
+        | QuantityRef::PlayerChosenNumber { .. }
+        | QuantityRef::DescendedThisTurn
+        | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
+        | QuantityRef::SpellsCastLastTurn
+        | QuantityRef::CardsDiscardedThisTurn { .. }
+        | QuantityRef::PlayerActionsThisTurn { .. }
+        | QuantityRef::DungeonsCompleted
+        | QuantityRef::CostXPaid
+        | QuantityRef::KickerCount
+        | QuantityRef::AdditionalCostPaymentCount
+        | QuantityRef::AdditionalCostPaymentCountFor { .. }
+        | QuantityRef::ConvokedCreatureCount
+        | QuantityRef::TimesCostPaidThisResolution
+        | QuantityRef::ColorsInCommandersColorIdentity
+        | QuantityRef::CommanderCastFromCommandZoneCount
+        | QuantityRef::CommanderManaValue { .. }
+        | QuantityRef::VoteCount { .. } => false,
     }
 }
 
@@ -1837,6 +1958,52 @@ fn characteristic_source_uses_filter_prop(
     // A truncated walk claims the prop: this feeds parse-time capability
     // reporting, where over-reporting a dependency is the harmless direction.
     found || !complete
+}
+
+/// CR 109.4 + CR 608.2c: Player-level quantity filters can cross back into
+/// object filters and quantity expressions. Preserve chosen-property
+/// dependencies through both arms of a nested player predicate.
+fn player_filter_uses_filter_prop(
+    filter: &PlayerFilter,
+    pred: &impl Fn(&FilterProp) -> bool,
+) -> bool {
+    match filter {
+        PlayerFilter::OpponentDealtDamage { source, .. } => source
+            .as_deref()
+            .is_some_and(|source| target_filter_uses_filter_prop(source, pred)),
+        PlayerFilter::ControlsCount { filter, count, .. } => {
+            target_filter_uses_filter_prop(filter, pred)
+                || quantity_expr_uses_filter_prop(count, pred)
+        }
+        PlayerFilter::PlayerAttribute { attr, value, .. } => {
+            quantity_ref_uses_filter_prop(attr, pred) || quantity_expr_uses_filter_prop(value, pred)
+        }
+        PlayerFilter::TrackedSetPossessor { filter, .. } => {
+            target_filter_uses_filter_prop(filter, pred)
+        }
+        PlayerFilter::AllExcept { exclude } => player_filter_uses_filter_prop(exclude, pred),
+        PlayerFilter::Controller
+        | PlayerFilter::Opponent
+        | PlayerFilter::DefendingPlayer
+        | PlayerFilter::OpponentLostLife
+        | PlayerFilter::OpponentGainedLife
+        | PlayerFilter::HasLostTheGame
+        | PlayerFilter::OpponentAttacked { .. }
+        | PlayerFilter::OpponentAttackingEnchantedPlayer
+        | PlayerFilter::All
+        | PlayerFilter::HighestSpeed
+        | PlayerFilter::ZoneChangedThisWay
+        | PlayerFilter::PerformedActionThisWay { .. }
+        | PlayerFilter::OwnersOfCardsExiledBySource
+        | PlayerFilter::TriggeringPlayer
+        | PlayerFilter::OpponentOtherThanTriggering
+        | PlayerFilter::OpponentOfTriggeringPlayer
+        | PlayerFilter::OpponentOfTriggeringPlayerNotAttacked
+        | PlayerFilter::VotedFor { .. }
+        | PlayerFilter::ParentObjectTargetController
+        | PlayerFilter::ChosenPlayer { .. }
+        | PlayerFilter::ParentObjectTargetOwner => false,
+    }
 }
 
 fn target_filter_uses_filter_prop(
@@ -2325,6 +2492,18 @@ fn deliver_coordinated_graveyard_permission_in_ability(def: &mut AbilityDefiniti
             .as_deref()
             .filter(|_| sentence_is_fully_modelled)
             .and_then(|sub| match &*sub.effect {
+                // CR 601.3 + CR 611.2c: "cast spells from your graveyard" now
+                // lowers on its own to the graveyard permission
+                // (`oracle_effect::try_parse_class_wide_graveyard_cast_grant`);
+                // widen that grant to the land half as well. Only a plain grant
+                // is widened: a rider already folded into it would be lost.
+                effect @ Effect::GenericEffect {
+                    duration: Some(window),
+                    ..
+                } => plain_own_graveyard_cast_grant_filter(effect).and_then(|target| {
+                    coordinated_graveyard_permission(target)
+                        .map(|permission| (window.clone(), permission))
+                }),
                 Effect::CastFromZone {
                     target, duration, ..
                 } => duration
@@ -2341,21 +2520,12 @@ fn deliver_coordinated_graveyard_permission_in_ability(def: &mut AbilityDefiniti
                     .and_then(|window| {
                         coordinated_graveyard_permission(target)
                             .map(|permission| (window.clone(), permission))
-                    })
-                    .map(|(window, permission)| Effect::GenericEffect {
-                        static_abilities: vec![StaticDefinition::continuous()
-                            .affected(TargetFilter::Controller)
-                            .modifications(vec![ContinuousModification::GrantStaticAbility {
-                                definition: Box::new(permission),
-                            }])],
-                        // CR 611.2a: one stated window scopes both halves;
-                        // `layers::prune_end_of_turn_effects` ends it at cleanup
-                        // (CR 514.2).
-                        duration: Some(window),
-                        target: Some(TargetFilter::Controller),
-                        end_cost: None,
                     }),
                 _ => None,
+            })
+            // CR 611.2a: one stated window scopes both halves.
+            .map(|(window, permission)| {
+                crate::parser::oracle_effect::graveyard_permission_grant(permission, Some(window))
             });
 
         if let Some(effect) = recovered {
@@ -2437,6 +2607,38 @@ fn parse_graveyard_anchor_sentence_tail(input: &str) -> OracleResult<'_, &str> {
     take_till(|c: char| c == '.').parse(rest)
 }
 
+/// CR 601.3: the card filter of a plain "cast <class> spells from your
+/// graveyard" permission grant — unlimited, cast-only, own graveyard, no rider —
+/// or `None` for any other effect.
+fn plain_own_graveyard_cast_grant_filter(effect: &Effect) -> Option<&TargetFilter> {
+    if !crate::parser::oracle_ir::ast::is_graveyard_permission_grant(effect) {
+        return None;
+    }
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = effect
+    else {
+        return None;
+    };
+    let [ContinuousModification::GrantStaticAbility { definition }] =
+        static_abilities.first()?.modifications.as_slice()
+    else {
+        return None;
+    };
+    match &definition.mode {
+        StaticMode::GraveyardCastPermission {
+            frequency: CastFrequency::Unlimited,
+            play_mode: CardPlayMode::Cast,
+            graveyard_destination_replacement: None,
+            extra_cost: None,
+            enters_with_counter: None,
+            required_cast_keyword: None,
+            pool: GraveyardPermissionPool::OwnGraveyard,
+        } => definition.affected.as_ref(),
+        _ => None,
+    }
+}
+
 /// CR 116.2a + CR 601.2a: build the two-part permission from the cast half of the
 /// sentence -- the land axis and the card axis under ONE grant, because the
 /// printed sentence is one permission naming two actions.
@@ -2494,6 +2696,7 @@ fn coordinated_graveyard_permission(cast_target: &TargetFilter) -> Option<Static
             extra_cost: None,
             enters_with_counter: None,
             required_cast_keyword: None,
+            pool: GraveyardPermissionPool::OwnGraveyard,
         })
         // CR 611.2c: class-wide and re-evaluated live, so cards that reach the
         // graveyard later this turn are covered.
@@ -6777,6 +6980,19 @@ fn parse_normalized_oracle_ir(
                     i += 1;
                     continue;
                 }
+            } else if is_as_self_enters_frame(&lower) {
+                // CR 614.1c + CR 603.6d: "As ~ enters, <one-shot>" is a
+                // replacement effect. Static-shaped frame lines — Tibalt's quoted
+                // "you may spend mana as though" — would otherwise be claimed by
+                // the static parser. This site runs before Priority 8, so it also
+                // sees static-shaped frame lines that a Priority-8 arm claims
+                // (Thief of Blood, Arsenal Thresher). The gate declines those, and
+                // on `None` the line falls through to the static parser and then
+                // to Priority 8, exactly as before.
+                if emit_as_enters_one_shot(&mut emitter, item_line, &line, card_name) {
+                    i += 1;
+                    continue;
+                }
             }
             // Guard: ability-word-prefixed trigger lines (e.g., "Flurry — Whenever...")
             // handled above at Priority 6b. The check below is kept as a defensive
@@ -6938,6 +7154,7 @@ fn parse_normalized_oracle_ir(
                     amount: PreventionAmount::All,
                     amount_dynamic: None,
                     target: TargetFilter::Any,
+                    recipient_scope: EffectScope::Single,
                     scope: PreventionScope::AllDamage,
                     damage_source_filter: Some(TargetFilter::Typed(source_filter)),
                     prevention_duration: None,
@@ -6994,7 +7211,14 @@ fn parse_normalized_oracle_ir(
             // again in `ability_ir_at` repeats one computation rather than
             // performing two different ones.
             let ir = parse_ability_ir_with_context(&line, AbilityKind::Spell, &mut ctx);
-            if !has_unimplemented(&lower_ability_ir(&ir)) {
+            let lowered = lower_ability_ir(&ir);
+            // A prevention with a target role this route cannot bind faithfully
+            // stays here as its gap: falling through would let Priority 8 read it
+            // as a blanket, card-wide prevention replacement.
+            let is_held_prevent_gap = any_unimplemented(&lowered, &|name| {
+                name == PREVENT_DEALT_BY_TARGET_GAP || name == PREVENT_RECIPIENT_TARGET_ROLE_GAP
+            });
+            if !has_unimplemented(&lowered) || is_held_prevent_gap {
                 emitter.ability_ir_at(item_line, ir);
                 i += 1;
                 continue;
@@ -7191,6 +7415,16 @@ fn parse_normalized_oracle_ir(
                 i += 1;
                 continue;
             }
+        }
+
+        // CR 614.1c: replacement-tier last resort for "As ~ enters, <one-shot>"
+        // frame lines no earlier route claimed; runs after Priority 8 so every
+        // specific as-enters arm keeps its lines.
+        if is_as_self_enters_frame(&lower)
+            && emit_as_enters_one_shot(&mut emitter, item_line, &line, card_name)
+        {
+            i += 1;
+            continue;
         }
 
         if let Some(def) = try_parse_opening_hand_reveal_delayed_trigger(&line, &lower) {
@@ -12056,7 +12290,14 @@ pub(super) fn lower_unsupported_node(
 /// and wildcard-free, a newly added definition-carrying `Effect` variant is now
 /// a compile error there rather than a silent miss here.
 pub(super) fn has_unimplemented(def: &AbilityDefinition) -> bool {
-    if matches!(*def.effect, Effect::Unimplemented { .. }) {
+    any_unimplemented(def, &|_| true)
+}
+
+/// True when any `Effect::Unimplemented` reachable from `def` (root, nested
+/// definitions, `sub_ability`, `else_ability`) has a gap `name` accepted by
+/// `matches_name`. `has_unimplemented` is the accept-everything instance.
+fn any_unimplemented(def: &AbilityDefinition, matches_name: &dyn Fn(&str) -> bool) -> bool {
+    if matches!(&*def.effect, Effect::Unimplemented { name, .. } if matches_name(name)) {
         return true;
     }
     // `||` rather than `|=`: once a nested failure is found the remaining
@@ -12064,11 +12305,18 @@ pub(super) fn has_unimplemented(def: &AbilityDefinition) -> bool {
     // walk the `.any()`/`||` chain it replaced was.
     let mut nested_has_unimplemented = false;
     def.effect.for_each_nested_definition(&mut |_, nested| {
-        nested_has_unimplemented = nested_has_unimplemented || has_unimplemented(nested);
+        nested_has_unimplemented =
+            nested_has_unimplemented || any_unimplemented(nested, matches_name);
     });
     nested_has_unimplemented
-        || def.sub_ability.as_deref().is_some_and(has_unimplemented)
-        || def.else_ability.as_deref().is_some_and(has_unimplemented)
+        || def
+            .sub_ability
+            .as_deref()
+            .is_some_and(|d| any_unimplemented(d, matches_name))
+        || def
+            .else_ability
+            .as_deref()
+            .is_some_and(|d| any_unimplemented(d, matches_name))
 }
 
 /// Parse an activated-ability effect chain with self-reference fallback.

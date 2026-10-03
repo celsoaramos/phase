@@ -2,7 +2,7 @@ use crate::types::ability::{
     cost_paid_object_snapshot_ids_eq, AbilityKind, ContinuousModification, CopyCountStatus,
     DetachedRemainder, Duration, Effect, EffectKind, KeywordAction, PlayerFilter, QuantityExpr,
     ResolvedAbility, SiblingCondition, SpellContext, SubAbilityLink, TargetChoiceTiming,
-    TargetFilter, TargetRef, TargetSelectionMode, TriggerCondition,
+    TargetFilter, TargetReadOrigin, TargetRef, TargetSelectionMode, TriggerCondition,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterType;
@@ -15,7 +15,7 @@ use crate::types::game_state::{
     StackEntry, StackEntryKind, StackPaidSnapshot, StackResolutionPolicy, TriggerSourceContext,
     WaitingFor,
 };
-use crate::types::identifiers::{ObjectId, TriggerFiring};
+use crate::types::identifiers::{ObjectId, ObjectIncarnationRef, TriggerFiring};
 use crate::types::player::PlayerId;
 use crate::types::resolved_commands::{
     ResolvedStackEntryFinalizeCommand, ResolvedStackEntryFinalizeReplayInvariantError,
@@ -25,29 +25,42 @@ use crate::types::resolved_commands::{
     ResolvedUncommittedTriggerRemovalReplayInvariantError,
 };
 use crate::types::zones::Zone;
+use std::collections::BTreeMap;
 
 use super::ability_utils::{
-    build_target_slots, flatten_specified_targets_in_chain, flatten_targets_in_chain,
-    illegal_declared_target_slots, validate_targets_in_chain,
+    build_target_slots, clear_illegal_local_target_slots, flatten_specified_targets_in_chain,
+    flatten_targets_in_chain, illegal_declared_target_slots, validate_targets_in_chain,
 };
 use super::effects;
 use super::targeting;
 use super::zone_pipeline::{self, ZoneMoveRequest, ZoneMoveResult};
 
+/// A second carrier cannot begin while one is installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ResolutionCarrierError {
+    #[error("a resolution carrier is already installed")]
+    AlreadyResolving,
+}
+
 /// Transfers an already-popped stack entry into the active resolution carrier.
+///
+/// CR 608.2: Exactly one stack object resolves at a time. Refuses, leaving the
+/// installed carrier and its firing untouched, when one is already resolving.
 pub(super) fn begin_resolving_stack_entry(
     state: &mut GameState,
     entry: StackEntry,
     firing: Option<TriggerFiring>,
-) {
-    debug_assert!(state.resolving_stack_entry.is_none());
-    debug_assert!(state.resolving_trigger_firing.is_none());
+) -> Result<(), ResolutionCarrierError> {
+    if state.resolving_stack_entry.is_some() || state.resolving_trigger_firing.is_some() {
+        return Err(ResolutionCarrierError::AlreadyResolving);
+    }
     debug_assert_eq!(
         matches!(&entry.kind, StackEntryKind::TriggeredAbility { .. }),
         firing.is_some()
     );
     state.resolving_stack_entry = Some(entry);
     state.resolving_trigger_firing = firing;
+    Ok(())
 }
 
 /// Settles the active resolution carrier after its owning resolution completes.
@@ -84,7 +97,7 @@ pub(super) fn finish_resolving_stack_entry(
 /// reads here as a pruned slot. No printed card combines that re-seeding with
 /// a `ParentTargetSlot` consumer; writing the seeded copy back into the carrier
 /// would make the two agree.
-fn record_illegal_target_slots(state: &mut GameState, validated: Option<&ResolvedAbility>) {
+fn record_illegal_target_slots(state: &mut GameState, validated: Option<&mut ResolvedAbility>) {
     if let Some(root) = state
         .resolving_stack_entry
         .as_mut()
@@ -537,6 +550,11 @@ fn remove_stack_entry_at_unobserved(
             cause,
         })
         .expect("resolved stack removal must have a live journal cause");
+    // CR 701.20a: a triggered ability caused by revealing a card keeps that
+    // card revealed only until it leaves the stack — resolved, countered,
+    // fizzled, or drained. The release is its own journaled information edit,
+    // so replay applies it after this removal without re-deriving it.
+    state.release_stack_bound_reveals(entry.id);
 
     Some(PoppedStackEntry {
         entry,
@@ -731,6 +749,11 @@ pub(super) fn pop_uncommitted_pending_trigger_entry(
         .resolved_rules_journal
         .record_uncommitted_trigger_removal(command)
         .expect("resolved uncommitted trigger removal must have a live journal cause");
+    // CR 603.3d + CR 701.20a: only an ability actually removed from the stack
+    // ends its reveal lease; a cursor consumed without a pop leaves nothing.
+    if let Some(removed) = removed.as_ref() {
+        state.release_stack_bound_reveals(removed.entry.id);
+    }
     if let Some(firing) = removed.and_then(|removed| removed.trigger_firing) {
         super::lifecycle::record_delayed_terminal(firing, disposition);
     }
@@ -1455,12 +1478,17 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // begin resolving. A parked continuation remains live and therefore still
     // fails the invariant below rather than being silently cleared.
     super::engine::settle_resolving_stack_entry_after_continuation_resume(state);
-    // CR 707.10: A prior resolution must have settled before another stack
-    // object can begin resolving. A parked continuation owns its carrier until
-    // its own completion or abort path; silently clearing it here would lose a
-    // receipt-eligible delayed firing.
-    debug_assert!(state.resolving_stack_entry.is_none());
-    debug_assert!(state.resolving_trigger_firing.is_none());
+    // CR 608.2c + CR 608.2m: A prior resolution must finish its instructions
+    // before another stack object begins resolving. A parked continuation owns
+    // its carrier until its own completion or abort path; silently clearing it here would
+    // lose a receipt-eligible delayed firing. This holds in release builds too:
+    // with a live carrier the top entry stays on the stack and nothing begins.
+    if state.resolving_stack_entry.is_some() || state.resolving_trigger_firing.is_some() {
+        tracing::error!(
+            "resolve_top refused: a resolution carrier is still installed; the stack top was not popped"
+        );
+        return;
+    }
     // CR 400.7j: the self-move re-latch is resolution-scoped; clear it alongside
     // `resolving_stack_entry` so it never leaks into the next resolution.
     state.resolution_source_relatch = None;
@@ -1469,6 +1497,15 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // republished below for an `ActivatedAbility` entry (and only for that kind).
     state.announced_source_x = None;
     state.turn_up_paid_cost_source = None;
+    // CR 608.2c + CR 608.2h: the "that many" counts an instruction stamps are
+    // resolution-local — a later instruction of THIS resolution reads them, and no
+    // other stack object may. One player action can resolve several stack objects
+    // in a row, so clear them here, before this object begins resolving, rather
+    // than only once per action in `apply()`. A CR 615.5 prevention/replacement
+    // rider reads its stamped amount synchronously, inside the event or resolution
+    // that stamped it, and never passes through here.
+    state.last_effect_count = None;
+    state.last_effect_counts_by_player.clear();
 
     // CR 405.5: When all players pass in succession, the top object on the stack resolves.
     let Some(PoppedStackEntry {
@@ -1482,7 +1519,8 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
     };
     // CR 603.4 + CR 608.2b: transfer the exact firing before any branch can
     // abort, resolve, or park this popped triggered ability.
-    begin_resolving_stack_entry(state, entry.clone(), trigger_firing);
+    begin_resolving_stack_entry(state, entry.clone(), trigger_firing)
+        .expect("the carrier slot was checked empty before popping");
 
     // CR 113.3b: Activated keyword abilities (Equip / Crew / Saddle / Station)
     // resolve via their typed payload — they have no ResolvedAbility/targets
@@ -1799,7 +1837,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // Only run targeting validation and effect execution when an ability exists.
     // Permanent spells with no spell ability (ability is None) skip straight to
     // zone-change handling below.
-    if let Some(ref ability) = ability {
+    if let Some(ability) = ability.as_mut() {
         // CR 608.2b + CR 115.10a: count only the targets the spell SPECIFIED, not
         // anaphoric snapshots an inheriting rider carries — see
         // `flatten_specified_targets_in_chain`. BOTH sides use it: an all-anaphoric
@@ -1826,7 +1864,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
             && !bestow_reverted_at_resolution
             && !mutate_reverted_at_resolution
         {
-            let validated = validate_targets_in_chain(state, ability);
+            let mut validated = validate_targets_in_chain(state, ability);
             let legal_targets = flatten_specified_targets_in_chain(&validated);
             if targeting::check_fizzle(&original_targets, &legal_targets) {
                 // CR 608.2b: Fizzle — all targets illegal, spell is countered on resolution.
@@ -1882,10 +1920,12 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                 state.resolution_source_relatch = None;
                 return;
             }
-            record_illegal_target_slots(state, Some(&validated));
+            record_illegal_target_slots(state, Some(&mut validated));
+            let _ = illegal_declared_target_slots(ability, &mut validated);
             execute_effect(state, &validated, events);
         } else {
             record_illegal_target_slots(state, None);
+            clear_illegal_local_target_slots(ability);
             execute_effect(state, ability, events);
         }
     }
@@ -2182,12 +2222,16 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                     *enter_tapped = crate::types::proposed_event::EtbTapState::Tapped;
                 }
             }
-            // CR 712.14a + CR 310.12b: If this spell was finalized from an
-            // ExileWithAltCost permission with `cast_transformed`, the permanent
-            // enters the battlefield transformed (resolving to its back face).
-            // The finalized stack-paid snapshot is authoritative here; the
-            // mutable permission list is casting-time authorization, not
-            // resolution-time cast metadata.
+            // CR 712.8c + CR 712.11a + CR 712.13 + CR 310.12b: if this spell was
+            // finalized from an ExileWithAltCost permission with
+            // `cast_transformed`, the permanent enters the battlefield
+            // transformed (resolving to its back face) — a spell cast
+            // transformed has its back face up with only its back face's
+            // characteristics and resolves onto the battlefield with that face
+            // up; the engine keeps the front face up on the stack and swaps to
+            // the back face at entry. The finalized stack-paid snapshot is
+            // authoritative here; the mutable permission list is casting-time
+            // authorization, not resolution-time cast metadata.
             if let Some(obj) = state.objects.get(&entry.id) {
                 // CR 107.3m + CR 707.10: a resolving copied spell has no new
                 // payment snapshot, but inherits the original spell's chosen
@@ -2214,17 +2258,22 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                 // the ZoneChange ProposedEvent so Doubling-Season-class
                 // AddCounter replacements (CR 614.1a) see and modify them as
                 // the replacement pipeline runs.
-                // CR 712.14a: For cast_transformed (Craft / ExileWithAltCost) the
-                // spell is on the stack with the front face but enters as the back
-                // face — read loyalty/defense from the back face directly so the
-                // replacement pipeline sees the correct counter count.
+                // CR 712.8c + CR 712.11a + CR 712.13: for cast_transformed (Craft /
+                // ExileWithAltCost / a Siege's victory cast), a spell cast
+                // transformed has its back face up with only its back face's
+                // characteristics and resolves onto the battlefield with that
+                // face up; the engine keeps the front face up on the stack and
+                // swaps to the back face at entry — read loyalty/defense from
+                // the back face directly so the replacement pipeline sees the
+                // correct counter count. Lore is not seeded — the back face's
+                // own CR 714.3a replacement applies through the CR 614.12
+                // projection (`replacement::stage_transformed_entry_projection`).
                 let intrinsic = match (cast_transformed, obj.back_face.as_ref()) {
-                    (true, Some(back)) => super::printed_cards::intrinsic_entry_counters_for_face(
+                    (true, Some(back)) => super::printed_cards::intrinsic_face_entry_counters(
                         back.printed_loyalty,
                         back.loyalty,
                         resolving_spell_x,
                         back.defense,
-                        &back.card_types,
                     ),
                     _ => super::printed_cards::intrinsic_etb_counters(obj, resolving_spell_x),
                 };
@@ -3785,6 +3834,7 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
         activation_cost_reduction: _,
         activation_record: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp; batch candidacy is shape-only
+        illegal_local_target_slots: _, // CR 608.2b node-local legality stamp; batch candidacy is shape-only
         controller: _,
         original_controller,
         scoped_player,
@@ -3830,6 +3880,7 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
         repeat_until,
         replacement_applied: _,
         sub_link,
+        target_reads,
         sibling_condition,
         modal,
         mode_abilities,
@@ -3919,6 +3970,7 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
         && chosen_players.is_empty()
         && repeat_until.is_none()
         && *sub_link == SubAbilityLink::ContinuationStep
+        && *target_reads == TargetReadOrigin::OwnAnnouncement
         // CR 702.1c ("the same is true") + CR 608.2c (written order): a
         // `ReplicatedOrBranch` per-item keyword-list sibling (Mutable Pupa,
         // Kathril) is not the vanilla batchable shape this proof
@@ -4026,6 +4078,7 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
         activation_cost_reduction: _,
         activation_record: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp; batch candidacy is shape-only
+        illegal_local_target_slots: _, // CR 608.2b node-local legality stamp; batch candidacy is shape-only
         controller: _,
         original_controller: _,
         scoped_player,
@@ -4071,6 +4124,7 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
         repeat_until,
         replacement_applied: _,
         sub_link,
+        target_reads,
         sibling_condition,
         modal,
         mode_abilities,
@@ -4138,6 +4192,7 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
         && chosen_players.is_empty()
         && repeat_until.is_none()
         && *sub_link == SubAbilityLink::ContinuationStep
+        && *target_reads == TargetReadOrigin::OwnAnnouncement
         // CR 702.1c ("the same is true") + CR 608.2c (written order): a
         // `ReplicatedOrBranch` per-item keyword-list sibling (Mutable Pupa,
         // Kathril) is not the vanilla batchable shape this proof
@@ -4247,6 +4302,7 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
         activation_cost_reduction: _,
         activation_record: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp; batch candidacy is shape-only
+        illegal_local_target_slots: _, // CR 608.2b node-local legality stamp; batch candidacy is shape-only
         controller: _,
         original_controller: _,
         scoped_player,
@@ -4292,6 +4348,7 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
         repeat_until,
         replacement_applied: _,
         sub_link,
+        target_reads,
         sibling_condition,
         modal,
         mode_abilities,
@@ -4363,6 +4420,7 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
         && chosen_players.is_empty()
         && repeat_until.is_none()
         && *sub_link == SubAbilityLink::ContinuationStep
+        && *target_reads == TargetReadOrigin::OwnAnnouncement
         // CR 702.1c ("the same is true") + CR 608.2c (written order): a
         // `ReplicatedOrBranch` per-item keyword-list sibling (Mutable Pupa,
         // Kathril) is not the vanilla batchable shape this proof
@@ -4782,6 +4840,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         repeat_until: a_repeat_until,
         replacement_applied: a_replacement_applied,
         sub_link: a_sub_link,
+        target_reads: a_target_reads,
         sibling_condition: a_sibling_condition,
         modal: a_modal,
         mode_abilities: a_mode_abilities,
@@ -4790,6 +4849,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         activation_cost_reduction: a_activation_cost_reduction,
         activation_record: a_activation_record,
         illegal_target_slots: a_illegal_target_slots,
+        illegal_local_target_slots: a_illegal_local_target_slots,
     } = a;
     let ResolvedAbility {
         effect: b_effect,
@@ -4862,6 +4922,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         repeat_until: b_repeat_until,
         replacement_applied: b_replacement_applied,
         sub_link: b_sub_link,
+        target_reads: b_target_reads,
         sibling_condition: b_sibling_condition,
         modal: b_modal,
         mode_abilities: b_mode_abilities,
@@ -4870,6 +4931,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         activation_cost_reduction: b_activation_cost_reduction,
         activation_record: b_activation_record,
         illegal_target_slots: b_illegal_target_slots,
+        illegal_local_target_slots: b_illegal_local_target_slots,
     } = b;
 
     a_effect == b_effect
@@ -4890,6 +4952,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         && a_activation_cost_reduction == b_activation_cost_reduction
         && a_activation_record == b_activation_record
         && a_illegal_target_slots == b_illegal_target_slots
+        && a_illegal_local_target_slots == b_illegal_local_target_slots
         && a_controller == b_controller
         && a_scoped_player == b_scoped_player
         && a_kind == b_kind
@@ -4949,6 +5012,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         && a_repeat_until == b_repeat_until
         && a_replacement_applied == b_replacement_applied
         && a_sub_link == b_sub_link
+        && a_target_reads == b_target_reads
         && a_sibling_condition == b_sibling_condition
         && a_modal == b_modal
         && a_mode_abilities == b_mode_abilities
@@ -5143,6 +5207,40 @@ pub struct StackDisplayGroup {
 /// adjacent entries preserves the actual resolution order for cases like
 /// stacked triggers from different sources interleaving.
 pub fn stack_display_groups(state: &GameState) -> Vec<StackDisplayGroup> {
+    stack_display_groups_revealing(state, &stack_revealed_card_names(state))
+}
+
+/// CR 701.20a: for each stack entry holding stack-bound reveal leases, the
+/// names of the leased occurrences that are still current (CR 400.7: a lease
+/// on an occurrence that has since changed zones names nothing). This is the
+/// public, unindexed presentation of the lease map; read it from rules state.
+pub(crate) fn stack_revealed_card_names(state: &GameState) -> BTreeMap<ObjectId, Vec<String>> {
+    state
+        .stack_bound_reveals
+        .iter()
+        .filter_map(|(entry, occurrences)| {
+            let names: Vec<String> = occurrences
+                .iter()
+                .filter_map(|occurrence| {
+                    state.objects.get(&occurrence.object_id).and_then(|object| {
+                        (ObjectIncarnationRef::from_object(object) == *occurrence)
+                            .then(|| object.name.clone())
+                    })
+                })
+                .collect();
+            (!names.is_empty()).then_some((*entry, names))
+        })
+        .collect()
+}
+
+/// [`stack_display_groups`] over a viewer projection, with the public reveal
+/// presentation (`revealed`, built from rules state because a projection
+/// carries no lease map) as part of each entry's grouping signature: two
+/// entries that keep different cards revealed are not the same thing twice.
+pub fn stack_display_groups_revealing(
+    state: &GameState,
+    revealed: &BTreeMap<ObjectId, Vec<String>>,
+) -> Vec<StackDisplayGroup> {
     let mut out: Vec<StackDisplayGroup> = Vec::new();
     // Track the previous entry's key alongside the output vector so we can
     // decide "merge or push" in O(1) per entry instead of re-scanning the
@@ -5171,7 +5269,7 @@ pub fn stack_display_groups(state: &GameState) -> Vec<StackDisplayGroup> {
             last_key = None;
             continue;
         }
-        let key = group_key(state, entry);
+        let key = group_key(state, entry, revealed);
         if last_key.as_ref() == Some(&key) {
             let last = out.last_mut().unwrap();
             last.count += 1;
@@ -5198,6 +5296,8 @@ struct StackGroupKey {
     paid: Option<StackPaidSnapshot>,
     is_pending: bool,
     provenance: Option<crate::types::game_state::SyntheticTriggerProvenance>,
+    /// CR 701.20a: the public names of the cards this entry keeps revealed.
+    revealed: Vec<String>,
 }
 
 /// Grouping signature for `stack_display_groups`. Two entries coalesce iff
@@ -5205,7 +5305,11 @@ struct StackGroupKey {
 /// visually-identical triggers that fire against different targets (e.g.
 /// N copies of "target player loses 1 life" picking different players)
 /// remain separate — coalescing them would misrepresent the resolution.
-fn group_key(state: &GameState, entry: &StackEntry) -> StackGroupKey {
+fn group_key(
+    state: &GameState,
+    entry: &StackEntry,
+    revealed: &BTreeMap<ObjectId, Vec<String>>,
+) -> StackGroupKey {
     let source_name = state
         .objects
         .get(&entry.source_id)
@@ -5246,6 +5350,7 @@ fn group_key(state: &GameState, entry: &StackEntry) -> StackGroupKey {
         paid,
         is_pending: effective_ability.is_pending,
         provenance,
+        revealed: revealed.get(&entry.id).cloned().unwrap_or_default(),
     }
 }
 
@@ -5373,6 +5478,68 @@ mod tests {
 
     fn setup() -> GameState {
         GameState::new_two_player(42)
+    }
+
+    #[test]
+    fn residual_trigger_firing_refuses_resolution_without_popping_the_stack() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Pending spell".to_string(),
+            Zone::Stack,
+        );
+        state.stack.push_back(StackEntry {
+            id: source,
+            source_id: source,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(1),
+                ability: Some(Box::new(ResolvedAbility::new(
+                    Effect::NoOp,
+                    Vec::new(),
+                    source,
+                    PlayerId(0),
+                ))),
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+        // Exercise the existing residual continuation-firing boundary, not a
+        // claim that ordinary play creates an incoherent carrier.
+        crate::game::effects::restore_continuation_trigger_firing(
+            &mut state,
+            Some(TriggerFiring::Ordinary),
+        );
+        assert!(state.resolving_stack_entry.is_none());
+        assert_eq!(
+            state.resolving_trigger_firing,
+            Some(TriggerFiring::Ordinary)
+        );
+        let mut events = Vec::new();
+
+        resolve_top(&mut state, &mut events);
+
+        assert_eq!(state.stack.len(), 1);
+        assert_eq!(state.stack.back().unwrap().id, source);
+        assert_eq!(state.objects[&source].zone, Zone::Stack);
+        assert_eq!(
+            state.resolving_trigger_firing,
+            Some(TriggerFiring::Ordinary)
+        );
+        assert!(events.is_empty());
+
+        // Paired reach control: this same spell resolves once the admission
+        // slots are empty, so refusal did not pass by using an empty stack.
+        state.resolving_trigger_firing = None;
+        resolve_top(&mut state, &mut events);
+        assert!(state.stack.is_empty());
+        assert_eq!(state.objects[&source].zone, Zone::Graveyard);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::StackResolved { object_id } if *object_id == source
+        )));
     }
 
     #[test]
@@ -9361,6 +9528,94 @@ mod tests {
                 Some(3),
                 "SourceIndependent fixed GainLife run should ignore distinct sources"
             );
+
+            let life_before = state.players[0].life;
+            let mut events = Vec::new();
+            let consumed = resolve_next_committed(&mut state, &mut events);
+
+            assert_eq!(consumed, 3);
+            assert_eq!(state.players[0].life, life_before + 3);
+            assert!(state.stack.is_empty());
+            assert_eq!(
+                crate::game::perf_counters::snapshot().stack_batched_entries,
+                3
+            );
+        }
+
+        /// CR 607.1: a triggered ability's provenance is derived from
+        /// its definition occurrence when read, never latched into its
+        /// `SpellContext` — so printed gain-life triggers carrying a definition
+        /// ref, put on the stack through the production authority, still batch.
+        #[test]
+        fn fixed_controller_gain_life_printed_triggers_with_definition_ref_still_batch() {
+            use crate::types::ability::{
+                SpellContext, TriggerBaseSetInstanceRef, TriggerDefinitionOccurrenceRef,
+                TriggerDefinitionRef,
+            };
+            use crate::types::identifiers::ObjectIncarnationRef;
+
+            fn push_printed_gain_life_trigger(
+                state: &mut GameState,
+                source: ObjectId,
+                trigger_event: GameEvent,
+            ) {
+                let entry_id = ObjectId(state.next_object_id);
+                state.next_object_id += 1;
+                let mut ability = ResolvedAbility::new(
+                    fixed_controller_gain_life_effect(),
+                    vec![],
+                    source,
+                    PlayerId(0),
+                );
+                ability.description = Some("you gain 1 life".to_string());
+                ability.ability_index = Some(0);
+                ability.trigger_definition_ref = Some(TriggerDefinitionRef {
+                    source: ObjectIncarnationRef::from_object(&state.objects[&source]),
+                    occurrence: TriggerDefinitionOccurrenceRef::Printed {
+                        base_set: TriggerBaseSetInstanceRef::INITIAL,
+                        printed_index: 0,
+                    },
+                });
+                let entry = StackEntry {
+                    id: entry_id,
+                    source_id: source,
+                    controller: PlayerId(0),
+                    kind: StackEntryKind::TriggeredAbility {
+                        source_id: source,
+                        ability: Box::new(ability),
+                        condition: None,
+                        trigger_event: Some(trigger_event),
+                        description: Some(
+                            "Whenever a creature enters, you gain 1 life.".to_string(),
+                        ),
+                        source_name: state.objects[&source].name.clone(),
+                        subject_match_count: None,
+                        die_result: None,
+                        provenance: None,
+                    },
+                };
+                let mut events = Vec::new();
+                super::super::push_to_stack(state, entry, &mut events);
+            }
+
+            crate::game::perf_counters::reset();
+            let mut state = setup();
+            let source_a = add_self_counter_source(&mut state, "Bogwater Lumaret A");
+            let source_b = add_self_counter_source(&mut state, "Bogwater Lumaret B");
+            let etb = life_event(PlayerId(0), 0);
+            push_printed_gain_life_trigger(&mut state, source_a, etb.clone());
+            push_printed_gain_life_trigger(&mut state, source_b, etb.clone());
+            push_printed_gain_life_trigger(&mut state, source_b, etb);
+
+            for entry in &state.stack {
+                let ability = entry.ability().expect("a triggered ability");
+                // Reach: the production stamps ran and the occurrence is attributable.
+                assert!(ability.trigger_definition_ref.is_some());
+                assert!(ability.source_incarnation.is_some());
+                assert!(ability.source_ability_provenance().is_some());
+                assert_eq!(ability.context, SpellContext::default(), "no latch");
+            }
+            assert_eq!(fixed_controller_gain_life_run_len(&state), Some(3));
 
             let life_before = state.players[0].life;
             let mut events = Vec::new();
@@ -15378,5 +15633,91 @@ mod tests {
             exile_moves, 1,
             "flashback must be exiled exactly once — RIP must not double-apply on a stack→exile move"
         );
+    }
+}
+
+#[cfg(test)]
+mod stack_bound_reveal_release_tests {
+    //! CR 603.3d + CR 701.20a: the uncommitted-trigger pop releases the popped
+    //! entry's reveal lease, and only when it actually popped.
+    use super::pop_uncommitted_pending_trigger_entry;
+    use crate::game::zones::create_object;
+    use crate::types::ability::{Effect, ResolvedAbility, TargetFilter};
+    use crate::types::game_state::{GameState, StackEntry, StackEntryKind};
+    use crate::types::identifiers::{CardId, ObjectId, TriggerFiring};
+    use crate::types::player::PlayerId;
+    use crate::types::zones::Zone;
+
+    fn trigger_entry(state: &mut GameState, source: ObjectId) -> ObjectId {
+        let entry_id = ObjectId(state.next_object_id);
+        state.next_object_id += 1;
+        state.stack.push_back(StackEntry {
+            id: entry_id,
+            source_id: source,
+            controller: PlayerId(0),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: source,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::GainLife {
+                        amount: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                    vec![],
+                    source,
+                    PlayerId(0),
+                )),
+                condition: None,
+                trigger_event: None,
+                description: None,
+                source_name: "Source".to_string(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        });
+        state
+            .stack_trigger_firings
+            .insert(entry_id, TriggerFiring::Ordinary);
+        entry_id
+    }
+
+    #[test]
+    fn the_603_3d_pop_releases_the_popped_entry_lease_only() {
+        let mut state = GameState::new_two_player(3);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".into(),
+            Zone::Battlefield,
+        );
+        let card = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Leased".into(),
+            Zone::Hand,
+        );
+        let entry = trigger_entry(&mut state, source);
+        state.grant_stack_bound_reveal(entry, &[card]);
+        assert!(state.holds_stack_bound_reveal(card), "reach guard: leased");
+
+        // A cursor that does not name the top entry consumes without popping.
+        state.pending_trigger_entry = Some(ObjectId(99_999));
+        pop_uncommitted_pending_trigger_entry(
+            &mut state,
+            crate::game::lifecycle::DelayedTerminalDisposition::NoLegalChoice,
+        );
+        assert!(state.holds_stack_bound_reveal(card), "no pop, no release");
+
+        state.pending_trigger_entry = Some(entry);
+        state.pending_trigger_firing = Some(TriggerFiring::Ordinary);
+        pop_uncommitted_pending_trigger_entry(
+            &mut state,
+            crate::game::lifecycle::DelayedTerminalDisposition::NoLegalChoice,
+        );
+        assert!(state.stack.is_empty(), "reach guard: popped");
+        assert!(!state.holds_stack_bound_reveal(card));
+        assert!(state.stack_bound_reveals.is_empty());
     }
 }
