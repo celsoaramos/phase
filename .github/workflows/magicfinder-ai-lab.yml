@@ -49,19 +49,14 @@ jobs:
         run: rustup toolchain install && rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
         with: { shared-key: mf-ai-lab }
-      - name: Card-data do motor servido (manifesto do R2), senão gerar
-        env:
-          R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+      # O card-data é saída do parser DESTA árvore: o do motor servido (R2) tem o
+      # formato da versão dele e não carrega numa branch sobre outra versão
+      # ("expected map with a single key", medido em 03/10).
+      - name: Gerar card-data com o parser desta branch
         run: |
+          ./scripts/gen-card-data.sh
           mkdir -p lab-data
-          if [ -n "$R2_PUBLIC_BASE" ]; then
-            url=$(curl -fsSL "$R2_PUBLIC_BASE/engine/manifest.json" | python3 -c 'import json,sys; m=json.load(sys.stdin); c=m.get("current",m); print(c.get("cards") or c.get("cardData") or "")' || true)
-            if [ -n "$url" ]; then curl -fsSL --compressed "$url" -o lab-data/card-data.json || rm -f lab-data/card-data.json; fi
-          fi
-          if [ ! -s lab-data/card-data.json ]; then
-            ./scripts/gen-card-data.sh
-            cp client/public/card-data.json lab-data/card-data.json
-          fi
+          cp client/public/card-data.json lab-data/card-data.json
           ls -la lab-data
       - name: Compilar ai-ladder
         run: cargo build --profile server-release -p phase-ai --features tune --bin ai-ladder
@@ -84,7 +79,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: lab-bin, path: lab-data }
       - name: ${{ matrix.run.name }}
+        shell: bash
         run: |
+          set -euo pipefail
           chmod +x lab-data/ai-ladder
           ./lab-data/ai-ladder lab-data ${{ matrix.run.args }} --json "out-${{ matrix.run.name }}.json" | tee table.md
           { echo "### ${{ matrix.run.name }}"; echo; echo '`${{ matrix.run.args }}`'; echo; cat table.md; } >> "$GITHUB_STEP_SUMMARY"
