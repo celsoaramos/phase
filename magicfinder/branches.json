@@ -142,5 +142,8 @@
   },
   {
     "branch": "card/marvo-clash-defending-player"
+  },
+  {
+    "branch": "card/ai-animate-upkeep"
   }
 ]
