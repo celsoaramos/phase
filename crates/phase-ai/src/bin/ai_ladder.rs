@@ -13,7 +13,7 @@
 //!
 //! SPEC is `difficulty[:native|wasm][,key=value...]`. Keys override single fields
 //! on top of the preset (`temp`, `patience`, `risk`, `stabilize`, `search=0|1`,
-//! `depth`, `strategy=0|1`, `gate=0|1`, `stack=0|1`, `mf=0|1` = all three) — so a code change gated behind a config
+//! `depth`, `det=K` (hidden-info samples; 0 = sees the opponent's hand), `strategy=0|1`, `gate=0|1`, `stack=0|1`, `mf=0|1` = all three) — so a code change gated behind a config
 //! field can be A/B'd in ONE binary against the same seeds.
 //!
 //! `--decks` adds named decks (`{"name": ["4 Card", "Card", ...]}`); a matchup
@@ -76,6 +76,7 @@ fn parse_spec(spec: &str) -> Result<Side, String> {
             "stabilize" => config.profile.stabilize_bias = num()?,
             "search" => config.search.enabled = num()? != 0.0,
             "depth" => config.search.max_depth = num()? as u32,
+            "det" => config.search.determinization_samples = num()? as u32,
             "strategy" => config.strategic.archetype_profile_everywhere = num()? != 0.0,
             "gate" => config.strategic.counter_risk_gate = num()? != 0.0,
             "stack" => config.strategic.stack_spell_credit = num()? != 0.0,
