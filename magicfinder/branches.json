@@ -151,5 +151,8 @@
   },
   {
     "branch": "ai/fair-wasm-hidden-info"
+  },
+  {
+    "branch": "ai/pump-needs-a-beneficiary"
   }
 ]
