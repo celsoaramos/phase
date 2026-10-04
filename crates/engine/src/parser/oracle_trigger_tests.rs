@@ -28949,7 +28949,9 @@ fn becomes_voice_non_event_predicate_is_unguarded_but_honest() {
     assert_eq!(triggers.len(), 2);
     assert_eq!(
         triggers[0].mode,
-        TriggerMode::Unknown("Whenever ~ attacks while its power becomes greater than 4".to_string())
+        TriggerMode::Unknown(
+            "Whenever ~ attacks while its power becomes greater than 4".to_string()
+        )
     );
     assert_eq!(triggers[0].valid_card, None);
     assert_eq!(
