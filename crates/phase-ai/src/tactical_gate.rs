@@ -1208,8 +1208,8 @@ fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<G
     None
 }
 
-/// A counter with nothing of the opponent's to hit only costs the AI cards: its
-/// own spell or ability and the counter itself (CR 701.6a).
+/// A plain counter that can only hit the AI's own spells costs it both spells
+/// (CR 701.6a). Own abilities, redirects, and additional payloads can be useful.
 ///
 /// The stack-wide check — empty, or every entry the AI's — was the whole test
 /// before. It misses the case where the opponent's entries are on the stack but
@@ -1224,16 +1224,24 @@ fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<G
 /// [`reject_futile_target`]. The cast is the only decision there is.
 ///
 /// So the check now asks what the counter can REACH (CR 115.1, CR 601.2c): the
-/// engine's own legal-target set for every counter effect, each target an entry
-/// the AI controls. Spells and activated abilities alike — Glen Elendra
+/// engine's own legal-target set for every plain counter effect, each target a
+/// spell the AI controls. Counter spells and activations alike — Glen Elendra
 /// Archmage's "{U}, Sacrifice: Counter target noncreature spell" walks into the
 /// same hole. A counter effect that exposes no target filter and a modal SPELL
 /// (CR 601.2b: at announcement `effects()` reports every mode at once) keep
 /// only the stack-wide check; an activation's `effects()` is already its root
 /// only (CR 700.2a), so its counter is committed.
 fn counter_reaches_nothing_foreign(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> bool {
+    if !is_pure_counter_payload(effects) {
+        return false;
+    }
     let ai = ctx.ai_player;
-    if ctx.state.stack.iter().all(|entry| entry.controller == ai) {
+    if ctx
+        .state
+        .stack
+        .iter()
+        .all(|entry| entry.controller == ai && matches!(entry.kind, StackEntryKind::Spell { .. }))
+    {
         return true;
     }
     let source_id = match &ctx.candidate.action {
@@ -1261,11 +1269,7 @@ fn counter_reaches_nothing_foreign(ctx: &PolicyContext<'_>, effects: &[&Effect])
             find_legal_targets(ctx.state, filter, ai, source_id)
                 .iter()
                 .all(|target| {
-                    matches!(target, TargetRef::Object(id) if ctx
-                        .state
-                        .stack
-                        .iter()
-                        .any(|entry| entry.id == *id && entry.controller == ai))
+                    matches!(target, TargetRef::Object(id) if is_own_stack_spell(ctx.state, ai, *id))
                 })
         })
 }
@@ -7486,6 +7490,81 @@ mod tests {
             gated.iter().any(|c| casts(&c.candidate.action, pierce)),
             "with an opponent noncreature spell in reach the cast stays in the pool"
         );
+    }
+
+    /// The announcement gate must retain useful counters before target selection.
+    #[test]
+    fn useful_self_counter_casts_remain_in_the_engine_issued_pool() {
+        let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        for (name, oracle, targets_ability) in [
+            ("Stifle", "Counter target activated or triggered ability.", true),
+            (
+                "Mixed Counter Probe",
+                "Counter target noncreature spell. Draw a card.",
+                false,
+            ),
+            (
+                "Memory Lapse",
+                "Counter target spell. If that spell is countered this way, put it on top of its owner's library instead of into that player's graveyard.",
+                false,
+            ),
+        ] {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain);
+            scenario.with_mana_pool(P0, pooled_mana(ManaType::Blue, 1));
+            let counter = scenario
+                .add_spell_to_hand_from_oracle(P0, name, true, oracle)
+                .with_mana_cost(ManaCost::Cost {
+                    generic: 0,
+                    shards: vec![ManaCostShard::Blue],
+                })
+                .id();
+            let drawback = scenario
+                .add_artifact_from_oracle(P0, "Drawback Probe", "{T}: You lose 3 life.")
+                .id();
+            let mut runner = scenario.build();
+            if targets_ability {
+                runner
+                    .act(GameAction::ActivateAbility {
+                        source_id: drawback,
+                        ability_index: 0,
+                    })
+                    .expect("the engine announces the harmful own ability");
+                assert!(runner.state().stack.iter().any(|entry| {
+                    entry.controller == P0
+                        && matches!(&entry.kind, StackEntryKind::ActivatedAbility { ability, .. }
+                            if matches!(ability.effect, Effect::LoseLife { .. }))
+                }), "reach-guard: the harmful own ability is on the stack");
+            } else {
+                push_stack_spell(runner.state_mut(), P0, "Counterspell", CoreType::Instant);
+            }
+            if name != "Memory Lapse" {
+                push_stack_spell(runner.state_mut(), P1, "Makindi Sliderunner", CoreType::Creature);
+            }
+            let state = runner.state_mut();
+            set_priority_window(state, Phase::PreCombatMain, P1);
+            let issued = engine::ai_support::candidate_actions(state);
+            assert!(
+                issued.iter().any(|candidate| casts(&candidate.action, counter)),
+                "reach-guard: the engine issues the {name} cast"
+            );
+            let decision = AiDecisionContext {
+                waiting_for: state.waiting_for.clone(),
+                candidates: issued.clone(),
+            };
+            let gated = gate_candidates(
+                state,
+                &decision,
+                issued,
+                P0,
+                &config,
+                &AiContext::empty(&config.weights),
+            );
+            assert!(
+                gated.iter().any(|candidate| casts(&candidate.candidate.action, counter)),
+                "the useful {name} self-counter must survive the announcement gate"
+            );
+        }
     }
 
     /// Non-vacuity: one opponent spell in the legal set makes it a real counter.
