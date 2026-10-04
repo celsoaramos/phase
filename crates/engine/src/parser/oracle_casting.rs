@@ -1259,24 +1259,26 @@ Trample";
         // No "another": two EARLIER spells, the plain count — unchanged.
         let restrictions = parse_casting_restriction_line(
             "Cast this spell only if you've cast two or more spells this turn.",
+        )
+        .expect("restrictions should parse");
+        assert!(
+            matches!(
+                restrictions.as_slice(),
+                [CastingRestriction::RequiresCondition {
+                    condition: Some(ParsedCondition::QuantityComparison {
+                        lhs: QuantityExpr::Ref {
+                            qty: QuantityRef::SpellsCastThisTurn {
+                                scope: CountScope::Controller,
+                                filter: None,
+                            }
+                        },
+                        comparator: Comparator::GE,
+                        rhs: QuantityExpr::Fixed { value: 2 },
+                    }),
+                }]
+            ),
+            "got {restrictions:?}"
         );
-        if let Some(restrictions) = restrictions {
-            assert!(
-                matches!(
-                    restrictions.as_slice(),
-                    [CastingRestriction::RequiresCondition {
-                        condition: Some(ParsedCondition::QuantityComparison {
-                            lhs: QuantityExpr::Ref {
-                                qty: QuantityRef::SpellsCastThisTurn { filter: None, .. }
-                            },
-                            rhs: QuantityExpr::Fixed { value: 2 },
-                            ..
-                        }),
-                    }]
-                ),
-                "got {restrictions:?}"
-            );
-        }
     }
 
     #[test]
