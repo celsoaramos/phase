@@ -5984,8 +5984,55 @@ fn attacks_while_controller_gate_rejects_unconsumed_rider() {
         "the complete controller gate must qualify the attack: {condition}"
     );
 
-    let partial = parse_trigger_lines(
+    let conjunction = parse_trigger_lines(
         "Whenever this creature attacks while you have the most life or are tied for most life and you control a Forest, draw a card.",
+        "Probe",
+    );
+    assert_eq!(conjunction.len(), 1);
+    assert_eq!(conjunction[0].mode, TriggerMode::Attacks);
+    let Some(TriggerCondition::EventTime { condition }) = &conjunction[0].condition else {
+        panic!("the complete conjunction must qualify the attack: {conjunction:?}");
+    };
+    let TriggerCondition::And { conditions } = condition.as_ref() else {
+        panic!("both state conditions must survive: {condition:?}");
+    };
+    assert_eq!(conditions.len(), 2);
+    assert!(matches!(
+        &conditions[0],
+        TriggerCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::Controller,
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::AllPlayers {
+                        aggregate: AggregateFunction::Max,
+                        exclude: None,
+                    },
+                },
+            },
+        }
+    ));
+    let TriggerCondition::ControlsType {
+        filter: TargetFilter::Typed(filter),
+    } = &conditions[1]
+    else {
+        panic!("Forest control must survive: {:?}", conditions[1]);
+    };
+    assert_eq!(
+        filter.type_filters,
+        vec![TypeFilter::Subtype("Forest".to_string())]
+    );
+    assert_eq!(filter.controller, Some(ControllerRef::You));
+    assert!(filter.properties.contains(&FilterProp::InZone {
+        zone: Zone::Battlefield,
+    }));
+
+    let partial = parse_trigger_lines(
+        "Whenever this creature attacks while you have the most life or are tied for most life but not if you control a Forest, draw a card.",
         "Probe",
     );
     assert_eq!(partial.len(), 1);
