@@ -73,8 +73,8 @@ describe("GiftRecipientModalContent", () => {
     expect(screen.getByRole("heading", { name: "Choose Gift Recipient" })).toBeInTheDocument();
   });
 
-  it.each([
-    ["gift", { type: "Gift" } as CastOpponentChoicePurpose],
+  it.each<[string, CastOpponentChoicePurpose]>([
+    ["gift", { type: "Gift" }],
     ["effect-cost", OPPONENT_GAINS_THREE],
   ])("cancels the %s cast when the recipient prompt is dismissed", (_name, purpose) => {
     const dispatch = renderModal(purpose);
