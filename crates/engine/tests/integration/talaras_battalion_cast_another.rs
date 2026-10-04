@@ -103,7 +103,8 @@ fn talara_is_not_castable_before_any_spell() {
 
 #[test]
 fn talara_is_castable_after_another_green_spell() {
-    let (mut runner, talara, green, _) = setup("Talara's Battalion", TALARA, 4, 3, 1, ManaColor::Green);
+    let (mut runner, talara, green, _) =
+        setup("Talara's Battalion", TALARA, 4, 3, 1, ManaColor::Green);
     runner.cast(green).resolve();
     let action = cast_action(&runner, talara);
     runner
@@ -115,7 +116,8 @@ fn talara_is_castable_after_another_green_spell() {
 
 #[test]
 fn talara_is_not_castable_after_only_a_blue_spell() {
-    let (mut runner, talara, _, blue) = setup("Talara's Battalion", TALARA, 4, 3, 1, ManaColor::Green);
+    let (mut runner, talara, _, blue) =
+        setup("Talara's Battalion", TALARA, 4, 3, 1, ManaColor::Green);
     runner.cast(blue).resolve();
     let action = cast_action(&runner, talara);
     assert!(
@@ -127,7 +129,8 @@ fn talara_is_not_castable_after_only_a_blue_spell() {
 
 #[test]
 fn illusory_angel_is_castable_after_any_other_spell() {
-    let (mut runner, angel, _, blue) = setup("Illusory Angel", ILLUSORY_ANGEL, 4, 4, 2, ManaColor::Blue);
+    let (mut runner, angel, _, blue) =
+        setup("Illusory Angel", ILLUSORY_ANGEL, 4, 4, 2, ManaColor::Blue);
     let refused = cast_action(&runner, angel);
     assert!(runner.act(refused).is_err(), "no spell cast yet this turn");
     runner.cast(blue).resolve();
