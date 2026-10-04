@@ -73,6 +73,18 @@ describe("GiftRecipientModalContent", () => {
     expect(screen.getByRole("heading", { name: "Choose Gift Recipient" })).toBeInTheDocument();
   });
 
+  it.each([
+    ["gift", { type: "Gift" } as CastOpponentChoicePurpose],
+    ["effect-cost", OPPONENT_GAINS_THREE],
+  ])("cancels the %s cast when the recipient prompt is dismissed", (_name, purpose) => {
+    const dispatch = renderModal(purpose);
+    expect(screen.getByRole("button", { name: "Bob" })).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(dispatch).toHaveBeenCalledExactlyOnceWith({ type: "CancelCast" });
+  });
+
   it("shows the cost being paid for an effect-cost purpose and dispatches the choice", () => {
     const dispatch = renderModal(OPPONENT_GAINS_THREE);
 

@@ -106,6 +106,9 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  87 — ChooseGiftRecipient gains a purpose that distinguishes Gift from
+ *       EffectCost. A v86 peer would display a cost-recipient prompt as a
+ *       gift promise. Bumped in lockstep with full-game protocol 105.
  *  86 — game_setup and state_update carry GameState, whose PendingCast
  *       gains delved_cards and whose pending cost-move resume swaps
  *       DelveManaPayment for FinalizeDelvedCast (#9400). Bumped in lockstep
@@ -536,7 +539,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 86 as const;
+export const WIRE_PROTOCOL_VERSION = 87 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

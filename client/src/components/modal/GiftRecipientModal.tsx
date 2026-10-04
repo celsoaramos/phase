@@ -45,6 +45,7 @@ export function GiftRecipientModalContent({
         id: String(opponent),
         label: getOpponentDisplayName(opponent),
       }))}
+      onClose={() => dispatch({ type: "CancelCast" })}
       onChoose={(id) => {
         dispatch({
           type: "ChooseGiftRecipient",

@@ -210,6 +210,10 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 105 — ChooseGiftRecipient gains a purpose that distinguishes Gift from
+ *      EffectCost. A v104 peer would show gift copy for a cost-recipient
+ *      prompt; the exact-match handshake refuses that pairing. P2P moves
+ *      in lockstep (wire 87); lobby carriers are unchanged.
  * 104 — PendingCast gains `delved_cards` and the pending cost-move resume
  *      swaps DelveManaPayment for the FinalizeDelvedCast completion: delve
  *      fuel is exiled when the total cost is paid (#9400). A v103 peer
@@ -687,7 +691,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 104;
+export const PROTOCOL_VERSION = 105;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
