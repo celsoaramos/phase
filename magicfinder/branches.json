@@ -147,7 +147,8 @@
     "branch": "card/ai-animate-upkeep"
   },
   {
-    "branch": "card/cast-only-if-cast-another"
+    "branch": "card/cast-only-if-cast-another",
+    "pr": 9562
   },
   {
     "branch": "ai/fair-wasm-hidden-info"
