@@ -5965,6 +5965,36 @@ fn preacher_of_the_schism_keeps_both_life_gates() {
     );
 }
 
+/// CR 603.2 + CR 508.1m: an attack `while` gate must consume its whole
+/// qualification; a partially parsed controller gate stays unsupported.
+#[test]
+fn attacks_while_controller_gate_rejects_unconsumed_rider() {
+    let complete = parse_trigger_lines(
+        "Whenever this creature attacks while you have the most life or are tied for most life, draw a card.",
+        "Probe",
+    );
+    assert_eq!(complete.len(), 1);
+    assert_eq!(complete[0].mode, TriggerMode::Attacks);
+    let condition = format!("{:?}", complete[0].condition);
+    assert!(
+        condition.contains("EventTime")
+            && condition.contains("LifeTotal { player: Controller }")
+            && condition.contains("AllPlayers")
+            && condition.contains("GE"),
+        "the complete controller gate must qualify the attack: {condition}"
+    );
+
+    let partial = parse_trigger_lines(
+        "Whenever this creature attacks while you have the most life or are tied for most life and you control a Forest, draw a card.",
+        "Probe",
+    );
+    assert_eq!(partial.len(), 1);
+    assert!(
+        matches!(partial[0].mode, TriggerMode::Unknown(_)),
+        "an unconsumed state rider must remain explicitly unsupported: {partial:?}"
+    );
+}
+
 /// The "the player" arm only binds when the most-life qualifier follows.
 #[test]
 fn attacks_the_player_without_most_life_qualifier_does_not_bind_player_scope() {
