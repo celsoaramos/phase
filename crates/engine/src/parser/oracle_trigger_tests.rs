@@ -28900,33 +28900,46 @@ fn head_shape_inside_the_subject_truncates_but_stays_honest() {
     assert_eq!(triggers[1].valid_card, None);
 }
 
-/// KNOWN EXPOSURE E2.
+/// KNOWN EXPOSURE E2: the open event-head splitter still separates these
+/// predicates, but unsupported `while` tails must not become broad attacks.
 #[test]
 fn comparison_predicate_siblings_are_unguarded_but_honest() {
-    for (text, expected_unknown) in [
-        (
-            "Whenever this creature attacks while your life total is greater than 20 or is less than 5, draw a card.",
-            "Whenever ~ is less than 5",
-        ),
-        (
-            "Whenever this creature attacks while your life total is even or is odd, draw a card.",
-            "Whenever ~ is odd",
-        ),
-    ] {
-        let triggers = parse_trigger_lines(text, "~");
-        assert_eq!(triggers.len(), 2, "{text}");
-        assert_eq!(triggers[0].mode, TriggerMode::Attacks, "{text}");
-        assert_eq!(triggers[0].valid_card, Some(TargetFilter::SelfRef), "{text}");
-        assert_eq!(
-            triggers[1].mode,
-            TriggerMode::Unknown(expected_unknown.to_string()),
-            "{text}"
-        );
-        assert_eq!(triggers[1].valid_card, None, "{text}");
-    }
+    let triggers = parse_trigger_lines(
+        "Whenever this creature attacks while your life total is greater than 20 or is less than 5, draw a card.",
+        "~",
+    );
+    assert_eq!(triggers.len(), 2);
+    assert_eq!(triggers[0].mode, TriggerMode::Attacks);
+    assert_eq!(triggers[0].valid_card, Some(TargetFilter::SelfRef));
+    assert!(matches!(
+        &triggers[0].condition,
+        Some(TriggerCondition::EventTime { .. })
+    ));
+    assert_eq!(
+        triggers[1].mode,
+        TriggerMode::Unknown("Whenever ~ is less than 5".to_string())
+    );
+    assert_eq!(triggers[1].valid_card, None);
+
+    let triggers = parse_trigger_lines(
+        "Whenever this creature attacks while your life total is even or is odd, draw a card.",
+        "~",
+    );
+    assert_eq!(triggers.len(), 2);
+    assert_eq!(
+        triggers[0].mode,
+        TriggerMode::Unknown("Whenever ~ attacks while your life total is even".to_string())
+    );
+    assert_eq!(triggers[0].valid_card, None);
+    assert_eq!(
+        triggers[1].mode,
+        TriggerMode::Unknown("Whenever ~ is odd".to_string())
+    );
+    assert_eq!(triggers[1].valid_card, None);
 }
 
-/// KNOWN EXPOSURE E3.
+/// KNOWN EXPOSURE E3: the open `becomes` head splits this non-event predicate;
+/// the unsupported `while` tail stays Unknown rather than becoming an attack.
 #[test]
 fn becomes_voice_non_event_predicate_is_unguarded_but_honest() {
     let triggers = parse_trigger_lines(
@@ -28934,8 +28947,11 @@ fn becomes_voice_non_event_predicate_is_unguarded_but_honest() {
         "~",
     );
     assert_eq!(triggers.len(), 2);
-    assert_eq!(triggers[0].mode, TriggerMode::Attacks);
-    assert_eq!(triggers[0].valid_card, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        triggers[0].mode,
+        TriggerMode::Unknown("Whenever ~ attacks while its power becomes greater than 4".to_string())
+    );
+    assert_eq!(triggers[0].valid_card, None);
     assert_eq!(
         triggers[1].mode,
         TriggerMode::Unknown("Whenever ~ becomes less than 2".to_string())
