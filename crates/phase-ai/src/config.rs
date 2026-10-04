@@ -1581,10 +1581,25 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
         config.search.max_depth = config.search.max_depth.min(2);
         config.search.max_nodes = config.search.max_nodes * 2 / 3;
         config.search.rollout_depth = config.search.rollout_depth.min(2);
+        // MagicFinder (2026-10-03): in the browser the AI plays against a PERSON,
+        // and it must not read that person's hand. Determinized search samples
+        // the hidden cards instead. Measured with paired seeds (ai-ladder, full
+        // card data, 40 games per mirror): VeryHard 95x101, Medium 97x102 and the
+        // MagicFinder challengers 100x100 against the perfect-information preset —
+        // no strength lost. cEDH keeps its own calibration.
+        if config.search.enabled
+            && config.search.determinization_samples == 0
+            && difficulty != AiDifficulty::CEDH
+        {
+            config.search.determinization_samples = WASM_DETERMINIZATION_SAMPLES;
+        }
     }
 
     config
 }
+
+/// Hidden-information samples per decision in the browser (see `create_config`).
+pub const WASM_DETERMINIZATION_SAMPLES: u32 = 4;
 
 impl AiConfig {
     /// Return a copy of this config with measurement mode enabled: wall-clock
@@ -1705,6 +1720,41 @@ mod tests {
     }
 
     #[test]
+    fn browser_presets_do_not_read_the_opponents_hand() {
+        for difficulty in [
+            AiDifficulty::Medium,
+            AiDifficulty::Hard,
+            AiDifficulty::VeryHard,
+        ] {
+            let wasm = create_config(difficulty, Platform::Wasm);
+            assert_eq!(
+                wasm.search.determinization_samples, WASM_DETERMINIZATION_SAMPLES,
+                "{difficulty:?}"
+            );
+            // Native (server, ai-duel, the upstream gates) is unchanged.
+            assert_eq!(
+                create_config(difficulty, Platform::Native)
+                    .search
+                    .determinization_samples,
+                0
+            );
+        }
+        // No search, nothing to sample.
+        assert_eq!(
+            create_config(AiDifficulty::VeryEasy, Platform::Wasm)
+                .search
+                .determinization_samples,
+            0
+        );
+        assert_eq!(
+            create_config(AiDifficulty::CEDH, Platform::Wasm)
+                .search
+                .determinization_samples,
+            0
+        );
+    }
+
+    #[test]
     fn medium_enables_search() {
         let config = create_config(AiDifficulty::Medium, Platform::Native);
         assert_eq!(config.temperature, 1.0);
@@ -1752,15 +1802,21 @@ mod tests {
         assert!(wasm.search.max_depth <= 2);
         assert!(wasm.search.max_nodes < native.search.max_nodes);
         assert!(wasm.search.rollout_depth <= native.search.rollout_depth);
-        assert_eq!(wasm.search.determinization_samples, 0);
+        // MagicFinder: the browser samples hidden information (see create_config).
+        assert_eq!(
+            wasm.search.determinization_samples,
+            WASM_DETERMINIZATION_SAMPLES
+        );
+        assert_eq!(native.search.determinization_samples, 0);
     }
 
     #[test]
-    fn all_search_tiers_ship_perfect_information() {
-        // Product decision 2026-07-18: every shipped preset is K=0 (perfect-info
-        // "strength floor") on every platform and player count. K>0 is an
-        // experiment/measurement knob only — the ensemble machinery is covered by
-        // search.rs ensemble tests, which set K manually.
+    fn native_tiers_ship_perfect_information_and_the_browser_samples_hidden_info() {
+        // Upstream product decision 2026-07-18: every NATIVE preset is K=0
+        // (perfect-info "strength floor"). MagicFinder 2026-10-03: in the browser
+        // (Wasm) the search tiers sample the opponent's hidden cards instead of
+        // reading them — measured with no strength lost. No-search tiers have
+        // nothing to sample; cEDH keeps its own calibration.
         for diff in [
             AiDifficulty::VeryEasy,
             AiDifficulty::Easy,
@@ -1770,10 +1826,18 @@ mod tests {
             AiDifficulty::CEDH,
         ] {
             for platform in [Platform::Native, Platform::Wasm] {
+                let samples_hidden = platform == Platform::Wasm
+                    && diff != AiDifficulty::CEDH
+                    && create_config(diff, platform).search.enabled;
+                let expected = if samples_hidden {
+                    WASM_DETERMINIZATION_SAMPLES
+                } else {
+                    0
+                };
                 for players in [2u8, 4, 6] {
                     let c = create_config_for_players(diff, platform, players);
                     assert_eq!(
-                        c.search.determinization_samples, 0,
+                        c.search.determinization_samples, expected,
                         "{diff:?}/{platform:?}/{players}p"
                     );
                 }
