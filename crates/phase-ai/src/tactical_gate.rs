@@ -361,6 +361,10 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject;
     }
 
+    if temporary_pump_spell_without_beneficiary(ctx, &effects) {
+        return GateDecision::Reject;
+    }
+
     if let Some((power_bonus, toughness_bonus)) = pure_fixed_pump_bonus(&effects) {
         let source_is_spell = ctx.source_object().is_some_and(|source| {
             source.card_types.core_types.contains(&CoreType::Instant)
@@ -1436,6 +1440,54 @@ fn self_pump_on_unblocked_attacker(
                 .blocker_assignments
                 .get(&source_id)
                 .is_none_or(|blockers| blockers.is_empty())
+    })
+}
+
+/// A temporary pump SPELL that no creature of ours can use (CR 514.2: it ends
+/// at cleanup). Field report 2026-10-03 (MagicFinder): the AI cast Unchecked
+/// Growth on its only creature — tapped — at the beginning of the opponent's
+/// combat. A tapped creature outside combat neither attacks nor blocks, so the
+/// card was thrown away. The window gate above only asks whether waiting is
+/// better; this asks whether ANYONE benefits, and covers pumps with a rider
+/// (Unchecked Growth's conditional trample) that `pure_fixed_pump_bonus` skips.
+///
+/// Not a reject: a live hostile stack (the pump may save a creature from
+/// damage), or any own creature that is untapped (can still attack or block)
+/// or already attacking/blocking.
+fn temporary_pump_spell_without_beneficiary(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> bool {
+    let source_is_spell = ctx.source_object().is_some_and(|source| {
+        source.card_types.core_types.contains(&CoreType::Instant)
+            || source.card_types.core_types.contains(&CoreType::Sorcery)
+    });
+    if !source_is_spell || effects.is_empty() {
+        return false;
+    }
+    // A shrink ("-3/-3") can be removal aimed at THEIR creature — never this gate's business.
+    let has_positive_pump = effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Pump { .. }))
+        && !has_toughness_shrink(effects);
+    let only_temporary_combat_effects = effects.iter().all(|effect| {
+        matches!(effect, Effect::Pump { .. })
+            || crate::search::effect_is_temporary_combat_modifier(effect)
+    });
+    if !has_positive_pump || !only_temporary_combat_effects {
+        return false;
+    }
+    if TacticalFacts::derive(ctx.state, ctx.ai_player).live_stack_response {
+        return false;
+    }
+    let in_combat = |id: &ObjectId| {
+        ctx.state.combat.as_ref().is_some_and(|c| {
+            c.attackers.iter().any(|a| a.object_id == *id) || c.blocker_to_attacker.contains_key(id)
+        })
+    };
+    !ctx.state.battlefield.iter().any(|id| {
+        ctx.state.objects.get(id).is_some_and(|obj| {
+            obj.controller == ctx.ai_player
+                && obj.card_types.core_types.contains(&CoreType::Creature)
+                && (!obj.tapped || in_combat(id))
+        })
     })
 }
 
@@ -6901,6 +6953,133 @@ mod tests {
         };
 
         assert_eq!(assess_candidate(&ctx), GateDecision::Reject);
+    }
+
+    /// Field report 2026-10-03: pump on the AI's only creature, TAPPED, at the
+    /// beginning of the opponent's combat. Nobody can use it.
+    fn pump_on_tapped_only_creature_at_opponents_combat(
+        oracle: &str,
+        tapped: bool,
+    ) -> GateDecision {
+        let mut scenario = GameScenario::new();
+        let bear = scenario.add_creature(P0, "Bear", 2, 2).id();
+        let growth = scenario
+            .add_spell_to_hand_from_oracle(P0, "Pump", true, oracle)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        state.objects.get_mut(&bear).unwrap().tapped = tapped;
+        state.phase = Phase::BeginCombat;
+        state.active_player = P1;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: Vec::new(),
+        };
+        let candidate = CandidateAction {
+            action: GameAction::CastSpell {
+                object_id: growth,
+                card_id: state.objects.get(&growth).unwrap().card_id,
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            },
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Spell),
+        };
+        let ctx = PolicyContext {
+            state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: P0,
+            config: &config,
+            context: &AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        assess_candidate(&ctx)
+    }
+
+    #[test]
+    fn rejects_pump_when_our_only_creature_is_tapped_out_of_combat() {
+        assert_eq!(
+            pump_on_tapped_only_creature_at_opponents_combat(
+                "Target creature gets +3/+3 until end of turn.",
+                true
+            ),
+            GateDecision::Reject
+        );
+    }
+
+    #[test]
+    fn rejects_pump_with_a_rider_when_nobody_can_use_it() {
+        // Unchecked Growth: the conditional trample rider kept it out of the
+        // pure-pump window gate.
+        assert_eq!(
+            pump_on_tapped_only_creature_at_opponents_combat(
+                "Target creature gets +4/+4 until end of turn. If it's a Spirit, it gains trample until end of turn.",
+                true
+            ),
+            GateDecision::Reject
+        );
+    }
+
+    #[test]
+    fn an_untapped_creature_keeps_the_pump_out_of_the_no_beneficiary_reject() {
+        // It can still block: whether NOW is the right time is the window gate's call.
+        assert!(!temporary_pump_without_beneficiary_for_test(
+            "Target creature gets +3/+3 until end of turn.",
+            false
+        ));
+    }
+
+    fn temporary_pump_without_beneficiary_for_test(oracle: &str, tapped: bool) -> bool {
+        let mut scenario = GameScenario::new();
+        let bear = scenario.add_creature(P0, "Bear", 2, 2).id();
+        let growth = scenario
+            .add_spell_to_hand_from_oracle(P0, "Pump", true, oracle)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        state.objects.get_mut(&bear).unwrap().tapped = tapped;
+        state.phase = Phase::BeginCombat;
+        state.active_player = P1;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+        let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: Vec::new(),
+        };
+        let candidate = CandidateAction {
+            action: GameAction::CastSpell {
+                object_id: growth,
+                card_id: state.objects.get(&growth).unwrap().card_id,
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            },
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Spell),
+        };
+        let ctx = PolicyContext {
+            state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: P0,
+            config: &config,
+            context: &AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        temporary_pump_spell_without_beneficiary(&ctx, &ctx.effects())
+    }
+
+    #[test]
+    fn the_tapped_case_is_caught_by_the_no_beneficiary_rule_itself() {
+        assert!(temporary_pump_without_beneficiary_for_test(
+            "Target creature gets +4/+4 until end of turn. If it's a Spirit, it gains trample until end of turn.",
+            true
+        ));
     }
 
     #[test]

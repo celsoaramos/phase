@@ -868,7 +868,7 @@ fn ability_effect_is_temporary_combat_modifier(ability: &AbilityDefinition) -> b
     }
 }
 
-fn effect_is_temporary_combat_modifier(effect: &Effect) -> bool {
+pub(crate) fn effect_is_temporary_combat_modifier(effect: &Effect) -> bool {
     match effect {
         Effect::GenericEffect {
             static_abilities,
