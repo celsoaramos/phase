@@ -269,11 +269,38 @@ export async function saveAuthoritativeGame(
   adapter: EngineAdapter,
   fallbackState: GameState,
 ): Promise<void> {
+  await saveGame(gameId, await authoritativePersistenceState(adapter, fallbackState));
+}
+
+/** Commit the engine-authored initial snapshot before a fresh game can start. */
+export async function saveAuthoritativeGameStrict(
+  gameId: string,
+  adapter: EngineAdapter,
+  fallbackState: GameState,
+): Promise<void> {
+  await saveResumableGameStrict(gameId, await authoritativePersistenceState(adapter, fallbackState));
+}
+
+/**
+ * Capture the engine-authored trusted envelope for a persistence boundary
+ * (saves, undo checkpoints). Rendered screen states are viewer projections
+ * (`wire_projection`) that the restore ingress fails closed on, so anything
+ * that may later be restored must come from this boundary. Returns null when
+ * the adapter holds no local engine — callers push/save nothing restorable
+ * rather than an unrestorable projection.
+ */
+export async function captureTrustedCheckpoint(
+  adapter: EngineAdapter,
+): Promise<PersistedGameState | null> {
   const trustedJson = await adapter.exportPersistenceState?.();
-  await saveGame(
-    gameId,
-    trustedJson ? JSON.parse(trustedJson) as PersistedGameState : fallbackState,
-  );
+  return trustedJson ? JSON.parse(trustedJson) as PersistedGameState : null;
+}
+
+async function authoritativePersistenceState(
+  adapter: EngineAdapter,
+  fallbackState: GameState,
+): Promise<PersistedGameState> {
+  return (await captureTrustedCheckpoint(adapter)) ?? fallbackState;
 }
 
 export async function loadGame(gameId: string): Promise<PersistedGameState | null> {
@@ -285,6 +312,12 @@ export async function loadGame(gameId: string): Promise<PersistedGameState | nul
   }
 }
 
+/** Read a saved game without interpreting an IndexedDB failure as absence. */
+export async function loadGameStrict(gameId: string): Promise<PersistedGameState | null> {
+  const state = await get<PersistedGameState>(GAME_KEY_PREFIX + gameId, getGameStore());
+  return state === undefined ? null : migratePersistedGameState(state);
+}
+
 export async function clearGame(gameId: string): Promise<void> {
   try {
     await del(GAME_KEY_PREFIX + gameId, getGameStore());
@@ -294,6 +327,18 @@ export async function clearGame(gameId: string): Promise<void> {
     // would surface a game the engine has forgotten.
     await del(P2P_HOST_KEY_PREFIX + gameId, getGameStore());
   } catch { /* best effort */ }
+  const active = loadActiveGame();
+  if (active?.id === gameId) {
+    clearActiveGame();
+  }
+}
+
+/** Remove every game-scoped record before reusing a game ID for a fresh start. */
+export async function clearGameStrict(gameId: string): Promise<void> {
+  const store = getGameStore();
+  await del(GAME_CHECKPOINTS_PREFIX + gameId, store);
+  await del(P2P_HOST_KEY_PREFIX + gameId, store);
+  await del(GAME_KEY_PREFIX + gameId, store);
   const active = loadActiveGame();
   if (active?.id === gameId) {
     clearActiveGame();
@@ -336,15 +381,15 @@ export async function clearP2PHostSession(gameId: string): Promise<void> {
 
 // ── Checkpoints (IndexedDB) ─────────────────────────────────────────────
 
-export async function saveCheckpoints(gameId: string, checkpoints: GameState[]): Promise<void> {
+export async function saveCheckpoints(gameId: string, checkpoints: PersistedGameState[]): Promise<void> {
   try {
     await set(GAME_CHECKPOINTS_PREFIX + gameId, checkpoints, getGameStore());
   } catch { /* best effort */ }
 }
 
-export async function loadCheckpoints(gameId: string): Promise<GameState[]> {
+export async function loadCheckpoints(gameId: string): Promise<PersistedGameState[]> {
   try {
-    const checkpoints = await get<GameState[]>(GAME_CHECKPOINTS_PREFIX + gameId, getGameStore());
+    const checkpoints = await get<PersistedGameState[]>(GAME_CHECKPOINTS_PREFIX + gameId, getGameStore());
     return checkpoints?.map((checkpoint) => migratePersistedGameState(checkpoint)) ?? [];
   } catch {
     return [];
