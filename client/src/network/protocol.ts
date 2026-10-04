@@ -106,6 +106,11 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  88 — GameState and game actions carry exact replacement-choice preferences,
+ *       remembered responses, and prompt eligibility metadata. Bumped with
+ *       full-game protocol 106.
+ *  87 — GameState and game actions carry the nominal quantity of a deferred
+ *       mana-source selection. Bumped with full-game protocol 105.
  *  86 — game_setup and state_update carry GameState, whose PendingCast
  *       gains delved_cards and whose pending cost-move resume swaps
  *       DelveManaPayment for FinalizeDelvedCast (#9400). Bumped in lockstep
@@ -536,8 +541,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-/** v87: full-game v105 replacement-choice preferences and remembered responses. */
-export const WIRE_PROTOCOL_VERSION = 87 as const;
+export const WIRE_PROTOCOL_VERSION = 88 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {
