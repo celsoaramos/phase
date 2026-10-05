@@ -5929,6 +5929,181 @@ fn trigger_attacks_enchanted_player_scopes_to_attached_player() {
     );
 }
 
+/// CR 102.1 + CR 508.1b: Preacher of the Schism — BOTH attack triggers keep their
+/// life-total gate. Before, each came out with no condition and no defender scope,
+/// so the token AND the card arrived on every attack.
+#[test]
+fn preacher_of_the_schism_keeps_both_life_gates() {
+    let triggers = parse_trigger_lines(
+        "Whenever this creature attacks the player with the most life or tied for most life, create a 1/1 white Vampire creature token with lifelink.",
+        "Preacher of the Schism",
+    );
+    assert_eq!(triggers.len(), 1);
+    assert_eq!(triggers[0].mode, TriggerMode::Attacks);
+    assert_eq!(
+        triggers[0].attack_target_filter,
+        Some(AttackTargetFilter::Player)
+    );
+    let vt = format!("{:?}", triggers[0].valid_target);
+    assert!(
+        vt.contains("PlayerAttribute") && vt.contains("LifeTotal") && vt.contains("GE"),
+        "defender must be scoped to the most-life player, got {vt}"
+    );
+
+    let triggers = parse_trigger_lines(
+        "Whenever this creature attacks while you have the most life or are tied for most life, you draw a card and you lose 1 life.",
+        "Preacher of the Schism",
+    );
+    assert_eq!(triggers.len(), 1);
+    assert_eq!(triggers[0].mode, TriggerMode::Attacks);
+    let cond = format!("{:?}", triggers[0].condition);
+    assert!(
+        cond.contains("LifeTotal { player: Controller }")
+            && cond.contains("GE")
+            && cond.contains("AllPlayers"),
+        "while-gate must be your life >= max life, got {cond}"
+    );
+}
+
+/// CR 603.2 + CR 508.1m: an attack `while` gate must consume its whole
+/// qualification; a partially parsed controller gate stays unsupported.
+#[test]
+fn attacks_while_controller_gate_rejects_unconsumed_rider() {
+    let complete = parse_trigger_lines(
+        "Whenever this creature attacks while you have the most life or are tied for most life, draw a card.",
+        "Probe",
+    );
+    assert_eq!(complete.len(), 1);
+    assert_eq!(complete[0].mode, TriggerMode::Attacks);
+    let condition = format!("{:?}", complete[0].condition);
+    assert!(
+        condition.contains("EventTime")
+            && condition.contains("LifeTotal { player: Controller }")
+            && condition.contains("AllPlayers")
+            && condition.contains("GE"),
+        "the complete controller gate must qualify the attack: {condition}"
+    );
+
+    let conjunction = parse_trigger_lines(
+        "Whenever this creature attacks while you have the most life or are tied for most life and you control a Forest, draw a card.",
+        "Probe",
+    );
+    assert_eq!(conjunction.len(), 1);
+    assert_eq!(conjunction[0].mode, TriggerMode::Attacks);
+    let Some(TriggerCondition::EventTime { condition }) = &conjunction[0].condition else {
+        panic!("the complete conjunction must qualify the attack: {conjunction:?}");
+    };
+    let TriggerCondition::And { conditions } = condition.as_ref() else {
+        panic!("both state conditions must survive: {condition:?}");
+    };
+    assert_eq!(conditions.len(), 2);
+    assert!(matches!(
+        &conditions[0],
+        TriggerCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::Controller,
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::AllPlayers {
+                        aggregate: AggregateFunction::Max,
+                        exclude: None,
+                    },
+                },
+            },
+        }
+    ));
+    let TriggerCondition::ControlsType {
+        filter: TargetFilter::Typed(filter),
+    } = &conditions[1]
+    else {
+        panic!("Forest control must survive: {:?}", conditions[1]);
+    };
+    assert_eq!(
+        filter.type_filters,
+        vec![TypeFilter::Subtype("Forest".to_string())]
+    );
+    assert_eq!(filter.controller, Some(ControllerRef::You));
+    assert!(filter.properties.contains(&FilterProp::InZone {
+        zone: Zone::Battlefield,
+    }));
+
+    let partial = parse_trigger_lines(
+        "Whenever this creature attacks while you have the most life or are tied for most life but not if you control a Forest, draw a card.",
+        "Probe",
+    );
+    assert_eq!(partial.len(), 1);
+    assert!(
+        matches!(partial[0].mode, TriggerMode::Unknown(_)),
+        "an unconsumed state rider must remain explicitly unsupported: {partial:?}"
+    );
+}
+
+/// The "the player" arm only binds when the most-life qualifier follows.
+#[test]
+fn attacks_the_player_without_most_life_qualifier_does_not_bind_player_scope() {
+    // CR 508.1b: unmodelled "the player …" qualifiers — no "or tied" tail, a
+    // different superlative, and speed (no per-candidate reader) — must stay
+    // explicitly unsupported. The discriminating check is that NO `Attacks`
+    // trigger comes out at all: an unscoped one would fire on every attack.
+    for text in [
+        "Whenever this creature attacks the player with the fewest cards in hand, draw a card.",
+        "Whenever this creature attacks the player with the most life, draw a card.",
+        "Whenever this creature attacks the player with the most speed or tied for most speed, draw a card.",
+        // Partially recognised: the leader grammar matches a prefix, but the
+        // qualifier continues past it — the terminator check must decline.
+        "Whenever this creature attacks the player with the most life or tied for most life and controls a Forest, draw a card.",
+    ] {
+        let triggers = parse_trigger_lines(text, "Probe");
+        assert!(
+            !triggers.is_empty(),
+            "{text}: the line must still surface (as unsupported), not vanish"
+        );
+        assert!(
+            triggers
+                .iter()
+                .all(|t| !matches!(t.mode, TriggerMode::Attacks)),
+            "{text}: no generic Attacks trigger may escape: {triggers:?}"
+        );
+    }
+    // Positive reach guard for the partial case above: the SAME qualifier,
+    // ending at the clause boundary, binds the scoped leader filter — so the
+    // decline is caused by the trailing rider, not by the grammar failing.
+    let triggers = parse_trigger_lines(
+        "Whenever this creature attacks the player with the most life or tied for most life, draw a card.",
+        "Probe",
+    );
+    assert_eq!(triggers.len(), 1);
+    assert_eq!(triggers[0].mode, TriggerMode::Attacks);
+    assert_eq!(
+        triggers[0].attack_target_filter,
+        Some(AttackTargetFilter::Player)
+    );
+    let vt = format!("{:?}", triggers[0].valid_target);
+    assert!(
+        vt.contains("LifeTotal") && vt.contains("GE"),
+        "the complete qualifier must scope the defender, got {vt}"
+    );
+
+    // Reach guard: the same grammar reads another property, not just life.
+    let triggers = parse_trigger_lines(
+        "Whenever this creature attacks the player with the most cards in hand or tied for most cards in hand, draw a card.",
+        "Probe",
+    );
+    assert_eq!(
+        triggers[0].attack_target_filter,
+        Some(AttackTargetFilter::Player)
+    );
+    let vt = format!("{:?}", triggers[0].valid_target);
+    assert!(
+        vt.contains("HandSize") && vt.contains("GE"),
+        "defender must be scoped to the most-cards player, got {vt}"
+    );
+}
+
 /// Issue #5249 — The Spear of Bashenga: "Whenever equipped creature attacks
 /// the monarch, destroy target tapped nonland permanent that player controls."
 /// The " the monarch" defender scope must parse to
@@ -22410,6 +22585,72 @@ fn harsh_mentor_ability_activation_trigger_accepts_oxford_type_list() {
     );
 }
 
+// SHAPE: actor scope is independent of loyalty kind and source-object scope.
+#[test]
+fn loyalty_ability_trigger_actor_scopes_shape() {
+    let opponent = TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent));
+    for (line, expected) in [
+        ("Whenever an opponent activates a loyalty ability, Gideon deals 1 damage to that player.", opponent),
+        ("Whenever you activate a loyalty ability, draw a card.", TargetFilter::Controller),
+        ("When a player activates a loyalty ability, draw a card.", TargetFilter::Player),
+    ] {
+        let def = parse_trigger_line(line, "Gideon the Oathless");
+        assert_eq!(def.mode, TriggerMode::LoyaltyAbilityActivated);
+        assert_eq!(def.valid_target, Some(expected));
+        assert_eq!(def.valid_card, None);
+        assert_no_unimplemented(def.execute.as_deref().expect("recognized effect"));
+    }
+    // The positives above guard these strict grammar refusals.
+    for line in [
+        "Whenever you activates a loyalty ability, draw a card.",
+        "Whenever an opponent activate a loyalty ability, draw a card.",
+        "Whenever a player activates a loyalty ability with an unsupported rider, draw a card.",
+    ] {
+        assert_ne!(
+            parse_trigger_line(line, "Synthetic loyalty grammar").mode,
+            TriggerMode::LoyaltyAbilityActivated
+        );
+    }
+}
+
+// SHAPE: full verbatim Oracle must retain both printed triggers and Ward.
+#[test]
+fn gideon_the_oathless_full_oracle_shape() {
+    let oracle = "Ward—Discard a card.\nWhenever a creature an opponent controls enters, Gideon deals 1 damage to that player.\nWhenever an opponent activates a loyalty ability, Gideon deals 1 damage to that player.";
+    let parsed = parse_oracle_text(
+        oracle,
+        "Gideon the Oathless",
+        &[],
+        &["Creature".to_string()],
+        &["Human".to_string(), "Mercenary".to_string()],
+    );
+    assert_eq!(parsed.triggers.len(), 2);
+    assert_eq!(parsed.triggers[0].mode, TriggerMode::ChangesZone);
+    let loyalty = &parsed.triggers[1];
+    assert_eq!(loyalty.mode, TriggerMode::LoyaltyAbilityActivated);
+    assert_eq!(
+        loyalty.valid_target,
+        Some(TargetFilter::Typed(
+            TypedFilter::default().controller(ControllerRef::Opponent)
+        ))
+    );
+    for trigger in &parsed.triggers {
+        assert_no_unimplemented(
+            trigger
+                .execute
+                .as_deref()
+                .expect("recognized printed effect"),
+        );
+    }
+    for ability in &parsed.abilities {
+        assert_no_unimplemented(ability);
+    }
+    assert!(parsed.extracted_keywords.iter().any(|kw| matches!(
+        kw,
+        Keyword::Ward(crate::types::keywords::WardCost::DiscardCard)
+    )));
+}
+
 // --- CR 606.2: "Whenever you activate a loyalty ability of [pw]" ---
 
 /// CR 606.2: Ajani Unrelenting's unqualified form accepts every loyalty
@@ -22421,6 +22662,7 @@ fn loyalty_ability_trigger_without_planeswalker_qualifier() {
         "Ajani Unrelenting",
     );
     assert_eq!(def.mode, TriggerMode::LoyaltyAbilityActivated);
+    assert_eq!(def.valid_target, Some(TargetFilter::Controller));
     assert_eq!(def.valid_card, None);
     let execute = def.execute.as_ref().expect("execute ability present");
     assert!(
@@ -22441,6 +22683,7 @@ fn loyalty_ability_trigger_chandra_subtype_regulator() {
             "Chandra's Regulator",
         );
     assert_eq!(def.mode, TriggerMode::LoyaltyAbilityActivated);
+    assert_eq!(def.valid_target, Some(TargetFilter::Controller));
     assert_eq!(
         def.valid_card,
         Some(TargetFilter::Typed(
@@ -22464,6 +22707,7 @@ fn loyalty_ability_trigger_chandra_subtype_keral_keep() {
             "Keral Keep Disciples",
         );
     assert_eq!(def.mode, TriggerMode::LoyaltyAbilityActivated);
+    assert_eq!(def.valid_target, Some(TargetFilter::Controller));
     assert_eq!(
         def.valid_card,
         Some(TargetFilter::Typed(
@@ -22487,6 +22731,7 @@ fn loyalty_ability_trigger_enchanted_elspeth() {
             "Elspeth's Talent",
         );
     assert_eq!(def.mode, TriggerMode::LoyaltyAbilityActivated);
+    assert_eq!(def.valid_target, Some(TargetFilter::Controller));
     assert_eq!(def.valid_card, Some(TargetFilter::AttachedTo));
     let execute = def.execute.as_ref().expect("execute ability present");
     assert!(
@@ -22505,6 +22750,7 @@ fn loyalty_ability_trigger_enchanted_rowan() {
             "Rowan's Talent",
         );
     assert_eq!(def.mode, TriggerMode::LoyaltyAbilityActivated);
+    assert_eq!(def.valid_target, Some(TargetFilter::Controller));
     assert_eq!(def.valid_card, Some(TargetFilter::AttachedTo));
     let execute = def.execute.as_ref().expect("execute ability present");
     assert!(
@@ -23025,6 +23271,118 @@ fn trigger_one_or_more_put_into_your_graveyard_with_unconsumed_origin_tail_stays
         matches!(def.mode, TriggerMode::Unknown(_)),
         "an unconsumed batched origin remainder must fail the arm, got {:?}",
         def.mode
+    );
+}
+
+/// Reach-guard for the honest-red pins below: the same sentence with a
+/// recognized origin parses through the single put-into-exile arm, so the
+/// pins' `Unknown` result can only come from the origin, not an upstream bail.
+#[test]
+fn trigger_put_into_exile_from_your_library_parses_origin() {
+    let def = parse_trigger_line(
+        "Whenever a creature card is put into exile from your library, draw a card.",
+        "Some Card",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    assert_eq!(def.origin, Some(Zone::Library));
+    assert_eq!(def.destination, Some(Zone::Exile));
+}
+
+/// Honest-red (#9505): an origin the single put-into-exile arm cannot parse
+/// fails the arm instead of silently becoming an unconstrained exile trigger
+/// that fires on exile from any zone.
+#[test]
+fn trigger_put_into_exile_from_unparseable_origin_stays_unknown() {
+    let def = parse_trigger_line(
+        "Whenever a creature card is put into exile from an opponent's library, draw a card.",
+        "Some Card",
+    );
+    assert!(
+        matches!(def.mode, TriggerMode::Unknown(_)),
+        "an unparseable exile origin must fail the arm, got {:?}",
+        def.mode
+    );
+}
+
+/// Honest-red (#9505): a recognized origin followed by an unconsumed tail
+/// fails the arm instead of silently dropping the remainder.
+#[test]
+fn trigger_put_into_exile_with_unconsumed_origin_tail_stays_unknown() {
+    let def = parse_trigger_line(
+        "Whenever a creature card is put into exile from your library or an opponent's hand, draw a card.",
+        "Some Card",
+    );
+    assert!(
+        matches!(def.mode, TriggerMode::Unknown(_)),
+        "an unconsumed exile origin remainder must fail the arm, got {:?}",
+        def.mode
+    );
+}
+
+/// Honest-red (#9505, batched fall-through): a batched exile line whose origin
+/// the batched arm rejects must not be rescued by the single arm via subject
+/// decomposition as an unconstrained exile trigger. The reach-guard is the
+/// your-qualified batched sibling (Rakshasa Vizier shape), which differs only
+/// in the origin possessive.
+#[test]
+fn trigger_one_or_more_put_into_exile_from_unparseable_origin_stays_unknown() {
+    let accepted = parse_trigger_line(
+        "Whenever one or more cards are put into exile from your library, draw a card.",
+        "Some Card",
+    );
+    assert_eq!(
+        accepted.mode,
+        TriggerMode::ChangesZoneAll,
+        "reach-guard: the your-qualified batched line must parse"
+    );
+
+    let def = parse_trigger_line(
+        "Whenever one or more cards are put into exile from an opponent's library, draw a card.",
+        "Some Card",
+    );
+    assert!(
+        matches!(def.mode, TriggerMode::Unknown(_)),
+        "an unparseable batched exile origin must not fall through as unconstrained, got {:?}",
+        def.mode
+    );
+}
+
+/// Positive controls: every origin the single put-into-exile arm recognizes
+/// still parses to a `ChangesZone` trigger with the expected scalar origin.
+#[test]
+fn trigger_put_into_exile_accepted_origins() {
+    let cases = [
+        ("the battlefield", Some(Zone::Battlefield)),
+        ("anywhere", None),
+        ("your library", Some(Zone::Library)),
+        ("your hand", Some(Zone::Hand)),
+        ("your graveyard", Some(Zone::Graveyard)),
+    ];
+    for (origin_text, expected_origin) in cases {
+        let line =
+            format!("Whenever a creature card is put into exile from {origin_text}, draw a card.");
+        let def = parse_trigger_line(&line, "Some Card");
+        assert_eq!(def.mode, TriggerMode::ChangesZone, "{line}");
+        assert_eq!(def.origin, expected_origin, "{line}");
+        assert_eq!(def.destination, Some(Zone::Exile), "{line}");
+    }
+}
+
+/// Self-referential shape (Urza's Sylex): "When ~ is put into exile from the
+/// battlefield" keeps its battlefield origin and exile look-back zone.
+#[test]
+fn trigger_self_put_into_exile_from_battlefield() {
+    let def = parse_trigger_line(
+        "When Urza's Sylex is put into exile from the battlefield, you may pay {2}.",
+        "Urza's Sylex",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    assert_eq!(def.origin, Some(Zone::Battlefield));
+    assert_eq!(def.destination, Some(Zone::Exile));
+    assert!(
+        def.trigger_zones.contains(&Zone::Exile),
+        "self-referential exile trigger must look back from exile, got {:?}",
+        def.trigger_zones
     );
 }
 
@@ -28725,33 +29083,46 @@ fn head_shape_inside_the_subject_truncates_but_stays_honest() {
     assert_eq!(triggers[1].valid_card, None);
 }
 
-/// KNOWN EXPOSURE E2.
+/// KNOWN EXPOSURE E2: the open event-head splitter still separates these
+/// predicates, but unsupported `while` tails must not become broad attacks.
 #[test]
 fn comparison_predicate_siblings_are_unguarded_but_honest() {
-    for (text, expected_unknown) in [
-        (
-            "Whenever this creature attacks while your life total is greater than 20 or is less than 5, draw a card.",
-            "Whenever ~ is less than 5",
-        ),
-        (
-            "Whenever this creature attacks while your life total is even or is odd, draw a card.",
-            "Whenever ~ is odd",
-        ),
-    ] {
-        let triggers = parse_trigger_lines(text, "~");
-        assert_eq!(triggers.len(), 2, "{text}");
-        assert_eq!(triggers[0].mode, TriggerMode::Attacks, "{text}");
-        assert_eq!(triggers[0].valid_card, Some(TargetFilter::SelfRef), "{text}");
-        assert_eq!(
-            triggers[1].mode,
-            TriggerMode::Unknown(expected_unknown.to_string()),
-            "{text}"
-        );
-        assert_eq!(triggers[1].valid_card, None, "{text}");
-    }
+    let triggers = parse_trigger_lines(
+        "Whenever this creature attacks while your life total is greater than 20 or is less than 5, draw a card.",
+        "~",
+    );
+    assert_eq!(triggers.len(), 2);
+    assert_eq!(triggers[0].mode, TriggerMode::Attacks);
+    assert_eq!(triggers[0].valid_card, Some(TargetFilter::SelfRef));
+    assert!(matches!(
+        &triggers[0].condition,
+        Some(TriggerCondition::EventTime { .. })
+    ));
+    assert_eq!(
+        triggers[1].mode,
+        TriggerMode::Unknown("Whenever ~ is less than 5".to_string())
+    );
+    assert_eq!(triggers[1].valid_card, None);
+
+    let triggers = parse_trigger_lines(
+        "Whenever this creature attacks while your life total is even or is odd, draw a card.",
+        "~",
+    );
+    assert_eq!(triggers.len(), 2);
+    assert_eq!(
+        triggers[0].mode,
+        TriggerMode::Unknown("Whenever ~ attacks while your life total is even".to_string())
+    );
+    assert_eq!(triggers[0].valid_card, None);
+    assert_eq!(
+        triggers[1].mode,
+        TriggerMode::Unknown("Whenever ~ is odd".to_string())
+    );
+    assert_eq!(triggers[1].valid_card, None);
 }
 
-/// KNOWN EXPOSURE E3.
+/// KNOWN EXPOSURE E3: the open `becomes` head splits this non-event predicate;
+/// the unsupported `while` tail stays Unknown rather than becoming an attack.
 #[test]
 fn becomes_voice_non_event_predicate_is_unguarded_but_honest() {
     let triggers = parse_trigger_lines(
@@ -28759,8 +29130,13 @@ fn becomes_voice_non_event_predicate_is_unguarded_but_honest() {
         "~",
     );
     assert_eq!(triggers.len(), 2);
-    assert_eq!(triggers[0].mode, TriggerMode::Attacks);
-    assert_eq!(triggers[0].valid_card, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        triggers[0].mode,
+        TriggerMode::Unknown(
+            "Whenever ~ attacks while its power becomes greater than 4".to_string()
+        )
+    );
+    assert_eq!(triggers[0].valid_card, None);
     assert_eq!(
         triggers[1].mode,
         TriggerMode::Unknown("Whenever ~ becomes less than 2".to_string())
