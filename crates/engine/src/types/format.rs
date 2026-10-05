@@ -1222,7 +1222,8 @@ impl<'de> Deserialize<'de> for FormatConfig {
                     return Err(serde::de::Error::custom(format!(
                         "FormatConfig for {} contradicts its own custom_rules.structural — every \
                          runtime field must be exactly what FormatConfig::for_custom_rules \
-                         derives from the declared rules (allow_debug_actions excepted). Derived: \
+                         derives from the declared rules (allow_debug_actions \
+                         excepted). Derived: \
                          starting_life {}, players {}-{}, deck_size {:?}, singleton {}, \
                          command_zone {}, commander_damage_threshold {:?}, uses_commander {}, \
                          team_based {}, archenemy_player {:?}, supplies_fixed_deck {}, \
@@ -1262,9 +1263,9 @@ impl<'de> Deserialize<'de> for FormatConfig {
             // NoLooserThan, Derived, HostChoice, ShapeLocked, and
             // HostChoiceWithin). `built_in_axes_no_looser_than_rules`
             // re-derives the authoritative config via `FormatConfig::for_format`
-            // and checks every one of this struct's 17 fields against it —
+            // and checks every one of this struct's 18 fields against it —
             // absorbing what was previously a single ad hoc
-            // `default_deck_copy_limit` check as one of its 17 rows, rather
+            // `default_deck_copy_limit` check as one of its 18 rows, rather
             // than adding a parallel second check. `range_of_influence`'s row
             // is a documented `Deferred` non-check (see that function's own
             // comment on the field), not an omission.
@@ -1515,6 +1516,17 @@ impl GameFormat {
     pub fn admits_digital_only_cards(self) -> bool {
         self.legality_format()
             .is_none_or(LegalityFormat::admits_digital_only_cards)
+    }
+
+    /// Whether this format's venture pool includes Baldur's Gate Wilderness:
+    /// the formats whose own rules positively restrict nothing
+    /// ([`CardPool::Unrestricted`]) offer it alongside the AFR trio on a
+    /// normal venture (CR 701.49a) and as an alternative to Undercity on an
+    /// initiative venture (CR 726.2); every other format offers only the
+    /// printed pool. Derived from [`Self::card_pool`] — never re-list the
+    /// formats here.
+    pub fn offers_baldurs_gate_wilderness(self) -> bool {
+        matches!(self.card_pool(), CardPool::Unrestricted)
     }
 
     /// CR 100.4a: Per-format sideboard policy.

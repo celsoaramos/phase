@@ -1765,7 +1765,9 @@ fn build_prompt_input(
         // `CollectedCostModifiers::generic_only_units` as bare `{1}` multipliers
         // and never become snapshot entries, and `order_relevant_reductions`
         // additionally keeps only shard-bearing amounts. So every entry here is
-        // a `Static` or a `Defiler`, and both carry a `display_name`.
+        // a `Static`, a `Defiler` or the reduction an Emerge or Offering
+        // sacrifice earned (`SacrificedForCost`), and each carries a
+        // `display_name`.
         WaitingFor::OrderCostReductions {
             reductions,
             hybrid_symbols,
@@ -2809,7 +2811,7 @@ pub fn convert_available_action(
         GameAction::SelectTargets { .. } | GameAction::ChooseTarget { .. } => {
             AvailableActionConversion::Skip
         }
-        GameAction::ChooseReplacement { .. } => {
+        GameAction::ChooseReplacement { .. } | GameAction::ChooseReplacementAndRemember { .. } => {
             AvailableActionConversion::Unsupported("local.replacement-choice-unsupported")
         }
         // Answered through the Reorder prompt for `WaitingFor::OrderTriggers`.
@@ -2978,6 +2980,7 @@ pub fn convert_available_action(
         | GameAction::SetPriorityPassingMode { .. }
         | GameAction::SetPriorityYield { .. }
         | GameAction::SetMayTriggerAutoChoice { .. }
+        | GameAction::SetReplacementAutoChoice { .. }
         | GameAction::SetTriggerOrderTemplate { .. } => {
             AvailableActionConversion::Unsupported("local.autopass-settings-unsupported")
         }

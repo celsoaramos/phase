@@ -762,6 +762,76 @@ fn castability_follows_two_swamps_through_a_filter_land_payment() {
     assert!(state.pending_cast.is_none());
 }
 
+/// CR 601.2g + CR 605.3b: The producer -> filter-land routes a priority probe
+/// memoizes are spell-independent, so one probe must answer every cost the
+/// same way the uncached witness does, whichever cost explores the route tree
+/// first and whether a later query is served from the memo or resumes it.
+#[test]
+fn priority_probe_filter_land_route_memo_matches_the_uncached_witness() {
+    let mut state = setup_game_at_main_phase();
+    let spell =
+        create_generic_creature_in_hand(&mut state, 9_030, PlayerId(0), "Route Memo Stand-In", 0);
+    for name in ["First Swamp", "Second Swamp"] {
+        create_tap_mana_source(
+            &mut state,
+            name,
+            ManaProduction::Fixed {
+                colors: vec![ManaColor::Black],
+                contribution: ManaContribution::Base,
+            },
+        );
+    }
+    create_black_red_filter_land(&mut state, 9_031);
+    let colored = |shards: Vec<ManaCostShard>| ManaCost::Cost { shards, generic: 0 };
+    // Two Swamps plus a filter land net three mana: {B}{B}{R} is payable only
+    // through the filter-land route, {B}{B}{R}{R} is not payable at all.
+    let payable = colored(vec![
+        ManaCostShard::Black,
+        ManaCostShard::Black,
+        ManaCostShard::Red,
+    ]);
+    let unpayable = colored(vec![
+        ManaCostShard::Black,
+        ManaCostShard::Black,
+        ManaCostShard::Red,
+        ManaCostShard::Red,
+    ]);
+    assert!(can_feasibly_pay_mana_cost(
+        &state,
+        PlayerId(0),
+        Some(spell),
+        &payable
+    ));
+    assert!(!can_feasibly_pay_mana_cost(
+        &state,
+        PlayerId(0),
+        Some(spell),
+        &unpayable
+    ));
+
+    let feasible_with = |probe: &PriorityCastProbe, cost: &ManaCost| {
+        can_feasibly_pay_mana_cost_with_probe(
+            probe.state(),
+            PlayerId(0),
+            Some(spell),
+            cost,
+            Some(probe),
+        )
+    };
+
+    // Exhaust the route tree first, then answer from the memo.
+    let exhausted = PriorityCastProbe::new(&state, PlayerId(0));
+    assert!(!feasible_with(&exhausted, &unpayable));
+    assert!(feasible_with(&exhausted, &payable));
+    assert!(!feasible_with(&exhausted, &unpayable));
+
+    // Stop early on a payable cost, then resume the walk for an unpayable one.
+    let resumed = PriorityCastProbe::new(&state, PlayerId(0));
+    assert!(feasible_with(&resumed, &payable));
+    assert!(!feasible_with(&resumed, &unpayable));
+    assert!(feasible_with(&resumed, &payable));
+}
+
 #[test]
 fn castability_follows_a_manual_nonland_producer_through_a_filter_land_payment() {
     let mut state = setup_game_at_main_phase();
@@ -13260,6 +13330,118 @@ fn heliod_warped_eclipse_reduces_by_sum_of_opponents_draws() {
     }
 }
 
+/// CR 205.2a + CR 607.2a + CR 601.2f (#6898): Cemetery Prowler's "for each card
+/// type they share with cards exiled with ~" reduces by the INTERSECTION of the
+/// spell's card types with the linked-exile population's card types — not the
+/// population's distinct-type count, not the exiled card count, and not the whole
+/// card count (which the ObjectCount misparse produced).
+fn prowler_shared_card_type_reduction(
+    types_exiled: &[&[CoreType]],
+    spell_types: &[CoreType],
+) -> u32 {
+    let mut state = setup_game_at_main_phase();
+    let player = PlayerId(0);
+
+    let prowler = create_object(
+        &mut state,
+        CardId(850),
+        player,
+        "Cemetery Prowler".to_string(),
+        Zone::Battlefield,
+    );
+    state
+        .objects
+        .get_mut(&prowler)
+        .unwrap()
+        .static_definitions
+        .push(
+            StaticDefinition::new(StaticMode::ModifyCost {
+                mode: crate::types::statics::CostModifyMode::Reduce,
+                amount: ManaCost::generic(1),
+                spell_filter: None,
+                reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
+                dynamic_count: Some(QuantityRef::SharedCardTypes {
+                    source: crate::types::ability::CardTypeSetSource::ExiledBySource,
+                }),
+            })
+            .affected(TargetFilter::Typed(
+                TypedFilter::card().controller(ControllerRef::You),
+            )),
+        );
+
+    for types in types_exiled {
+        let exiled = add_exiled_card(&mut state, player, "Exiled Card");
+        let obj = state.objects.get_mut(&exiled).unwrap();
+        obj.card_types.core_types = types.to_vec();
+        link_exiled_to_source(&mut state, exiled, prowler);
+    }
+
+    let spell = create_object(
+        &mut state,
+        CardId(851),
+        player,
+        "Generic Spell".to_string(),
+        Zone::Hand,
+    );
+    {
+        let obj = state.objects.get_mut(&spell).unwrap();
+        obj.card_types.core_types = spell_types.to_vec();
+        obj.mana_cost = ManaCost::Cost {
+            generic: 3,
+            shards: vec![],
+        };
+    }
+    let mut cost = state.objects.get(&spell).unwrap().mana_cost.clone();
+    apply_battlefield_cost_modifiers(&state, player, spell, &mut cost);
+    match cost {
+        ManaCost::Cost { generic, .. } => generic,
+        other => panic!("expected ManaCost::Cost, got {other:?}"),
+    }
+}
+
+#[test]
+fn cemetery_prowler_reduces_by_shared_card_types() {
+    // An empty linked-exile population shares no card types, even when the
+    // spell itself has a card type.
+    assert_eq!(
+        prowler_shared_card_type_reduction(&[], &[CoreType::Creature]),
+        3
+    );
+
+    // Two exiled creature cards → one shared type → {1} (the Gatherer ruling's
+    // "creature spells cost {1} less, not {2} less").
+    assert_eq!(
+        prowler_shared_card_type_reduction(
+            &[&[CoreType::Creature], &[CoreType::Creature]],
+            &[CoreType::Creature],
+        ),
+        2
+    );
+    // Exiled instant, casting a sorcery → shares nothing → no reduction.
+    assert_eq!(
+        prowler_shared_card_type_reduction(&[&[CoreType::Instant]], &[CoreType::Sorcery]),
+        3
+    );
+    // Mixed exiled creature + instant, casting a creature → only "creature"
+    // shared → {1}, not the population's 2 distinct types.
+    assert_eq!(
+        prowler_shared_card_type_reduction(
+            &[&[CoreType::Creature], &[CoreType::Instant]],
+            &[CoreType::Creature],
+        ),
+        2
+    );
+    // Multi-typed "artifact creature" spell sharing both types with an exiled
+    // artifact creature → each shared type counted exactly once → {2}.
+    assert_eq!(
+        prowler_shared_card_type_reduction(
+            &[&[CoreType::Artifact, CoreType::Creature]],
+            &[CoreType::Artifact, CoreType::Creature],
+        ),
+        1
+    );
+}
+
 #[test]
 fn activated_ability_cost_reduction_applies_to_matching_permanent_type() {
     let mut state = setup_game_at_main_phase();
@@ -16101,7 +16283,7 @@ fn snuff_out_alt_cost_paid_resolves_destroy_on_chosen_target() {
         "Snuff Out should have destroyed the target creature on resolution"
     );
     assert!(events.iter().any(
-        |e| matches!(e, GameEvent::CreatureDestroyed { object_id } if *object_id == target_id)
+        |e| matches!(e, GameEvent::CreatureDestroyed { object_id, .. } if *object_id == target_id)
     ));
 }
 
@@ -19671,6 +19853,10 @@ fn delve_exiles_graveyard_card_for_generic() {
     )
     .expect("delving a graveyard card is legal");
 
+    // CR 601.2h: selecting pays nothing; the card leaves with the total cost.
+    assert_eq!(state.objects.get(&gy).unwrap().zone, Zone::Graveyard);
+
+    apply_as_current(&mut state, GameAction::PassPriority).expect("commit the payment");
     // CR 702.66a: the delved card is exiled.
     assert_eq!(
         state.objects.get(&gy).unwrap().zone,
@@ -19706,6 +19892,7 @@ fn delve_records_exiled_with_casting_spell() {
         },
     )
     .expect("delving a graveyard card is legal");
+    apply_as_current(&mut state, GameAction::PassPriority).expect("commit the payment");
 
     assert!(
         state
@@ -19717,7 +19904,7 @@ fn delve_records_exiled_with_casting_spell() {
 }
 
 #[test]
-fn delve_cancel_cast_returns_exiled_cards_to_graveyard() {
+fn delve_cancel_cast_leaves_selected_cards_in_graveyard() {
     use super::super::engine::apply_as_current;
     let mut state = setup_game_at_main_phase();
     let obj_id = make_delve_spell(&mut state);
@@ -24058,6 +24245,47 @@ fn cancel_cast_uses_stamped_convoked_creatures_when_pending_snapshot_is_empty() 
 }
 
 #[test]
+fn terminal_cancel_with_fresh_pending_cast_drops_delve_markers() {
+    let mut state = setup_game_at_main_phase();
+    let fuel = create_object(
+        &mut state,
+        CardId(71),
+        PlayerId(0),
+        "Delve Fuel".to_string(),
+        Zone::Graveyard,
+    );
+    let spell = create_object(
+        &mut state,
+        CardId(72),
+        PlayerId(0),
+        "Delve Spell".to_string(),
+        Zone::Hand,
+    );
+    state.players[0]
+        .mana_pool
+        .add(ManaUnit::convoke_payment(ManaType::Colorless, fuel));
+    let pending = PendingCast::new(
+        spell,
+        CardId(72),
+        ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            spell,
+            PlayerId(0),
+        ),
+        ManaCost::generic(1),
+    );
+
+    handle_cancel_cast(&mut state, &pending, &mut Vec::new());
+
+    assert!(state.players[0].mana_pool.mana.is_empty());
+    assert_eq!(state.objects[&fuel].zone, Zone::Graveyard);
+}
+
+#[test]
 fn generic_convoke_payment_cannot_pay_colorless_mana_symbol() {
     use crate::game::engine::apply_as_current;
 
@@ -24677,13 +24905,13 @@ fn pay_and_push_emits_targeting_events_for_chained_spell_targets() {
     // declaration continuation, so reproduce its event before paying costs.
     emit_targeting_events(
         &state,
-        &flatten_targets_in_chain(&ability),
+        &crate::game::ability_utils::flatten_targets_in_chain(&ability),
         object_id,
         PlayerId(0),
         &mut events,
     );
 
-    let waiting_for = crate::game::casting_costs::pay_and_push(
+    let waiting_for = crate::game::casting_costs::pay_and_push_with_lock(
         &mut state,
         PlayerId(0),
         object_id,
@@ -24700,6 +24928,7 @@ fn pay_and_push_emits_targeting_events_for_chained_spell_targets() {
         None,
         Zone::Hand,
         CastPaymentMode::Auto,
+        crate::game::casting_costs::CostLockInput::default(),
         &mut events,
     )
     .expect("spell with chained targets should cast");
@@ -29699,6 +29928,267 @@ fn will_scion_of_peace_reduces_white_blue_spells_by_life_gained() {
     );
 }
 
+/// CR 611.2a + CR 601.2f: a player-wide transient cost grant stops discounting
+/// the moment its duration lapses, even though the stored TCE is swept later.
+/// `ForAsLongAs`/`DuringYourTurn` flips the duration without touching the
+/// list, so the cast on the far side proves the liveness gate — not a sweep —
+/// refused the discount.
+#[test]
+fn transient_player_wide_grant_stops_when_its_duration_lapses() {
+    use crate::game::dungeon::dungeon_sentinel_id;
+    use crate::types::statics::{CostModifyMode, CostReductionReach, StaticMode};
+
+    let mut state = GameState::new_two_player(42);
+    let spell = create_object(
+        &mut state,
+        CardId(10),
+        PlayerId(0),
+        "Discountable Spell".to_string(),
+        Zone::Hand,
+    );
+    {
+        let obj = state.objects.get_mut(&spell).unwrap();
+        obj.mana_cost = ManaCost::generic(3);
+        obj.base_mana_cost = ManaCost::generic(3);
+        obj.base_card_types.core_types.push(CoreType::Instant);
+        obj.card_types.core_types.push(CoreType::Instant);
+    }
+    let grant = ContinuousModification::GrantStaticAbility {
+        definition: Box::new(StaticDefinition::new(StaticMode::ModifyCost {
+            mode: CostModifyMode::Reduce,
+            amount: ManaCost::generic(2),
+            spell_filter: None,
+            dynamic_count: None,
+            reach: CostReductionReach::SpillsToGeneric,
+        })),
+    };
+    state.add_transient_continuous_effect(
+        dungeon_sentinel_id(PlayerId(0)),
+        PlayerId(0),
+        Duration::ForAsLongAs {
+            condition: StaticCondition::DuringYourTurn,
+        },
+        TargetFilter::SpecificPlayer { id: PlayerId(0) },
+        vec![grant],
+        None,
+    );
+
+    let cost = |state: &GameState, id| {
+        apply_cost_modifiers_to_base(
+            state,
+            PlayerId(0),
+            id,
+            state.objects.get(&id).unwrap().mana_cost.clone(),
+        )
+        .expect("cost computed")
+    };
+    state.active_player = PlayerId(0);
+    assert_eq!(
+        cost(&state, spell),
+        ManaCost::generic(1),
+        "live duration discounts 3 by 2"
+    );
+    assert_eq!(
+        state.transient_continuous_effects.len(),
+        1,
+        "one stored grant before the boundary"
+    );
+    state.active_player = PlayerId(1);
+    assert_eq!(
+        cost(&state, spell),
+        ManaCost::generic(3),
+        "lapsed duration discounts nothing"
+    );
+    assert_eq!(
+        state.transient_continuous_effects.len(),
+        1,
+        "the TCE is still stored; the liveness gate — not a sweep — refused it"
+    );
+}
+
+/// CR 611.2c + CR 604.1: an object-bound transient grant is never read off
+/// the TCE — not even after its recipient leaves and stops supplying a
+/// functioning static. The functioning-static path owns it; the direct
+/// collector reads only player-wide grants, so no board-wide discount leaks
+/// onto unrelated spells.
+#[test]
+fn transient_object_bound_grant_is_ignored_after_its_recipient_leaves() {
+    use crate::game::layers::evaluate_layers;
+    use crate::types::statics::{CostModifyMode, CostReductionReach, StaticMode};
+
+    let mut state = GameState::new_two_player(42);
+    let granter = create_object(
+        &mut state,
+        CardId(1),
+        PlayerId(0),
+        "Granter".to_string(),
+        Zone::Battlefield,
+    );
+    let make_spell = |state: &mut GameState, id: u64, name: &str, core: CoreType| {
+        let s = create_object(state, CardId(id), PlayerId(0), name.to_string(), Zone::Hand);
+        let obj = state.objects.get_mut(&s).unwrap();
+        obj.mana_cost = ManaCost::generic(3);
+        obj.base_mana_cost = ManaCost::generic(3);
+        obj.base_card_types.core_types.push(core);
+        obj.card_types.core_types.push(core);
+        s
+    };
+    let instant = make_spell(&mut state, 10, "Matching Instant", CoreType::Instant);
+    let creature = make_spell(&mut state, 11, "Unrelated Creature", CoreType::Creature);
+    let grant = ContinuousModification::GrantStaticAbility {
+        definition: Box::new(StaticDefinition::new(StaticMode::ModifyCost {
+            mode: CostModifyMode::Reduce,
+            amount: ManaCost::generic(2),
+            spell_filter: Some(TargetFilter::Typed(TypedFilter {
+                type_filters: vec![TypeFilter::AnyOf(vec![
+                    TypeFilter::Instant,
+                    TypeFilter::Sorcery,
+                ])],
+                controller: None,
+                properties: vec![],
+            })),
+            dynamic_count: None,
+            reach: CostReductionReach::SpillsToGeneric,
+        })),
+    };
+    state.add_transient_continuous_effect(
+        granter,
+        PlayerId(0),
+        Duration::UntilEndOfTurn,
+        TargetFilter::SpecificObject { id: granter },
+        vec![grant],
+        None,
+    );
+    evaluate_layers(&mut state);
+
+    let cost = |state: &GameState, id| {
+        apply_cost_modifiers_to_base(
+            state,
+            PlayerId(0),
+            id,
+            state.objects.get(&id).unwrap().mana_cost.clone(),
+        )
+        .expect("cost computed")
+    };
+    // Control: with the recipient out, the grafted static discounts exactly
+    // once (double collection would floor to {0}) and the filter still binds.
+    assert_eq!(
+        cost(&state, instant),
+        ManaCost::generic(1),
+        "functioning graft discounts the matching spell once"
+    );
+    assert_eq!(
+        cost(&state, creature),
+        ManaCost::generic(3),
+        "the filter excludes the unrelated spell"
+    );
+
+    // The recipient leaves; no layer pass runs, so the TCE is still stored —
+    // exactly the state the direct collector must refuse.
+    state.battlefield.retain(|id| *id != granter);
+    state.objects.get_mut(&granter).unwrap().zone = Zone::Graveyard;
+    assert_eq!(
+        state.transient_continuous_effects.len(),
+        1,
+        "the grant is still stored after its recipient left"
+    );
+    assert_eq!(
+        cost(&state, instant),
+        ManaCost::generic(3),
+        "no functioning graft, no direct read: the matching spell pays full"
+    );
+    assert_eq!(
+        cost(&state, creature),
+        ManaCost::generic(3),
+        "the unrelated spell stays untouched"
+    );
+}
+
+/// CR 601.2f: the reduction-order prompt labels a transient grant's row by its
+/// source — the live object first, then the construction snapshot when the
+/// source changed zones (CR 400.7) or is a dungeon sentinel. A later dungeon
+/// must not rename the original room grant.
+#[test]
+fn transient_grant_display_name_keeps_the_source_snapshot() {
+    use crate::game::dungeon::{dungeon_sentinel_id, DungeonId, DungeonProgress};
+
+    let mut state = GameState::new_two_player(42);
+    let beacon = create_object(
+        &mut state,
+        CardId(1),
+        PlayerId(0),
+        "Beacon".to_string(),
+        Zone::Battlefield,
+    );
+    state.dungeon_progress.insert(
+        PlayerId(0),
+        DungeonProgress {
+            current_dungeon: Some(DungeonId::BaldursGateWilderness),
+            current_room: 11,
+            ..Default::default()
+        },
+    );
+    state.add_transient_continuous_effect(
+        beacon,
+        PlayerId(0),
+        Duration::UntilEndOfTurn,
+        TargetFilter::SpecificPlayer { id: PlayerId(0) },
+        vec![],
+        None,
+    );
+    state.add_transient_continuous_effect(
+        dungeon_sentinel_id(PlayerId(0)),
+        PlayerId(0),
+        Duration::UntilEndOfTurn,
+        TargetFilter::SpecificPlayer { id: PlayerId(0) },
+        vec![],
+        None,
+    );
+
+    let tces = state.transient_continuous_effects.clone();
+    assert_eq!(
+        super::transient_grant_display_name(&state, &tces[0]),
+        "Beacon",
+        "a live source names itself"
+    );
+    assert_eq!(
+        super::transient_grant_display_name(&state, &tces[1]),
+        "Baldur's Gate Wilderness",
+        "a sentinel source uses its construction-time dungeon"
+    );
+
+    state
+        .dungeon_progress
+        .get_mut(&PlayerId(0))
+        .unwrap()
+        .current_dungeon = None;
+    assert_eq!(
+        super::transient_grant_display_name(&state, &tces[1]),
+        "Baldur's Gate Wilderness",
+        "completing the dungeon must not erase the grant's label"
+    );
+    state
+        .dungeon_progress
+        .get_mut(&PlayerId(0))
+        .unwrap()
+        .current_dungeon = Some(DungeonId::Undercity);
+    assert_eq!(
+        super::transient_grant_display_name(&state, &tces[1]),
+        "Baldur's Gate Wilderness",
+        "a later dungeon must not rename the grant"
+    );
+
+    // The snapshot leg: the source leaves the object map entirely, so only
+    // the construction-time name remains.
+    state.battlefield.retain(|id| *id != beacon);
+    state.objects.remove(&beacon);
+    assert_eq!(
+        super::transient_grant_display_name(&state, &tces[0]),
+        "Beacon",
+        "a zoned-out source keeps its snapshotted name"
+    );
+}
+
 /// CR 601.2f: self-spell reductions and battlefield raises share one total
 /// cost calculation. A self reduction must not floor the spell to {0}
 /// before a battlefield tax is added.
@@ -31551,6 +32041,7 @@ fn chosen_muldrotha_variant_requests_and_consumes_permanent_type_slot() {
                 extra_cost: None,
                 enters_with_counter: None,
                 required_cast_keyword: None,
+                pool: crate::types::statics::GraveyardPermissionPool::OwnGraveyard,
             })
             .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Permanent))),
         );
@@ -31698,6 +32189,7 @@ fn muldrotha_and_graveyard_artifact_creature(state: &mut GameState) -> (ObjectId
                 extra_cost: None,
                 enters_with_counter: None,
                 required_cast_keyword: None,
+                pool: crate::types::statics::GraveyardPermissionPool::OwnGraveyard,
             })
             .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Permanent))),
         );
@@ -60354,6 +60846,7 @@ fn an_activation_journal_row_round_trips() {
         activator: PlayerId(0),
         source,
         source_lki: state.objects[&source].snapshot_public_characteristics(),
+        source_zone: crate::types::zones::Zone::Battlefield,
         ability_tag: Some(crate::types::ability::AbilityTag::Boast),
         is_loyalty_ability: true,
         targets: vec![

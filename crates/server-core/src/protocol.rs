@@ -1141,7 +1141,8 @@ mod tests {
     use engine::types::game_state::ProductionOverride;
     use engine::types::identifiers::ObjectIncarnationRef;
     use engine::types::mana::{
-        ManaSourcePenalty, ManaSourceSelection, ManaType, TapsForManaSelection,
+        ManaSourceOutput, ManaSourcePenalty, ManaSourceQuantity, ManaSourceSelection, ManaType,
+        TapsForManaSelection,
     };
     use serde_json::Value;
 
@@ -1239,6 +1240,33 @@ mod tests {
                 action: restored_action,
             } => assert_eq!(restored_action, generic),
             _ => panic!("wrong variant"),
+        }
+
+        let GameAction::ActivateManaSource { mut selection } = generic else {
+            unreachable!("fixture action is a generic mana-source selection");
+        };
+        selection.ability_index = Some(0);
+        selection.penalty = ManaSourcePenalty::Sacrifices;
+        selection.taps_for_mana.clear();
+        for quantity in [ManaSourceQuantity::Fixed(3), ManaSourceQuantity::Variable] {
+            selection.output = ManaSourceOutput::DeferredColorChoice { quantity };
+            selection.mana_type = ManaType::Colorless;
+            let msg = ClientMessage::Action {
+                action: GameAction::ActivateManaSource {
+                    selection: selection.clone(),
+                },
+            };
+            let json = serde_json::to_string(&msg).unwrap();
+            let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
+            let ClientMessage::Action { action } = parsed else {
+                panic!("wrong variant");
+            };
+            assert_eq!(
+                action,
+                GameAction::ActivateManaSource {
+                    selection: selection.clone()
+                }
+            );
         }
     }
 
@@ -3318,6 +3346,54 @@ mod tests {
         }
     }
 
+    /// `GameEvent::AbilityActivated` now carries `kind: "Mana"` for mana-ability
+    /// activations and an optional `departed_source_lki`; a v100 peer cannot
+    /// parse the `Mana` kind, so it must be refused before it receives v101 state.
+    /// `Effect::AdditionalPhase` now carries a `TurnSegment` in place of its
+    /// `phase` field and an `ExtraPhaseRecipient` in place of its `target`
+    /// field; a v99 peer cannot parse it, so it must be refused before it
+    /// receives v100 state.
+    /// `GraveyardCastPermission.pool` (CR 404.1 + CR 601.3) is new in serialized
+    /// full-game state; a v98 peer would default it to the own graveyard and
+    /// refuse a cast from any graveyard the permission allows, so it must be
+    /// refused before it receives v99 state.
+    /// `ZoneOpponentChooserPurpose::PerPlayerChoiceOrder` (CR 101.4c) and
+    /// `SubstituteChooser` (CR 800.4g), the per-player frame's `current` and
+    /// `nominee` fields, and `PerPlayerScope::Opponents` (CR 102.2 + CR 102.3)
+    /// are serialized; a v97 peer cannot deserialize them, so it must be
+    /// refused before it receives v98 state.
+    /// `ResolvedAbility.target_reads` and `AbilityDefinition.target_reads`
+    /// (`TargetReadOrigin`, CR 115.1 + CR 608.2c) are serialized; a v96 peer
+    /// would default the field and rebuild a target slot the rules do not
+    /// announce, so it must be refused before it receives v97 state.
+    /// `FilterProp::Unblocked` is reshaped to `FilterProp::BlockStatus { status:
+    /// AttackerBlockStatus }` (CR 509.1h); a v94 peer cannot parse the new
+    /// `"BlockStatus"` tag carried in `GameState` ability definitions, so it must
+    /// be refused before it receives v95 state.
+    /// `SpellContext.creation_lookback_event` and `TriggerSourceContext.mana_cost`
+    /// are new in serialized full-game state (CR 603.7 + CR 603.10a + CR 608.2h,
+    /// CR 707.2); a v93 peer would drop both and resolve a phase-delayed
+    /// departure look-back differently, so it must be refused before it
+    /// receives v94 state.
+    /// `ReductionProvenance` gains `SacrificedForCost`, the reduction an Emerge
+    /// or Offering sacrifice earns before a deferred target declaration; v92
+    /// state cannot decode a v93 provenance, so it must be refused before
+    /// state delivery.
+    /// `ResolvedAbility.parent_target_missing_reason` is serialized and gains
+    /// `ParentTargetMissingReason::RevealUntil`, and `EffectOutcomeSignal` gains
+    /// `RevealUntilMatched`, and the CR 701.20a reveal lease adds
+    /// `ResolvedInformationLifetime::UntilStackObjectLeaves` plus
+    /// `GameState.stack_bound_reveals` (CR 701.20a + CR 603.12), presented through
+    /// `DerivedViews.stack_revealed_cards`; a v91 peer cannot parse
+    /// the tags and would drop a paused reveal-until whiff's verdict, so it must
+    /// be refused before it receives v92 state.
+    /// `PendingManaAbility` now carries required `chosen_counter_counts`
+    /// instead of `chosen_counter_count` (#9207); v90 state cannot decode as
+    /// v91 state, so it must be refused before state delivery.
+    /// `FormatConfig` gained `allow_experimental_dungeons`; a v89 peer fails
+    /// the flag closed to `false` and runs the game without the experimental
+    /// dungeon pool the host chose, so it must be refused before it receives
+    /// v90 state.
     /// `GraveyardCastPermission.required_cast_keyword` (CR 118.9b) is new in
     /// serialized full-game state; a v88 peer would drop it silently and admit
     /// a printed-cost graveyard cast the permission forbids, so it must be
@@ -3332,8 +3408,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_89_for_graveyard_cast_methods() {
-        assert_eq!(PROTOCOL_VERSION, 89);
+    fn protocol_version_is_106_for_deferred_mana_and_remembered_replacement_choices() {
+        assert_eq!(PROTOCOL_VERSION, 106);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3344,7 +3420,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_89_for_graveyard_cast_methods` stays
+    /// `protocol_version_is_106_for_deferred_mana_and_remembered_replacement_choices` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

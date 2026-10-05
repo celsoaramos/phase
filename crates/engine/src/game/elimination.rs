@@ -91,7 +91,6 @@ fn abandon_pending_spell_casts(
             | PendingCostMoveResume::WardSacrificePayment { .. }
             | PendingCostMoveResume::ReplacementMayCost { .. }
             | PendingCostMoveResume::Foretell { .. }
-            | PendingCostMoveResume::DelveManaPayment { .. }
             | PendingCostMoveResume::UnlessBouncePayment { .. }
             | PendingCostMoveResume::ManaAbilityPayment { .. }
             | PendingCostMoveResume::LoyaltyActivation { .. }
@@ -466,6 +465,23 @@ pub fn eliminate_players_simultaneously(
         }
         state.waiting_for = WaitingFor::GameOver { winner };
     } else {
+        // CR 800.4a + CR 608.2m + CR 800.4g/800.4h: once every departure,
+        // control-effect end and stack removal above has settled, reconcile an
+        // active per-player zone choice against the final set of living
+        // players. The resolution keeps going: order candidates and the pending
+        // pool are recomputed, and a choice whose maker left goes to the player
+        // the rules name. Runs before the generic dead-actor repoint below,
+        // which would otherwise hand priority on while leaving the frame
+        // parked. Acts only when that frame owns `waiting_for`; a refusal is
+        // reported and leaves the frame parked rather than guessing.
+        if let Err(refusal) =
+            super::effects::choose_from_zone::reconcile_per_player_choice_after_departure(
+                state, events,
+            )
+        {
+            tracing::error!(%refusal, "per-player zone choice was not reconciled after a departure");
+        }
+
         if let Some(frame) = staged_optional_sacrifice_decline {
             state.push_optional_effect_frame(frame);
             super::engine_payment_choices::handle_optional_effect_choice(state, false, events)
@@ -1894,7 +1910,8 @@ mod tests {
                 },
             },
             Some(TriggerFiring::ReceiptEligible(origin)),
-        );
+        )
+        .expect("the fixture begins with no carrier installed");
         let continuation = PendingContinuation::new(
             Box::new(ResolvedAbility::new(
                 Effect::NoOp,
@@ -1910,6 +1927,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         });
         state.waiting_for = WaitingFor::PayCost {
             player: payer,
@@ -2016,6 +2034,7 @@ mod tests {
         controller: PlayerId,
     ) -> crate::types::game_state::PendingChangeZoneIteration {
         crate::types::game_state::PendingChangeZoneIteration {
+            pending_return_result_producer: None,
             logical_zone_change_group: group,
             paused_current,
             remaining,
@@ -2229,6 +2248,7 @@ mod tests {
             candidates: Vec::new(),
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
         state.push_batch_delivery(crate::types::game_state::PendingBatchDeliveries {
             logical_zone_change_group: group,
@@ -2296,6 +2316,7 @@ mod tests {
             candidates: Vec::new(),
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
         state.push_change_zone_iteration(pending_change_zone_iteration(
             group,
@@ -3502,6 +3523,7 @@ mod tests {
             candidates: vec![],
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
         // Coupled continuation slots the resume drain would clear on a normal answer.
         state.replacement_may_cost_paused = true;
@@ -3643,6 +3665,7 @@ mod tests {
             candidates: Vec::new(),
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
         state.push_connive_reentry(PendingConniveReentry {
             conniver: state
@@ -3697,6 +3720,7 @@ mod tests {
             candidates: Vec::new(),
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
         state.push_batch_delivery(pending_search_found_zone_delivery(found));
         assert!(state.active_batch_delivery().is_some());
@@ -3743,6 +3767,7 @@ mod tests {
             candidates: vec![],
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
         let parked_found = ObjectId(77);
         state.pending_search_found_batch =
@@ -3819,6 +3844,7 @@ mod tests {
             candidates: Vec::new(),
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
         let source = create_object(
             &mut state,

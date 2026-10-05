@@ -10,6 +10,9 @@
   "manaSourceSelection": {
     "title": "Escolha uma fonte de mana",
     "description": "Esta habilidade de mana exige sacrificar uma permanente.",
+    "baseOutput_one": "Produção base: {{count}} mana",
+    "baseOutput_other": "Produção base: {{count}} manas",
+    "baseOutputVariable": "Quantidade base determinada na ativação",
     "sacrifice": "Sacrificar",
     "back": "Voltar ao pagamento de mana",
     "unknownSource": "Fonte de mana"
@@ -808,6 +811,7 @@
     "titleTargets": "Alvos: {{targets}}",
     "titlePaid": "Pago: {{paid}}",
     "titleContext": "Contexto: {{context}}",
+    "revealedCards": "Revelada: {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}} de mana",
     "paidColorsSpent": "{{count}} cores",
@@ -1382,6 +1386,7 @@
       "target": "Alvo",
       "return": "Devolver",
       "discard": "Descartar",
+      "reveal": "Revelar",
       "evidence": "Evidência",
       "manifest": "Manifestar",
       "untap": "Desvirar",
@@ -2004,7 +2009,11 @@
   },
   "zoneOpponentChooser": {
     "title": "Escolher oponente",
-    "subtitle": "Escolha qual oponente faz a escolha."
+    "subtitle": "Escolha qual oponente faz a escolha.",
+    "orderTitle": "Escolher próximo jogador",
+    "orderSubtitle": "Escolha para quem fazer a próxima seleção.",
+    "substituteTitle": "Escolher jogador",
+    "substituteSubtitle": "Escolha quem faz esta escolha."
   },
   "pileOpponent": {
     "title": "Choose Opponent",
@@ -2262,7 +2271,9 @@
     "accept": "Sim",
     "decline": "Não",
     "sourceFallback": "Efeito",
-    "entryLabel": "{{source}} — {{decision}}"
+    "entryLabel": "{{source}} — {{decision}}",
+    "optionalTriggers": "Habilidades desencadeadas opcionais ({{count, number}})",
+    "replacementChoices": "Escolhas de substituição ({{count, number}})"
   },
   "optionalEffect": {
     "sourceFallback": "Efeito",
@@ -2271,6 +2282,12 @@
     "no": "Não",
     "dontAskAgain": "Não perguntar novamente neste jogo",
     "dontAskAgainForSameCard": "Usar esta escolha para cada cópia desta carta neste jogo"
+  },
+  "keywordDetail": {
+    "selfManaCost": "seu custo de mana",
+    "selfManaValue": "seu valor de mana",
+    "manaCostReduced": "seu custo de mana reduzido em {{reduction}}",
+    "spliceOnto": "em {{subtype}} {{cost}}"
   },
   "resolutionOptionalPayment": {
     "title": "Escolha um pagamento opcional",
@@ -2289,7 +2306,8 @@
       "zoneExile": "o exílio",
       "zoneHand": "sua mão",
       "discard": "Descarte {{count}} {{cards}}",
-      "exile": "Exile {{count}} {{cards}} de {{zone}}"
+      "exile": "Exile {{count}} {{cards}} de {{zone}}",
+      "reveal": "Revele {{count}} {{cards}} de {{zone}}"
     }
   },
   "topOrBottom": {
@@ -2335,6 +2353,8 @@
     "confirm": "Confirmar"
   },
   "replacement": {
+    "remember": "Lembrar esta escolha nesta partida",
+    "savedChoice": "Substituição: {{choice}}",
     "eyebrow": "Ordem de Resolução",
     "title": "Efeitos de Substituição",
     "orderSubtitle": "Todos estes efeitos alteram como este evento acontece. Arraste para definir a ordem de aplicação — o último aplicado é o que prevalece (CR 616.1).",

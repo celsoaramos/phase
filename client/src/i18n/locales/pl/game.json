@@ -10,6 +10,9 @@
   "manaSourceSelection": {
     "title": "Wybierz źródło many",
     "description": "Ta zdolność many wymaga poświęcenia permanenta.",
+    "baseOutput_one": "Podstawowa ilość: {{count}} mana",
+    "baseOutput_other": "Podstawowa ilość: {{count}} many",
+    "baseOutputVariable": "Podstawowa ilość ustalana przy aktywacji",
     "sacrifice": "Poświęć",
     "back": "Wróć do płatności many",
     "unknownSource": "Źródło many"
@@ -808,6 +811,7 @@
     "titleTargets": "Cele: {{targets}}",
     "titlePaid": "Zapłacono: {{paid}}",
     "titleContext": "Kontekst: {{context}}",
+    "revealedCards": "Odkryta: {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}} many",
     "paidColorsSpent": "{{count}} kolorów",
@@ -1382,6 +1386,7 @@
       "target": "Cel",
       "return": "Zwróć",
       "discard": "Odrzuć",
+      "reveal": "Ujawnij",
       "evidence": "Dowody",
       "manifest": "Manifest",
       "untap": "Odkręć",
@@ -2004,7 +2009,11 @@
   },
   "zoneOpponentChooser": {
     "title": "Wybierz przeciwnika",
-    "subtitle": "Wybierz, który przeciwnik dokonuje wyboru."
+    "subtitle": "Wybierz, który przeciwnik dokonuje wyboru.",
+    "orderTitle": "Wybierz następnego gracza",
+    "orderSubtitle": "Wybierz, dla kogo dokonać następnego wyboru.",
+    "substituteTitle": "Wybierz gracza",
+    "substituteSubtitle": "Wybierz, kto dokona tego wyboru."
   },
   "pileOpponent": {
     "title": "Choose Opponent",
@@ -2262,7 +2271,9 @@
     "accept": "Tak",
     "decline": "Nie",
     "sourceFallback": "Efekt",
-    "entryLabel": "{{source}} — {{decision}}"
+    "entryLabel": "{{source}} — {{decision}}",
+    "optionalTriggers": "Opcjonalne zdolności wyzwalane ({{count, number}})",
+    "replacementChoices": "Wybory zastępowania ({{count, number}})"
   },
   "optionalEffect": {
     "sourceFallback": "Efekt",
@@ -2271,6 +2282,12 @@
     "no": "Nie",
     "dontAskAgain": "Nie pytaj ponownie w tej grze",
     "dontAskAgainForSameCard": "Użyj tego wyboru dla każdej kopii tej karty w tej grze"
+  },
+  "keywordDetail": {
+    "selfManaCost": "jego koszt many",
+    "selfManaValue": "jego wartość many",
+    "manaCostReduced": "jego koszt many zmniejszony o {{reduction}}",
+    "spliceOnto": "do {{subtype}} {{cost}}"
   },
   "resolutionOptionalPayment": {
     "title": "Wybierz opcjonalną opłatę",
@@ -2289,7 +2306,8 @@
       "zoneExile": "wygnania",
       "zoneHand": "twojej ręki",
       "discard": "Odrzuć {{count}} {{cards}}",
-      "exile": "Wygnaj {{count}} {{cards}} z {{zone}}"
+      "exile": "Wygnaj {{count}} {{cards}} z {{zone}}",
+      "reveal": "Ujawnij {{count}} {{cards}} z {{zone}}"
     }
   },
   "topOrBottom": {
@@ -2335,6 +2353,8 @@
     "confirm": "Potwierdź"
   },
   "replacement": {
+    "remember": "Zapamiętaj ten wybór w tej grze",
+    "savedChoice": "Zastąpienie: {{choice}}",
     "eyebrow": "Kolejność rozpatrywania",
     "title": "Efekty zastępujące",
     "orderSubtitle": "Wszystkie te efekty zmieniają przebieg tego zdarzenia. Przeciągnij, aby ustalić kolejność — ostatni zastosowany efekt jest tym, który zadziała (CR 616.1).",

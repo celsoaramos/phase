@@ -1,8 +1,11 @@
 use crate::types::ability::{
-    ControllerRef, FilterProp, ResolvedAbility, TargetFilter, TargetRef, TypeFilter, TypedFilter,
+    ControllerRef, FilterProp, ResolvedAbility, TargetChoiceTiming, TargetFilter, TargetRef,
+    TypeFilter, TypedFilter,
 };
 use crate::types::events::GameEvent;
-use crate::types::game_state::{GameState, StackEntry, StackEntryKind, TriggerSourceContext};
+use crate::types::game_state::{
+    DepartedStackSpell, GameState, StackEntry, StackEntryKind, TriggerSourceContext,
+};
 use crate::types::identifiers::{ObjectId, TrackedSetId};
 use crate::types::keywords::{HexproofFilter, Keyword};
 use crate::types::player::PlayerId;
@@ -646,6 +649,63 @@ pub(crate) fn object_could_be_targeted_by_triggering_spell(
     })
 }
 
+/// CR 608.2h + CR 400.7: What a spell-cast trigger's "that spell" / self-cast
+/// "this spell" currently names, per [`triggering_spell`]. `Gone` is distinct
+/// from "no spell-cast event at all" (that case is `None` on the function's
+/// own return type) — it means the event names a spell with neither a live
+/// stack entry nor a departed-spell record.
+pub(crate) enum TriggeringSpell<'a> {
+    OnStack(&'a StackEntry),
+    Departed(&'a DepartedStackSpell),
+    Gone,
+}
+
+/// CR 608.2h + CR 400.7 + CR 601.2i: What a spell-cast trigger's "that spell"
+/// / self-cast "this spell" now names. `None` unless
+/// `state.current_trigger_event` is `GameEvent::SpellCast`; every consumer
+/// falls back to its own non-spell-cast path in that case. Layered like
+/// `triggering_spell_resolved_ability` beside it: live stack entry (at the
+/// pinned incarnation, when a pin exists) → the pinned or newest departed
+/// record → `Gone`.
+pub(crate) fn triggering_spell(state: &GameState) -> Option<TriggeringSpell<'_>> {
+    let GameEvent::SpellCast { object_id, .. } = state.current_trigger_event.as_ref()? else {
+        return None;
+    };
+    let object_id = *object_id;
+    // CR 601.2i: the pin bound when this trigger was put on the stack
+    // (`triggers.rs::triggering_spell_pin`), read from the resolving carrier
+    // — a flip branch (Krark) builds a fresh executing ability that does not
+    // itself carry the pin — and used only while it still names this event's
+    // spell.
+    let pin = state
+        .resolving_stack_entry
+        .as_ref()
+        .and_then(|entry| entry.ability())
+        .and_then(|ability| ability.context.triggering_spell)
+        .filter(|pin| pin.object_id == object_id);
+
+    let on_stack = state.objects.get(&object_id).is_some_and(|obj| {
+        obj.zone == Zone::Stack && pin.is_none_or(|pin| pin.incarnation == obj.incarnation)
+    });
+    if on_stack {
+        if let Some(entry) = state.stack.iter().rev().find(|entry| {
+            entry.id == object_id && matches!(entry.kind, StackEntryKind::Spell { .. })
+        }) {
+            return Some(TriggeringSpell::OnStack(entry));
+        }
+    }
+
+    let records = state.departed_stack_spells.get(&object_id);
+    let key = match pin {
+        Some(pin) => Some(pin.incarnation),
+        None => records.and_then(|records| records.keys().max().copied()),
+    };
+    match key.and_then(|key| records.and_then(|records| records.get(&key))) {
+        Some(record) => Some(TriggeringSpell::Departed(record)),
+        None => Some(TriggeringSpell::Gone),
+    }
+}
+
 /// CR 707.10a: Resolve the triggering spell's `ResolvedAbility` for legality
 /// checks. Prefer the live stack entry; fall back to `resolving_stack_entry`
 /// (spell mid-resolution) or reconstruct from the spell object when the stack
@@ -1009,7 +1069,7 @@ pub fn resolved_targets(
     // exposed through `resolving_stack_entry`; the live stack lookup covers
     // target resolution before the entry is popped.
     if matches!(target_filter, TargetFilter::ParentTargetSlot { .. }) {
-        return super::ability_utils::flatten_targets_in_chain(parent_slot_base(state, ability));
+        return super::ability_utils::declared_targets_in_chain(parent_slot_base(state, ability));
     }
     // CR 601.2c + CR 608.2b: Pre-selected targets take precedence over
     // event-context resolution when the player chose targets at activation/
@@ -1102,7 +1162,7 @@ pub(crate) fn parent_chain_targets_from_root(
     state: &GameState,
     ability: &ResolvedAbility,
 ) -> Vec<TargetRef> {
-    super::ability_utils::flatten_targets_in_chain(resolving_root_ability(state, ability))
+    super::ability_utils::declared_targets_in_chain(resolving_root_ability(state, ability))
 }
 
 /// CR 608.2c: The root `ResolvedAbility` of the currently-resolving stack
@@ -1168,7 +1228,7 @@ pub(crate) fn resolve_parent_slot_from_root(
     ability: &ResolvedAbility,
     index: usize,
 ) -> Option<TargetRef> {
-    super::ability_utils::flatten_targets_in_chain(parent_slot_base(state, ability))
+    super::ability_utils::declared_targets_in_chain(parent_slot_base(state, ability))
         .into_iter()
         .nth(index)
 }
@@ -1210,20 +1270,12 @@ pub(crate) fn resolve_live_parent_slot_from_root(
     let illegal_at_resolution = resolution_carrier_entry(state, ability)
         .and_then(StackEntry::ability)
         .is_some_and(|root| {
-            use super::ability_utils::flatten_targets_in_chain as flatten;
             let base = parent_slot_base(state, ability);
-            let branch =
-                |node: Option<&ResolvedAbility>| node.map_or(0, |node| flatten(node).len());
             // CR 608.2b: illegal targets won't be affected by parts of the effect for which they're illegal.
-            let ahead: usize =
-                std::iter::successors(Some(root), |node| node.sub_ability.as_deref())
-                    .take_while(|node| !std::ptr::eq(*node, base))
-                    .map(|node| {
-                        flatten(node).len()
-                            - branch(node.sub_ability.as_deref())
-                            - branch(node.else_ability.as_deref())
-                    })
-                    .sum();
+            // The stamp, this offset and the slot reader all count declared
+            // slots (`declared_targets_in_chain` numbering), so an inheriting
+            // rider's carried snapshot never shifts a later slot.
+            let ahead = super::ability_utils::declared_slots_ahead_of(root, base);
             root.illegal_target_slots.contains(&(ahead + index))
         });
     if illegal_at_resolution {
@@ -1336,6 +1388,27 @@ pub(crate) fn resolved_object_ids_for_filter(
 ) -> Vec<ObjectId> {
     let ctx = super::filter::FilterContext::from_ability(ability);
     resolved_object_ids_for_filter_with_context(state, ability, filter, &ctx)
+}
+
+/// CR 301.5a + CR 301.5f + CR 303.4b + CR 115.10a: an untargeted "equipped
+/// creature" / "enchanted creature" recipient of a resolution-timed instruction
+/// is whatever the source is attached to as that instruction resolves. No target
+/// slot was announced for it (`ability.targets` is empty), so the host is read
+/// from the attachment relationship. Single authority for both the instruction's
+/// recipient (`counters::resolve_defined_or_targets`) and a condition whose
+/// anaphor names that recipient (`evaluate_condition`'s `TargetMatchesFilter`),
+/// so the two can never disagree about which object "it" is.
+/// `None` when this node does not name such a recipient.
+pub(crate) fn resolution_bound_attachment_hosts(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    recipient: &TargetFilter,
+) -> Option<Vec<ObjectId>> {
+    let names_resolution_bound_host = ability.target_choice_timing
+        == TargetChoiceTiming::Resolution
+        && ability.targets.is_empty()
+        && recipient.contains_source_attachment_host();
+    names_resolution_bound_host.then(|| resolved_object_ids_for_filter(state, ability, recipient))
 }
 
 /// Resolve a filter with a caller-supplied semantic context. This preserves the
@@ -1640,15 +1713,26 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
             let controller = state.objects.get(&source_obj_id)?.controller;
             Some(TargetRef::Player(controller))
         }
-        // CR 108.3 + CR 608.2c: `ParentTargetOwner` mirrors `ParentTargetController`
-        // but returns the *owner* of the resolved object. When no trigger event
-        // supplies a source object (Enslave's phase trigger), fall back to the
-        // ability source's AttachedTo host — the Aura/Equipment context where
-        // "its owner" anaphorically refers to the equipped/enchanted permanent.
+        // CR 108.3 + CR 603.10a + CR 608.2c + CR 608.2h: `ParentTargetOwner`
+        // mirrors `ParentTargetController` but returns the *owner* of the
+        // resolved object. Zone-change triggers prefer the record/LKI owner,
+        // because the departing object may already be a new object by the time
+        // the ability resolves. When no trigger event supplies a source object
+        // (Enslave's phase trigger), fall back to the ability source's
+        // AttachedTo host — the Aura/Equipment context where "its owner"
+        // anaphorically refers to the equipped/enchanted permanent.
         TargetFilter::ParentTargetOwner => {
+            if let Some(GameEvent::ZoneChanged { record, .. }) = event {
+                return Some(TargetRef::Player(record.owner));
+            }
             if let Some(event) = event {
                 if let Some(source_obj_id) = extract_source_from_event(event) {
-                    if let Some(owner) = state.objects.get(&source_obj_id).map(|o| o.owner) {
+                    if let Some(owner) = state
+                        .objects
+                        .get(&source_obj_id)
+                        .map(|o| o.owner)
+                        .or_else(|| state.lki_cache.get(&source_obj_id).map(|lki| lki.owner))
+                    {
                         return Some(TargetRef::Player(owner));
                     }
                 }
@@ -1984,7 +2068,7 @@ pub(crate) fn extract_source_from_event(
         GameEvent::Evolved { object_id } => Some(*object_id),
         GameEvent::CounterRemoved { object_id, .. } => Some(*object_id),
         GameEvent::TokenCreated { object_id, .. } => Some(*object_id),
-        GameEvent::CreatureDestroyed { object_id } => Some(*object_id),
+        GameEvent::CreatureDestroyed { object_id, .. } => Some(*object_id),
         GameEvent::PermanentSacrificed { object_id, .. } => Some(*object_id),
         GameEvent::Unattached {
             old_target: TargetRef::Object(object_id),
@@ -3268,6 +3352,7 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{Comparator, ContinuousModification, Duration, QuantityExpr};
     use crate::types::card_type::CoreType;
+    use crate::types::format::FormatConfig;
     use crate::types::game_state::{
         CastingVariant, DrainStatus, PostReplacementDrain, ResidentDrainPolicy,
     };
@@ -3639,6 +3724,34 @@ mod tests {
             ObjectId(999),
         );
         assert_eq!(result, Some(TargetRef::Player(PlayerId(1))));
+    }
+
+    #[test]
+    fn parent_target_owner_prefers_zone_change_record_owner() {
+        // CR 108.3 + CR 603.10a + CR 608.2h: leaves-the-battlefield owner
+        // anaphors read the zone-change record/LKI authority. The live object
+        // row is absent here on purpose; falling back to live object state (or
+        // to the ability controller) would return None or P1 instead of P0.
+        let mut state = GameState::new(FormatConfig::standard(), 3, 0);
+        let moved = ObjectId(77);
+        state.current_trigger_event = Some(GameEvent::ZoneChanged {
+            object_id: moved,
+            from: Some(Zone::Battlefield),
+            to: Zone::Graveyard,
+            record: Box::new(crate::types::game_state::ZoneChangeRecord {
+                owner: PlayerId(0),
+                controller: PlayerId(1),
+                ..crate::types::game_state::ZoneChangeRecord::test_minimal(
+                    moved,
+                    Some(Zone::Battlefield),
+                    Zone::Graveyard,
+                )
+            }),
+        });
+
+        let result =
+            resolve_event_context_target(&state, &TargetFilter::ParentTargetOwner, ObjectId(999));
+        assert_eq!(result, Some(TargetRef::Player(PlayerId(0))));
     }
 
     #[test]
@@ -7088,6 +7201,8 @@ mod tests {
             player_id: PlayerId(1),
             source_id: ObjectId(99),
             kind: crate::types::events::ActivatedAbilityKind::Normal,
+            departed_source_lki: None,
+            trigger_state: crate::types::events::ActivationTriggerState::Pending,
         };
         assert_eq!(extract_player_from_event(&event, &state), Some(PlayerId(1)));
     }

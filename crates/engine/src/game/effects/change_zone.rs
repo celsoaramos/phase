@@ -612,6 +612,36 @@ fn capture_devour_snapshot_before_single_entry(
 }
 
 /// Move target objects between zones.
+/// CR 610.3 + CR 610.3b: True when the "until" event bounding THIS node's own
+/// zone change (`ResolvedAbility::bounded_zone_change_event`) already occurred —
+/// latched on this node after the ability triggered, or emitted earlier in this
+/// same resolution. The initial one-shot move then does not happen. Shared by
+/// the single-object and mass resolvers so each bounded node refuses on its own
+/// latch.
+pub(crate) fn until_event_already_occurred(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    events: &[GameEvent],
+) -> bool {
+    let Some(duration_event) = ability.bounded_zone_change_event() else {
+        return false;
+    };
+    ability.context.duration_events.contains(&duration_event)
+        || events.iter().any(|event| {
+            crate::game::engine::duration_event_matches(
+                state,
+                ability.source_id,
+                ability
+                    .trigger_source
+                    .as_ref()
+                    .map(|source| source.identity.reference),
+                ability.controller,
+                duration_event,
+                event,
+            )
+        })
+}
+
 pub fn resolve(
     state: &mut GameState,
     ability: &ResolvedAbility,
@@ -697,34 +727,13 @@ pub fn resolve(
     // CR 610.3b: If the specified event occurred after this triggered ability
     // triggered but before its initial one-shot zone change, the object does
     // not move.
-    if let Some(duration_event) = ability
-        .duration
-        .as_ref()
-        .and_then(Duration::zone_change_event)
-    {
-        let occurred_before_this_resolution =
-            ability.context.duration_events.contains(&duration_event);
-        let occurred_earlier_this_resolution = events.iter().any(|event| {
-            crate::game::engine::duration_event_matches(
-                state,
-                ability.source_id,
-                ability
-                    .trigger_source
-                    .as_ref()
-                    .map(|source| source.identity.reference),
-                ability.controller,
-                duration_event,
-                event,
-            )
+    if until_event_already_occurred(state, ability, events) {
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+            subject: None,
         });
-        if occurred_before_this_resolution || occurred_earlier_this_resolution {
-            events.push(GameEvent::EffectResolved {
-                kind: EffectKind::from(&ability.effect),
-                source_id: ability.source_id,
-                subject: None,
-            });
-            return Ok(completed_result(0));
-        }
+        return Ok(completed_result(0));
     }
 
     let mut origin = origin;
@@ -1383,6 +1392,7 @@ pub fn resolve(
                 .expect("paused ChangeZone retains its explicit delivery prefix");
                 state.push_change_zone_iteration(
                     crate::types::game_state::PendingChangeZoneIteration {
+                        pending_return_result_producer: None,
                         logical_zone_change_group,
                         paused_current: anticipated_pause.map(|mut boundary| {
                             boundary.append_delivery_events(&events[delivery_start..]);
@@ -1437,6 +1447,7 @@ pub fn resolve(
                 .expect("paused ChangeZone retains its explicit delivery prefix");
                 state.push_change_zone_iteration_after_child(
                     crate::types::game_state::PendingChangeZoneIteration {
+                        pending_return_result_producer: None,
                         logical_zone_change_group,
                         paused_current: Some(
                             state
@@ -1916,6 +1927,21 @@ pub fn resolve_all(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
+    // CR 610.3b: an "until" event that already occurred before this mass
+    // move's initial zone change means nothing moves and no return link is
+    // installed. That refusal is non-performance for this node's own "if you
+    // do" rider (CR 118.12); `resolve_ability_chain` derives it from this same
+    // predicate over the call's own event window, so no resolution-wide flag
+    // is written here.
+    if until_event_already_occurred(state, ability, events) {
+        state.last_effect_count = Some(0);
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+            subject: None,
+        });
+        return Ok(());
+    }
     // CR 400.3 + CR 701.23: When the target filter encodes multiple zones via
     // `InAnyZone`, scan their union; otherwise fall back to the explicit `origin`
     // (or `Battlefield`). Single-zone filters (`InZone` alone) preserve legacy
@@ -2339,6 +2365,7 @@ pub fn resolve_all(
                 .expect("paused ChangeZoneAll retains its explicit delivery prefix");
                 state.push_change_zone_iteration_after_child(
                     crate::types::game_state::PendingChangeZoneIteration {
+                        pending_return_result_producer: None,
                         logical_zone_change_group,
                         paused_current: (!entry_target_choice).then(|| {
                             state
@@ -2402,6 +2429,7 @@ pub fn resolve_all(
                 .expect("paused ChangeZoneAll retains its explicit delivery prefix");
                 state.push_change_zone_iteration(
                     crate::types::game_state::PendingChangeZoneIteration {
+                        pending_return_result_producer: None,
                         logical_zone_change_group,
                         paused_current: anticipated_pause.map(|mut boundary| {
                             boundary.append_delivery_events(&events[delivery_start..]);
@@ -6951,6 +6979,7 @@ mod tests {
         let logical_zone_change_group =
             crate::game::triggers::allocate_logical_zone_change_group(&mut state, &[hero, soldier]);
         state.push_change_zone_iteration(crate::types::game_state::PendingChangeZoneIteration {
+            pending_return_result_producer: None,
             logical_zone_change_group,
             paused_current: None,
             remaining: vec![hero, soldier],

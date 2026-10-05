@@ -10,6 +10,9 @@
   "manaSourceSelection": {
     "title": "Scegli una fonte di mana",
     "description": "Questa abilità di mana richiede di sacrificare un permanente.",
+    "baseOutput_one": "Produzione base: {{count}} mana",
+    "baseOutput_other": "Produzione base: {{count}} mana",
+    "baseOutputVariable": "Quantità base determinata all’attivazione",
     "sacrifice": "Sacrifica",
     "back": "Torna al pagamento del mana",
     "unknownSource": "Fonte di mana"
@@ -808,6 +811,7 @@
     "titleTargets": "Bersagli: {{targets}}",
     "titlePaid": "Pagato: {{paid}}",
     "titleContext": "Contesto: {{context}}",
+    "revealedCards": "Rivelata: {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}} mana",
     "paidColorsSpent": "{{count}} colori",
@@ -1382,6 +1386,7 @@
       "target": "Bersaglio",
       "return": "Restituisci",
       "discard": "Scarta",
+      "reveal": "Rivela",
       "evidence": "Prove",
       "manifest": "Manifesta",
       "untap": "Stappa",
@@ -2004,7 +2009,11 @@
   },
   "zoneOpponentChooser": {
     "title": "Scegli avversario",
-    "subtitle": "Scegli quale avversario effettua la scelta."
+    "subtitle": "Scegli quale avversario effettua la scelta.",
+    "orderTitle": "Scegli il giocatore successivo",
+    "orderSubtitle": "Scegli per chi effettuare la prossima selezione.",
+    "substituteTitle": "Scegli giocatore",
+    "substituteSubtitle": "Scegli chi effettua questa scelta."
   },
   "pileOpponent": {
     "title": "Choose Opponent",
@@ -2262,7 +2271,9 @@
     "accept": "Sì",
     "decline": "No",
     "sourceFallback": "Effetto",
-    "entryLabel": "{{source}} — {{decision}}"
+    "entryLabel": "{{source}} — {{decision}}",
+    "optionalTriggers": "Abilità innescate facoltative ({{count, number}})",
+    "replacementChoices": "Scelte di sostituzione ({{count, number}})"
   },
   "optionalEffect": {
     "sourceFallback": "Effetto",
@@ -2271,6 +2282,12 @@
     "no": "No",
     "dontAskAgain": "Non chiedere di nuovo in questa partita",
     "dontAskAgainForSameCard": "Usa questa scelta per ogni copia di questa carta in questa partita"
+  },
+  "keywordDetail": {
+    "selfManaCost": "il suo costo di mana",
+    "selfManaValue": "il suo valore di mana",
+    "manaCostReduced": "il suo costo di mana ridotto di {{reduction}}",
+    "spliceOnto": "su {{subtype}} {{cost}}"
   },
   "resolutionOptionalPayment": {
     "title": "Scegli un pagamento opzionale",
@@ -2289,7 +2306,8 @@
       "zoneExile": "l’esilio",
       "zoneHand": "la tua mano",
       "discard": "Scarta {{count}} {{cards}}",
-      "exile": "Esilia {{count}} {{cards}} da {{zone}}"
+      "exile": "Esilia {{count}} {{cards}} da {{zone}}",
+      "reveal": "Rivela {{count}} {{cards}} da {{zone}}"
     }
   },
   "topOrBottom": {
@@ -2335,6 +2353,8 @@
     "confirm": "Conferma"
   },
   "replacement": {
+    "remember": "Ricorda questa scelta per questa partita",
+    "savedChoice": "Sostituzione: {{choice}}",
     "eyebrow": "Ordine di risoluzione",
     "title": "Effetti di sostituzione",
     "orderSubtitle": "Questi effetti cambiano tutti il modo in cui avviene questo evento. Trascina per stabilire l'ordine di applicazione: l'ultimo applicato è quello che ha effetto (CR 616.1).",
