@@ -8777,6 +8777,7 @@ mod tests {
             category_pools: Default::default(),
             pool_size: 0,
             hand_size: 7,
+            creature_value_ceiling: 0.0,
         };
 
         let dw = choose_attackers_with_targets_with_profile_and_threat(

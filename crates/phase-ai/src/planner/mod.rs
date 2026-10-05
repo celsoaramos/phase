@@ -1808,6 +1808,7 @@ mod tests {
             category_pools: Default::default(),
             pool_size: 0,
             hand_size: 0,
+            creature_value_ceiling: 0.0,
         });
         let services = PlannerServices::new(PlayerId(0), &config, policies, ctx_threat);
 

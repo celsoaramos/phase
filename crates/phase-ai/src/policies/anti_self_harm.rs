@@ -1417,12 +1417,17 @@ fn score_target_object(ctx: &PolicyContext<'_>, object_id: ObjectId, beneficial:
                 }
             }
 
-            // Removal quality mismatch: penalize premium removal on cheap targets
+            // Removal quality mismatch: penalize real removal on cheap targets.
+            // Scaled by the spell's mana value over four, so a two-mana Doom
+            // Blade on a 1/1 pays half of what a four-mana spell pays and a
+            // one-mana spell pays nothing — the first 1/1 of the game used to
+            // eat the two-mana removal for free.
             if let Some(source) = ctx.source_object() {
                 let spell_mv = source.mana_cost.mana_value();
                 let target_value = evaluate_creature(ctx.state, object_id);
-                if spell_mv >= 4 && target_value < 4.0 {
+                if spell_mv >= 2 && target_value < 4.0 {
                     score += ctx.penalties().removal_quality_mismatch
+                        * (f64::from(spell_mv) / 4.0)
                         * (1.0 - target_value / 4.0).max(0.0);
                 }
             }

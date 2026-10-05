@@ -28,7 +28,8 @@ use super::stack_awareness::{
     COUNTER_IMPACT_THRESHOLD,
 };
 use super::strategy_helpers::{
-    targetable_threat_value, untapped_opponent_blocker_value, visible_opponent_creature_value,
+    targetable_creature_value, targetable_threat_value, untapped_opponent_blocker_value,
+    visible_opponent_creature_value,
 };
 #[cfg(test)]
 use engine::types::game_state::CastPaymentMode;
@@ -384,12 +385,22 @@ fn removal_score(ctx: &PolicyContext<'_>) -> f64 {
     // back to all opponent creatures — targetable_threat_value only evaluates creatures
     // and would return 0.0 for non-creature-exclusive filters.
     let effects = ctx.effects();
+    // `Some(value)` only for single-target CREATURE removal: the raw value of
+    // the best creature it can hit. Burn that can go to a player's face and
+    // broad removal (Vindicate) stay `None` and are never held below.
+    let mut best_creature_target = None;
     let max_threat = if let Some(source) = ctx.source_object() {
         let creature_filter = effects
             .iter()
             .filter(|e| targets_creatures_only(e))
             .find_map(|e| extract_target_filter(e));
         if let Some(filter) = creature_filter {
+            best_creature_target = Some(targetable_creature_value(
+                ctx.state,
+                ctx.ai_player,
+                filter,
+                source.id,
+            ));
             targetable_threat_value(ctx.state, ctx.ai_player, filter, source.id)
         } else {
             all_opponent_creature_threat(ctx)
@@ -424,6 +435,55 @@ fn removal_score(ctx: &PolicyContext<'_>) -> f64 {
     };
 
     0.3 + (max_threat / 25.0).min(0.8) + stabilize_bonus + pump_response
+        - hold_removal_discount(ctx, best_creature_target)
+}
+
+/// Turns of combat the opponent's untapped creatures need to kill us. A small
+/// creature is a real clock at four life and no clock at twenty.
+const HOLD_REMOVAL_MIN_CLOCK_TURNS: i32 = 6;
+
+/// Hold single-target creature removal for a better target. Fires only when the
+/// best creature the spell can hit is worth less than `hold_removal_floor`, the
+/// opponent's known deck still carries a creature worth at least the floor, and
+/// we are under no lethal pressure (not `Stabilize`, and their board is at least
+/// `HOLD_REMOVAL_MIN_CLOCK_TURNS` from killing us). The discount grows as the
+/// target shrinks: `0.35 * (1 - value / floor)`, so a 1/1 under a 4.0 floor costs
+/// the cast 0.21 and the 0.3 base of `removal_score` no longer beats a pass on
+/// its own. Player burn and sweepers never reach here (`best_creature_target` is
+/// `None`), and so never wait.
+fn hold_removal_discount(ctx: &PolicyContext<'_>, best_creature_target: Option<f64>) -> f64 {
+    let Some(target_value) = best_creature_target else {
+        return 0.0;
+    };
+    let floor = ctx.penalties().hold_removal_floor;
+    if floor <= 0.0 || target_value >= floor {
+        return 0.0;
+    }
+    let Some(threat) = ctx.context.opponent_threat.as_ref() else {
+        return 0.0;
+    };
+    if threat.creature_value_ceiling < floor {
+        return 0.0;
+    }
+    if matches!(ctx.strategic_intent(), StrategicIntent::Stabilize) {
+        return 0.0;
+    }
+    let my_life = ctx.state.players[ctx.ai_player.0 as usize].life;
+    let opponent_power: i32 = ctx
+        .state
+        .battlefield
+        .iter()
+        .filter_map(|&id| {
+            let object = ctx.state.objects.get(&id)?;
+            (object.card_types.core_types.contains(&CoreType::Creature)
+                && players::is_opponent(ctx.state, ctx.ai_player, object.controller))
+            .then(|| object.power.unwrap_or(0).max(0))
+        })
+        .sum();
+    if opponent_power > 0 && my_life <= opponent_power * HOLD_REMOVAL_MIN_CLOCK_TURNS {
+        return 0.0;
+    }
+    0.35 * (1.0 - target_value / floor).clamp(0.0, 1.0)
 }
 
 /// Fallback: max threat across all opponent creatures (no filter applied).
@@ -2123,6 +2183,161 @@ mod tests {
             };
             static_abilities[0].affected_zone = Some(Zone::Graveyard);
         }));
+    }
+
+    /// A two-mana "Destroy target creature." in `PlayerId(0)`'s hand, and the
+    /// `CastSpell` candidate for it.
+    fn doom_blade_cast(state: &mut GameState) -> CandidateAction {
+        let card_id = CardId(state.next_object_id);
+        let id = create_object(
+            state,
+            card_id,
+            PlayerId(0),
+            "Doom Blade".to_string(),
+            Zone::Hand,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Instant);
+        obj.mana_cost = ManaCost::Cost {
+            shards: vec![engine::types::mana::ManaCostShard::Black],
+            generic: 1,
+        };
+        *std::sync::Arc::make_mut(&mut obj.abilities) = vec![AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Destroy {
+                target: TargetFilter::Typed(TypedFilter::creature()),
+                cant_regenerate: false,
+            },
+        )];
+        CandidateAction {
+            action: GameAction::CastSpell {
+                object_id: id,
+                card_id,
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::default(),
+            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
+        }
+    }
+
+    /// `EffectTimingPolicy::score` for casting `candidate` while the opponent's
+    /// known deck tops out at `creature_value_ceiling`.
+    fn removal_cast_score(
+        state: &GameState,
+        candidate: &CandidateAction,
+        creature_value_ceiling: f64,
+    ) -> f64 {
+        let decision = AiDecisionContext {
+            waiting_for: WaitingFor::Priority {
+                player: PlayerId(0),
+            },
+            candidates: vec![candidate.clone()],
+        };
+        let config = AiConfig::default();
+        let mut context = crate::context::AiContext::empty(&config.weights);
+        context.opponent_threat = Some(crate::threat_profile::ThreatProfile {
+            probabilities: Default::default(),
+            opponent_archetype: crate::deck_profile::DeckArchetype::Midrange,
+            category_pools: Default::default(),
+            pool_size: 40,
+            hand_size: 5,
+            creature_value_ceiling,
+        });
+        EffectTimingPolicy.score(&PolicyContext {
+            state,
+            decision: &decision,
+            candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        })
+    }
+
+    /// Hold the removal: Doom Blade with only a 1/1 to hit, the opponent's deck
+    /// known to carry 5/5s, and us at twenty — the cast loses
+    /// `0.35 * (1 - 2.5 / 4.0)` against the same board with no bigger creature to
+    /// wait for. Before this the first 1/1 of the game ate the removal.
+    #[test]
+    fn removal_is_held_for_a_bigger_creature_still_in_the_deck() {
+        let mut state = GameState::new_two_player(42);
+        state.turn_number = 2;
+        state.phase = Phase::PreCombatMain;
+        let token = creature(&mut state, PlayerId(1), "Token");
+        let obj = state.objects.get_mut(&token).unwrap();
+        obj.power = Some(1);
+        obj.toughness = Some(1);
+        let candidate = doom_blade_cast(&mut state);
+
+        let floor = AiConfig::default().policy_penalties.hold_removal_floor;
+        assert_eq!(floor, 4.0, "the test arithmetic assumes the default floor");
+        let token_value = crate::eval::evaluate_creature(&state, token);
+        assert!(token_value < floor);
+
+        let no_bigger_creature = removal_cast_score(&state, &candidate, 0.0);
+        let bigger_creature_coming = removal_cast_score(&state, &candidate, 8.0);
+        let expected_discount = 0.35 * (1.0 - token_value / floor);
+        assert!(
+            (no_bigger_creature - bigger_creature_coming - expected_discount).abs() < 1e-9,
+            "hold discount: {no_bigger_creature} - {bigger_creature_coming} != {expected_discount}"
+        );
+    }
+
+    /// Lethal pressure cancels the hold: at four life a 1/1 is a four-turn
+    /// clock, and the removal fires at it whatever the deck still holds.
+    #[test]
+    fn removal_is_not_held_under_pressure() {
+        let mut state = GameState::new_two_player(42);
+        state.turn_number = 2;
+        state.phase = Phase::PreCombatMain;
+        state.players[0].life = 4;
+        let token = creature(&mut state, PlayerId(1), "Token");
+        let obj = state.objects.get_mut(&token).unwrap();
+        obj.power = Some(1);
+        obj.toughness = Some(1);
+        let candidate = doom_blade_cast(&mut state);
+
+        assert_eq!(
+            removal_cast_score(&state, &candidate, 0.0),
+            removal_cast_score(&state, &candidate, 8.0),
+            "at four life the 1/1 is a clock and the removal is not held"
+        );
+    }
+
+    /// The hold is for creature removal only: burn that can go to the face is
+    /// never held, whatever the opponent's deck promises.
+    #[test]
+    fn player_burn_is_never_held() {
+        let mut state = GameState::new_two_player(42);
+        state.turn_number = 2;
+        state.phase = Phase::PreCombatMain;
+        let token = creature(&mut state, PlayerId(1), "Token");
+        let obj = state.objects.get_mut(&token).unwrap();
+        obj.power = Some(1);
+        obj.toughness = Some(1);
+        let mut candidate = doom_blade_cast(&mut state);
+        let GameAction::CastSpell { object_id, .. } = &candidate.action else {
+            unreachable!()
+        };
+        let bolt = state.objects.get_mut(object_id).unwrap();
+        bolt.name = "Lightning Bolt".to_string();
+        *std::sync::Arc::make_mut(&mut bolt.abilities) = vec![AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::DealDamage {
+                amount: engine::types::ability::QuantityExpr::Fixed { value: 3 },
+                target: TargetFilter::Any,
+                damage_source: None,
+                excess: None,
+            },
+        )];
+        candidate.metadata = ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell);
+
+        assert_eq!(
+            removal_cast_score(&state, &candidate, 0.0),
+            removal_cast_score(&state, &candidate, 8.0),
+            "burn that can target a player is never held"
+        );
     }
 
     fn counter_effect() -> Effect {

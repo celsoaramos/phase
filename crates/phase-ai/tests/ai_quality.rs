@@ -1642,6 +1642,128 @@ fn counterspell_entry(count: u32) -> DeckEntry {
     }
 }
 
+/// A vanilla 5/5 for five in a deck pool: the "bigger creature still to come"
+/// that makes two-mana removal wait for a better target than a 1/1.
+fn big_creature_entry(count: u32) -> DeckEntry {
+    DeckEntry {
+        card: CardFace {
+            name: "Hill Giant's Big Brother".to_string(),
+            card_type: CardType {
+                core_types: vec![CoreType::Creature],
+                ..Default::default()
+            },
+            mana_cost: ManaCost::generic(5),
+            power: Some(engine::types::ability::PtValue::Fixed(5)),
+            toughness: Some(engine::types::ability::PtValue::Fixed(5)),
+            ..Default::default()
+        },
+        count,
+    }
+}
+
+/// Doom Blade in hand with two Swamps, the opponent's only creature a 1/1 and
+/// their known deck full of 5/5s. Returns the VeryHard root scores of
+/// `PassPriority` and the `CastSpell`, with the hold floor at `floor`.
+fn doom_blade_root_scores(life: i32, floor: f64) -> (f64, f64) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_life(P0, life);
+    scenario.with_life(P1, 20);
+    scenario.add_creature(P1, "Token", 1, 1);
+    scenario
+        .add_spell_to_hand_from_oracle(P0, "Doom Blade", true, "Destroy target creature.")
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![engine::types::mana::ManaCostShard::Black],
+            generic: 1,
+        });
+    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Black);
+    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Black);
+    // Both libraries stocked: with an empty library the search sees the
+    // opponent decking on its next draw and every line scores as a win.
+    let filler: Vec<&str> = std::iter::repeat_n("Filler", 12).collect();
+    scenario.with_library_top(P0, &filler);
+    scenario.with_library_top(P1, &filler);
+
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P0;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+        let entries = std::sync::Arc::new(vec![big_creature_entry(12)]);
+        state.deck_pools.push(PlayerDeckPool {
+            player: P1,
+            registered_main: std::sync::Arc::clone(&entries),
+            registered_sideboard: std::sync::Arc::new(Vec::new()),
+            current_main: entries,
+            current_sideboard: std::sync::Arc::new(Vec::new()),
+            ..Default::default()
+        });
+        state.players[1].hand = engine::im::vector![
+            engine::types::identifiers::ObjectId(90),
+            engine::types::identifiers::ObjectId(91),
+            engine::types::identifiers::ObjectId(92),
+        ];
+    }
+    let mut config = create_config(AiDifficulty::VeryHard, Platform::Native);
+    config.policy_penalties.hold_removal_floor = floor;
+    let scores = score_candidates(runner.state(), P0, &config);
+    let score_of = |pred: fn(&GameAction) -> bool| {
+        scores
+            .iter()
+            .find(|(action, _)| pred(action))
+            .map(|(_, score)| *score)
+            .expect("candidate present")
+    };
+    (
+        score_of(|a| matches!(a, GameAction::PassPriority)),
+        score_of(|a| matches!(a, GameAction::CastSpell { .. })),
+    )
+}
+
+/// Hold the two-mana removal for the 5/5 still in the opponent's deck: at
+/// twenty life the hold floor lowers the Doom Blade cast at the lone 1/1
+/// (`PassPriority` unchanged) — before this the first 1/1 of the game ate the
+/// removal with no discount at all. The hold is a tactical nudge (0.35 at most,
+/// weighted 0.1 into the root score), deliberately not sized to overrule the
+/// search's continuation value, so this asserts the ordering of the two
+/// configurations rather than the final pick.
+#[test]
+fn hold_floor_discounts_two_mana_removal_on_a_lone_small_creature() {
+    let (pass_held, cast_held) = doom_blade_root_scores(20, 4.0);
+    let (pass_free, cast_free) = doom_blade_root_scores(20, 0.0);
+    assert!(
+        cast_held < cast_free,
+        "with the floor the cast at the 1/1 must score lower: {cast_held} vs {cast_free}"
+    );
+    assert!(
+        cast_free - cast_held > 0.01,
+        "the discount must survive the 0.1 tactical weight: {cast_free} - {cast_held}"
+    );
+    // The pass's own continuation value moves only through search ordering
+    // (the prior never touches PassPriority), so compare the margins.
+    assert!(
+        cast_held - pass_held < cast_free - pass_free,
+        "the cast's lead over passing must shrink: held {} vs free {}",
+        cast_held - pass_held,
+        cast_free - pass_free
+    );
+}
+
+/// Lethal pressure cancels the hold: at four life a 1/1 is a four-turn clock,
+/// the floor changes nothing, and the AI fires the removal.
+#[test]
+fn removal_is_not_held_and_is_cast_when_life_is_short() {
+    let (pass_held, cast_held) = doom_blade_root_scores(4, 4.0);
+    let (pass_free, cast_free) = doom_blade_root_scores(4, 0.0);
+    assert_eq!(pass_held, pass_free);
+    assert_eq!(cast_held, cast_free, "no hold under lethal pressure");
+    assert!(
+        cast_held > pass_held,
+        "at four life Doom Blade fires at the 1/1: cast {cast_held} vs pass {pass_held}"
+    );
+}
+
 fn wrath_entry(count: u32) -> DeckEntry {
     DeckEntry {
         card: CardFace {

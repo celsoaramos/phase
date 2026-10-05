@@ -133,6 +133,29 @@ pub(crate) fn targetable_threat_value(
         .fold(0.0, f64::max)
 }
 
+/// Raw `evaluate_creature` value of the best opponent creature matching `filter`
+/// — the same sweep as `targetable_threat_value` without the controller threat
+/// weighting, so a value can be compared against a creature-value floor.
+pub(crate) fn targetable_creature_value(
+    state: &GameState,
+    ai_player: PlayerId,
+    filter: &TargetFilter,
+    source_id: ObjectId,
+) -> f64 {
+    let ctx = FilterContext::from_source(state, source_id);
+    state
+        .battlefield
+        .iter()
+        .filter_map(|&id| {
+            let object = state.objects.get(&id)?;
+            (object.card_types.core_types.contains(&CoreType::Creature)
+                && players::is_opponent(state, ai_player, object.controller)
+                && matches_target_filter(state, id, filter, &ctx))
+            .then(|| evaluate_creature(state, id))
+        })
+        .fold(0.0, f64::max)
+}
+
 pub(crate) fn battlefield_pressure_delta(state: &GameState, ai_player: PlayerId) -> f64 {
     let mut ours = 0.0;
     let mut theirs = 0.0;
