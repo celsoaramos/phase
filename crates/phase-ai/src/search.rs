@@ -3665,6 +3665,7 @@ pub(crate) fn build_ai_context_with_session(
                 category_pools: Default::default(),
                 pool_size: 0,
                 hand_size: 0,
+                creature_value_ceiling: 0.0,
             })
         }
         ThreatAwareness::Full => build_threat_profile_multiplayer(state, player),

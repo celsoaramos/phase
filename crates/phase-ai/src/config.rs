@@ -303,6 +303,11 @@ pub struct PolicyPenalties {
     pub overkill_base_penalty: f64,
     /// Penalty for using premium removal on cheap targets.
     pub removal_quality_mismatch: f64,
+    /// Creature value (`evaluate_creature`: a 2/2 is 5.0, a 1/1 is 2.5) below
+    /// which single-target creature removal is held for a better target when
+    /// the opponent's deck is known to carry bigger creatures and we are not
+    /// under lethal pressure. `0.0` disables the hold.
+    pub hold_removal_floor: f64,
 
     /// Bonus for bouncing a token (ceases to exist) or tucking to library.
     pub bounce_token_bonus: f64,
@@ -686,6 +691,8 @@ impl Default for PolicyPenalties {
             worthy_target_threshold: 3.0,
             overkill_base_penalty: -2.0,
             removal_quality_mismatch: -1.5,
+            // A 1/1 (2.5) and a 2/1 (3.5) are below it; a 2/2 (5.0) is not.
+            hold_removal_floor: 4.0,
             bounce_token_bonus: 3.0,
             bounce_cheap_discount: -2.0,
             bounce_expensive_bonus_per_mv: 0.3,
@@ -1120,6 +1127,7 @@ pub const ACTIVE_POLICY_PENALTY_FIELDS: &[&str] = &[
     "combo_progress_next_turn_bonus",
     "own_chalice_counter_penalty",
     "opponent_chalice_counter_penalty",
+    "hold_removal_floor",
 ];
 
 /// Policy penalties intentionally not present in an active CMA-ES parameter

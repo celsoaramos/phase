@@ -76,6 +76,11 @@ pub struct ThreatProfile {
     pub pool_size: u32,
     /// Opponent's current hand size.
     pub hand_size: u32,
+    /// Combat value (`creature_combat_value`, printed stats and keywords) of
+    /// the biggest creature card still in the opponent's deck pool. `0.0` when
+    /// the pool is unknown or has no creature with printed stats. Tells removal
+    /// whether a bigger target than the one on the table is still to come.
+    pub creature_value_ceiling: f64,
 }
 
 /// P(at least 1 success in sample) = 1 - C(N-K, n) / C(N, n)
@@ -220,6 +225,11 @@ pub fn build_threat_profile(
     }
 
     let opponent_archetype = DeckProfile::analyze(&deck_view.entries).archetype;
+    let creature_value_ceiling = deck_view
+        .entries
+        .iter()
+        .filter_map(|entry| remaining_creature_value(&entry.card))
+        .fold(0.0, f64::max);
 
     let probabilities = ThreatProbabilities {
         counterspell: hypergeometric_at_least_one(pool_size, pools.counterspell.count, hand_size),
@@ -239,7 +249,29 @@ pub fn build_threat_profile(
         category_pools: pools,
         pool_size,
         hand_size,
+        creature_value_ceiling,
     }
+}
+
+/// Printed combat value of a creature card face, or `None` for a non-creature
+/// or a creature whose power/toughness is not a fixed number (CR 208.3 `*`).
+fn remaining_creature_value(card: &CardFace) -> Option<f64> {
+    use engine::types::ability::PtValue;
+    if !card.card_type.core_types.contains(&CoreType::Creature) {
+        return None;
+    }
+    let fixed = |value: &Option<PtValue>| match value {
+        Some(PtValue::Fixed(n)) => Some(*n),
+        _ => None,
+    };
+    let power = fixed(&card.power)?;
+    let toughness = fixed(&card.toughness)?;
+    Some(crate::eval::creature_combat_value(
+        power,
+        toughness,
+        |kw| card.keywords.contains(kw),
+        &crate::eval::KeywordBonuses::default(),
+    ))
 }
 
 /// Compute mana-gated threat probabilities for the current game state.
@@ -539,6 +571,7 @@ mod tests {
             category_pools: pools,
             pool_size: 30,
             hand_size: 5,
+            creature_value_ceiling: 0.0,
         };
 
         // With only 3 mana: no castable wipes → probability 0
