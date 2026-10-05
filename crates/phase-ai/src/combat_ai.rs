@@ -1788,7 +1788,7 @@ pub fn choose_blockers_with_profile(
             incoming_power >= p_life || effective_life <= attacker_power;
 
         // Find a blocker that survives and can kill the attacker
-        let best = available_blockers
+        let candidates: Vec<(ObjectId, u8, f64)> = available_blockers
             .iter()
             .filter(|&&bid| {
                 !used_blockers.contains(&bid)
@@ -1813,10 +1813,55 @@ pub fn choose_blockers_with_profile(
                 }
                 Some((bid, priority, blocker_value(&bid)))
             })
-            .max_by(|a, b| {
-                a.1.cmp(&b.1)
-                    .then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
-            });
+            .collect();
+
+        // Within a priority level the tie-break depends on what happens to the
+        // blocker. When it SURVIVES (priority >= 2) the most valuable body is the
+        // safest wall, so keep "highest value". When it DIES the body is the price
+        // of the block, so pay the lowest price:
+        //  - priority 1 (trade): among every blocker that kills the attacker, the
+        //    cheapest one whose value the trade justifies (`favorable_trade`).
+        //    Testing only the most expensive killer declined trades a cheaper
+        //    killer made favourable, and accepted trades with the dearer creature.
+        //  - priority 0 (chump): the cheapest body — chumping with the best
+        //    creature on the board is the blunder a player sees immediately.
+        // If no killer passes `favorable_trade`, fall through to the chump
+        // candidates: the chump predicates below decide whether a block happens.
+        let attacker_tramples = attacker.has_keyword(&Keyword::Trample);
+        let cmp_value = |a: &f64, b: &f64| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+        let best: Option<(ObjectId, u8, f64)> = match candidates.iter().map(|c| c.1).max() {
+            None => None,
+            Some(p) if p >= 2 => candidates
+                .iter()
+                .filter(|c| c.1 == p)
+                .max_by(|a, b| cmp_value(&a.2, &b.2))
+                .copied(),
+            Some(_) => candidates
+                .iter()
+                .filter(|&&(bid, priority, value)| {
+                    if priority != 1 {
+                        return false;
+                    }
+                    let prevented = if attacker_tramples {
+                        state
+                            .objects
+                            .get(&bid)
+                            .and_then(|b| b.toughness)
+                            .unwrap_or(1)
+                    } else {
+                        attacker_power
+                    };
+                    value <= attacker_value + prevented as f64
+                })
+                .min_by(|a, b| cmp_value(&a.2, &b.2))
+                .or_else(|| {
+                    candidates
+                        .iter()
+                        .filter(|c| c.1 == 0)
+                        .min_by(|a, b| cmp_value(&a.2, &b.2))
+                })
+                .copied(),
+        };
 
         if let Some((blocker_id, priority, selected_blocker_value)) = best {
             // Damage-reflection check (Jackal Pup pattern): if the blocker has a
@@ -1859,13 +1904,25 @@ pub fn choose_blockers_with_profile(
                 }
             }
 
+            // A chump buys ONE turn for the price of a creature. It is only worth
+            // paying when this attacker, on its own, is close to lethal: at
+            // `effective_life <= attacker_power * 2` the next swing is the last one
+            // the player can afford to take. The former `* 3` band made 20 life
+            // chump a lone 7/7 — spending a body on damage the player could absorb.
+            let attacker_near_lethal = effective_life <= attacker_power * 2;
             let should_chump_stabilize = priority == 0
                 && damage_prevented >= 2
                 && matches!(objective, CombatObjective::Stabilize)
-                && effective_life <= attacker_power * 3;
-            // Race chump: losing the damage race, block anything with power >= 2
-            let should_chump_race =
-                priority == 0 && attacker_power >= 2 && matches!(objective, CombatObjective::Race);
+                && attacker_near_lethal;
+            // Race chump: losing the damage race, block anything with power >= 2 —
+            // but only once the swing actually threatens the life total (the whole
+            // attack is lethal, or this attacker alone puts the player within one
+            // more hit). While racing at a healthy life total the body is worth
+            // more on offense than the few life a chump saves.
+            let should_chump_race = priority == 0
+                && attacker_power >= 2
+                && matches!(objective, CombatObjective::Race)
+                && (incoming_power >= effective_life || attacker_near_lethal);
             // CR 903.10a: Skip chumps that don't actually save under commander damage
             // (e.g. 1/1 in front of a 12/12 trample commander with 3 cmd-damage headroom).
             let chump_unsafe =
@@ -2462,8 +2519,13 @@ fn determine_block_objective(
     // for the unconditional save; the bands here only widen the Stabilize window.
     let threshold = incoming_power as f64 * profile.stabilize_bias;
 
-    // Multi-turn lethality: dead in ~2-3 turns at this rate
-    if life as f64 <= threshold * 2.5 {
+    // Multi-turn lethality: dead in two turns at this rate. The bias is clamped
+    // to 1.0 in THIS band only: a defensive bias (Hard 1.1, VeryHard 1.2) stacked
+    // on the former `* 2.5` made 20 life Stabilize against a lone 7/7
+    // (7 × 1.2 × 2.5 = 21) and chump it. Widening the window below is still a
+    // legitimate use of a bias under 1.0 (Easy/VeryEasy stabilize later).
+    let stabilize_threshold = incoming_power as f64 * profile.stabilize_bias.min(1.0);
+    if life as f64 <= stabilize_threshold * 2.0 {
         return CombatObjective::Stabilize;
     }
 
@@ -4111,6 +4173,183 @@ mod tests {
         );
     }
 
+    // --- Block choice: pay the lowest price for a dying blocker (2026-10) ---
+
+    /// A chump never spends the best creature. 7/7 into a 1/1 token and a 5/5 at
+    /// 20 life: either no block (the damage is affordable) or the token chumps —
+    /// the 5/5 must never be the chump. Checked under every shipped profile,
+    /// because VeryHard's defensive bias was what pushed 20 life into Stabilize.
+    #[test]
+    fn chump_never_spends_the_best_creature() {
+        for difficulty in [
+            AiDifficulty::VeryEasy,
+            AiDifficulty::Easy,
+            AiDifficulty::Medium,
+            AiDifficulty::Hard,
+            AiDifficulty::VeryHard,
+        ] {
+            let mut state = setup();
+            state.players[1].life = 20;
+            let giant = add_creature(&mut state, PlayerId(0), "Giant", 7, 7, vec![]);
+            let token = add_creature(&mut state, PlayerId(1), "Token", 1, 1, vec![]);
+            let fatty = add_creature(&mut state, PlayerId(1), "Fatty", 5, 5, vec![]);
+            let profile = create_config(difficulty, Platform::Native).profile;
+
+            let blockers =
+                choose_blockers_with_profile(&state, PlayerId(1), &[giant], &profile, None);
+
+            assert!(
+                !blockers.contains(&(fatty, giant)),
+                "{difficulty:?}: the 5/5 must never chump the 7/7, got {blockers:?}"
+            );
+            assert!(
+                blockers.is_empty() || blockers == vec![(token, giant)],
+                "{difficulty:?}: only no block or a token chump is acceptable, got {blockers:?}"
+            );
+        }
+    }
+
+    /// Trade with the cheapest creature that kills the attacker. 3/3 into a 3/3
+    /// and a 4/3 flyer (both kill it, both die): the vanilla 3/3 trades, the
+    /// dearer flyer is kept.
+    #[test]
+    fn trade_uses_the_cheapest_killer() {
+        let mut state = setup();
+        state.players[1].life = 20;
+        let attacker = add_creature(&mut state, PlayerId(0), "Bear", 3, 3, vec![]);
+        let bear = add_creature(&mut state, PlayerId(1), "Bear", 3, 3, vec![]);
+        let flyer = add_creature(
+            &mut state,
+            PlayerId(1),
+            "Flyer",
+            4,
+            3,
+            vec![Keyword::Flying],
+        );
+        assert!(
+            evaluate_creature(&state, flyer) > evaluate_creature(&state, bear),
+            "fixture: the flyer must be the dearer creature"
+        );
+
+        let blockers = choose_blockers(&state, PlayerId(1), &[attacker]);
+
+        assert_eq!(
+            blockers,
+            vec![(bear, attacker)],
+            "the cheapest killer trades; the dearer flyer stays home"
+        );
+    }
+
+    /// A blocker that kills AND survives still beats any trade: 3/3 into a 3/3
+    /// and a 4/4 — the 4/4 blocks for free.
+    #[test]
+    fn surviving_killer_still_beats_a_trade() {
+        let mut state = setup();
+        state.players[1].life = 20;
+        let attacker = add_creature(&mut state, PlayerId(0), "Bear", 3, 3, vec![]);
+        let _bear = add_creature(&mut state, PlayerId(1), "Bear", 3, 3, vec![]);
+        let big = add_creature(&mut state, PlayerId(1), "Big", 4, 4, vec![]);
+
+        let blockers = choose_blockers(&state, PlayerId(1), &[attacker]);
+
+        assert_eq!(blockers, vec![(big, attacker)]);
+    }
+
+    /// A trade the dearest killer makes unfavourable is still taken by a cheaper
+    /// killer: 2/2 into a 2/2 and a 6/2 (dies to the 2/2, kills it, far too dear).
+    #[test]
+    fn cheaper_killer_rescues_a_trade_the_dearest_killer_declines() {
+        let mut state = setup();
+        state.players[1].life = 20;
+        let attacker = add_creature(&mut state, PlayerId(0), "Bear", 2, 2, vec![]);
+        let bear = add_creature(&mut state, PlayerId(1), "Bear", 2, 2, vec![]);
+        let glass = add_creature(
+            &mut state,
+            PlayerId(1),
+            "Glass Cannon",
+            6,
+            2,
+            vec![Keyword::Flying, Keyword::Trample],
+        );
+        let attacker_value = evaluate_creature(&state, attacker);
+        assert!(
+            evaluate_creature(&state, glass) > attacker_value + 2.0,
+            "fixture: the glass cannon must fail favorable_trade on its own"
+        );
+        assert!(evaluate_creature(&state, bear) <= attacker_value + 2.0);
+
+        let blockers = choose_blockers(&state, PlayerId(1), &[attacker]);
+
+        assert_eq!(blockers, vec![(bear, attacker)]);
+    }
+
+    /// Chump only when the attacker threatens the life total. Lone 7/7 against a
+    /// single 2/2: at 20 life no block (the damage is affordable and the body is
+    /// worth more next turn); at 8 life the next swing is the last one the
+    /// defender can take, so the 2/2 chumps.
+    #[test]
+    fn chump_only_when_the_attacker_threatens_the_life_total() {
+        for difficulty in [AiDifficulty::Medium, AiDifficulty::VeryHard] {
+            let profile = create_config(difficulty, Platform::Native).profile;
+
+            let mut state = setup();
+            state.players[1].life = 20;
+            let giant = add_creature(&mut state, PlayerId(0), "Giant", 7, 7, vec![]);
+            let bear = add_creature(&mut state, PlayerId(1), "Bear", 2, 2, vec![]);
+            let blockers =
+                choose_blockers_with_profile(&state, PlayerId(1), &[giant], &profile, None);
+            assert!(
+                blockers.is_empty(),
+                "{difficulty:?}: at 20 life the 2/2 must not chump a lone 7/7, got {blockers:?}"
+            );
+
+            state.players[1].life = 8;
+            let blockers =
+                choose_blockers_with_profile(&state, PlayerId(1), &[giant], &profile, None);
+            assert_eq!(
+                blockers,
+                vec![(bear, giant)],
+                "{difficulty:?}: at 8 life the 2/2 must chump the 7/7"
+            );
+        }
+    }
+
+    /// Regression: lethal incoming is always blocked, with whatever is there.
+    #[test]
+    fn lethal_incoming_is_still_blocked() {
+        let mut state = setup();
+        state.players[1].life = 5;
+        let giant = add_creature(&mut state, PlayerId(0), "Giant", 7, 7, vec![]);
+        let token = add_creature(&mut state, PlayerId(1), "Token", 1, 1, vec![]);
+        let _fatty = add_creature(&mut state, PlayerId(1), "Fatty", 5, 5, vec![]);
+
+        let blockers = choose_blockers(&state, PlayerId(1), &[giant]);
+
+        assert_eq!(
+            blockers,
+            vec![(token, giant)],
+            "lethal must be blocked, and with the cheapest body"
+        );
+
+        // Two attackers whose sum is lethal: both get a body in front of them.
+        let mut state = setup();
+        state.players[1].life = 6;
+        let a1 = add_creature(&mut state, PlayerId(0), "Ogre", 4, 4, vec![]);
+        let a2 = add_creature(&mut state, PlayerId(0), "Brute", 3, 3, vec![]);
+        add_creature(&mut state, PlayerId(1), "Token A", 1, 1, vec![]);
+        add_creature(&mut state, PlayerId(1), "Token B", 1, 1, vec![]);
+        let blockers = choose_blockers(&state, PlayerId(1), &[a1, a2]);
+        let unblocked: i32 = [(a1, 4), (a2, 3)]
+            .iter()
+            .filter(|(id, _)| !blockers.iter().any(|&(_, a)| a == *id))
+            .map(|(_, p)| p)
+            .sum();
+        assert!(
+            unblocked < 6,
+            "lethal attack must be brought under the life total, got {blockers:?}"
+        );
+    }
+
     /// Thread 1541556099650691193 — maintainer: "100% should have traded".
     /// `sorted_attackers` puts the 2/5 (value 8.0) ahead of the 3/2 (value 6.5),
     /// so the lone 4/2 used to be spent chumping the wall it cannot kill instead
@@ -4142,9 +4381,12 @@ mod tests {
     }
 
     /// The reservation only withholds a blocker that actually has a trade. With
-    /// nothing on the board it can kill, the Race chump behaviour is unchanged.
+    /// nothing on the board it can kill, the chump rule alone decides — and at
+    /// 22 life against 8 incoming the 4/2 is NOT spent on the 6/6: the damage is
+    /// affordable and the body attacks for 4 next turn. Once the 6/6 alone puts
+    /// the player within one more hit (12 life), the chump is taken.
     #[test]
-    fn chump_still_taken_when_no_trade_exists() {
+    fn chump_not_taken_while_racing_at_a_healthy_life_total() {
         let mut state = setup();
         let wall = add_creature(&mut state, PlayerId(0), "Wall", 2, 5, vec![]);
         let ogre = add_creature(&mut state, PlayerId(0), "Ogre", 6, 6, vec![]);
@@ -4158,10 +4400,17 @@ mod tests {
         );
 
         let blockers = choose_blockers(&state, PlayerId(1), &[wall, ogre]);
-
         assert!(
-            blockers.contains(&(blocker, ogre)),
-            "with no trade available the 4/2 should still chump the 6/6, got {blockers:?}"
+            blockers.is_empty(),
+            "at 22 life the 4/2 must not chump an 8-power swing, got {blockers:?}"
+        );
+
+        state.players[1].life = 12;
+        let blockers = choose_blockers(&state, PlayerId(1), &[wall, ogre]);
+        assert_eq!(
+            blockers,
+            vec![(blocker, ogre)],
+            "once the 6/6 alone threatens the life total the 4/2 chumps it"
         );
     }
 

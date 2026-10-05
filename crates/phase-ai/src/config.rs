@@ -1454,7 +1454,10 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
             0.5,
             AiProfile {
                 risk_tolerance: 0.55,
-                interaction_patience: 0.9,
+                // 0.7, the same as VeryHard: patience must be monotonic across the
+                // ladder (`preset_patience_is_monotonic`). At 0.9 Hard sat on
+                // interaction longer than VeryHard, inverting the two presets.
+                interaction_patience: 0.7,
                 stabilize_bias: 1.1,
                 combat_ev_model: CombatEvModel::DownsideWeighted,
                 ..AiProfile::default()
@@ -1742,6 +1745,33 @@ mod tests {
         assert_eq!(config.search.max_branching, 5);
         assert_eq!(config.search.rollout_samples, 2);
         assert_eq!(config.search.determinization_samples, 0);
+    }
+
+    /// The ladder must not invert on patience: a harder preset never holds its
+    /// interaction LESS patiently than an easier one, so the value is
+    /// non-decreasing from VeryEasy to VeryHard. Hard shipped 0.9 against
+    /// VeryHard's 0.7 — the one inversion (CEDH is another format, left out).
+    #[test]
+    fn preset_patience_is_monotonic() {
+        let ladder = [
+            AiDifficulty::VeryEasy,
+            AiDifficulty::Easy,
+            AiDifficulty::Medium,
+            AiDifficulty::Hard,
+            AiDifficulty::VeryHard,
+        ];
+        for platform in [Platform::Native, Platform::Wasm] {
+            let patience: Vec<f64> = ladder
+                .iter()
+                .map(|&d| create_config(d, platform).profile.interaction_patience)
+                .collect();
+            for pair in patience.windows(2) {
+                assert!(
+                    pair[1] >= pair[0],
+                    "interaction_patience must be non-decreasing along the ladder, got {patience:?} on {platform:?}"
+                );
+            }
+        }
     }
 
     #[test]
