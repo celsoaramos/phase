@@ -738,32 +738,17 @@ fn wish_outside_game_scope_default_is_the_deck_construction_policy_not_a_cr_mand
 
 #[test]
 fn game_format_from_str_display_roundtrip_builtins() {
-    let all = [
-        GameFormat::Standard,
-        GameFormat::Limited,
-        GameFormat::Commander,
-        GameFormat::Pioneer,
-        GameFormat::Modern,
-        GameFormat::Premodern,
-        GameFormat::Legacy,
-        GameFormat::Vintage,
-        GameFormat::Historic,
-        GameFormat::Timeless,
-        GameFormat::Pauper,
-        GameFormat::PauperCommander,
-        GameFormat::DuelCommander,
-        GameFormat::TinyLeaders,
-        GameFormat::Oathbreaker,
-        GameFormat::Brawl,
-        GameFormat::HistoricBrawl,
-        GameFormat::FreeForAll,
-        GameFormat::TwoHeadedGiant,
-        GameFormat::Archenemy,
-        GameFormat::Planechase,
-        GameFormat::Momir,
-    ];
-    assert_eq!(all.len(), 22);
-    for format in all {
+    use strum::IntoEnumIterator;
+
+    // Was a hand-written 22-element array guarded by `assert_eq!(all.len(), 22)`
+    // — which cannot fail from the enum growing (22 == 22 holds however many
+    // variants exist), and which was blind to `GameFormat::CommanderDraft`
+    // being absent. Iterating the enum means a new format arrives here on its
+    // own and reds if `FromStr` has no arm for it. `FromStr` ends in
+    // `other => Err(..)` and is NOT compiler-forced; `Deserialize` for
+    // `GameFormat` delegates to it, so the registry-iterating deserialization
+    // tests below also exercise every arm, not just this test.
+    for format in GameFormat::iter() {
         let s = format.to_string();
         let back: GameFormat = s.parse().unwrap();
         assert_eq!(format, back);
@@ -822,6 +807,8 @@ fn game_format_deserialize_accepts_valid_custom_string() {
 
 #[test]
 fn commander_eligibility_rule_from_source_format_covers_every_builtin() {
+    use strum::IntoEnumIterator;
+
     use CommanderEligibilityRule::*;
     let cases = [
         (GameFormat::Standard, None),
@@ -846,7 +833,26 @@ fn commander_eligibility_rule_from_source_format_covers_every_builtin() {
         (GameFormat::Archenemy, None),
         (GameFormat::Planechase, None),
         (GameFormat::Momir, None),
+        // CR 903.13g: Commander Draft games follow Commander's rules, and
+        // CR 903.13f routes deck construction through CR 903.5, so CR 903.3's
+        // eligibility test applies unchanged — the value `from_source_format`
+        // already returns, read off its arm rather than chosen here. This row
+        // was MISSING; see the commit message.
+        (GameFormat::CommanderDraft, Some(Standard)),
+        (GameFormat::Freeform, None),
+        (GameFormat::FreeformCommander, Some(FreeformAnyCastableCard)),
     ];
+    // This table had NO length assertion at all, despite its name. Ordered
+    // equality against the enum is what makes the name true and keeps it true:
+    // a new format reds here until its expected rule is stated. The table is
+    // compared in declaration order, so a format appended to the enum is
+    // appended here and no existing row moves.
+    let covered: Vec<GameFormat> = cases.iter().map(|(format, _)| *format).collect();
+    assert_eq!(
+        covered,
+        GameFormat::iter().collect::<Vec<_>>(),
+        "this table must cover every built-in GameFormat, in declaration order"
+    );
     for (format, expected) in cases {
         assert_eq!(
             CommanderEligibilityRule::from_source_format(format),
@@ -869,6 +875,8 @@ fn commander_eligibility_rule_from_source_format_rejects_custom_without_panickin
 
 #[test]
 fn game_format_serialization_is_byte_identical_to_old_derive_for_builtins() {
+    use strum::IntoEnumIterator;
+
     let expectations: &[(GameFormat, &str)] = &[
         (GameFormat::Standard, "Standard"),
         (GameFormat::Limited, "Limited"),
@@ -892,8 +900,19 @@ fn game_format_serialization_is_byte_identical_to_old_derive_for_builtins() {
         (GameFormat::Archenemy, "Archenemy"),
         (GameFormat::Planechase, "Planechase"),
         (GameFormat::Momir, "Momir"),
+        (GameFormat::CommanderDraft, "CommanderDraft"),
+        (GameFormat::Freeform, "Freeform"),
+        (GameFormat::FreeformCommander, "FreeformCommander"),
     ];
-    assert_eq!(expectations.len(), 22);
+    // Replaces `assert_eq!(expectations.len(), 22)`, which could not fail:
+    // 22 == 22 holds however the enum grows, and it did — `CommanderDraft`'s
+    // serde string was unasserted. See the commit message.
+    let covered: Vec<GameFormat> = expectations.iter().map(|(format, _)| *format).collect();
+    assert_eq!(
+        covered,
+        GameFormat::iter().collect::<Vec<_>>(),
+        "this table must cover every built-in GameFormat, in declaration order"
+    );
     for (format, expected) in expectations {
         let value = serde_json::to_value(format).unwrap();
         assert_eq!(value, serde_json::Value::String(expected.to_string()));
@@ -1321,9 +1340,9 @@ fn companion_candidates_returns_empty_for_custom_format_without_panicking() {
 // representations of the same state with nothing cross-checking them. Phase
 // 1c builds that resolver (FormatConfig::for_custom_rules), so the boundary
 // now accepts a Custom payload exactly when it equals what the resolver
-// derives from the payload's own custom_rules (allow_debug_actions excepted,
-// being a session capability rather than a format rule), and rejects
-// anything else. Each value below is constructed directly in Rust (bypassing
+// derives from the payload's own custom_rules (allow_debug_actions
+// excepted, being a session capability rather than a format rule), and
+// rejects anything else. Each value below is constructed directly in Rust (bypassing
 // Deserialize, which has no reason to reject it going the other way) and
 // round-tripped through `serde_json` — the only way to exercise
 // FormatConfig's real Deserialize impl without hand-guessing its full field
@@ -1504,6 +1523,28 @@ fn format_config_deserialization_ignores_allow_debug_actions_in_the_custom_equal
             .unwrap_or_else(|error| panic!("allow_debug_actions={allow_debug_actions}: {error}"));
         assert_eq!(back, config);
         assert_eq!(back.allow_debug_actions, allow_debug_actions);
+    }
+}
+
+#[test]
+fn format_config_deserialization_ignores_the_removed_experimental_dungeons_key() {
+    // Back-compat: saves, replays, and persisted setups written before the
+    // per-session experimental-dungeons flag was removed still carry the
+    // `allow_experimental_dungeons` key. The derived `Deserialize` impl sets
+    // no `deny_unknown_fields`, so the stale key must be ignored — not
+    // rejected — and the pool must come from the format alone. Both stale
+    // values must load; a `true` on a non-freeform config must NOT smuggle
+    // the Wilderness into its pool.
+    for stale_value in [true, false] {
+        let mut json = serde_json::to_value(FormatConfig::standard()).unwrap();
+        json.as_object_mut().unwrap().insert(
+            "allow_experimental_dungeons".to_string(),
+            serde_json::Value::Bool(stale_value),
+        );
+        let back = serde_json::from_value::<FormatConfig>(json)
+            .unwrap_or_else(|error| panic!("stale flag={stale_value}: {error}"));
+        assert_eq!(back, FormatConfig::standard());
+        assert!(!back.format.offers_baldurs_gate_wilderness());
     }
 }
 

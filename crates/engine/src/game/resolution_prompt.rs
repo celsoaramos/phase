@@ -583,6 +583,10 @@ pub(crate) fn chain_offers_choice(a: &ResolvedAbility) -> bool {
         distribution: _, // CR 601.2d concrete pre-assigned portions (announce-time)
         distribute: _, // CR 601.2d/603.3d unassigned division is an announce-time choice
         targets: _,   // concrete announced target refs (already resolved)
+        declares_chosen_group: _, // announce-time identity, no resolution prompt
+        reads_chosen_group: _, // bound selected targets, no new choice
+        declares_return_result: _, // publication itself does not prompt
+        reads_return_result: _, // consumes a settled value without a prompt
         source_id: _, // object id
         cast_occurrence: _, // finalized-cast provenance, no resolution-time choice
         source_incarnation: _, // self-transform epoch latch, no resolution-time choice
@@ -593,6 +597,7 @@ pub(crate) fn chain_offers_choice(a: &ResolvedAbility) -> bool {
         target_incarnations: _, // CR 400.7 referent pins, no choice
         selected_target_incarnations: _, // CR 400.7 selected-target pins, no choice
         illegal_target_slots: _, // CR 608.2b resolution legality stamp, no choice
+        illegal_local_target_slots: _, // CR 608.2b node-local legality stamp, no choice
         controller: _, // player id
         original_controller: _, // player id
         scoped_player: _, // player id (iteration binding)
@@ -623,8 +628,11 @@ pub(crate) fn chain_offers_choice(a: &ResolvedAbility) -> bool {
         chosen_players: _, // concrete chosen player ids (already selected)
         replacement_applied: _, // replacement provenance set, no prompt
         sub_link: _, // SubAbilityLink kind tag
+        target_reads: _, // TargetReadOrigin tag (announce-time), no prompt
         sibling_condition: _, // SiblingCondition replication marker, no resolution-time choice
         parent_target_missing_reason: _, // seam flag
+        activation_cost_reduction: _,
+        activation_record: _,
     } = a;
 
     // CR 603.5 + CR 608.2d: an optional effect / optional targeting /
@@ -1080,6 +1088,7 @@ mod tests {
             candidates: Vec::new(),
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
         assert!(
             !matches!(base.waiting_for, WaitingFor::ReplacementChoice { .. }),
