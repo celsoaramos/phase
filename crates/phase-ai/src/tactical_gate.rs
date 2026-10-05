@@ -6604,7 +6604,10 @@ mod tests {
                 .any(|selection| {
                     selection.source.object_id == slagheap
                         && selection.ability_index == Some(2)
-                        && selection.output == ManaSourceOutput::DeferredColorChoice
+                        && matches!(
+                            selection.output,
+                            ManaSourceOutput::DeferredColorChoice { .. }
+                        )
                 }),
             "the production source census includes the tapped, indexed deferred Slagheap ability"
         );
@@ -6961,7 +6964,10 @@ mod tests {
                 .any(|selection| {
                     selection.source.object_id == slagheap
                         && selection.ability_index == Some(2)
-                        && selection.output == ManaSourceOutput::DeferredColorChoice
+                        && matches!(
+                            selection.output,
+                            ManaSourceOutput::DeferredColorChoice { .. }
+                        )
                 }),
             "the funded archive context retains the indexed Slagheap source"
         );

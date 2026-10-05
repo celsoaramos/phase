@@ -1898,6 +1898,166 @@ fn threat_profile_influences_scoring_against_control_deck() {
     );
 }
 
+// ── Cast when castable (own spell on the stack is not a lost card) ──────
+
+/// P0 in its main phase with `lands` untapped Islands, a two-mana 2/2 in hand,
+/// a one-mana cantrip instant (not an answer — it only keeps quiescence from
+/// resolving the bear, exactly what Opt does in the blue mirror) and,
+/// optionally, a two-mana Counterspell; P1 with two open Islands, a cantrip of
+/// its own and a counterspell-heavy deck pool (the Full threat profile of
+/// Hard/VeryHard sees a live counter). Returns the runner and the bear's id.
+fn bear_in_hand_fixture(
+    phase: Phase,
+    lands: usize,
+    with_counterspell: bool,
+) -> (engine::game::scenario::GameRunner, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(phase);
+    for _ in 0..lands {
+        scenario.add_basic_land(P0, engine::types::mana::ManaColor::Blue);
+    }
+    scenario.add_basic_land(P1, engine::types::mana::ManaColor::Blue);
+    scenario.add_basic_land(P1, engine::types::mana::ManaColor::Blue);
+    // The opponent holds an instant too, so its priority after the AI's cast
+    // is a real decision and quiescence never resolves the bear by itself —
+    // the shape of every blue-mirror hand.
+    scenario
+        .add_spell_to_hand(P1, "Cantrip", true)
+        .with_mana_cost(ManaCost::generic(1));
+    let bear = scenario
+        .add_creature_to_hand(P0, "Bear", 2, 2)
+        .with_mana_cost(ManaCost::generic(2))
+        .id();
+    scenario
+        .add_spell_to_hand(P0, "Cantrip", true)
+        .with_mana_cost(ManaCost::generic(1));
+    if with_counterspell {
+        scenario
+            .add_spell_to_hand(P0, "Counterspell", true)
+            .with_mana_cost(ManaCost::generic(2))
+            .with_ability(Effect::Counter {
+                target: TargetFilter::Any,
+                source_rider: None,
+                countered_spell_zone: None,
+            });
+    }
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P0;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+        let entries = std::sync::Arc::new(vec![counterspell_entry(8)]);
+        state.deck_pools.push(PlayerDeckPool {
+            player: P1,
+            registered_main: std::sync::Arc::clone(&entries),
+            registered_sideboard: std::sync::Arc::new(Vec::new()),
+            current_main: entries,
+            current_sideboard: std::sync::Arc::new(Vec::new()),
+            ..Default::default()
+        });
+        for phantom in [90, 91] {
+            state.players[1]
+                .hand
+                .push_back(engine::types::identifiers::ObjectId(phantom));
+        }
+    }
+    (runner, bear)
+}
+
+/// `(cast score, pass score)` of the bear at `difficulty`, from the
+/// deterministic `score_candidates` ranking.
+fn bear_cast_and_pass(
+    state: &engine::types::game_state::GameState,
+    bear: ObjectId,
+    difficulty: AiDifficulty,
+) -> (f64, f64) {
+    let config = create_config(difficulty, Platform::Native);
+    let scored = score_candidates(state, P0, &config);
+    let cast = scored
+        .iter()
+        .find(|(a, _)| matches!(a, GameAction::CastSpell { object_id, .. } if *object_id == bear))
+        .map(|(_, s)| *s);
+    let pass = scored
+        .iter()
+        .find(|(a, _)| matches!(a, GameAction::PassPriority))
+        .map(|(_, s)| *s);
+    match (cast, pass) {
+        (Some(cast), Some(pass)) => (cast, pass),
+        _ => {
+            panic!("{difficulty:?}: expected the bear's CastSpell and PassPriority, got {scored:?}")
+        }
+    }
+}
+
+/// Four lands, a castable bear, no instant-speed ANSWER (only a cantrip):
+/// every searching tier casts it in the pre-combat main phase. Before the
+/// own-spell credit the leaf after the cast scored "card gone, creature not
+/// yet on the battlefield" whenever quiescence stalled on that cantrip, and
+/// the blue-control mirror (`ai-ladder --audit`, v0.102.0) saw VeryHard pass
+/// with a castable creature 2.2–2.9 times a game. The mechanism itself is
+/// pinned (with its non-vacuity half) in `planner::tests::
+/// own_creature_spell_on_the_stack_is_credited_when_the_caster_holds_priority`;
+/// this scenario guards the decision at the three searching tiers.
+#[test]
+fn casts_the_affordable_bear_with_no_answer_in_hand() {
+    let (runner, bear) = bear_in_hand_fixture(Phase::PreCombatMain, 4, false);
+    for diff in [
+        AiDifficulty::Medium,
+        AiDifficulty::Hard,
+        AiDifficulty::VeryHard,
+    ] {
+        let (cast, pass) = bear_cast_and_pass(runner.state(), bear, diff);
+        assert!(
+            cast > pass,
+            "{diff:?}: with four lands and no answer to hold mana for, casting the bear \
+             ({cast:.3}) must outscore passing ({pass:.3})"
+        );
+    }
+}
+
+/// Post-combat main is the last window of the turn: with a castable bear and
+/// no answer in hand, passing is the `PassWithCastable` blunder.
+#[test]
+fn casts_the_affordable_bear_post_combat() {
+    let (runner, bear) = bear_in_hand_fixture(Phase::PostCombatMain, 4, false);
+    for diff in [
+        AiDifficulty::Medium,
+        AiDifficulty::Hard,
+        AiDifficulty::VeryHard,
+    ] {
+        let (cast, pass) = bear_cast_and_pass(runner.state(), bear, diff);
+        assert!(
+            cast > pass,
+            "{diff:?}: post-combat with a castable bear and no answer, casting \
+             ({cast:.3}) must outscore passing ({pass:.3})"
+        );
+    }
+}
+
+/// Holding the counter is still priced in: with three lands, casting the bear
+/// leaves one open and the Counterspell in hand goes dead for the turn cycle.
+/// The margin of "cast over pass" must be smaller than in the same position
+/// without the Counterspell (the AI may still hold — direction is not asserted,
+/// only that the answer in hand pulls toward passing).
+#[test]
+fn counterspell_in_hand_still_pulls_toward_holding_mana() {
+    let (plain, bear) = bear_in_hand_fixture(Phase::PreCombatMain, 3, false);
+    let (holding, bear_h) = bear_in_hand_fixture(Phase::PreCombatMain, 3, true);
+    for diff in [AiDifficulty::Hard, AiDifficulty::VeryHard] {
+        let (cast, pass) = bear_cast_and_pass(plain.state(), bear, diff);
+        let (cast_h, pass_h) = bear_cast_and_pass(holding.state(), bear_h, diff);
+        let margin = cast - pass;
+        let margin_h = cast_h - pass_h;
+        assert!(
+            margin_h < margin,
+            "{diff:?}: a Counterspell the cast would strand must lower the cast margin: \
+             without {margin:.3} (cast {cast:.3} / pass {pass:.3}), \
+             with {margin_h:.3} (cast {cast_h:.3} / pass {pass_h:.3})"
+        );
+    }
+}
+
 // ── Mana development (Unit 1) ────────────────────────────────────────────
 
 /// Row 1 — the headline regression: a mana-screwed AI must make its land drop.
