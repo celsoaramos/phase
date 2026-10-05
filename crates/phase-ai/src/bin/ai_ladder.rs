@@ -529,7 +529,9 @@ fn lab_pass_detail(pre: &GameState, action: &GameAction, seat: PlayerId, cfg: &A
     let mut instants: Vec<String> = Vec::new();
     let mut cheapest_instant: Option<u32> = None;
     for id in &me.hand {
-        let Some(o) = pre.objects.get(id) else { continue };
+        let Some(o) = pre.objects.get(id) else {
+            continue;
+        };
         if o.zone != Zone::Hand {
             continue;
         }
