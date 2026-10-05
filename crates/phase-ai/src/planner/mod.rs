@@ -1212,7 +1212,14 @@ impl<'a> PlannerServices<'a> {
             return self.evaluate_state_cached(state);
         }
         let quiesced = self.quiesce(state);
-        self.evaluate_state_cached(&quiesced)
+        let stalled = self.evaluate_state_cached(&quiesced);
+        match self.own_spell_credit(&quiesced) {
+            Some((resolved, keep)) => {
+                let value = self.evaluate_state_cached(&resolved);
+                stalled + keep * (value - stalled)
+            }
+            None => stalled,
+        }
     }
 
     /// Evaluate a leaf state for utility with quiescence.
@@ -1223,7 +1230,112 @@ impl<'a> PlannerServices<'a> {
         }
         let quiesced = self.quiesce(state);
         let value = self.evaluate_for_planner(&quiesced);
-        self.reduce_utility(&quiesced, &value)
+        let stalled = self.reduce_utility(&quiesced, &value);
+        match self.own_spell_credit(&quiesced) {
+            Some((resolved, keep)) => {
+                let value = self.evaluate_for_planner(&resolved);
+                let resolved_utility = self.reduce_utility(&resolved, &value);
+                stalled + keep * (resolved_utility - stalled)
+            }
+            None => stalled,
+        }
+    }
+
+    /// The AI's own spells are on the stack and nobody has responded yet:
+    /// the position where they resolve, and the share of that outcome to
+    /// credit (`policy_penalties.own_spell_stack_credit` × the chance the
+    /// opponent does NOT counter, from the mana-gated threat profile).
+    ///
+    /// `quiesce` stops as soon as the player with priority has any non-pass
+    /// option. Right after the AI casts a creature it holds priority itself,
+    /// and with an instant in hand (an Opt, a Counterspell) it always has one —
+    /// so the leaf the search scores is "card gone from hand, creature not on
+    /// the battlefield", about a card below passing. Measured in the blue
+    /// control mirror (`ai-ladder --probe`, v0.102.0): Air Elemental with eight
+    /// lands open scored tactical −23.75 against −17.50 for the pass, with the
+    /// spell still on the stack and the AI holding priority at the leaf, and
+    /// VeryHard passed post-combat with a castable creature 2.2–2.9 times per
+    /// game. The same leaf is reached one ply later with the opponent holding
+    /// priority (it has instants too); both cases are covered here.
+    ///
+    /// Only the AI's own objects on the stack qualify: an opposing spell or
+    /// ability on the stack is a real decision point and is left alone. The
+    /// resolved value is `None` when the stack cannot be walked to empty with
+    /// passes and forced choices (a choice prompt the quiescer cannot answer,
+    /// an engine refusal, the deadline) — the leaf then keeps the stalled
+    /// score exactly as before.
+    fn own_spell_credit(&self, quiesced: &GameState) -> Option<(GameState, f64)> {
+        let scale = self.config.policy_penalties.own_spell_stack_credit;
+        if !(scale > 0.0) {
+            return None;
+        }
+        if quiesced.stack.is_empty()
+            || !quiesced.stack.iter().all(|entry| {
+                entry.controller == self.ai_player
+                    && matches!(
+                        entry.kind,
+                        engine::types::game_state::StackEntryKind::Spell { .. }
+                    )
+            })
+            || !matches!(quiesced.waiting_for, WaitingFor::Priority { .. })
+        {
+            return None;
+        }
+        let resolved = self.resolve_own_spells(quiesced)?;
+        let keep = (scale.min(1.0)) * (1.0 - self.own_spell_counter_risk(quiesced));
+        Some((resolved, keep))
+    }
+
+    /// Mana-gated probability that an opponent holds a counterspell it can pay
+    /// for right now (0.0 without a threat profile — Easy/Medium search tiers,
+    /// or no deck knowledge). The actual opponent hand is never read.
+    fn own_spell_counter_risk(&self, state: &GameState) -> f64 {
+        let Some(threat) = &self.context.opponent_threat else {
+            return 0.0;
+        };
+        engine::game::players::opponents(state, self.ai_player)
+            .iter()
+            .map(|&opp| {
+                crate::threat_profile::castable_probabilities(threat, state, opp).counterspell
+            })
+            .fold(0.0, f64::max)
+            .clamp(0.0, 1.0)
+    }
+
+    /// Walk `quiesced` to an empty stack by passing priority for whoever holds
+    /// it and letting `quiesce` answer forced choices; `None` when a step does
+    /// not make progress.
+    fn resolve_own_spells(&self, quiesced: &GameState) -> Option<GameState> {
+        const MAX_RESOLVE_STEPS: u32 = 12;
+        let mut sim = quiesced.clone();
+        for _ in 0..MAX_RESOLVE_STEPS {
+            if sim.stack.is_empty() {
+                return Some(self.quiesce(&sim));
+            }
+            if self.deadline.expired() || matches!(sim.waiting_for, WaitingFor::GameOver { .. }) {
+                return None;
+            }
+            if !matches!(sim.waiting_for, WaitingFor::Priority { .. }) {
+                let next = self.quiesce(&sim);
+                if next.stack.len() == sim.stack.len()
+                    && std::mem::discriminant(&next.waiting_for)
+                        == std::mem::discriminant(&sim.waiting_for)
+                {
+                    return None;
+                }
+                sim = next;
+                continue;
+            }
+            if apply_as_current_for_simulation(
+                &mut sim,
+                engine::types::actions::GameAction::PassPriority,
+            )
+            .is_err()
+            {
+                return None;
+            }
+        }
+        sim.stack.is_empty().then(|| self.quiesce(&sim))
     }
 
     pub fn tactical_score(
@@ -2222,6 +2334,106 @@ mod tests {
         });
 
         state
+    }
+
+    /// The leaf right after the AI casts a creature while it still holds an
+    /// instant: quiescence stalls (the AI has priority and a non-pass option),
+    /// so without the own-spell credit the cast is scored as a card lost.
+    /// Returns (state before the cast, state with the bear on the stack).
+    fn bear_cast_with_instant_in_hand() -> (GameState, GameState) {
+        use engine::game::scenario::GameScenario;
+        use engine::types::mana::{ManaColor, ManaCost};
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(engine::types::phase::Phase::PreCombatMain);
+        for _ in 0..4 {
+            scenario.add_basic_land(PlayerId(0), ManaColor::Blue);
+        }
+        let bear = scenario
+            .add_creature_to_hand(PlayerId(0), "Bear", 2, 2)
+            .with_mana_cost(ManaCost::generic(2))
+            .id();
+        scenario
+            .add_spell_to_hand(PlayerId(0), "Opt", true)
+            .with_mana_cost(ManaCost::generic(1));
+        let mut runner = scenario.build();
+        {
+            let state = runner.state_mut();
+            state.active_player = PlayerId(0);
+            state.priority_player = PlayerId(0);
+            state.waiting_for = WaitingFor::Priority {
+                player: PlayerId(0),
+            };
+        }
+        let before = runner.state().clone();
+        let mut after = before.clone();
+        let card_id = after.objects[&bear].card_id;
+        apply_as_current_for_simulation(
+            &mut after,
+            GameAction::CastSpell {
+                object_id: bear,
+                card_id,
+                targets: Vec::new(),
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+            },
+        )
+        .expect("the bear is castable with four Islands");
+        assert_eq!(
+            after.stack.len(),
+            1,
+            "fixture: the bear must be on the stack"
+        );
+        assert!(
+            matches!(after.waiting_for, WaitingFor::Priority { player } if player == PlayerId(0)),
+            "fixture: the caster holds priority, got {:?}",
+            after.waiting_for
+        );
+        (before, after)
+    }
+
+    /// Measured in the blue-control mirror (v0.102.0): Air Elemental on the
+    /// stack with the AI holding priority scored tactical −23.75 against
+    /// −17.50 for passing, because quiescence stopped at the instant in hand
+    /// and the leaf had neither the card nor the creature. The credit values
+    /// the stalled leaf as the position where the spell resolves.
+    #[test]
+    fn own_creature_spell_on_the_stack_is_credited_when_the_caster_holds_priority() {
+        let (before, after) = bear_cast_with_instant_in_hand();
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let policies = PolicyRegistry::default();
+
+        // Non-vacuity: the quiescer alone leaves the bear on the stack here.
+        let services = PlannerServices::new_default(PlayerId(0), &config, &policies);
+        assert_eq!(
+            services.quiesce(&after).stack.len(),
+            1,
+            "fixture: quiescence must stall with the Opt castable"
+        );
+
+        let mut credited = PlannerServices::new_default(PlayerId(0), &config, &policies);
+        let hand = credited.evaluate_state_quiesced(&before);
+        let stack = credited.evaluate_state_quiesced(&after);
+        assert!(
+            stack >= hand - 0.5,
+            "a creature nobody has answered must not score as a lost card: \
+             stack {stack:.3} vs hand {hand:.3}"
+        );
+
+        // The switch: with the credit at zero the old leaf is back — a full
+        // card below passing — which is what the blue mirror was paying.
+        let mut off = config.clone();
+        off.policy_penalties.own_spell_stack_credit = 0.0;
+        let mut uncredited = PlannerServices::new_default(PlayerId(0), &off, &policies);
+        let hand_off = uncredited.evaluate_state_quiesced(&before);
+        let stack_off = uncredited.evaluate_state_quiesced(&after);
+        assert!(
+            stack_off < hand_off - 0.5,
+            "non-vacuity: without the credit the stalled leaf scores the cast as a loss: \
+             stack {stack_off:.3} vs hand {hand_off:.3}"
+        );
+        assert!(
+            stack > stack_off,
+            "the credit must raise the stalled leaf: {stack:.3} vs {stack_off:.3}"
+        );
     }
 
     #[test]

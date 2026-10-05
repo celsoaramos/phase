@@ -368,6 +368,17 @@ pub struct PolicyPenalties {
     /// Penalty multiplier for tapping out when opponent likely has countermagic.
     #[serde(default = "default_threat_counter_tapout_penalty")]
     pub threat_counter_tapout_penalty: f64,
+    /// Share (0..=1) of the resolved-spell value credited to the AI's own
+    /// spells still on the stack at a search leaf, before anyone has
+    /// responded. Quiescence stops with the spell on the stack whenever either
+    /// player holds an instant, and that leaf has lost the card from hand
+    /// without gaining the permanent — so "cast" scored about a card below
+    /// "pass" and the AI passed with a castable creature in every blue hand.
+    /// The credit is the resolved value discounted by the mana-gated counter
+    /// probability of the opponent's deck (`threat_profile`); 0.0 restores the
+    /// uncredited leaf.
+    #[serde(default = "default_own_spell_stack_credit")]
+    pub own_spell_stack_credit: f64,
     /// Penalty multiplier for overextending when opponent likely has board wipe.
     #[serde(default = "default_threat_wipe_overextend_penalty")]
     pub threat_wipe_overextend_penalty: f64,
@@ -708,6 +719,7 @@ impl Default for PolicyPenalties {
             tempo_curve_bonus: default_tempo_curve_bonus(),
             synergy_casting_bonus: default_synergy_casting_bonus(),
             threat_counter_tapout_penalty: default_threat_counter_tapout_penalty(),
+            own_spell_stack_credit: default_own_spell_stack_credit(),
             threat_wipe_overextend_penalty: default_threat_wipe_overextend_penalty(),
             combo_progress_this_turn_bonus: default_combo_progress_this_turn_bonus(),
             combo_progress_next_turn_bonus: default_combo_progress_next_turn_bonus(),
@@ -1025,6 +1037,13 @@ fn default_tempo_curve_bonus() -> f64 {
 fn default_synergy_casting_bonus() -> f64 {
     0.25
 }
+/// Full credit: a spell nobody has answered yet is worth what it resolves
+/// into, minus the counter risk the leaf blends in. Tunable so CMA-ES can
+/// shade it, but a trained value below zero is clamped to zero in the planner.
+fn default_own_spell_stack_credit() -> f64 {
+    1.0
+}
+
 fn default_threat_counter_tapout_penalty() -> f64 {
     -1.5
 }
@@ -1115,6 +1134,7 @@ pub const ACTIVE_POLICY_PENALTY_FIELDS: &[&str] = &[
     "tempo_curve_bonus",
     "synergy_casting_bonus",
     "threat_counter_tapout_penalty",
+    "own_spell_stack_credit",
     "threat_wipe_overextend_penalty",
     "combo_progress_this_turn_bonus",
     "combo_progress_next_turn_bonus",
