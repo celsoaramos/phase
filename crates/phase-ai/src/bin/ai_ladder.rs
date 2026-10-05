@@ -46,6 +46,7 @@ use engine::game::deck_loading::{
 };
 use engine::game::engine::start_game_skip_mulligan;
 use engine::game::turn_control;
+use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{GameState, WaitingFor};
 use engine::types::player::PlayerId;
@@ -343,6 +344,7 @@ fn run_game(
                     for item in results.results.iter() {
                         if let Some(seat) = decision_seat(before) {
                             audit_step(before, &item.action, seat, &mut tally);
+                            lab_pass_detail(before, &item.action, seat, &configs[&seat]);
                         }
                         before = &item.state;
                     }
@@ -376,7 +378,6 @@ fn run_probe(
     a: &Side,
     b: &Side,
 ) {
-    use engine::types::actions::GameAction;
     use engine::types::phase::Phase;
     let mut agree = 0usize;
     let mut a_casts = 0usize;
@@ -491,6 +492,99 @@ fn run_probe(
         }
     }
     println!("spots {spots}: A tops a creature cast {a_casts}, B {b_casts}, agree {agree}");
+}
+
+/// `LAB_PASS_DETAIL=1`: one line per post-combat pass with a castable creature
+/// or sorcery (the `PassWithCastable` blunder), saying what the hand held:
+/// the cheapest castable creature, the instant-speed cards (castable now or
+/// not), whether the mana left after the creature still covers the cheapest
+/// instant, and the opponent's open mana. This is how to tell "holding the
+/// counter" from "passing for nothing".
+fn lab_pass_detail(pre: &GameState, action: &GameAction, seat: PlayerId, cfg: &AiConfig) {
+    use engine::ai_support::legal_actions;
+    use engine::types::keywords::Keyword;
+    use engine::types::phase::Phase;
+    use engine::types::zones::Zone;
+    if std::env::var("LAB_PASS_DETAIL").is_err() {
+        return;
+    }
+    if !matches!(action, GameAction::PassPriority)
+        || pre.phase != Phase::PostCombatMain
+        || pre.active_player != seat
+        || !pre.stack.is_empty()
+        || !matches!(pre.waiting_for, WaitingFor::Priority { player } if player == seat)
+    {
+        return;
+    }
+    let actions = legal_actions(pre);
+    let castable: std::collections::HashSet<_> = actions
+        .iter()
+        .filter_map(|a| match a {
+            GameAction::CastSpell { object_id, .. } => Some(*object_id),
+            _ => None,
+        })
+        .collect();
+    let me = &pre.players[seat.0 as usize];
+    let mut creature: Option<(u32, String)> = None;
+    let mut instants: Vec<String> = Vec::new();
+    let mut cheapest_instant: Option<u32> = None;
+    for id in &me.hand {
+        let Some(o) = pre.objects.get(id) else { continue };
+        if o.zone != Zone::Hand {
+            continue;
+        }
+        let mv = o.mana_cost.mana_value();
+        let is_creature = o.card_types.core_types.contains(&CoreType::Creature);
+        let instant_speed =
+            o.card_types.core_types.contains(&CoreType::Instant) || o.has_keyword(&Keyword::Flash);
+        if instant_speed {
+            instants.push(format!(
+                "{}{}",
+                o.name,
+                if castable.contains(id) { "*" } else { "" }
+            ));
+            cheapest_instant = Some(cheapest_instant.map_or(mv, |c: u32| c.min(mv)));
+        } else if castable.contains(id)
+            && (is_creature || o.card_types.core_types.contains(&CoreType::Sorcery))
+            && creature.as_ref().is_none_or(|(c, _)| mv < *c)
+        {
+            creature = Some((mv, o.name.clone()));
+        }
+    }
+    let Some((mv, name)) = creature else { return };
+    // Untapped lands stand in for open mana (the mirrors in runs.txt are
+    // basic-land decks; `zone_eval::available_mana` is crate-private).
+    let open_lands = |p: PlayerId| -> u32 {
+        pre.battlefield
+            .iter()
+            .filter(|id| {
+                pre.objects.get(id).is_some_and(|o| {
+                    o.controller == p
+                        && !o.tapped
+                        && o.card_types.core_types.contains(&CoreType::Land)
+                })
+            })
+            .count() as u32
+    };
+    let mine = open_lands(seat);
+    let opp = engine::game::players::opponents(pre, seat)
+        .iter()
+        .map(|&o| open_lands(o))
+        .max()
+        .unwrap_or(0);
+    let left = mine.saturating_sub(mv);
+    let verdict = match cheapest_instant {
+        None => "no-instant",
+        Some(c) if left >= c => "fits-both",
+        Some(_) => "hold",
+    };
+    println!(
+        "PASSDETAIL depth={} t{} seat={} {verdict} creature={name}({mv}) mana={mine} left={left} oppOpen={opp} instants=[{}]",
+        cfg.search.max_depth,
+        pre.turn_number,
+        seat.0,
+        instants.join(",")
+    );
 }
 
 /// Two-sided exact sign test (binomial, p = 0.5) on decided games.
