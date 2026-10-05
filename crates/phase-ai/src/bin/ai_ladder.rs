@@ -18,6 +18,13 @@
 //!
 //! `--decks` adds named decks (`{"name": ["4 Card", "Card", ...]}`); a matchup
 //! `x-vs-y` whose sides are both deck names uses them instead of the duel suite.
+//! Given a DIRECTORY, every `*.json` under it in the duel_decks snapshot shape
+//! (`{name, main: [{name, count}]}`) is registered under its file stem
+//! (`boros-energy`), so `--matchups boros-energy-vs-affinity` works.
+//!
+//! `--audit` plays one AI decision per step and runs every decision through
+//! `phase_ai::blunder_audit` — a table of blunders per game per side follows
+//! the win table (and `--json` carries the counts).
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -28,7 +35,8 @@ use std::path::PathBuf;
 
 use rayon::prelude::*;
 
-use phase_ai::auto_play::run_ai_actions;
+use phase_ai::auto_play::{run_ai_actions, run_ai_actions_bounded};
+use phase_ai::blunder_audit::{audit_step, AuditTally, Blunder};
 use phase_ai::config::{create_config_for_players, AiConfig, AiDifficulty, Platform};
 use phase_ai::duel_suite::{all_matchups, resolve_deck_ref};
 
@@ -37,6 +45,7 @@ use engine::game::deck_loading::{
     load_and_hydrate_decks, resolve_deck_list, DeckList, DeckPayload, PlayerDeckList,
 };
 use engine::game::engine::start_game_skip_mulligan;
+use engine::game::turn_control;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{GameState, WaitingFor};
 use engine::types::player::PlayerId;
@@ -113,6 +122,66 @@ fn expand_deck(lines: &[String]) -> Vec<String> {
     out
 }
 
+/// Load `--decks`: a JSON map `{name: [lines]}`, or a directory of duel_decks
+/// snapshots (`{name, main: [{name, count}]}`) registered by file stem.
+fn load_decks(path: &PathBuf) -> HashMap<String, Vec<String>> {
+    if path.is_dir() {
+        let mut out = HashMap::new();
+        let mut files = Vec::new();
+        collect_json_files(path, &mut files);
+        for file in files {
+            let text = std::fs::read_to_string(&file).expect("read deck file");
+            match deck_lines_from_snapshot(&text) {
+                Some(lines) => {
+                    let stem = file
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if out.insert(stem.clone(), lines).is_some() {
+                        eprintln!("--decks: duplicate deck stem '{stem}' ({})", file.display());
+                    }
+                }
+                None => eprintln!(
+                    "--decks: {} is not a {{name, main:[{{name,count}}]}} snapshot, skipped",
+                    file.display()
+                ),
+            }
+        }
+        return out;
+    }
+    serde_json::from_str(&std::fs::read_to_string(path).expect("read --decks"))
+        .expect("--decks must be {name: [lines]} or a directory of deck snapshots")
+}
+
+fn collect_json_files(dir: &PathBuf, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for p in entries {
+        if p.is_dir() {
+            collect_json_files(&p, out);
+        } else if p.extension().and_then(|e| e.to_str()) == Some("json") {
+            out.push(p);
+        }
+    }
+}
+
+/// `{name, main: [{name, count}]}` -> `["4 Card", ...]` (the `expand_deck` shape).
+fn deck_lines_from_snapshot(text: &str) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let main = v.get("main")?.as_array()?;
+    let mut lines = Vec::with_capacity(main.len());
+    for card in main {
+        let name = card.get("name")?.as_str()?;
+        let count = card.get("count").and_then(|c| c.as_u64()).unwrap_or(1);
+        lines.push(format!("{count} {name}"));
+    }
+    Some(lines)
+}
+
 fn payload_for(
     db: &CardDatabase,
     id: &str,
@@ -183,6 +252,19 @@ struct GameOut {
     /// the end-of-game board reads as zero for whoever just died.
     last_alive: Profile,
     panicked: bool,
+    /// Blunders per seat (`--audit` only; empty otherwise).
+    audit: AuditTally,
+}
+
+/// The seat that owns the decision `state` is waiting on (the AI actor
+/// `run_ai_actions` will pick for it), or `None` when nobody can act.
+fn decision_seat(state: &GameState) -> Option<PlayerId> {
+    state
+        .waiting_for
+        .acting_players()
+        .into_iter()
+        .next()
+        .map(|p| turn_control::authorized_submitter_for_player(state, p))
 }
 
 fn run_game(
@@ -191,6 +273,7 @@ fn run_game(
     seed: u64,
     p0: &AiConfig,
     p1: &AiConfig,
+    audit: bool,
 ) -> GameOut {
     let mut state = GameState::new_two_player(seed);
     load_and_hydrate_decks(&mut state, payload, Some(db));
@@ -208,6 +291,13 @@ fn run_game(
     let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed);
     let session = phase_ai::session::AiSession::arc_from_game(&state);
     let mut last_alive = snapshot(&state);
+    let mut tally = AuditTally {
+        games: 1,
+        ..AuditTally::default()
+    };
+    // One decision per step under `--audit`, so every action can be judged
+    // against the exact state it was taken in; the unbounded batch otherwise.
+    let mut steps = 0usize;
     loop {
         if let WaitingFor::GameOver { winner } = &state.waiting_for {
             return GameOut {
@@ -215,18 +305,26 @@ fn run_game(
                 turns: state.turn_number,
                 last_alive,
                 panicked: false,
+                audit: tally,
             };
         }
-        if state.turn_number >= MAX_TURNS {
+        if state.turn_number >= MAX_TURNS || steps > 20_000 {
             return GameOut {
                 winner: None,
                 turns: state.turn_number,
                 last_alive,
                 panicked: false,
+                audit: tally,
             };
         }
+        steps += 1;
+        let pre = audit.then(|| state.clone());
         let step = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            run_ai_actions(&mut state, &players, &configs, &mut rng, &session)
+            if audit {
+                run_ai_actions_bounded(&mut state, &players, &configs, &mut rng, &session, 1)
+            } else {
+                run_ai_actions(&mut state, &players, &configs, &mut rng, &session)
+            }
         }));
         match step {
             Ok(results) if results.is_empty() => {
@@ -235,9 +333,20 @@ fn run_game(
                     turns: state.turn_number,
                     last_alive,
                     panicked: false,
+                    audit: tally,
                 }
             }
-            Ok(_) => {
+            Ok(results) => {
+                if let Some(pre) = pre.as_ref() {
+                    // Item i was decided in the state item i-1 left behind.
+                    let mut before: &GameState = pre;
+                    for item in results.results.iter() {
+                        if let Some(seat) = decision_seat(before) {
+                            audit_step(before, &item.action, seat, &mut tally);
+                        }
+                        before = &item.state;
+                    }
+                }
                 if !matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
                     last_alive = snapshot(&state);
                 }
@@ -248,6 +357,7 @@ fn run_game(
                     turns: state.turn_number,
                     last_alive,
                     panicked: true,
+                    audit: tally,
                 }
             }
         }
@@ -415,6 +525,8 @@ struct Tally {
     a_lands: u64,
     b_lands: u64,
     games: usize,
+    /// Blunder counts for side A / side B (seat-corrected).
+    audit: [std::collections::BTreeMap<Blunder, u32>; 2],
 }
 
 fn main() {
@@ -428,6 +540,7 @@ fn main() {
     let mut decks_path: Option<PathBuf> = None;
     let mut json_out: Option<PathBuf> = None;
     let mut probe: usize = 0;
+    let mut audit = false;
     let mut i = 0;
     while i < args.len() {
         let take = |i: &mut usize| -> String {
@@ -446,6 +559,7 @@ fn main() {
             "--decks" => decks_path = Some(PathBuf::from(take(&mut i))),
             "--json" => json_out = Some(PathBuf::from(take(&mut i))),
             "--probe" => probe = take(&mut i).parse().expect("--probe"),
+            "--audit" => audit = true,
             "-h" | "--help" => {
                 eprintln!(
                     "{}",
@@ -476,8 +590,7 @@ fn main() {
         std::process::exit(1)
     });
     let decks: HashMap<String, Vec<String>> = match &decks_path {
-        Some(p) => serde_json::from_str(&std::fs::read_to_string(p).expect("read --decks"))
-            .expect("--decks must be {name: [lines]}"),
+        Some(p) => load_decks(p),
         None => HashMap::new(),
     };
     let side_a = parse_spec(&a_spec).unwrap_or_else(|e| {
@@ -529,7 +642,11 @@ fn main() {
             } else {
                 (&side_b.config, &side_a.config)
             };
-            (m, a_is_p0, run_game(&payloads[m].1, &db, game_seed, p0, p1))
+            (
+                m,
+                a_is_p0,
+                run_game(&payloads[m].1, &db, game_seed, p0, p1, audit),
+            )
         })
         .collect();
 
@@ -545,6 +662,11 @@ fn main() {
         t.b_lands += out.last_alive.lands[b_seat] as u64;
         if out.panicked {
             t.panics += 1;
+        }
+        for (side, seat) in [(0usize, a_seat), (1usize, b_seat)] {
+            for (b, n) in &out.audit.per_seat[seat] {
+                *t.audit[side].entry(*b).or_insert(0) += n;
+            }
         }
         match out.winner {
             Some(PlayerId(w)) if w as usize == a_seat => t.a += 1,
@@ -583,6 +705,12 @@ fn main() {
         total.b += t.b;
         total.draws += t.draws;
         total.panics += t.panics;
+        total.games += t.games;
+        for side in 0..2 {
+            for (b, n) in &t.audit[side] {
+                *total.audit[side].entry(*b).or_insert(0) += n;
+            }
+        }
     }
     let decided = (total.a + total.b).max(1);
     println!(
@@ -593,6 +721,28 @@ fn main() {
         100.0 * total.a as f64 / decided as f64,
         sign_test(total.a, total.b)
     );
+    let mut audit_json = serde_json::Map::new();
+    if audit {
+        let g = total.games.max(1) as f64;
+        println!();
+        println!("| blunder | A/game | B/game |");
+        println!("|---|---|---|");
+        for b in Blunder::all() {
+            let a_n = total.audit[0].get(b).copied().unwrap_or(0);
+            let b_n = total.audit[1].get(b).copied().unwrap_or(0);
+            println!(
+                "| {} | {:.2} | {:.2} |",
+                b.label(),
+                a_n as f64 / g,
+                b_n as f64 / g
+            );
+            audit_json.insert(
+                format!("{b:?}"),
+                serde_json::json!({"a": a_n, "b": b_n, "a_per_game": a_n as f64 / g, "b_per_game": b_n as f64 / g}),
+            );
+        }
+        println!("| games audited | {} | {} |", total.games, total.games);
+    }
     let [evals, credits, blocks] = phase_ai::lab_counters::snapshot();
     eprintln!("lab counters: leaf evals (stack-credit side) {evals}, stack credits {credits}, counter-gate blocks {blocks}");
     eprintln!(
@@ -606,6 +756,7 @@ fn main() {
             "a": side_a.label, "b": side_b.label, "games_per_matchup": pairs * 2, "seed": seed,
             "rows": rows,
             "total": {"a": total.a, "b": total.b, "draws": total.draws, "p": sign_test(total.a, total.b)},
+            "audit": if audit { serde_json::Value::Object(audit_json) } else { serde_json::Value::Null },
         });
         std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).expect("write --json");
     }
@@ -624,6 +775,17 @@ mod tests {
         // 10 x 30 ≈ 0.0022 (the kitchen × fury number in the MagicFinder notes).
         let p = sign_test(10, 30);
         assert!(p > 0.001 && p < 0.003, "{p}");
+    }
+
+    #[test]
+    fn snapshot_decks_become_count_lines() {
+        let lines = deck_lines_from_snapshot(
+            r#"{"name":"X","format":"modern","main":[{"name":"Island","count":4},{"name":"Ponder"}]}"#,
+        )
+        .expect("snapshot shape");
+        assert_eq!(lines, vec!["4 Island".to_string(), "1 Ponder".to_string()]);
+        assert_eq!(expand_deck(&lines).len(), 5);
+        assert!(deck_lines_from_snapshot(r#"{"lab-blue": ["4 Island"]}"#).is_none());
     }
 
     #[test]

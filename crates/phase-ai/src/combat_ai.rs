@@ -2647,7 +2647,8 @@ fn crackback_damage(
     unblocked_damage
 }
 
-fn battlefield_power(state: &GameState, player: PlayerId) -> i32 {
+#[doc(hidden)]
+pub fn battlefield_power(state: &GameState, player: PlayerId) -> i32 {
     state
         .battlefield
         .iter()
@@ -2664,7 +2665,8 @@ fn battlefield_power(state: &GameState, player: PlayerId) -> i32 {
         .sum()
 }
 
-fn sum_power(state: &GameState, ids: &[ObjectId]) -> i32 {
+#[doc(hidden)]
+pub fn sum_power(state: &GameState, ids: &[ObjectId]) -> i32 {
     ids.iter()
         .filter_map(|&id| {
             state
@@ -3130,7 +3132,8 @@ fn block_exchange(blocker: &BlockStats, attacker: &BlockStats) -> (bool, bool) {
 }
 
 /// Evaluate whether a single blocker kills the attacker and/or survives combat.
-fn evaluate_block_outcome(
+#[doc(hidden)]
+pub fn evaluate_block_outcome(
     blocker: &engine::game::game_object::GameObject,
     attacker: &engine::game::game_object::GameObject,
 ) -> (bool, bool) {

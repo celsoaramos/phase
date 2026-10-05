@@ -1,5 +1,6 @@
 pub mod ability_chain;
 pub mod auto_play;
+pub mod blunder_audit;
 pub mod card_advantage;
 pub mod card_hints;
 // Every item in `card_value` is `pub(crate)`; the module follows.
