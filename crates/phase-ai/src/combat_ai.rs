@@ -593,6 +593,26 @@ pub(crate) fn choose_attackers_with_targets_with_profile_and_deadline_and_threat
                 selected.push(id);
             }
         }
+        // Group pass: the loop above judged each candidate ALONE against the
+        // defender's best single block, so a wide board facing one blocker
+        // stayed home — every 2/2 "would be blocked and die" although only one
+        // of them can be. Re-evaluate the held-back candidates as a swarm.
+        promote_group_attack(
+            state,
+            &GroupAttackInputs {
+                candidates: &candidates,
+                mandatory: &mandatory,
+                selected_defender,
+                valid_attack_targets_by_attacker: targeting.valid_attack_targets_by_attacker,
+                opponent_blockers: &opponent_blockers,
+                latent_blocker_count: latent_blocker_bodies.len(),
+                defender: evaluated_defender,
+                objective,
+                slices: &slices,
+                deadline: targeting.comparison_deadline.as_ref(),
+            },
+            &mut selected,
+        );
         selected
     });
 
@@ -750,6 +770,305 @@ pub(crate) fn choose_attackers_with_targets_with_profile_and_deadline_and_threat
     };
     emit_attack_trace(player, &candidates, &assignments);
     assignments
+}
+
+/// Inputs of the swarm re-evaluation that follows the per-candidate attack loop.
+struct GroupAttackInputs<'a> {
+    candidates: &'a [ObjectId],
+    mandatory: &'a [ObjectId],
+    selected_defender: Option<PlayerId>,
+    valid_attack_targets_by_attacker: Option<&'a HashMap<ObjectId, Vec<AttackTarget>>>,
+    opponent_blockers: &'a [ObjectId],
+    /// Man-lands the defender could animate (`DownsideWeighted` only). They are
+    /// not simulated as bodies, but they count as potential blockers for the
+    /// "fewer blockers than attackers" admission.
+    latent_blocker_count: usize,
+    defender: Option<PlayerId>,
+    objective: CombatObjective,
+    slices: &'a BlockLegalitySlices,
+    deadline: Option<&'a Deadline>,
+}
+
+/// Simulated outcome of the defender's best blocker ASSIGNMENT against a whole
+/// attacking group, each blocker used at most once.
+struct GroupBlockOutcome {
+    /// Damage that reaches the defending player.
+    unblocked_damage: i32,
+    /// Combined value of our attackers that die in the exchange.
+    value_lost: f64,
+    /// `unblocked_damage` reaches the defender's life even after the defender
+    /// abandons value blocks and chumps the biggest attackers it can.
+    lethal: bool,
+}
+
+/// CR 509.1a: the defending player assigns each untapped blocker to at most one
+/// attacker. Models the defender's assignment in two passes — first the blocks a
+/// rational defender WANTS (positive `defender_gain`, best gain first), then, if
+/// the damage that still gets through is lethal, the chump blocks it NEEDS (each
+/// remaining blocker on the highest-power attacker it can legally block).
+///
+/// Bounded O(attackers × blockers × min(attackers, blockers)); returns `None`
+/// when `deadline` expires so the caller keeps the per-candidate verdict.
+fn simulate_group_block(
+    state: &GameState,
+    attackers: &[ObjectId],
+    blockers: &[ObjectId],
+    defender_life: i32,
+    slices: &BlockLegalitySlices,
+    deadline: Option<&Deadline>,
+) -> Option<GroupBlockOutcome> {
+    // (attacker, blocker) legality matrix, computed once.
+    let legal: Vec<Vec<ObjectId>> = attackers
+        .iter()
+        .map(|&attacker| {
+            if deadline.is_some_and(Deadline::expired) {
+                return Vec::new();
+            }
+            let Some(obj) = state.objects.get(&attacker) else {
+                return Vec::new();
+            };
+            if has_cant_be_blocked(state, obj) {
+                return Vec::new();
+            }
+            blockers
+                .iter()
+                .copied()
+                .filter(|&blocker| slices.can_block_pair(state, blocker, attacker))
+                .collect()
+        })
+        .collect();
+    if deadline.is_some_and(Deadline::expired) {
+        return None;
+    }
+    let values: Vec<f64> = attackers
+        .iter()
+        .map(|&id| evaluate_creature(state, id))
+        .collect();
+    let mut assigned: Vec<Option<ObjectId>> = vec![None; attackers.len()];
+    let mut used: HashSet<ObjectId> = HashSet::new();
+
+    // Pass 1 — value blocks the defender wants.
+    loop {
+        if deadline.is_some_and(Deadline::expired) {
+            return None;
+        }
+        let mut best: Option<(usize, DefenderBlock)> = None;
+        for (index, &attacker) in attackers.iter().enumerate() {
+            if assigned[index].is_some() {
+                continue;
+            }
+            let eligible: Vec<ObjectId> = legal[index]
+                .iter()
+                .copied()
+                .filter(|blocker| !used.contains(blocker))
+                .collect();
+            if eligible.is_empty() {
+                continue;
+            }
+            let Some(block) = defender_best_block_from_eligible(
+                state,
+                attacker,
+                values[index],
+                &eligible,
+                |id| evaluate_creature(state, id),
+            ) else {
+                continue;
+            };
+            if block.defender_gain <= 0.0 {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(_, current)| block.defender_gain > current.defender_gain)
+            {
+                best = Some((index, block));
+            }
+        }
+        let Some((index, block)) = best else {
+            break;
+        };
+        let Some(blocker) = block.blocker_id else {
+            break;
+        };
+        assigned[index] = Some(blocker);
+        used.insert(blocker);
+    }
+
+    let unblocked_damage = |assigned: &[Option<ObjectId>]| -> i32 {
+        attackers
+            .iter()
+            .zip(assigned)
+            .filter_map(|(&attacker, blocker)| {
+                let obj = state.objects.get(&attacker)?;
+                let power = obj.power.unwrap_or(0).max(0);
+                match blocker {
+                    None => Some(power),
+                    // CR 702.19b: a trampler assigns lethal damage to its
+                    // blocker and the rest to the player.
+                    Some(blocker) if obj.has_keyword(&Keyword::Trample) => {
+                        let blocker = state.objects.get(blocker)?;
+                        let lethal = (blocker.toughness.unwrap_or(0)
+                            - i32::try_from(blocker.damage_marked).unwrap_or(0))
+                        .max(0);
+                        Some((power - lethal).max(0))
+                    }
+                    Some(_) => Some(0),
+                }
+            })
+            .sum()
+    };
+
+    let mut damage = unblocked_damage(&assigned);
+    let mut lethal = false;
+    if defender_life > 0 && damage >= defender_life {
+        // Pass 2 — survival: chump the biggest unblocked attackers with whatever
+        // is left. The value blocks already made are kept (they also absorb).
+        let mut order: Vec<usize> = (0..attackers.len())
+            .filter(|&index| assigned[index].is_none())
+            .collect();
+        order.sort_by_key(|&index| {
+            std::cmp::Reverse(
+                state
+                    .objects
+                    .get(&attackers[index])
+                    .and_then(|obj| obj.power)
+                    .unwrap_or(0),
+            )
+        });
+        for index in order {
+            if let Some(&blocker) = legal[index].iter().find(|blocker| !used.contains(blocker)) {
+                assigned[index] = Some(blocker);
+                used.insert(blocker);
+            }
+        }
+        damage = unblocked_damage(&assigned);
+        lethal = damage >= defender_life;
+    }
+
+    let value_lost = attackers
+        .iter()
+        .zip(&assigned)
+        .zip(&values)
+        .filter_map(|((&attacker, blocker), &value)| {
+            let blocker = state.objects.get(&(*blocker)?)?;
+            let attacker = state.objects.get(&attacker)?;
+            let (blocker_kills_attacker, _) = evaluate_block_outcome(blocker, attacker);
+            blocker_kills_attacker.then_some(value)
+        })
+        .sum();
+
+    Some(GroupBlockOutcome {
+        unblocked_damage: damage,
+        value_lost,
+        lethal,
+    })
+}
+
+/// Attack-as-a-group: when the defender has fewer potential blockers than we
+/// have eligible attackers, judge the held-back candidates as ONE declaration.
+/// Simulates the defender's best assignment (each blocker used once) with and
+/// without the group, and promotes the whole group when the extra damage that
+/// gets through is at least the value the group puts at risk — and always when
+/// the group makes the attack lethal. Four 2/2s facing one 4/4 at ten life
+/// swing (six damage for one bear); one 2/2 facing that 4/4 still stays home.
+fn promote_group_attack(
+    state: &GameState,
+    input: &GroupAttackInputs<'_>,
+    selected: &mut Vec<ObjectId>,
+) {
+    let Some(defender) = input.defender else {
+        return;
+    };
+    // The free candidates: not already attacking, not forced to, not the
+    // commander (CR 903.8 — never trade it outside a certified lethal), and
+    // able to attack the chosen defender.
+    let free: Vec<ObjectId> = input
+        .candidates
+        .iter()
+        .copied()
+        .filter(|id| !selected.contains(id) && !input.mandatory.contains(id))
+        .filter(|&id| state.objects.get(&id).is_some_and(|obj| !obj.is_commander))
+        .filter(|id| {
+            input.selected_defender.is_none_or(|chosen| {
+                input
+                    .valid_attack_targets_by_attacker
+                    .is_none_or(|by_attacker| {
+                        by_attacker
+                            .get(id)
+                            .is_some_and(|targets| targets.contains(&AttackTarget::Player(chosen)))
+                    })
+            })
+        })
+        .collect();
+    if free.is_empty() {
+        return;
+    }
+    // Admission: the defender cannot cover every attacker. Latent man-land
+    // bodies count here — a single 2/2 into one animatable land is still a
+    // one-on-one the per-candidate loop already settled.
+    let eligible_total = selected.len() + input.mandatory.len() + free.len();
+    let potential_blockers = input.opponent_blockers.len() + input.latent_blocker_count;
+    if potential_blockers >= eligible_total {
+        return;
+    }
+    let defender_life = state.players[defender.0 as usize].life;
+
+    // Baseline: what already attacks, judged by the same assignment model.
+    let mut base_attackers: Vec<ObjectId> = selected.clone();
+    for &id in input.mandatory {
+        if !base_attackers.contains(&id) {
+            base_attackers.push(id);
+        }
+    }
+    let mut group_attackers = base_attackers.clone();
+    group_attackers.extend(free.iter().copied());
+
+    let Some(base) = simulate_group_block(
+        state,
+        &base_attackers,
+        input.opponent_blockers,
+        defender_life,
+        input.slices,
+        input.deadline,
+    ) else {
+        return;
+    };
+    let Some(group) = simulate_group_block(
+        state,
+        &group_attackers,
+        input.opponent_blockers,
+        defender_life,
+        input.slices,
+        input.deadline,
+    ) else {
+        return;
+    };
+
+    // A heuristic "lethal" is not a certificate. The lethal shortcut only fires
+    // when the engine's reducer replay certifies this exact group declaration
+    // (CR 508.1 / 509.1 / 510.1); an indeterminate witness (a trample damage
+    // choice, an unsupported topology) falls back to the value rule, so this
+    // pass never promotes raw excess power the engine has not confirmed.
+    let certified_lethal = group.lethal && {
+        let declaration: Vec<_> = group_attackers
+            .iter()
+            .map(|&id| (id, AttackTarget::Player(defender)))
+            .collect();
+        matches!(
+            adversarial_swarm_witness(state, state.active_player, &declaration),
+            SwarmWitnessResult::Certified(witness)
+                if witness.is_lethal && witness.binds_declaration(state, &declaration)
+        )
+    };
+    let marginal_damage = group.unblocked_damage - base.unblocked_damage;
+    let marginal_risk = (group.value_lost - base.value_lost).max(0.0);
+    let promote = certified_lethal
+        || (!matches!(input.objective, CombatObjective::Stabilize)
+            && marginal_damage > 0
+            && f64::from(marginal_damage) >= marginal_risk);
+    if promote {
+        selected.extend(free);
+    }
 }
 
 /// Single-opponent planeswalker redirect (CR 508.1: legality of attacking a
@@ -2581,7 +2900,10 @@ fn race_clock(state: &GameState, attacker: PlayerId, defender: PlayerId) -> u32 
     if defender_life <= 0 {
         return 0;
     }
-    let attack_power = battlefield_power(state, attacker);
+    // Eligible attackers only, minus what the defender's best block soaks up —
+    // the raw power sum called a board of blocked-every-turn creatures a clock.
+    let attack_power =
+        battlefield_power(state, attacker) - best_block_absorption(state, attacker, defender);
     if attack_power <= 0 {
         return u32::MAX;
     }
@@ -2709,22 +3031,105 @@ fn crackback_damage(
     unblocked_damage
 }
 
+/// Power `player` can actually bring to its next attack declaration: creatures
+/// without defender that are eligible attackers. On its own turn that means
+/// untapped and not summoning sick (CR 302.6) — a 5/5 that just entered is not
+/// a clock this turn. On another player's turn its board untaps and sheds
+/// summoning sickness before its own combat, so only defender bodies drop out.
 #[doc(hidden)]
 pub fn battlefield_power(state: &GameState, player: PlayerId) -> i32 {
+    let is_active = state.active_player == player;
     state
         .battlefield
         .iter()
         .filter_map(|&id| {
             let object = state.objects.get(&id)?;
-            if object.controller == player
-                && object.card_types.core_types.contains(&CoreType::Creature)
+            if object.controller != player
+                || !object.card_types.core_types.contains(&CoreType::Creature)
+                || object.has_keyword(&Keyword::Defender)
             {
-                Some(object.power.unwrap_or(0))
-            } else {
-                None
+                return None;
             }
+            if is_active {
+                let sick = !object.has_keyword(&Keyword::Haste)
+                    && !object
+                        .entered_battlefield_turn
+                        .is_some_and(|etb| etb < state.turn_number);
+                if object.tapped || sick {
+                    return None;
+                }
+            }
+            Some(object.power.unwrap_or(0).max(0))
         })
         .sum()
+}
+
+/// The part of `attacker`'s eligible power that `defender`'s untapped creatures
+/// absorb under their best single-use assignment: each blocker soaks the
+/// highest-power attacker it can legally block (a trampler only loses the
+/// blocker's toughness, CR 702.19b). A board of four 2/2s facing one 4/4 is a
+/// six-power clock, not an eight- or zero-power one.
+fn best_block_absorption(state: &GameState, attacker: PlayerId, defender: PlayerId) -> i32 {
+    let blockers = untapped_creature_blockers(state, defender);
+    if blockers.is_empty() {
+        return 0;
+    }
+    let is_active = state.active_player == attacker;
+    let mut attackers: Vec<(ObjectId, i32, bool)> = state
+        .battlefield
+        .iter()
+        .filter_map(|&id| {
+            let object = state.objects.get(&id)?;
+            if object.controller != attacker
+                || !object.card_types.core_types.contains(&CoreType::Creature)
+                || object.has_keyword(&Keyword::Defender)
+                || has_cant_be_blocked(state, object)
+            {
+                return None;
+            }
+            if is_active {
+                let sick = !object.has_keyword(&Keyword::Haste)
+                    && !object
+                        .entered_battlefield_turn
+                        .is_some_and(|etb| etb < state.turn_number);
+                if object.tapped || sick {
+                    return None;
+                }
+            }
+            Some((
+                id,
+                object.power.unwrap_or(0).max(0),
+                object.has_keyword(&Keyword::Trample),
+            ))
+        })
+        .collect();
+    attackers.sort_by_key(|&(_, power, _)| std::cmp::Reverse(power));
+    let slices = BlockLegalitySlices::collect(state);
+    let mut used: HashSet<ObjectId> = HashSet::new();
+    let mut absorbed = 0;
+    for (attacker_id, power, trample) in attackers {
+        if used.len() == blockers.len() {
+            break;
+        }
+        let Some(&blocker) = blockers.iter().find(|&&blocker| {
+            !used.contains(&blocker) && slices.can_block_pair(state, blocker, attacker_id)
+        }) else {
+            continue;
+        };
+        used.insert(blocker);
+        absorbed += if trample {
+            state
+                .objects
+                .get(&blocker)
+                .and_then(|obj| obj.toughness)
+                .unwrap_or(0)
+                .max(0)
+                .min(power)
+        } else {
+            power
+        };
+    }
+    absorbed
 }
 
 #[doc(hidden)]
@@ -7608,19 +8013,34 @@ mod tests {
             )
         ));
 
-        assert_eq!(
-            choose_attackers_with_targets_with_profile(
-                runner.state(),
-                PlayerId(0),
-                &AiProfile::default(),
-                CombatLookahead::Disabled,
-                Some(&valid_attacker_ids),
-                Some(&valid_attack_targets),
-                None,
-            ),
-            vec![(commander, AttackTarget::Player(PlayerId(1)))],
-            "the mandatory attacker remains legal, but an indeterminate complete declaration must not promote optional bears"
+        // The certificate is revoked, so the bears are NOT promoted as a lethal
+        // alpha. They still attack — through the group pass, on value: the 5/5
+        // is spent on the goaded commander whether or not the bears come along,
+        // so the three bears add nine damage for zero extra risk. Before the
+        // group pass this declaration was the commander alone: three 3/3s held
+        // home against a single blocker that could not touch them.
+        let declared = choose_attackers_with_targets_with_profile(
+            runner.state(),
+            PlayerId(0),
+            &AiProfile::default(),
+            CombatLookahead::Disabled,
+            Some(&valid_attacker_ids),
+            Some(&valid_attack_targets),
+            None,
         );
+        assert!(
+            declared.contains(&(commander, AttackTarget::Player(PlayerId(1)))),
+            "the mandatory attacker remains in the declaration: {declared:?}"
+        );
+        for bear in &bears {
+            assert!(
+                declared.contains(&(*bear, AttackTarget::Player(PlayerId(1)))),
+                "the bears ride along with the goaded commander (group pass, zero marginal risk): {declared:?}"
+            );
+        }
+        runner
+            .declare_attackers(&declared)
+            .expect("the group declaration must be reducer-legal");
     }
 
     /// A lethal certificate must bypass crackback pruning. Holding back one
@@ -8850,6 +9270,158 @@ mod tests {
         obj.entered_battlefield_turn = Some(1);
         *std::sync::Arc::make_mut(&mut obj.abilities) = vec![ability];
         id
+    }
+
+    /// Attack-as-a-group: four 2/2s facing one 4/4 with the opponent at ten.
+    /// Judged one by one every bear "gets blocked and dies", so the swarm stayed
+    /// home forever while the 4/4 could only ever eat one of them; six damage
+    /// for one bear is the attack a human makes without thinking.
+    #[test]
+    fn wide_board_attacks_as_a_group_into_a_single_blocker() {
+        let mut scenario = engine::game::scenario::GameScenario::new();
+        scenario.at_phase(engine::types::phase::Phase::PreCombatMain);
+        scenario.with_life(PlayerId(0), 20);
+        scenario.with_life(PlayerId(1), 10);
+        let bears: Vec<_> = (0..4)
+            .map(|_| scenario.add_creature(PlayerId(0), "Bear", 2, 2).id())
+            .collect();
+        scenario.add_creature(PlayerId(1), "Hill Giant", 4, 4);
+        let mut runner = scenario.build();
+        runner.advance_to_combat();
+        let state = runner.state();
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::DeclareAttackers {
+                player: PlayerId(0),
+                ..
+            }
+        ));
+
+        for difficulty in [
+            AiDifficulty::Easy,
+            AiDifficulty::Medium,
+            AiDifficulty::Hard,
+            AiDifficulty::VeryHard,
+        ] {
+            let config = create_config(difficulty, Platform::Native);
+            let attacks = choose_attackers_with_targets_with_profile_and_deadline_and_threat(
+                state,
+                PlayerId(0),
+                &config.profile,
+                CombatLookahead::Disabled,
+                None,
+                AttackTargetingContext {
+                    valid_attacker_ids: None,
+                    valid_attack_targets: None,
+                    valid_attack_targets_by_attacker: None,
+                    comparison_deadline: Some(Deadline::none()),
+                },
+                None,
+            );
+            let attacking: Vec<_> = attacks.iter().map(|(id, _)| *id).collect();
+            for bear in &bears {
+                assert!(
+                    attacking.contains(bear),
+                    "{difficulty:?}: all four bears must swing together into the lone 4/4, got {attacks:?}"
+                );
+            }
+        }
+    }
+
+    /// The group pass is a swarm rule, not a license to suicide: one 2/2 into
+    /// one 4/4 at twenty life is the one-on-one the per-candidate verdict
+    /// already settled, and the bear stays home.
+    #[test]
+    fn lone_bear_still_holds_into_a_bigger_blocker() {
+        let mut scenario = engine::game::scenario::GameScenario::new();
+        scenario.at_phase(engine::types::phase::Phase::PreCombatMain);
+        scenario.with_life(PlayerId(0), 20);
+        scenario.with_life(PlayerId(1), 20);
+        scenario.add_creature(PlayerId(0), "Bear", 2, 2);
+        scenario.add_creature(PlayerId(1), "Hill Giant", 4, 4);
+        let mut runner = scenario.build();
+        runner.advance_to_combat();
+        assert!(
+            choose_attackers(runner.state(), PlayerId(0)).is_empty(),
+            "a lone 2/2 must not swing into a 4/4 at twenty life"
+        );
+    }
+
+    /// Two 2/2s into one 3/3 at twenty: the extra two damage does not pay for
+    /// the bear the 3/3 eats, so the group stays home — the promotion compares
+    /// the marginal damage with the value put at risk, it is not "attack when
+    /// outnumbering".
+    #[test]
+    fn group_pass_declines_when_the_extra_damage_is_not_worth_the_bear() {
+        let mut scenario = engine::game::scenario::GameScenario::new();
+        scenario.at_phase(engine::types::phase::Phase::PreCombatMain);
+        scenario.with_life(PlayerId(0), 20);
+        scenario.with_life(PlayerId(1), 20);
+        scenario.add_creature(PlayerId(0), "Bear", 2, 2);
+        scenario.add_creature(PlayerId(0), "Bear", 2, 2);
+        scenario.add_creature(PlayerId(1), "Centaur", 3, 3);
+        let mut runner = scenario.build();
+        runner.advance_to_combat();
+        assert!(
+            choose_attackers(runner.state(), PlayerId(0)).is_empty(),
+            "two bears into a 3/3 at twenty trade a bear for two damage"
+        );
+    }
+
+    /// Two 2/2s into one 3/3 with the opponent at two: the group is lethal
+    /// through any single block, so it swings regardless of the trade.
+    #[test]
+    fn group_pass_always_promotes_a_lethal_swarm() {
+        let mut scenario = engine::game::scenario::GameScenario::new();
+        scenario.at_phase(engine::types::phase::Phase::PreCombatMain);
+        scenario.with_life(PlayerId(0), 20);
+        scenario.with_life(PlayerId(1), 2);
+        let bears: Vec<_> = (0..2)
+            .map(|_| scenario.add_creature(PlayerId(0), "Bear", 2, 2).id())
+            .collect();
+        scenario.add_creature(PlayerId(1), "Centaur", 3, 3);
+        let mut runner = scenario.build();
+        runner.advance_to_combat();
+        let attacking = choose_attackers(runner.state(), PlayerId(0));
+        for bear in &bears {
+            assert!(
+                attacking.contains(bear),
+                "lethal swarm must swing: {attacking:?}"
+            );
+        }
+    }
+
+    /// `race_clock` counts eligible attackers minus the defender's best block:
+    /// four 2/2s facing one 4/4 are a six-power clock (two turns at ten life),
+    /// and a summoning-sick 5/5 is no clock at all on the turn it entered.
+    #[test]
+    fn race_clock_counts_eligible_power_minus_the_best_block() {
+        let mut state = setup();
+        for _ in 0..4 {
+            add_creature(&mut state, PlayerId(0), "Bear", 2, 2, vec![]);
+        }
+        add_creature(&mut state, PlayerId(1), "Hill Giant", 4, 4, vec![]);
+        state.players[1].life = 10;
+        assert_eq!(battlefield_power(&state, PlayerId(0)), 8);
+        assert_eq!(best_block_absorption(&state, PlayerId(0), PlayerId(1)), 2);
+        assert_eq!(race_clock(&state, PlayerId(0), PlayerId(1)), 2);
+
+        let sick = add_creature(&mut state, PlayerId(0), "Sick", 5, 5, vec![]);
+        state
+            .objects
+            .get_mut(&sick)
+            .unwrap()
+            .entered_battlefield_turn = Some(state.turn_number);
+        assert_eq!(
+            battlefield_power(&state, PlayerId(0)),
+            8,
+            "a creature that entered this turn cannot attack this turn"
+        );
+        // The opponent's board untaps before its own combat: a tapped 4/4 is
+        // still a four-power clock against us.
+        let giant = untapped_creature_blockers(&state, PlayerId(1))[0];
+        state.objects.get_mut(&giant).unwrap().tapped = true;
+        assert_eq!(battlefield_power(&state, PlayerId(1)), 4);
     }
 
     #[test]
