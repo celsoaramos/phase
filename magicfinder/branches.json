@@ -155,5 +155,8 @@
   },
   {
     "branch": "ai/pump-needs-a-beneficiary"
+  },
+  {
+    "branch": "ai/combat-block-choice"
   }
 ]
