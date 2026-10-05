@@ -155,5 +155,11 @@
   },
   {
     "branch": "ai/combat-block-choice"
+  },
+  {
+    "branch": "ai/attack-as-a-group"
+  },
+  {
+    "branch": "ai/mulligan-castability-tapland"
   }
 ]
