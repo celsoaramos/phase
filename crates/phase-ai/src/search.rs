@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use rand::{Rng, RngCore, SeedableRng};
@@ -14,6 +15,7 @@ use engine::ai_support::{
     root_may_yield_adverse_exchange, targeted_exchange_verdict,
     validated_candidate_actions_for_semantic_owner, AiDecisionContract, TargetedExchangeVerdict,
 };
+use engine::game::mana_payment::{mana_type_to_demand_index, outer_cost_color_demand, ColorDemand};
 use engine::types::ability::{
     AbilityDefinition, ContinuousModification, Duration, Effect, ResolvedAbility, StaticDefinition,
     TargetFilter, TargetRef,
@@ -41,6 +43,7 @@ use crate::combat_ai::{
 use crate::config::{AiConfig, PlannerMode, ThreatAwareness};
 use crate::context::AiContext;
 use crate::features::DeckFeatures;
+use crate::mana_colors::land_produced_color_types;
 use crate::plan::{PlanSnapshot, PlanState};
 use crate::planner::{
     apply_candidate, prepare_payment_candidates, BeamContinuationPlanner, ContinuationPlanner,
@@ -4661,16 +4664,18 @@ fn plan_aware_bottom_cards(
         .collect();
     let final_hand_size = hand.len().saturating_sub(count);
     let land_target = plan_bottoming_land_target(plan, final_hand_size);
-    let land_count = hand
-        .iter()
-        .filter(|id| {
-            state
-                .objects
-                .get(id)
-                .is_some_and(|obj| obj.card_types.core_types.contains(&CoreType::Land))
-        })
-        .count();
-    let mut surplus_lands = land_count.saturating_sub(land_target);
+    let is_land = |id: &ObjectId| {
+        state
+            .objects
+            .get(id)
+            .is_some_and(|obj| obj.card_types.core_types.contains(&CoreType::Land))
+    };
+    let hand_lands: Vec<ObjectId> = hand.iter().copied().filter(is_land).collect();
+    let surplus_lands = hand_lands.len().saturating_sub(land_target);
+    // The surplus lands to bottom are the ones whose colours the hand's spells
+    // do not need — the Swamp in a hand of Islands and blue spells — never
+    // simply the first lands in hand order.
+    let spare_lands = spare_hand_lands(state, &hand, &hand_lands, surplus_lands);
     let mut scored = Vec::with_capacity(hand.len());
 
     // Only the candidate selection POOL excludes the earmarked object.
@@ -4679,14 +4684,15 @@ fn plan_aware_bottom_cards(
             if is_plan_payoff_name(features, &obj.name) {
                 25.0 + intrinsic_value(state, id)
             } else if obj.card_types.core_types.contains(&CoreType::Land) {
-                if surplus_lands > 0 {
-                    surplus_lands -= 1;
+                if spare_lands.contains(&id) {
                     -5.0
                 } else {
                     30.0
                 }
             } else {
-                intrinsic_value(state, id)
+                // A spell the hand's lands cannot cast in the opening turns is
+                // worth less in this hand than its printed value says.
+                intrinsic_value(state, id) * opening_castability(state, id, &hand_lands)
             }
         });
         scored.push((id, score));
@@ -4694,6 +4700,129 @@ fn plan_aware_bottom_cards(
 
     scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
     scored.into_iter().take(count).map(|(id, _)| id).collect()
+}
+
+/// Turns of the opening a kept hand is judged on: the land drops the hand's own
+/// lands can be expected to make before the draws take over.
+const OPENING_TURNS: u32 = 4;
+
+/// WUBRG demand of the non-land cards in `hand`: element-wise MAX colored pips
+/// over the castable-in-the-opening spells (mana value within
+/// `OPENING_TURNS`), the same "how many sources of this colour does one card
+/// need" reading `land_sequencing` uses for the land drop.
+fn hand_opening_color_demand(state: &GameState, hand: &[ObjectId]) -> ColorDemand {
+    let mut demand = [0u32; 5];
+    for obj in hand.iter().filter_map(|id| state.objects.get(id)) {
+        if obj.card_types.core_types.contains(&CoreType::Land)
+            || obj.mana_cost.mana_value() > OPENING_TURNS
+        {
+            continue;
+        }
+        for (slot, needed) in demand
+            .iter_mut()
+            .zip(outer_cost_color_demand(&obj.mana_cost))
+        {
+            *slot = (*slot).max(needed);
+        }
+    }
+    demand
+}
+
+/// WUBRG colours one land produces, as demand-array indices.
+fn land_color_indices(state: &GameState, land: ObjectId) -> Vec<usize> {
+    state
+        .objects
+        .get(&land)
+        .map(|obj| {
+            land_produced_color_types(&obj.card_types.subtypes, &obj.abilities)
+                .into_iter()
+                .filter_map(mana_type_to_demand_index)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `surplus` lands in `hand_lands` a mulligan should bottom: the ones the
+/// hand's spells need least. A land is kept while it supplies a colour the
+/// hand demands and the other lands do not cover (it is the hand's only Island);
+/// among the rest, the land producing the fewest demanded colours goes first,
+/// hand order breaking ties. Mulligan keep/mull is decided elsewhere and does
+/// not read this.
+fn spare_hand_lands(
+    state: &GameState,
+    hand: &[ObjectId],
+    hand_lands: &[ObjectId],
+    surplus: usize,
+) -> HashSet<ObjectId> {
+    if surplus == 0 {
+        return HashSet::new();
+    }
+    let demand = hand_opening_color_demand(state, hand);
+    let mut supply = [0u32; 5];
+    let colors: Vec<(ObjectId, Vec<usize>)> = hand_lands
+        .iter()
+        .map(|&land| {
+            let indices = land_color_indices(state, land);
+            for &index in &indices {
+                supply[index] += 1;
+            }
+            (land, indices)
+        })
+        .collect();
+    let mut ranked: Vec<(usize, usize, usize, ObjectId)> = colors
+        .iter()
+        .enumerate()
+        .map(|(order, (land, indices))| {
+            // Colours this land alone keeps covered: bottoming it leaves the
+            // hand short of a demanded colour.
+            let critical = indices
+                .iter()
+                .filter(|&&index| demand[index] > 0 && supply[index] <= demand[index])
+                .count();
+            let useful = indices.iter().filter(|&&index| demand[index] > 0).count();
+            (critical, useful, order, *land)
+        })
+        .collect();
+    ranked.sort();
+    ranked
+        .into_iter()
+        .take(surplus)
+        .map(|(_, _, _, land)| land)
+        .collect()
+}
+
+/// How castable `card` is in the opening given the lands in hand, in `0.5..=1`:
+/// the share of its colored pips the hand's lands can pay (a card with no
+/// colored pips is fully castable), discounted by a quarter when its mana
+/// value exceeds `OPENING_TURNS`. Draws can still fix the hand, so an uncovered
+/// colour halves the card's weight rather than zeroing it.
+fn opening_castability(state: &GameState, card: ObjectId, hand_lands: &[ObjectId]) -> f64 {
+    let Some(obj) = state.objects.get(&card) else {
+        return 1.0;
+    };
+    let mut supply = [0u32; 5];
+    for &land in hand_lands {
+        for index in land_color_indices(state, land) {
+            supply[index] += 1;
+        }
+    }
+    let demand = outer_cost_color_demand(&obj.mana_cost);
+    let total: u32 = demand.iter().sum();
+    let covered: u32 = demand
+        .iter()
+        .zip(supply)
+        .map(|(&needed, have)| needed.min(have))
+        .sum();
+    let coverage = if total == 0 {
+        1.0
+    } else {
+        f64::from(covered) / f64::from(total)
+    };
+    let mut factor = 0.5 + 0.5 * coverage;
+    if obj.mana_cost.mana_value() > OPENING_TURNS {
+        factor *= 0.75;
+    }
+    factor
 }
 
 fn plan_bottoming_land_target(plan: &PlanSnapshot, final_hand_size: usize) -> usize {
@@ -12189,6 +12318,130 @@ mod tests {
         assert!(
             bottoms.iter().all(|id| land_set.contains(id)),
             "bottoming should cut surplus lands before real threats"
+        );
+    }
+
+    /// A basic land in `owner`'s hand with its land subtype, so
+    /// `land_produced_color_types` reads a colour off it.
+    fn typed_land_in_hand(state: &mut GameState, owner: PlayerId, subtype: &str) -> ObjectId {
+        let id = named_vanilla_in_hand(state, owner, subtype);
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Land);
+        obj.card_types.subtypes.push(subtype.to_string());
+        id
+    }
+
+    /// A 3/3 creature in `owner`'s hand costing `generic` plus `shards`.
+    fn colored_creature_in_hand(
+        state: &mut GameState,
+        owner: PlayerId,
+        name: &str,
+        shards: Vec<engine::types::mana::ManaCostShard>,
+        generic: u32,
+    ) -> ObjectId {
+        let id = named_vanilla_in_hand(state, owner, name);
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.power = Some(3);
+        obj.toughness = Some(3);
+        obj.mana_cost = engine::types::mana::ManaCost::Cost { shards, generic };
+        id
+    }
+
+    /// Mulligan to six with two Islands, a Plains, a Swamp, two blue spells and
+    /// a white one: the surplus land to bottom is the Swamp — the only land
+    /// whose colour nothing in the hand needs. Hand order used to decide, and
+    /// the first land in hand went to the bottom whatever colour it made.
+    #[test]
+    fn plan_aware_bottoming_cuts_the_land_of_the_colour_the_hand_does_not_need() {
+        use engine::types::mana::ManaCostShard::{Blue, White};
+        let mut state = make_state();
+        let islands = [
+            typed_land_in_hand(&mut state, PlayerId(1), "Island"),
+            typed_land_in_hand(&mut state, PlayerId(1), "Island"),
+        ];
+        let plains = typed_land_in_hand(&mut state, PlayerId(1), "Plains");
+        let swamp = typed_land_in_hand(&mut state, PlayerId(1), "Swamp");
+        colored_creature_in_hand(&mut state, PlayerId(1), "Blue One", vec![Blue], 1);
+        colored_creature_in_hand(&mut state, PlayerId(1), "Blue Two", vec![Blue], 1);
+        colored_creature_in_hand(&mut state, PlayerId(1), "White One", vec![White], 1);
+
+        let bottoms = plan_aware_bottom_cards(
+            &state,
+            PlayerId(1),
+            1,
+            &DeckFeatures::default(),
+            &PlanSnapshot::default(),
+            None,
+        );
+        assert_eq!(
+            bottoms,
+            vec![swamp],
+            "the Swamp pays for no spell in this hand"
+        );
+        assert!(!bottoms.contains(&plains));
+        assert!(!islands.iter().any(|island| bottoms.contains(island)));
+    }
+
+    /// Two Islands, a Plains, a Swamp and three blue spells: whichever surplus
+    /// land goes, it is one of the two off-colour lands, never an Island and
+    /// never a spell.
+    #[test]
+    fn plan_aware_bottoming_never_cuts_the_colour_the_hand_needs() {
+        use engine::types::mana::ManaCostShard::Blue;
+        let mut state = make_state();
+        typed_land_in_hand(&mut state, PlayerId(1), "Island");
+        typed_land_in_hand(&mut state, PlayerId(1), "Island");
+        let plains = typed_land_in_hand(&mut state, PlayerId(1), "Plains");
+        let swamp = typed_land_in_hand(&mut state, PlayerId(1), "Swamp");
+        for name in ["Blue One", "Blue Two", "Blue Three"] {
+            colored_creature_in_hand(&mut state, PlayerId(1), name, vec![Blue], 1);
+        }
+
+        let bottoms = plan_aware_bottom_cards(
+            &state,
+            PlayerId(1),
+            1,
+            &DeckFeatures::default(),
+            &PlanSnapshot::default(),
+            None,
+        );
+        assert!(
+            bottoms == vec![plains] || bottoms == vec![swamp],
+            "an off-colour land goes to the bottom, got {bottoms:?}"
+        );
+    }
+
+    /// With the land count at target, the spell to bottom is the one the hand's
+    /// lands cannot cast: three Islands keep the blue 3/3 and bottom the green
+    /// one of the same printed value.
+    #[test]
+    fn plan_aware_bottoming_cuts_the_spell_the_lands_cannot_cast() {
+        use engine::types::mana::ManaCostShard::{Blue, Green};
+        let mut state = make_state();
+        for _ in 0..3 {
+            typed_land_in_hand(&mut state, PlayerId(1), "Island");
+        }
+        let blue = colored_creature_in_hand(&mut state, PlayerId(1), "Blue", vec![Blue], 2);
+        let green = colored_creature_in_hand(&mut state, PlayerId(1), "Green", vec![Green], 2);
+        assert_eq!(
+            intrinsic_value(&state, blue),
+            intrinsic_value(&state, green),
+            "fixture: identical printed value, only the colour differs"
+        );
+
+        let bottoms = plan_aware_bottom_cards(
+            &state,
+            PlayerId(1),
+            1,
+            &DeckFeatures::default(),
+            &PlanSnapshot::default(),
+            None,
+        );
+        assert_eq!(
+            bottoms,
+            vec![green],
+            "the uncastable green creature goes to the bottom"
         );
     }
 
