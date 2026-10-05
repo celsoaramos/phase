@@ -527,6 +527,11 @@ struct Tally {
     games: usize,
     /// Blunder counts for side A / side B (seat-corrected).
     audit: [std::collections::BTreeMap<Blunder, u32>; 2],
+    /// Wins by SEAT = by DECK: the first deck of a matchup always sits in seat
+    /// 0 and the second in seat 1 while the configs swap. With `--a == --b`
+    /// this is the only number that ranks decks (the A/B columns are 50/50 by
+    /// construction).
+    deck_wins: [usize; 2],
 }
 
 fn main() {
@@ -541,6 +546,10 @@ fn main() {
     let mut json_out: Option<PathBuf> = None;
     let mut probe: usize = 0;
     let mut audit = false;
+    // Each seed once, config A always in seat 0. With `--a == --b` the swapped
+    // game is the same game relabelled, so pairing doubles the cost for nothing;
+    // the deck ranking (`deck_wins`) only needs distinct games.
+    let mut no_swap = false;
     let mut i = 0;
     while i < args.len() {
         let take = |i: &mut usize| -> String {
@@ -560,6 +569,7 @@ fn main() {
             "--json" => json_out = Some(PathBuf::from(take(&mut i))),
             "--probe" => probe = take(&mut i).parse().expect("--probe"),
             "--audit" => audit = true,
+            "--no-swap" => no_swap = true,
             "-h" | "--help" => {
                 eprintln!(
                     "{}",
@@ -626,12 +636,20 @@ fn main() {
         "A = {}\nB = {}\n{} games per matchup (paired seeds)",
         side_a.label, side_b.label, games
     );
-    let pairs = games.div_ceil(2);
+    let pairs = if no_swap { games } else { games.div_ceil(2) };
     let started = std::time::Instant::now();
 
     // (matchup index, seed index, a_is_p0)
     let tasks: Vec<(usize, usize, bool)> = (0..payloads.len())
-        .flat_map(|m| (0..pairs).flat_map(move |s| [(m, s, true), (m, s, false)]))
+        .flat_map(|m| {
+            (0..pairs).flat_map(move |s| {
+                if no_swap {
+                    vec![(m, s, true)]
+                } else {
+                    vec![(m, s, true), (m, s, false)]
+                }
+            })
+        })
         .collect();
     let results: Vec<(usize, bool, GameOut)> = tasks
         .par_iter()
@@ -673,17 +691,20 @@ fn main() {
             Some(_) => t.b += 1,
             None => t.draws += 1,
         }
+        if let Some(PlayerId(w)) = out.winner {
+            t.deck_wins[(w as usize).min(1)] += 1;
+        }
     }
 
-    println!("| matchup | A | B | draws | A% | p | turns | creat A×B | lands A×B |");
-    println!("|---|---|---|---|---|---|---|---|---|");
+    println!("| matchup | A | B | draws | A% | p | turns | creat A×B | lands A×B | decks (1st×2nd) |");
+    println!("|---|---|---|---|---|---|---|---|---|---|");
     let mut total = Tally::default();
     let mut rows = Vec::new();
     for ((id, _), t) in payloads.iter().zip(&tallies) {
         let decided = (t.a + t.b).max(1);
         let g = t.games.max(1) as f64;
         println!(
-            "| {id} | {} | {} | {} | {:.1}% | {:.3} | {:.1} | {:.1} × {:.1} | {:.1} × {:.1} |",
+            "| {id} | {} | {} | {} | {:.1}% | {:.3} | {:.1} | {:.1} × {:.1} | {:.1} × {:.1} | {} × {} |",
             t.a,
             t.b,
             t.draws,
@@ -694,9 +715,12 @@ fn main() {
             t.b_creatures as f64 / g,
             t.a_lands as f64 / g,
             t.b_lands as f64 / g,
+            t.deck_wins[0],
+            t.deck_wins[1],
         );
         rows.push(serde_json::json!({
             "matchup": id, "a": t.a, "b": t.b, "draws": t.draws, "panics": t.panics,
+            "deck_wins": t.deck_wins, "games": t.games,
             "p": sign_test(t.a, t.b),
             "avg_turns": t.turns as f64 / g,
             "creatures": [t.a_creatures as f64 / g, t.b_creatures as f64 / g],
@@ -714,7 +738,7 @@ fn main() {
     }
     let decided = (total.a + total.b).max(1);
     println!(
-        "| **total** | {} | {} | {} | {:.1}% | {:.3} | | | |",
+        "| **total** | {} | {} | {} | {:.1}% | {:.3} | | | | |",
         total.a,
         total.b,
         total.draws,
