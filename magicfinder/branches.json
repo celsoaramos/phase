@@ -164,5 +164,8 @@
   },
   {
     "branch": "ai/cast-when-castable"
+  },
+  {
+    "branch": "card/soul-scar-mage-damage-to-counters"
   }
 ]
