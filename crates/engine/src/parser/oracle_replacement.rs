@@ -617,6 +617,12 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         if let Some(def) = parse_damage_modification_replacement(&norm_lower, &text) {
             return Some(def);
         }
+        // CR 614.1a + CR 614.6: "If <source> would deal [noncombat] damage to
+        // <recipient>, put that many <counter> counters on that <noun> instead"
+        // (Soul-Scar Mage) — the damage event is replaced by a counter placement.
+        if let Some(def) = parse_damage_to_counters_substitution(&norm_lower, &text) {
+            return Some(def);
+        }
         // Exotic pattern (coin-flip, redirection, etc.) — keep as no-op stub
         return Some(
             ReplacementDefinition::new(ReplacementEvent::DamageDone).description(text.to_string()),
@@ -7200,6 +7206,109 @@ fn parse_damage_modification_replacement(
         // unconditional damage doubler.
         WhileAntecedent::Unparsed => return None,
         WhileAntecedent::Absent => {}
+    }
+    Some(def)
+}
+
+/// CR 614.1a + CR 614.6 + CR 122.1: Parse a damage-to-counters SUBSTITUTION —
+///
+///   "If a source you control would deal noncombat damage to a creature an
+///    opponent controls, put that many -1/-1 counters on that creature
+///    instead."  (Soul-Scar Mage)
+///
+/// This is a replacement, not a prevention (CR 615): the damage event is
+/// replaced by the counter placement (CR 614.6 — the replaced event never
+/// happens), so the shield is unaffected by "damage can't be prevented"
+/// (CR 615.12 suppresses prevention only) and emits no `DamagePrevented`.
+///
+/// Grammar (positional nom spine, no scanning):
+///   `"if " <source subject> " would deal " ["noncombat " | "combat "]
+///    "damage to " <recipient type phrase> ", " <put-counters clause> " instead"`
+///
+/// * the source subject reuses `parse_damage_source_filter` (the same authority
+///   the damage-modification sibling uses — "a source you control" →
+///   `Typed { controller: You }`);
+/// * the recipient becomes `valid_card` (a typed `TargetFilter`, evaluated
+///   against the damage event's recipient object — a player recipient never
+///   matches a typed object filter);
+/// * the substitute is lowered by the ordinary effect-chain parser and must be
+///   a `PutCounter` whose count is the replaced event's amount ("that many" →
+///   `EventContextAmount`) and whose "that <noun>" anaphor is rewritten to the
+///   replaced event's recipient (`PostReplacementDamageTarget`).
+///
+/// Returns `None` (fall through to the stub) for any other shape, so the
+/// substitution never claims an unrelated "instead" clause.
+fn parse_damage_to_counters_substitution(
+    norm_lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    type E<'a> = OracleError<'a>;
+    let (after_verb, _) = (
+        tag::<_, _, E<'_>>("if "),
+        take_until(" would deal "),
+        tag(" would deal "),
+    )
+        .parse(norm_lower)
+        .ok()?;
+    // CR 120.2a: optional combat scope, positionally before the damage noun.
+    let (after_noun, combat_scope) = terminated(
+        opt(alt((
+            value(
+                CombatDamageScope::NoncombatOnly,
+                tag::<_, _, E<'_>>("noncombat "),
+            ),
+            value(CombatDamageScope::CombatOnly, tag("combat ")),
+        ))),
+        tag("damage to "),
+    )
+    .parse(after_verb)
+    .ok()?;
+    let (substitute_text, recipient_text) = terminated(take_until::<_, _, E<'_>>(", "), tag(", "))
+        .parse(after_noun)
+        .ok()?;
+    let (_, effect_text) = terminated(
+        take_until::<_, _, E<'_>>(" instead"),
+        (tag(" instead"), opt(char('.')), multispace0, eof),
+    )
+    .parse(substitute_text)
+    .ok()?;
+
+    // CR 614.1a: the replaced recipient must be a typed object scope.
+    let (recipient, rest) = parse_type_phrase_folding(recipient_text.trim());
+    if !rest.trim().is_empty() || matches!(recipient, TargetFilter::Any) {
+        return None;
+    }
+
+    // CR 614.1a: an unscoped substitution would replace every damage event in
+    // the game — fail closed when the source subject is not recognized.
+    let source_filter = parse_damage_source_filter(norm_lower)?;
+
+    let mut execute = parse_effect_chain(effect_text.trim(), AbilityKind::Spell);
+    // CR 608.2c: "that <noun>" lowers to `ParentTarget`; in a passive
+    // replacement it names the replaced event's damage recipient.
+    rewrite_parent_target_to_post_replacement_damage_target(&mut execute);
+    let is_counter_substitution = execute.sub_ability.is_none()
+        && matches!(
+            &*execute.effect,
+            Effect::PutCounter {
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+                target: TargetFilter::PostReplacementDamageTarget,
+                ..
+            }
+        );
+    if !is_counter_substitution {
+        return None;
+    }
+
+    let mut def = ReplacementDefinition::new(ReplacementEvent::DamageDone)
+        .valid_card(recipient)
+        .damage_source_filter(source_filter)
+        .execute(execute)
+        .description(original_text.to_string());
+    if let Some(cs) = combat_scope {
+        def = def.combat_scope(cs);
     }
     Some(def)
 }
@@ -16737,6 +16846,63 @@ mod tests {
             "a non-adjacent 'of that damage' phrase must not satisfy the anchored \
              'prevent N of that damage' grammar, got {def:?}"
         );
+    }
+
+    /// CR 614.1a + CR 614.6: Soul-Scar Mage — "If a source you control would
+    /// deal noncombat damage to a creature an opponent controls, put that many
+    /// -1/-1 counters on that creature instead." A damage-to-counters
+    /// SUBSTITUTION (not a CR 615 prevention): source scope `controller: You`,
+    /// recipient `valid_card` = creature an opponent controls, noncombat only,
+    /// and an `execute` that puts `EventContextAmount` -1/-1 counters on the
+    /// replaced event's recipient. No prevention shield, no amount modification.
+    #[test]
+    fn soul_scar_mage_damage_to_minus_counters_substitution() {
+        let def = parse_replacement_line(
+            "If a source you control would deal noncombat damage to a creature an \
+             opponent controls, put that many -1/-1 counters on that creature instead.",
+            "Soul-Scar Mage",
+        )
+        .expect("Soul-Scar Mage should parse as a damage replacement");
+
+        assert_eq!(def.event, ReplacementEvent::DamageDone);
+        assert_eq!(def.combat_scope, Some(CombatDamageScope::NoncombatOnly));
+        assert!(matches!(def.shield_kind, ShieldKind::None));
+        assert!(def.damage_modification.is_none());
+        assert!(def.damage_target_filter.is_none());
+
+        match def.damage_source_filter.as_ref() {
+            Some(TargetFilter::Typed(tf)) => {
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+            }
+            other => panic!("expected typed source filter (you control), got {other:?}"),
+        }
+        match def.valid_card.as_ref() {
+            Some(TargetFilter::Typed(tf)) => {
+                assert!(tf.type_filters.contains(&TypeFilter::Creature));
+                assert_eq!(tf.controller, Some(ControllerRef::Opponent));
+            }
+            other => panic!("expected creature-an-opponent-controls recipient, got {other:?}"),
+        }
+
+        let execute = def.execute.as_ref().expect("substitute effect present");
+        assert!(execute.sub_ability.is_none());
+        match &*execute.effect {
+            Effect::PutCounter {
+                counter_type,
+                count,
+                target,
+            } => {
+                assert_eq!(*counter_type, CounterType::Minus1Minus1);
+                assert_eq!(*target, TargetFilter::PostReplacementDamageTarget);
+                assert_eq!(
+                    *count,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::EventContextAmount
+                    }
+                );
+            }
+            other => panic!("expected Effect::PutCounter, got {other:?}"),
+        }
     }
 
     /// CR 614.1a + CR 615.5 + CR 608.2c: Vigor — "If damage would be dealt to

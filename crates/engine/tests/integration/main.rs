@@ -1311,6 +1311,7 @@ mod sliver_static_grants;
 mod smaug_noncombat_damage_treasure;
 mod snow_mana_production;
 mod sothera_supervoid_edict_reanimate;
+mod soul_scar_mage_damage_to_counters;
 mod soul_tether_heartwood_token;
 mod source_counter_gate_anaphor_8549;
 mod sovereign_okinec_ahau;
