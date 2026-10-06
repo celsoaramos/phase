@@ -167,5 +167,8 @@
   },
   {
     "branch": "card/soul-scar-mage-damage-to-counters"
+  },
+  {
+    "branch": "card/szadek-combat-damage-to-counters"
   }
 ]
