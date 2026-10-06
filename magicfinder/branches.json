@@ -161,5 +161,8 @@
   },
   {
     "branch": "ai/mulligan-castability-tapland"
+  },
+  {
+    "branch": "ai/cast-when-castable"
   }
 ]
