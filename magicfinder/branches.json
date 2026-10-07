@@ -166,6 +166,9 @@
     "branch": "ai/cast-when-castable"
   },
   {
+    "branch": "ai/focus-fire-damage-triggers"
+  },
+  {
     "branch": "card/soul-scar-mage-damage-to-counters"
   },
   {
