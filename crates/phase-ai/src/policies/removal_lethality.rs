@@ -48,18 +48,20 @@ use engine::game::filter::{matches_target_filter, FilterContext};
 use engine::game::game_object::GameObject;
 use engine::game::keywords::object_has_effective_keyword_kind;
 use engine::game::players::is_opponent;
-use engine::game::quantity::{resolve_quantity, resolve_quantity_with_targets_slice};
+use engine::game::quantity::{
+    resolve_quantity, resolve_quantity_with_targets, resolve_quantity_with_targets_slice,
+};
 use engine::game::targeting::find_legal_targets;
 use engine::types::ability::{
-    ControllerRef, DamageSource, Effect, QuantityExpr, TargetFilter, TargetRef, TypeFilter,
-    TypedFilter,
+    ControllerRef, DamageSource, Effect, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef,
+    TypeFilter, TypedFilter,
 };
 use engine::types::card_type::CoreType;
-use engine::types::game_state::{DistributionUnit, WaitingFor};
+use engine::types::game_state::{DistributionUnit, GameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::{Keyword, KeywordKind};
 
-use super::context::PolicyContext;
+use super::context::{collect_resolved_abilities, PolicyContext};
 use super::effect_classify::{
     effect_polarity, effect_targets_object, extract_target_filter, targets_creatures_only,
     EffectPolarity,
@@ -77,6 +79,12 @@ pub(crate) const WASTE_PENALTY_MULT: f64 = 0.45;
 /// Cap on the waste penalty so a single non-lethal target can dampen but not
 /// completely dominate the overall target ranking.
 pub(crate) const WASTE_PENALTY_MAX: f64 = 3.0;
+/// Reward for a hit that does not kill on its own but leaves the creature
+/// within reach of the AI's own damage triggers still queued behind it (CR
+/// 603.3b). Below [`LETHAL_BONUS`] so a kill available right now still wins,
+/// and above every waste penalty a split would collect, so the triggers stack
+/// their damage on one body instead of tickling two.
+pub(crate) const SETUP_BONUS: f64 = 1.5;
 
 /// CR 120.3: the object whose characteristics govern one damage effect's
 /// results. Deathtouch (CR 702.2b) and wither/infect (CR 120.3d) are read from
@@ -185,6 +193,46 @@ pub(crate) struct DamageOutcome {
     pub(crate) deathtouch: bool,
 }
 
+impl DamageOutcome {
+    /// Does this outcome change the creature at all?
+    pub(crate) fn is_empty(&self) -> bool {
+        self.marked == 0 && self.minus_counters == 0
+    }
+
+    /// CR 120.6: damage marked on a creature stays marked until the cleanup
+    /// step, so independent batches that land in the same turn add up — the
+    /// lethal-damage check (CR 704.5g) reads the running total, not one batch.
+    pub(crate) fn combined(&self, other: &Self) -> Self {
+        Self {
+            marked: self.marked.saturating_add(other.marked),
+            minus_counters: self.minus_counters.saturating_add(other.minus_counters),
+            deathtouch: self.deathtouch || other.deathtouch,
+        }
+    }
+
+    /// Fold `dealt` points from `source_id` into the outcome, routed by the
+    /// SOURCE's characteristics (CR 120.3). The single authority for that
+    /// routing, shared by the pending spell, the stack's committed damage and
+    /// the queued follow-up triggers so the three can never disagree.
+    fn add_dealt(&mut self, state: &GameState, source_id: ObjectId, dealt: u32, is_creature: bool) {
+        // CR 120.3d + CR 702.80a + CR 702.90c: wither/infect damage to a
+        // creature is dealt as -1/-1 counters and is never marked.
+        if is_creature
+            && (object_has_effective_keyword_kind(state, source_id, KeywordKind::Wither)
+                || object_has_effective_keyword_kind(state, source_id, KeywordKind::Infect))
+        {
+            self.minus_counters = self.minus_counters.saturating_add(dealt);
+        } else {
+            // CR 120.3e: otherwise the damage is marked on the creature.
+            self.marked = self.marked.saturating_add(dealt);
+        }
+        // CR 702.2b: the deathtouch flag comes from the source that actually
+        // dealt damage, mirroring `dealt_deathtouch_damage`.
+        self.deathtouch |= dealt > 0
+            && object_has_effective_keyword_kind(state, source_id, KeywordKind::Deathtouch);
+    }
+}
+
 /// What the pending spell or ability does to one candidate object, resolved
 /// against live game state (so `X` and dynamic amounts are concrete).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,32 +317,7 @@ pub(crate) fn pending_damage_to_object(
                 };
                 found = true;
                 let dealt = resolve_damage_amount(ctx, amount, damage_source.as_ref(), source_id);
-                // CR 120.3d + CR 702.80a + CR 702.90c: wither/infect damage to a
-                // creature is dealt as -1/-1 counters and is never marked.
-                if is_creature
-                    && (object_has_effective_keyword_kind(
-                        ctx.state,
-                        source_id,
-                        KeywordKind::Wither,
-                    ) || object_has_effective_keyword_kind(
-                        ctx.state,
-                        source_id,
-                        KeywordKind::Infect,
-                    ))
-                {
-                    outcome.minus_counters = outcome.minus_counters.saturating_add(dealt);
-                } else {
-                    // CR 120.3e: otherwise the damage is marked on the creature.
-                    outcome.marked = outcome.marked.saturating_add(dealt);
-                }
-                // CR 702.2b: the deathtouch flag comes from the source that
-                // actually dealt damage, mirroring `dealt_deathtouch_damage`.
-                outcome.deathtouch |= dealt > 0
-                    && object_has_effective_keyword_kind(
-                        ctx.state,
-                        source_id,
-                        KeywordKind::Deathtouch,
-                    );
+                outcome.add_dealt(ctx.state, source_id, dealt, is_creature);
             }
             // CR 120.1: multi-source batches and mass damage put damage on this
             // object from sources this policy does not model per-source. Bail
@@ -362,7 +385,11 @@ fn reduced_toughness(target: &GameObject, outcome: &DamageOutcome) -> i32 {
 
 /// Lethality contribution for pointing a damage removal spell at `target`.
 ///
-/// * Kills it (CR 704.5f / CR 704.5g / CR 704.5h) → `+LETHAL_BONUS`.
+/// * Kills it (CR 704.5f / CR 704.5g / CR 704.5h) → `+LETHAL_BONUS`. Damage
+///   other stack objects already aim at it counts toward the kill
+///   ([`stack_committed_damage`]).
+/// * Survives, but the AI's own damage triggers queued behind this one can
+///   finish it ([`queued_follow_up_damage`]) → `+SETUP_BONUS`.
 /// * Survives (high toughness, or indestructible per CR 702.12b) → a penalty
 ///   scaled by the body it failed to kill, so a 3-damage spell on a 7/7 ranks
 ///   well below a smaller target the same spell destroys.
@@ -377,14 +404,181 @@ pub(crate) fn lethality_bonus(
     let PendingDamage::Dealt(outcome) = pending_damage_to_object(ctx, target_id, target) else {
         return 0.0;
     };
-    if outcome.marked == 0 && outcome.minus_counters == 0 {
+    if outcome.is_empty() {
         return 0.0;
     }
-    if outcome_is_lethal(target, &outcome) {
+    // CR 405.5 + CR 120.6: damage another object already on the stack is
+    // committed to deal this creature lands in the same turn and adds to this
+    // one — two "deals 1 damage" triggers on a creature with 2 toughness left
+    // kill it, one on each of two creatures kills nothing. A creature the stack
+    // already kills on its own is `stack_awareness`'s redundancy business, so
+    // the committed damage only counts while it still needs help.
+    let committed = stack_committed_damage(ctx, target_id, target);
+    let with_stack = if committed.is_empty() || outcome_is_lethal(target, &committed) {
+        outcome
+    } else {
+        outcome.combined(&committed)
+    };
+    if outcome_is_lethal(target, &with_stack) {
         return LETHAL_BONUS;
     }
-    let survived = reduced_toughness(target, &outcome).max(0);
+    // CR 603.3b: the AI's own damage triggers still waiting to be put on the
+    // stack will pick their targets right after this one. Setting a kill up for
+    // them beats spreading the damage over bodies that all survive.
+    let follow_up = queued_follow_up_damage(ctx, target_id, target);
+    if !follow_up.is_empty() && outcome_is_lethal(target, &with_stack.combined(&follow_up)) {
+        return SETUP_BONUS;
+    }
+    let survived = reduced_toughness(target, &with_stack).max(0);
     -(f64::from(survived) * WASTE_PENALTY_MULT).min(WASTE_PENALTY_MAX)
+}
+
+/// Does the pending damage FINISH a creature that the damage already committed
+/// on the stack leaves alive? `stack_awareness` reads this so its "already
+/// targeted by non-lethal removal" penalty does not push the follow-up shot
+/// onto a different body — piling damage until something dies is the point.
+pub(crate) fn completes_stack_kill(ctx: &PolicyContext<'_>, target_id: ObjectId) -> bool {
+    let Some(target) = ctx.state.objects.get(&target_id) else {
+        return false;
+    };
+    let PendingDamage::Dealt(outcome) = pending_damage_to_object(ctx, target_id, target) else {
+        return false;
+    };
+    let committed = stack_committed_damage(ctx, target_id, target);
+    !outcome.is_empty()
+        && !committed.is_empty()
+        && !outcome_is_lethal(target, &committed)
+        && outcome_is_lethal(target, &outcome.combined(&committed))
+}
+
+/// Stack entries whose targets the current decision is still filling in. Their
+/// `ability.targets` are not the final answer (CR 601.2c / CR 603.3d), and the
+/// pending ability's own damage is already priced by
+/// [`pending_damage_to_object`], so they must not count as committed damage.
+fn entries_under_construction(ctx: &PolicyContext<'_>) -> [Option<ObjectId>; 2] {
+    let pending_cast = match &ctx.decision.waiting_for {
+        WaitingFor::TargetSelection { pending_cast, .. } => Some(pending_cast.object_id),
+        _ => None,
+    };
+    [ctx.state.pending_trigger_entry, pending_cast]
+}
+
+/// How many points one resolved `DealDamage` node already deals to `target_id`.
+/// Reads the completed division when there is one (CR 601.2d); otherwise every
+/// declared object target receives the full amount (CR 120.3).
+fn node_damage_to(state: &GameState, node: &ResolvedAbility, target_id: ObjectId) -> u32 {
+    let Effect::DealDamage { amount, .. } = &node.effect else {
+        return 0;
+    };
+    let is_target =
+        |target: &TargetRef| matches!(target, TargetRef::Object(id) if *id == target_id);
+    match &node.distribution {
+        Some(assigned) => assigned
+            .iter()
+            .filter(|(target, _)| is_target(target))
+            .map(|(_, points)| *points)
+            .sum(),
+        None if node.targets.iter().any(is_target) => {
+            u32::try_from(resolve_quantity_with_targets(state, amount, node).max(0))
+                .unwrap_or(u32::MAX)
+        }
+        None => 0,
+    }
+}
+
+/// Is this node's damage unconditional, so it can be counted on? A "may", an
+/// intervening condition, or a source other than the ability's own (CR 120.3:
+/// `DamageSource::Target` / `EachTarget` / the triggering object) is left out —
+/// under-counting only costs a bonus, over-counting would aim at a body that
+/// survives.
+fn node_is_plain_damage(node: &ResolvedAbility) -> bool {
+    matches!(
+        node.effect,
+        Effect::DealDamage {
+            damage_source: None,
+            ..
+        }
+    ) && node.condition.is_none()
+        && !node.optional
+}
+
+/// CR 405.5 + CR 120.6: the damage the objects ALREADY on the stack will deal
+/// to `target_id` when they resolve — the other half of a "focus fire" where
+/// several pingers aim at one creature. Every controller counts: an opponent's
+/// burn on the same creature finishes it just as well.
+pub(crate) fn stack_committed_damage(
+    ctx: &PolicyContext<'_>,
+    target_id: ObjectId,
+    target: &GameObject,
+) -> DamageOutcome {
+    let is_creature = target.card_types.core_types.contains(&CoreType::Creature);
+    let skip = entries_under_construction(ctx);
+    let mut outcome = DamageOutcome::default();
+    for entry in &ctx.state.stack {
+        if skip.contains(&Some(entry.id)) {
+            continue;
+        }
+        let Some(ability) = entry.ability() else {
+            continue;
+        };
+        for node in collect_resolved_abilities(ability) {
+            if !node_is_plain_damage(node) {
+                continue;
+            }
+            let dealt = node_damage_to(ctx.state, node, target_id);
+            if dealt > 0 {
+                outcome.add_dealt(ctx.state, node.source_id, dealt, is_creature);
+            }
+        }
+    }
+    outcome
+}
+
+/// CR 603.3b: damage the AI's OWN triggers that fired with this one — still
+/// queued in `deferred_triggers`, targets not chosen yet — could add to
+/// `target_id`. Two Footlight Fiends dying together put two "deals 1 damage to
+/// any target" triggers in line; the first one's choice should leave the second
+/// a kill to finish. Only single-target, undivided, unconditional damage whose
+/// target filter can legally reach `target_id` counts.
+pub(crate) fn queued_follow_up_damage(
+    ctx: &PolicyContext<'_>,
+    target_id: ObjectId,
+    target: &GameObject,
+) -> DamageOutcome {
+    let is_creature = target.card_types.core_types.contains(&CoreType::Creature);
+    let mut outcome = DamageOutcome::default();
+    for queued in &ctx.state.deferred_triggers {
+        let trigger = &queued.pending;
+        if trigger.controller != ctx.ai_player
+            || trigger.condition.is_some()
+            || trigger.distribute.is_some()
+            || trigger.modal.is_some()
+        {
+            continue;
+        }
+        for node in collect_resolved_abilities(&trigger.ability) {
+            if !node_is_plain_damage(node) || !node.targets.is_empty() {
+                continue;
+            }
+            let Effect::DealDamage { amount, .. } = &node.effect else {
+                continue;
+            };
+            let Some(filter) = extract_target_filter(&node.effect) else {
+                continue;
+            };
+            let reachable =
+                find_legal_targets(ctx.state, filter, trigger.controller, trigger.source_id)
+                    .contains(&TargetRef::Object(target_id));
+            if !reachable {
+                continue;
+            }
+            let dealt =
+                u32::try_from(resolve_quantity_with_targets(ctx.state, amount, node).max(0))
+                    .unwrap_or(u32::MAX);
+            outcome.add_dealt(ctx.state, node.source_id, dealt, is_creature);
+        }
+    }
+    outcome
 }
 
 /// CR 601.2d: does the pending spell or ability DIVIDE damage among the targets

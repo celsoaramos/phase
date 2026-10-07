@@ -75,6 +75,14 @@ fn score_target_redundancy(ctx: &PolicyContext<'_>, target_id: ObjectId) -> f64 
         return 0.0;
     }
 
+    // CR 120.6 + CR 704.5g: the damage already on the stack leaves the creature
+    // alive, and this damage on top of it kills — the follow-up shot of a focus
+    // fire, not a redundant one. Penalizing it pushed the second of two pingers
+    // onto a different body, and both creatures survived.
+    if super::removal_lethality::completes_stack_kill(ctx, target_id) {
+        return 0.0;
+    }
+
     if will_target_die_from_stack(ctx.state, target_id) {
         0.0
     } else {
