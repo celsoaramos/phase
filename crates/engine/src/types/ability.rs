@@ -9,7 +9,7 @@ use serde::ser::SerializeStructVariant;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-use super::card::{PrintedCardRef, PrintedLoyalty, TokenImageRef};
+use super::card::{PrintedCardRef, PrintedLoyalty, TokenArtDescriptor, TokenImageRef};
 use super::card_type::{CardType, CoreType, SubtypeSet, Supertype};
 use super::counter::{CounterMatch, CounterType};
 use super::events::BendingType;
@@ -24,7 +24,7 @@ use super::keywords::{Keyword, KeywordKind};
 use super::mana::{
     AbilityActivationScope, ManaColor, ManaCost, ManaType, SpellCostCriterion, ZoneSpend,
 };
-use super::phase::{Phase, PhaseGroup};
+use super::phase::{Phase, PhaseGroup, TurnSegment};
 use super::player::{PlayerCounterKind, PlayerId};
 use super::proposed_event::AppliedReplacementKey;
 use super::replacements::ReplacementEvent;
@@ -32,6 +32,7 @@ use super::statics::{ActivationExemption, CastFrequency, CostModifyMode, StaticM
 use super::stickers::{AppliedSticker, StickerKind};
 use super::triggers::TriggerMode;
 use super::zones::{EtbTapState, Zone};
+use crate::game::filter::FilterContext;
 use crate::game::game_object::DisplaySource;
 use crate::types::events::{ClashResult, PlayerActionKind};
 
@@ -187,6 +188,15 @@ pub enum ZoneChoiceCandidateSource {
     /// cost-paid object that has since left that zone is simply not offered and an
     /// unrelated object that happens to sit in the zone can never be.
     CostPaidObjects,
+    /// Read only the objects the preceding instruction handed this one as its
+    /// targets, filtered to the declared zone(s).
+    ///
+    /// CR 608.2c + CR 608.2d: "Put one of them into your hand" after "exile
+    /// cards … until you exile two nonland cards …" (Invasion of Alara) names
+    /// the batch that instruction found, not every card it exiled and not a
+    /// tracked set an earlier clause published. A member of the batch that has
+    /// since left the zone (cast from exile onto the stack) is not offered.
+    ParentTargets,
 }
 
 impl ZoneChoiceCandidateSource {
@@ -1623,6 +1633,122 @@ impl std::str::FromStr for BasicLandType {
     }
 }
 
+/// CR 612.2: the word classes a text-changing effect can name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TextWordDomain {
+    ColorWord,
+    BasicLandType,
+}
+
+/// CR 612.2: one concrete from-to word replacement; both words are of one class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum TextSubstitution {
+    Color {
+        from: ManaColor,
+        to: ManaColor,
+    },
+    BasicLandType {
+        from: BasicLandType,
+        to: BasicLandType,
+    },
+}
+
+/// `Fixed` is what the text layer applies, while `Chosen` is the parse-time form latched to `Fixed` when the effect installs (CR 608.2d + CR 611.2c) and inert if it reaches the layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum TextSubstitutionSpec {
+    Fixed(TextSubstitution),
+    Chosen { domains: Vec<TextWordDomain> },
+}
+
+impl TextSubstitution {
+    /// CR 612.2: a color word as printed in Oracle text.
+    fn color_word(color: ManaColor) -> &'static str {
+        match color {
+            ManaColor::White => "White",
+            ManaColor::Blue => "Blue",
+            ManaColor::Black => "Black",
+            ManaColor::Red => "Red",
+            ManaColor::Green => "Green",
+        }
+    }
+
+    /// Builds a color substitution; "it can't change a word to the same word" so
+    /// `from == to` is rejected.
+    pub fn color(from: ManaColor, to: ManaColor) -> Option<Self> {
+        (from != to).then_some(Self::Color { from, to })
+    }
+
+    /// Builds a basic-land-type substitution; `from == to` is rejected.
+    pub fn basic_land_type(from: BasicLandType, to: BasicLandType) -> Option<Self> {
+        (from != to).then_some(Self::BasicLandType { from, to })
+    }
+
+    /// The word class this substitution acts on.
+    pub fn domain(&self) -> TextWordDomain {
+        match self {
+            Self::Color { .. } => TextWordDomain::ColorWord,
+            Self::BasicLandType { .. } => TextWordDomain::BasicLandType,
+        }
+    }
+
+    /// CR 608.2d: every ordered pair the controller may name for `domains`
+    /// (domain order, then WUBRG / Plains-to-Forest order, `from != to`).
+    pub fn options(domains: &[TextWordDomain]) -> Vec<String> {
+        let mut out = Vec::new();
+        for domain in domains {
+            match domain {
+                TextWordDomain::ColorWord => {
+                    for from in ManaColor::ALL {
+                        for to in ManaColor::ALL {
+                            out.extend(Self::color(from, to).map(|s| s.label()));
+                        }
+                    }
+                }
+                TextWordDomain::BasicLandType => {
+                    for from in BasicLandType::all() {
+                        for to in BasicLandType::all() {
+                            out.extend(Self::basic_land_type(*from, *to).map(|s| s.label()));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The (from, to) words as the serialized carriers and the type line spell them.
+    pub fn words(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::Color { from, to } => (Self::color_word(*from), Self::color_word(*to)),
+            Self::BasicLandType { from, to } => (from.as_subtype_str(), to.as_subtype_str()),
+        }
+    }
+
+    /// Prompt label, e.g. `"Black -> Blue"`; the inverse of [`Self::from_label`].
+    pub fn label(&self) -> String {
+        let (from, to) = self.words();
+        format!("{from} -> {to}")
+    }
+
+    /// Parses a prompt label back into a substitution, rejecting `from == to`
+    /// and any pair whose class is outside `domains`.
+    pub fn from_label(label: &str, domains: &[TextWordDomain]) -> Option<Self> {
+        let (from, to) = label.split_once(" -> ")?;
+        domains.iter().find_map(|domain| match domain {
+            TextWordDomain::ColorWord => Self::color(
+                from.parse::<ManaColor>().ok()?,
+                to.parse::<ManaColor>().ok()?,
+            ),
+            TextWordDomain::BasicLandType => Self::basic_land_type(
+                from.parse::<BasicLandType>().ok()?,
+                to.parse::<BasicLandType>().ok()?,
+            ),
+        })
+    }
+}
+
 /// Odd or even — used by cards like "choose odd or even."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Parity {
@@ -1935,19 +2061,22 @@ pub enum PreventionAmount {
 
 /// CR 614.9: Recipient of a damage-redirection effect — the
 /// battle/creature/planeswalker/player the replaced damage is dealt to instead.
-/// Each variant is a distinct IDENTITY SOURCE for that recipient, resolved
-/// against live game state at damage-apply time by
+/// Each variant identifies the authority for that recipient. Resolution-created
+/// effects materialize `Controller` into `ChosenTarget` plus a concrete player;
+/// the remaining live identities are resolved at damage-apply time by
 /// `effects::create_damage_replacement::resolve_redirect_recipient`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum DamageRedirectTarget {
-    /// "...to you instead" — the replacement source's controller (Jade Monolith,
-    /// Goblin Psychopath).
+    /// CR 109.5 + CR 113.8: "...to you instead" in a resolving instruction is
+    /// the creating ability's controller (Jade Monolith, Goblin Psychopath),
+    /// captured at resolution. Outside that normalization, the live recipient
+    /// resolver reads the replacement host's current controller.
     Controller,
     /// "...to its/that source's/that spell's controller instead" — the
     /// prospective damage source's controller, read when the damage event is
     /// replaced (Mirror Strike, Reverberation, Reflect Damage). This is distinct
-    /// from [`Self::Controller`], which is the replacement host's controller.
+    /// from the creating ability's controller and the replacement host's controller.
     ///
     /// CR 614.9: a redirection effect may redirect damage to another player.
     DamageSourceController,
@@ -1959,6 +2088,8 @@ pub enum DamageRedirectTarget {
     /// or ability (spell: CR 115.1a + CR 601.2c; activated ability: CR 115.1c +
     /// CR 602.2b; "any target" domain CR 115.4); latched into the shield's
     /// `redirect_target` at resolution (Soltari Guerrillas, Harm's Way).
+    /// Runtime shields also use this concrete-destination carrier for an implicit
+    /// player captured from `Controller`; that use declares no additional target.
     #[serde(alias = "ChosenObjectTarget")]
     ChosenTarget,
     /// CR 303.4b + CR 301.5a: "...to enchanted creature instead" / "...to
@@ -4182,6 +4313,31 @@ impl Duration {
             | Self::UntilEndOfNextTurnOf { .. }
             | Self::UntilNextStepOf { .. }
             | Self::ForAsLongAs { .. }
+            | Self::UntilSourceExilesAnotherCard
+            | Self::UntilOpponentBecomesMonarch
+            | Self::UntilEvent { .. }
+            | Self::Permanent => false,
+        }
+    }
+
+    /// CR 611.2b: true for every "for as long as" STATE reading — the
+    /// durations that may already be over when the effect would begin, and
+    /// then never start. A resolver must test them on a settled board before
+    /// installing anything (`layers::resolved_duration_begins`).
+    pub const fn is_for_as_long_as(&self) -> bool {
+        match self {
+            Self::ForAsLongAs { .. }
+            | Self::WhileControllingHost
+            | Self::WhileHostOnBattlefield => true,
+            // Event deadlines and turn boundaries cannot be over before the
+            // effect begins; listed rather than swept into `_` so a new
+            // duration has to choose a side here.
+            Self::UntilHostLeavesPlay
+            | Self::UntilEndOfTurn
+            | Self::UntilEndOfCombat
+            | Self::UntilNextTurnOf { .. }
+            | Self::UntilEndOfNextTurnOf { .. }
+            | Self::UntilNextStepOf { .. }
             | Self::UntilSourceExilesAnotherCard
             | Self::UntilOpponentBecomesMonarch
             | Self::UntilEvent { .. }
@@ -7252,6 +7408,29 @@ impl TargetSelectionMode {
     }
 }
 
+/// CR 608.2b + CR 101.1: what happens when every target of this spell or
+/// ability is illegal as it tries to resolve. Root-only: read by the single
+/// CR 608.2b authority in `stack::resolve_top`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum IllegalTargetsDisposition {
+    /// CR 608.2b: the spell or ability doesn't resolve (the rules default).
+    #[default]
+    DoesNotResolve,
+    /// CR 101.1 overriding CR 608.2b: the card's own text says the ability still
+    /// resolves ("This ability still resolves if its target becomes illegal").
+    /// Illegal targets are still pruned and unaffected.
+    StillResolves,
+}
+
+impl IllegalTargetsDisposition {
+    /// `serde(skip_serializing_if)` helper: the rules default is omitted from
+    /// card-data.json so every other card's export is byte-identical.
+    pub fn is_does_not_resolve(&self) -> bool {
+        matches!(self, Self::DoesNotResolve)
+    }
+}
+
 /// CR 701.9a: How cards are selected from a zone during an effect or cost.
 ///
 /// Analogous to `TargetSelectionMode` but for cards from a player's hand (or
@@ -7566,18 +7745,15 @@ pub enum TargetFilter {
     /// "Exile <equipment-name>" / "Return <equipment-name> to its owner's
     /// hand"). Distinct from `SelfRef`, which is the object the ability is ON
     /// (the host creature). Emitted at parse time by the quote masker in
-    /// `normalize_card_name_refs`; always concretized to `SpecificObject { id }`
-    /// (the live granting-object id) at grant-clone time (`game/layers.rs`).
-    /// If it ever reaches runtime unconcretized it degrades to the ability
-    /// source (host) — fail-safe, never worse than the pre-fix behavior.
-    ///
-    /// ZONE-MOVE SCOPING (CR 201.5a second sentence + CR 400.7): the grant-time
-    /// concretization snapshots the granter's current battlefield id. CR 201.5a's
-    /// second sentence (a source moved to a new public zone → the name refers to
-    /// the new-zone object) is not modeled; no current card moves its granter and
-    /// then re-references it within one resolution (cost-exile/sacrifice cards
-    /// consume the granter before the effect; boomerangs return themselves last).
-    GrantingObject,
+    /// `normalize_card_name_refs`. It is read against the granter incarnation
+    /// stamped on the enclosing definition; unstamped, it resolves to the current
+    /// ability source, or inside a filter to no object. `bound` pins the stamped
+    /// incarnation into the filter itself for carriers read without the stamp; it
+    /// matches only that incarnation (CR 400.7).
+    GrantingObject {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bound: Option<ObjectIncarnationRef>,
+    },
     /// CR 702.95b: Resolves to the source object and the creature it is paired
     /// with. If the source is not paired, this matches no objects.
     SourceOrPaired,
@@ -8340,6 +8516,16 @@ pub enum ObjectScope {
     /// (Dismantle, Rite of the Serpent); every object-characteristic reader
     /// fail-closes to 0 and is marked `Unhandled` in `game/coverage.rs`.
     ChainRootTarget,
+    /// CR 201.5a: a granted ability's by-name reference to its granting object; unbound,
+    /// it reads as `Source` in counter reads (the one position produced) and fails closed
+    /// everywhere else.
+    GrantingObject,
+    /// CR 201.5a + CR 400.7: one exact object incarnation, read live while it exists in
+    /// any zone. After it changes zones, counter, power/toughness and mana-value reads use
+    /// its last known information only in a resolution that carries its ability
+    /// (CR 608.2h) and read 0 otherwise; color, name, typeline and mana-symbol reads are
+    /// live only and read 0.
+    SpecificObject { object: ObjectIncarnationRef },
 }
 
 /// CR 601.2a: A per-turn action journal — a chronological record of a kind of
@@ -8714,6 +8900,26 @@ pub enum CastManaSpentMetric {
     FromSource { source_filter: TargetFilter },
 }
 
+/// CR 612.2 + CR 107.4: How a mana-spent condition's color was written. A
+/// text-changing effect changes only color WORDS, so a `ManaSymbol` color is
+/// never rewritten while a `ColorWord` color is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SpentColor {
+    /// The color word of "at least three red mana was spent to cast this spell".
+    ColorWord { color: ManaColor },
+    /// The printed mana symbol of "{R} was spent to cast this spell".
+    ManaSymbol { color: ManaColor },
+}
+
+impl SpentColor {
+    pub fn color(self) -> ManaColor {
+        match self {
+            SpentColor::ColorWord { color } | SpentColor::ManaSymbol { color } => color,
+        }
+    }
+}
+
 /// A validated numeric reduction over one characteristic-bearing population.
 ///
 /// CR 202.3 + CR 208.1 + CR 209.1: the source must carry enough snapshot data
@@ -8773,6 +8979,11 @@ impl PropertyAggregate {
 
     pub fn source(&self) -> &CardTypeSetSource {
         &self.source
+    }
+
+    /// Filter rewrites keep every member's kind, so the constructor's invariants hold.
+    pub(crate) fn source_mut(&mut self) -> &mut CardTypeSetSource {
+        &mut self.source
     }
 }
 
@@ -9211,6 +9422,14 @@ pub enum QuantityRef {
     /// source set. Covers zone cards, linked-exile cards, and matching objects
     /// without proliferating card-type-count siblings.
     DistinctCardTypes { source: CardTypeSetSource },
+    /// CR 205.2a + CR 607.2a: Count the distinct card types the SOURCE object
+    /// (for a cast-time cost modifier, the spell being cost-modified) shares
+    /// with the population named by `source`. Distinct from
+    /// [`QuantityRef::DistinctCardTypes`], which counts every distinct type in
+    /// the population regardless of the source's own types — this is the
+    /// intersection the "they share with" wording requires (Cemetery Prowler:
+    /// "for each card type they share with cards exiled with ~").
+    SharedCardTypes { source: CardTypeSetSource },
     /// CR 205.3: Count distinct subtype *values* across a
     /// parameterized source set (Subgoyf — "the number of different subtypes
     /// other than creature types among cards in all graveyards"). The subtype
@@ -9302,7 +9521,8 @@ pub enum QuantityRef {
     ///
     /// - [`DamageChannel::Total`] (default): the total amount, via
     ///   `GameState::last_effect_amount`. Every non-damage producer (life lost,
-    ///   counters removed, cards drawn) stamps only this channel.
+    ///   counters removed, cards drawn) stamps only this channel; a shared-library
+    ///   simultaneous draw also fills the per-player table.
     /// - [`DamageChannel::Excess`]: the EXCESS amount (CR 120.10) — damage dealt
     ///   beyond lethal — via `GameState::last_effect_excess_amount`. Reads "the
     ///   amount of excess damage dealt to that creature this way" (Goblin
@@ -9933,6 +10153,7 @@ impl QuantityRef {
             | QuantityRef::TargetZoneCardCount { .. }
             | QuantityRef::Devotion { .. }
             | QuantityRef::DistinctCardTypes { .. }
+            | QuantityRef::SharedCardTypes { .. }
             | QuantityRef::DistinctSubtypes { .. }
             | QuantityRef::CardsExiledBySource
             | QuantityRef::ExiledCardPower { .. }
@@ -10103,9 +10324,22 @@ pub enum ObjectProperty {
 #[serde(tag = "type")]
 pub enum UntilCondition {
     /// CR 702.85a / CR 701.57a: Loop terminates when the just-exiled card
-    /// satisfies the filter. The matching card is exposed to the sub_ability
-    /// chain as an injected target.
-    NextMatches { filter: TargetFilter },
+    /// satisfies the filter and `count` cards have matched so far. The
+    /// matching cards are exposed to the sub_ability chain as injected
+    /// targets.
+    NextMatches {
+        filter: TargetFilter,
+        /// CR 608.2c: How many matching cards end the loop — "until you exile
+        /// two nonland cards with mana value 4 or less" (Invasion of Alara).
+        /// Defaults to one ("until you exile a nonland card"), so every
+        /// single-hit form and on-disk record keeps its meaning. When the
+        /// library runs out first, the loop ends with the matches found so far.
+        #[serde(
+            default = "default_quantity_one",
+            skip_serializing_if = "is_default_quantity_one"
+        )]
+        count: QuantityExpr,
+    },
     /// CR 202.3 + CR 107.3e: Loop terminates when the cumulative `property`
     /// summed over every card exiled this resolution satisfies
     /// `comparator(sum, threshold)`.
@@ -11046,6 +11280,9 @@ pub enum PlayerFilter {
     /// player facing the choice is the owner of the targeted permanent named in
     /// the prior clause, not the ability controller.
     ParentObjectTargetOwner,
+    /// CR 601.2a + CR 201.5a: the player who cast the granting object; lowered to
+    /// `TargetFilter::SpecificPlayer` when the grant is latched.
+    GrantingObjectCaster,
     /// CR 608.2c + CR 608.2h + CR 109.4 + CR 102.2: Each player matching
     /// `relation` who possessed — per `possession` — at least one member of the
     /// most recent tracked object set matching `filter`, restricted to members
@@ -15725,8 +15962,11 @@ impl StepSkipTarget {
 }
 
 /// CR 500.8 + CR 500.9 + CR 500.10: where an added phase or step is inserted.
-/// `ThisStep` and `ThisPhase` are resolved when the effect resolves, against
-/// the step it resolves in; `FirstOfTurn`, against the steps begun this turn.
+/// `ThisStep` and `ThisPhase` are resolved when the effect resolves:
+/// `ThisStep` against the step it resolves in, `ThisPhase` against the phase in
+/// progress, which the added-unit records decide (CR 500.9: an added step is
+/// part of its phase; CR 500.10: a created phase ends with its one step);
+/// `FirstOfTurn`, against the steps begun this turn.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ExtraPhaseAnchor {
@@ -15758,6 +15998,42 @@ impl ExtraPhaseAnchor {
     pub fn this_main_phase() -> Self {
         Self::ThisPhase {
             named: Some(vec![PhaseGroup::PrecombatMain, PhaseGroup::PostcombatMain]),
+        }
+    }
+}
+
+/// CR 500.10a: who gets an added step or phase, one kind per way the text
+/// names it. The parser chooses the kind from the subject; the resolver's
+/// own-turn gate matches every kind by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum ExtraPhaseRecipient {
+    /// "There is / are an additional …" names no player, so the step or phase
+    /// is added to the turn in progress.
+    NoPlayer,
+    /// "You get": the effect's controller.
+    Controller,
+    /// "That player gets" in a triggered ability (Paradox Haze): the player
+    /// the trigger event names.
+    TriggeringPlayer,
+    /// "Target player / target opponent gets": a player target announced with
+    /// the spell or ability (CR 115.1) and re-checked at resolution
+    /// (CR 608.2b). The filter is that target's.
+    TargetedPlayer(TargetFilter),
+}
+
+impl ExtraPhaseRecipient {
+    /// The `TargetFilter` that spells this recipient, for the walkers keyed on
+    /// `TargetFilter`: target-slot surfacing (`Effect::target_filter`),
+    /// event-context hydration, the declined-"if you do" referent audit, the
+    /// read/write and axis scans, and the coverage display. `NoPlayer` is
+    /// `TargetFilter::None`. The resolver never reads the recipient through it.
+    pub fn as_target_filter(&self) -> &TargetFilter {
+        match self {
+            Self::NoPlayer => &TargetFilter::None,
+            Self::Controller => &TargetFilter::Controller,
+            Self::TriggeringPlayer => &TargetFilter::TriggeringPlayer,
+            Self::TargetedPlayer(filter) => filter,
         }
     }
 }
@@ -16052,7 +16328,7 @@ impl FaceDownProfile {
 /// can install onto a persistent baseline.
 ///
 /// `ContinuousModification` is the engine-wide 57-variant layer vocabulary; only
-/// three of its kinds have a persistent-baseline installer. Carrying that subset
+/// four of its kinds have a persistent-baseline installer. Carrying that subset
 /// as its OWN type (rather than a `Vec<ContinuousModification>` guarded by a
 /// separate predicate) makes the acceptance gate and the installer the same
 /// authority: [`PerpetualModification::GrantAbility`] cannot be constructed
@@ -16087,6 +16363,11 @@ pub enum PerpetualGrantModification {
     /// closed rather than install a board-wide mana concession under a "this
     /// spell only" card.
     GrantAbility { definition: Box<AbilityDefinition> },
+    /// A quoted triggered ability (Jessie Zane's "When this creature enters,
+    /// draw a card.") — installed onto `trigger_definitions` +
+    /// `base_trigger_definitions` as a Printed slot via the
+    /// `push_printed_trigger` single authority.
+    GrantTrigger { trigger: Box<TriggerDefinition> },
 }
 
 impl TryFrom<ContinuousModification> for PerpetualGrantModification {
@@ -16201,6 +16482,39 @@ impl TryFrom<ContinuousModification> for PerpetualGrantModification {
             ContinuousModification::GrantAbility { definition } => {
                 Ok(Self::GrantAbility { definition })
             }
+            // Fail-closed: a `GrantTrigger` whose `execute` is missing or whose
+            // nested tree still carries `Effect::Unimplemented` did not actually
+            // parse (Racketeer Boss's "... and this spell perpetually loses this
+            // ability." — the loses class has no model, so the inner effect is
+            // the parser's honest "couldn't classify this" stub). Accepting it
+            // would install a trigger that does nothing (or half of a
+            // multi-quote grant) while the top-level effect stays
+            // `Effect::ApplyPerpetual`, so coverage would keep reporting the
+            // card as fully supported. Reuse
+            // `game::coverage::ability_tree_any` — the single walker authority
+            // — over the `AbilityDefinition`-shaped `execute`. Rejecting here
+            // propagates through the `Result` collect in
+            // `try_parse_perpetual_grant_ability`, which fails the whole clause
+            // closed rather than installing a partial grant.
+            //
+            // The `GrantAbility` resolution-time `GenericEffect` gate above is
+            // explicitly NOT mirrored: a trigger's `execute` runs through
+            // normal trigger resolution (CR 608.2c: the controller follows
+            // the ability's instructions in the order written), so a
+            // resolution-time grant nested inside it resolves like any other
+            // trigger body — that gate's rationale (the installer cannot route
+            // nested statics at
+            // grant time) does not apply.
+            ContinuousModification::GrantTrigger { trigger }
+                if trigger.execute.as_deref().is_none_or(|execute| {
+                    crate::game::coverage::ability_tree_any(execute, &|d| {
+                        matches!(&*d.effect, Effect::Unimplemented { .. })
+                    })
+                }) =>
+            {
+                Err(ContinuousModification::GrantTrigger { trigger })
+            }
+            ContinuousModification::GrantTrigger { trigger } => Ok(Self::GrantTrigger { trigger }),
             other => Err(other),
         }
     }
@@ -18950,8 +19264,10 @@ pub enum Effect {
     /// Guerrillas; "to any target" — Harm's Way), `redirect_object_filter`
     /// carries the recipient's `TargetFilter` so the targeting layer surfaces a
     /// standard target slot (`ability_utils::collect_target_slots`); the
-    /// resolver captures the chosen object or player into the shield. All other redirect forms host on the
-    /// controller / source with no declared target.
+    /// resolver captures the chosen object or player into the shield. `Controller`
+    /// instead captures the creating ability's controller without declaring a
+    /// redirect target. Either form can independently declare an original-recipient
+    /// target through `recipient_object_filter` (Jade Monolith).
     CreateDamageReplacement {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_filter: Option<TargetFilter>,
@@ -18973,7 +19289,7 @@ pub enum Effect {
         /// `ChosenTarget` form ("...deals that damage to target creature
         /// instead" — Soltari Guerrillas; "...is dealt to any target instead" —
         /// Harm's Way). `None` for the `Controller` /
-        /// `SourceObject` redirect forms, which need no target slot.
+        /// `SourceObject` redirect forms, which need no redirect-recipient slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         redirect_object_filter: Option<TargetFilter>,
         /// CR 115.1 + CR 614.9: The *original-recipient* target filter when the
@@ -19916,25 +20232,29 @@ pub enum Effect {
         #[serde(default)]
         scope: SkipScope,
     },
-    /// CR 500.8: Add an additional step or phase after the specified anchor phase.
+    /// CR 500.8 + CR 500.9 + CR 500.10: Add an additional step or phase after
+    /// the specified anchor. `segment` is what is added — a whole phase, a
+    /// phase created to hold one step, or a step added to the phase in
+    /// progress — as the text words it.
     /// Uses a LIFO stack on GameState.extra_phases. `followed_by` entries are pushed
-    /// before `phase`, so "additional combat followed by an additional main phase"
+    /// before `segment`, so "additional combat followed by an additional main phase"
     /// resolves in printed order while preserving CR 500.8 LIFO ordering.
-    /// CR 500.10a: Only adds steps/phases to the affected player's own turn.
+    /// CR 500.10a: `recipient` says who gets it; a player's grant adds only to
+    /// that player's own turn.
     /// `count` resolves at resolution time so dynamic quantities such as Obeka,
     /// Splitter of Seconds' "that many additional upkeep steps" thread the
     /// triggering event amount through `QuantityRef::EventContextAmount`. Legacy
     /// callers and explicit "an additional" wording deserialize to a Fixed 1.
     /// `after` is the CR 500.8/500.9/500.10 insertion point, resolved at
-    /// resolution time by `additional_phase::resolve`; `ThisStep`/`ThisPhase` are
-    /// relative to the step the effect resolves in.
+    /// resolution time by `additional_phase::resolve`; `ThisStep` is the step the
+    /// effect resolves in, and `ThisPhase` is the phase in progress
+    /// (`turns::final_step_of_phase_in_progress`).
     AdditionalPhase {
-        #[serde(default = "default_target_filter_controller")]
-        target: TargetFilter,
-        phase: Phase,
+        recipient: ExtraPhaseRecipient,
+        segment: TurnSegment,
         after: ExtraPhaseAnchor,
         #[serde(default)]
-        followed_by: Vec<Phase>,
+        followed_by: Vec<TurnSegment>,
         #[serde(default = "default_quantity_one")]
         count: QuantityExpr,
         /// CR 508.1c + CR 611.2c: Optional attacker restriction for the combat
@@ -21477,6 +21797,11 @@ impl TargetFilter {
                 | TargetFilter::ControllerAndControlledPermanents { .. }
                 | TargetFilter::TrackedSet { .. }
                 | TargetFilter::TrackedSetFiltered { .. }
+                // CR 115.10a: a bound object id is affected, never a declared target.
+                | TargetFilter::SpecificObject { .. }
+                // CR 201.5a + CR 115.10a: a granter named by a granted body is affected, never a
+                // declared target.
+                | TargetFilter::GrantingObject { .. }
         )
     }
 
@@ -21975,7 +22300,6 @@ impl Effect {
             | Effect::GrantExtraLoyaltyActivations { target, .. }
             | Effect::SkipNextTurn { target, .. }
             | Effect::SkipNextStep { target, .. }
-            | Effect::AdditionalPhase { target, .. }
             | Effect::Double { target, .. }
             | Effect::SetLifeTotal { target, .. }
             | Effect::GiveControl { target, .. }
@@ -22006,6 +22330,11 @@ impl Effect {
                 recipient: EachDamageRecipient::Shared(filter),
                 ..
             } => Some(filter),
+
+            // CR 115.1 + CR 608.2b: a targeted-player recipient surfaces its
+            // target slot here; the other kinds surface a filter that claims
+            // no slot (`None`, `Controller`, `TriggeringPlayer`).
+            Effect::AdditionalPhase { recipient, .. } => Some(recipient.as_target_filter()),
 
             Effect::CombineHost { host, .. }
             | Effect::ChooseAugmentAndCombineWithHost { host, .. } => Some(host.as_ref()),
@@ -23468,7 +23797,7 @@ impl Effect {
             // resolved up-front when the until-loop starts
             // (`game/effects/exile_from_top_until.rs`).
             Effect::ExileFromTopUntil { until, .. } => match until {
-                UntilCondition::NextMatches { .. } => {}
+                UntilCondition::NextMatches { count, .. } => f(count),
                 UntilCondition::CumulativeThreshold { threshold, .. } => f(threshold),
             },
             // A proposition guess resolves both comparison sides live
@@ -26022,6 +26351,9 @@ pub struct AbilityDefinition {
     pub announced_x: Option<QuantityExpr>,
     /// Stack-copy restriction from "This ability can't be copied."
     pub cant_be_copied: bool,
+    /// CR 608.2b + CR 101.1: root-only; read by stack::resolve_top. Set by the
+    /// trigger parser for "This ability still resolves if its target becomes illegal".
+    pub illegal_targets_disposition: IllegalTargetsDisposition,
     /// CR 601.2f: Self-referential cost reduction applied before activation.
     /// "This ability costs {N} less to activate for each [condition]"
     pub cost_reduction: Option<CostReduction>,
@@ -26084,6 +26416,8 @@ pub struct AbilityDefinition {
     /// This is deliberately separate from `FaceDownProfile`, which describes
     /// battlefield characteristics only.
     pub face_down_in_exile: ExileConcealment,
+    /// CR 201.5a: granter stamp; `stamp_granter` decides which nodes carry it.
+    pub granting_object: Option<ObjectIncarnationRef>,
 }
 
 /// Private serialization mirror for `AbilityDefinition`. Holds a borrowed view
@@ -26154,6 +26488,8 @@ struct AbilityDefinitionRepr<'a> {
     announced_x: &'a Option<QuantityExpr>,
     #[serde(skip_serializing_if = "is_false")]
     cant_be_copied: bool,
+    #[serde(skip_serializing_if = "IllegalTargetsDisposition::is_does_not_resolve")]
+    illegal_targets_disposition: IllegalTargetsDisposition,
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_reduction: &'a Option<CostReduction>,
     forward_result: bool,
@@ -26179,6 +26515,8 @@ struct AbilityDefinitionRepr<'a> {
     unlowered_guard: &'a Option<UnloweredGuard>,
     #[serde(skip_serializing_if = "ExileConcealment::is_public")]
     face_down_in_exile: ExileConcealment,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    granting_object: &'a Option<ObjectIncarnationRef>,
 }
 
 impl Serialize for AbilityDefinition {
@@ -26220,6 +26558,7 @@ impl Serialize for AbilityDefinition {
             min_x_value,
             announced_x,
             cant_be_copied,
+            illegal_targets_disposition,
             cost_reduction,
             forward_result,
             player_scope,
@@ -26233,6 +26572,7 @@ impl Serialize for AbilityDefinition {
             sibling_condition,
             unlowered_guard,
             face_down_in_exile,
+            granting_object,
         } = self;
         let repr = AbilityDefinitionRepr {
             kind,
@@ -26269,6 +26609,7 @@ impl Serialize for AbilityDefinition {
             min_x_value: *min_x_value,
             announced_x,
             cant_be_copied: *cant_be_copied,
+            illegal_targets_disposition: *illegal_targets_disposition,
             cost_reduction,
             forward_result: *forward_result,
             player_scope,
@@ -26282,6 +26623,7 @@ impl Serialize for AbilityDefinition {
             sibling_condition: *sibling_condition,
             unlowered_guard,
             face_down_in_exile: *face_down_in_exile,
+            granting_object,
         };
         /// Flatten wrapper: the mirror carries the real field set;
         /// `consumes_source` (#506) and `is_mana_ability` (CR 605.1a) are
@@ -26385,6 +26727,8 @@ struct AbilityDefinitionDe {
     #[serde(default)]
     cant_be_copied: bool,
     #[serde(default)]
+    illegal_targets_disposition: IllegalTargetsDisposition,
+    #[serde(default)]
     cost_reduction: Option<CostReduction>,
     #[serde(default)]
     forward_result: bool,
@@ -26410,6 +26754,8 @@ struct AbilityDefinitionDe {
     unlowered_guard: Option<UnloweredGuard>,
     #[serde(default)]
     face_down_in_exile: ExileConcealment,
+    #[serde(default)]
+    granting_object: Option<ObjectIncarnationRef>,
 }
 
 impl<'de> Deserialize<'de> for AbilityDefinition {
@@ -26456,6 +26802,7 @@ impl<'de> Deserialize<'de> for AbilityDefinition {
             min_x_value: de.min_x_value,
             announced_x: de.announced_x,
             cant_be_copied: de.cant_be_copied,
+            illegal_targets_disposition: de.illegal_targets_disposition,
             cost_reduction: de.cost_reduction,
             forward_result: de.forward_result,
             player_scope: de.player_scope,
@@ -26469,6 +26816,7 @@ impl<'de> Deserialize<'de> for AbilityDefinition {
             sibling_condition: de.sibling_condition,
             unlowered_guard: de.unlowered_guard,
             face_down_in_exile: de.face_down_in_exile,
+            granting_object: de.granting_object,
         })
     }
 }
@@ -26755,6 +27103,7 @@ impl AbilityDefinition {
             min_x_value: 0,
             announced_x: None,
             cant_be_copied: false,
+            illegal_targets_disposition: IllegalTargetsDisposition::DoesNotResolve,
             cost_reduction: None,
             forward_result: false,
             player_scope: None,
@@ -26768,6 +27117,7 @@ impl AbilityDefinition {
             sibling_condition: SiblingCondition::Dependent,
             unlowered_guard: None,
             face_down_in_exile: ExileConcealment::Public,
+            granting_object: None,
         }
     }
 
@@ -27086,6 +27436,10 @@ pub enum AbilityCondition {
     /// incarnation. Unlike an intervening-if, this is checked only while the
     /// effect resolves.
     TriggerEventTargetDamagedBySourceThisTurn,
+    /// CR 702.110b + CR 608.2c + CR 400.7: Resolution-time rider on a dies trigger:
+    /// the source creature exploited the triggering creature (the creature whose
+    /// death fired this trigger).
+    TriggerEventTargetExploitedBySource,
     /// CR 702.33d + CR 702.33f + CR 608.2c: An optional additional cost was paid
     /// during casting. Parameterized for kicker variant gating:
     ///
@@ -27205,12 +27559,13 @@ pub enum AbilityCondition {
     /// `QuantityCheck { lhs: ManaSpentToCast { scope, OfColor { color } }, GE, Fixed(minimum) }`,
     /// which carries the CR 400.7d subject anaphora as an explicit
     /// `CastManaObjectScope` that this variant cannot express. The leading-word
-    /// Adamant grammar already emits the generic form; this variant survives
-    /// only for the symbolic `{W}{W}` phrasing, which has no
-    /// `parse_inner_condition` grammar and fans into `And`/`Not` compositions.
+    /// Adamant grammar lowers to that generic form, so this variant is the
+    /// symbolic `{W}{W}` phrasing (no `parse_inner_condition` grammar; it fans
+    /// into `And`/`Not` compositions) plus the shadowed word fallback, and
+    /// `SpentColor` is how CR 612.2 tells the two apart.
     /// Retiring it is a semantic migration (per-card scope decision), not a
     /// rename — see `TriggerCondition::ManaColorSpent` for the sibling case.
-    ManaColorSpent { color: ManaColor, minimum: u32 },
+    ManaColorSpent { color: SpentColor, minimum: u32 },
     /// CR 608.2c: "If it's a [type] card" — gates sub_ability on the last
     /// revealed card's type, or on the just-moved card when the parent effect
     /// changed zones without revealing.
@@ -27392,8 +27747,10 @@ pub enum AbilityCondition {
         /// CR 608.2c: When `Some(n)`, the anaphoric subject tests the object in
         /// declared chain slot `n` (resolved from the flattened root chain via
         /// `resolve_live_parent_slot_from_root`) rather than this node's local
-        /// most-recent target. `None` (default) preserves the legacy
-        /// first-object / `TriggeringSource` behavior. Set by the two-target
+        /// most-recent target. `None` (default) tests the gated node's
+        /// resolution-bound attachment-host recipient
+        /// (`targeting::resolution_bound_attachment_hosts`), else its first
+        /// object target, else `TriggeringSource`. Set by the two-target
         /// counter-chain rewrite in `lower_effect_chain_ir` so a condition on the
         /// first-declared fighter (Malamet: "if the creature you control entered
         /// this turn") reads slot 0 under most-recent-only chain propagation.
@@ -27685,6 +28042,7 @@ impl AbilityCondition {
                 .iter()
                 .any(|condition| matches!(condition, AbilityCondition::WhenYouDo)),
             AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn
+            | AbilityCondition::TriggerEventTargetExploitedBySource
             | AbilityCondition::AdditionalCostPaidInstead
             | AbilityCondition::AlternativeManaCostPaid
             | AbilityCondition::EffectOutcome { .. }
@@ -27819,6 +28177,7 @@ impl AbilityCondition {
                     | EffectOutcomeSignal::RevealUntilMatched,
             } => false,
             AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn
+            | AbilityCondition::TriggerEventTargetExploitedBySource
             | AbilityCondition::AdditionalCostPaidInstead
             | AbilityCondition::AlternativeManaCostPaid
             | AbilityCondition::EventOutcomeWon
@@ -28149,6 +28508,9 @@ pub struct SpellContext {
     /// ordinary ability-chain handoffs without widening every ability literal.
     #[serde(default, skip_serializing_if = "ExileConcealment::is_public")]
     pub face_down_in_exile: ExileConcealment,
+    /// CR 201.5a: the granter stamped on the definition this ability was built from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granting_object: Option<ObjectIncarnationRef>,
     /// CR 603.7 + CR 603.10a + CR 608.2h: The battlefield-departure event a
     /// phase-delayed triggered ability was created under ("When this creature
     /// dies, at the beginning of the next end step, …"). The later phase event
@@ -28167,6 +28529,12 @@ pub struct SpellContext {
     pub forwarded_result_context: Option<Box<ForwardedResultContext>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_forwarded_zone_result: Option<PendingForwardedZoneResult>,
+    /// CR 400.7j + CR 608.2c: every card an "exile cards … until …" loop moved
+    /// to exile in this resolution, handed down the rest of its chain. "The
+    /// other cards exiled this way" (Invasion of Alara) are found among exactly
+    /// these cards. Empty outside such a chain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exile_until_batch: Vec<crate::types::identifiers::ObjectIncarnationRef>,
     /// CR 610.3b: specified duration events observed after a triggered ability
     /// triggered but before this initial zone-change effect occurred.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -28273,6 +28641,10 @@ pub struct SpellContext {
     /// Used by AbilityCondition::effect_performed() to gate dependent sub_abilities.
     #[serde(default)]
     pub optional_effect_performed: bool,
+    /// CR 118.12: A mandatory instruction of this run ("sacrifice it and attach …")
+    /// that did nothing, so a later member's "if you do" is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unperformed_compound_instruction: Option<EffectKind>,
     /// CR 608.2d: The just-resolved `Effect::OpponentGuess` outcome, stamped onto
     /// the stashed continuation chain by the guess answer handler. Tri-state:
     /// `None` = no guess happened (impossible commit per CR 609.3 / empty hand),
@@ -28795,13 +29167,14 @@ pub enum TriggerCondition {
     /// CR 207.2c: "if at least N mana of [color] was spent to cast this spell" — Adamant.
     ///
     /// LEGACY SHAPE, produced by the independent trigger-side grammar in
-    /// `parser::oracle_trigger`. The canonical generic form is
+    /// `parser::oracle_trigger`: the word form by `try_extract_adamant_condition`,
+    /// the symbol form by `SymbolicManaSpentIntro`. The canonical generic form is
     /// `QuantityCheck { lhs: ManaSpentToCast { scope, OfColor { color } }, GE, Fixed(minimum) }`
     /// (see `AbilityCondition::ManaColorSpent`). Converging this one is a
     /// SEMANTIC migration, not a rename: the producer accepts both "this spell"
     /// and "that spell" and records neither, so lowering requires a per-card
     /// CR 400.7d `CastManaObjectScope` decision.
-    ManaColorSpent { color: ManaColor, minimum: u32 },
+    ManaColorSpent { color: SpentColor, minimum: u32 },
     /// CR 601.2b: "if no mana was spent to cast it" / "if mana from a [source] was spent"
     ManaSpentCondition { text: String },
     /// CR 400.7: "if it had a +1/+1 counter on it" / "if it had counters on it"
@@ -28980,6 +29353,11 @@ pub enum TriggerCondition {
     /// "Whenever two or more <subject> attack" (Argent Dais) compares the number
     /// of attacking objects of the subject class when attackers are declared
     /// (CR 508.1a + CR 603.2); there is no intervening "if" to recheck.
+    /// CR 603.8: a state trigger's own condition ("When there are four or more
+    /// page counters on ~", "When you control no other creatures") is likewise
+    /// its trigger event, read when the game state matches it and not rechecked
+    /// on resolution — Plague Boiler's ruling: removing a counter in response
+    /// won't stop the effect. An intervening "if" beside it is still rechecked.
     EventTime { condition: Box<TriggerCondition> },
 }
 
@@ -29762,6 +30140,9 @@ pub struct TriggerDefinition {
     /// every non-Room trigger: no door gating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_door: Option<crate::game::game_object::RoomDoor>,
+    /// CR 201.5a: granter stamp; `stamp_granter` decides which nodes carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granting_object: Option<ObjectIncarnationRef>,
 }
 
 /// CR 605.1b: Which aggregate mana output a mana-ability trigger requires.
@@ -30356,6 +30737,7 @@ impl TriggerDefinition {
             mana_ability_produced: None,
             clash_result: None,
             room_door: None,
+            granting_object: None,
         }
     }
 
@@ -30613,6 +30995,9 @@ pub struct StaticDefinition {
     /// static: no door gating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_door: Option<crate::game::game_object::RoomDoor>,
+    /// CR 201.5a: granter stamp; `stamp_granter` decides which nodes carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granting_object: Option<ObjectIncarnationRef>,
 }
 
 /// CR 702.16n / CR 702.16p: Which attachments a protection-granting continuous
@@ -30798,6 +31183,7 @@ impl StaticDefinition {
             bypass_beneficiary: None,
             protection_does_not_remove: None,
             room_door: None,
+            granting_object: None,
         }
     }
 
@@ -31626,6 +32012,9 @@ pub struct ReplacementDefinition {
     /// official Vorinclex ruling). Ignored by every non-`AddCounter` event.
     #[serde(default, skip_serializing_if = "CounterReplacementSubject::is_default")]
     pub counter_replacement_subject: CounterReplacementSubject,
+    /// CR 201.5a: granter stamp; `stamp_granter` decides which nodes carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granting_object: Option<ObjectIncarnationRef>,
 }
 
 impl ReplacementDefinition {
@@ -31739,6 +32128,7 @@ impl ReplacementDefinition {
             source_object: None,
             origin: ReplacementOrigin::Characteristic,
             counter_replacement_subject: CounterReplacementSubject::Recipient,
+            granting_object: None,
         }
     }
 
@@ -31771,6 +32161,20 @@ impl ReplacementDefinition {
     pub fn valid_card(mut self, filter: TargetFilter) -> Self {
         self.valid_card = Some(filter);
         self
+    }
+
+    /// CR 201.5a: the context `valid_card` is read in, naming this replacement's granter.
+    pub(crate) fn valid_card_context(
+        &self,
+        state: &super::game_state::GameState,
+        source_id: ObjectId,
+        controller: Option<PlayerId>,
+    ) -> FilterContext<'static> {
+        match controller {
+            Some(controller) => FilterContext::from_source_with_controller(source_id, controller),
+            None => FilterContext::from_source(state, source_id),
+        }
+        .with_granting_object(self.granting_object)
     }
 
     pub fn description(mut self, desc: String) -> Self {
@@ -32209,6 +32613,12 @@ pub enum ContinuousModification {
         /// `None` for printed-card sources.
         #[serde(default)]
         token_image_ref: Option<TokenImageRef>,
+        /// Intrinsic token-art body of the source, carried so a copy of a
+        /// token without an exact ref still renders from the source's shape
+        /// rather than the recipient's stale descriptor. `None` for
+        /// printed-card sources and pre-descriptor snapshots.
+        #[serde(default)]
+        token_art: Option<TokenArtDescriptor>,
     },
     /// CR 707.2c + CR 613.1a: Parse-time MARKER for the static ability
     /// "enchanted creature is a copy of the chosen creature" (Metamorphic
@@ -32235,6 +32645,12 @@ pub enum ContinuousModification {
     SetTextName {
         name: String,
     },
+    /// CR 612.1 + CR 612.2 + CR 613.1c: replaces every instance of one word with
+    /// another in the recipient's rules text and type line (Layer 3). Applied by
+    /// the Text pre-pass in `game::layers`, never by the per-modification apply loop.
+    SubstituteTextWord {
+        substitution: TextSubstitutionSpec,
+    },
     AddPower {
         value: i32,
     },
@@ -32260,11 +32676,10 @@ pub enum ContinuousModification {
     /// of** the objects matching `source` (Myr Welder / Dark Impostor / Patchwork
     /// Crawler "all [creature] cards exiled with it", Territory Forge "the exiled
     /// card", Mairsil, Experiment Kraj, …). The set is dynamic — recomputed each
-    /// layer pass — so it is expanded into one `GrantAbility` per matching
-    /// activated ability at continuous-effect collection time
-    /// (`active_continuous_effects_from_static_definitions`); the layer-6 apply of
-    /// this variant itself is therefore a no-op. `source` is resolved relative to
-    /// each recipient of the host static (`FilterContext::from_source(recipient)`).
+    /// layer pass — so the meta-effect is retained through earlier layers and
+    /// expanded into `GrantAbility` effects when it applies in layer 6. The
+    /// provider filter uses the host's identity and each recipient's current
+    /// controller for controller-relative references.
     GrantAllActivatedAbilitiesOf {
         source: TargetFilter,
         /// CR 602.5b + CR 602.5c: An optional use-restriction injected into every
@@ -32284,12 +32699,10 @@ pub enum ContinuousModification {
     /// abilities of** the objects matching `source` (Koh, the Face Stealer "Koh
     /// has all activated and triggered abilities of the last chosen card"). The
     /// triggered-ability mirror of `GrantAllActivatedAbilitiesOf`: the set is
-    /// dynamic — recomputed each layer pass — so it is expanded into one
-    /// `GrantTrigger` per matching trigger definition at continuous-effect
-    /// collection time (`expand_granted_triggered_abilities`); the layer-6 apply
-    /// of this variant itself is therefore a no-op. `source` is resolved relative
-    /// to the host static with each recipient's controller, mirroring the
-    /// activated expander. Distinct sibling rather than a parameter of
+    /// dynamic — recomputed each layer pass — so it is retained through earlier
+    /// layers and expanded into `GrantTrigger` effects when it applies in layer
+    /// 6. `source` is resolved relative to the host static with each recipient's
+    /// current controller, mirroring the activated expander. Distinct sibling rather than a parameter of
     /// `GrantAllActivatedAbilitiesOf` because activated and triggered abilities
     /// land in different stores (CR 602.1 `obj.abilities` via `GrantAbility` vs
     /// CR 603.1 `obj.trigger_definitions` via `GrantTrigger`) with different
@@ -33048,6 +33461,13 @@ pub struct ResolvedAbility {
     /// overwrites it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub illegal_target_slots: Vec<usize>,
+    /// CR 608.2b: This node's target-vector indices removed by the initial
+    /// legality check for the current resolution. Unlike `illegal_target_slots`,
+    /// these are local pre-compaction indices, not declared-chain identities.
+    /// The resolution boundary overwrites this metadata before execution; target
+    /// propagation only uses its presence to avoid refilling an emptied node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub illegal_local_target_slots: Vec<usize>,
     pub controller: PlayerId,
     /// CR 109.5: The controller of the spell or ability before any
     /// resolution-time player-scope iteration rebinds the acting player.
@@ -33158,6 +33578,13 @@ pub struct ResolvedAbility {
     /// Stack-copy restriction from "This ability can't be copied."
     #[serde(default, skip_serializing_if = "is_false")]
     pub cant_be_copied: bool,
+    /// CR 608.2b + CR 101.1: root-only; read by stack::resolve_top. Copied from
+    /// `AbilityDefinition::illegal_targets_disposition`; a sub-ability's value is ignored.
+    #[serde(
+        default,
+        skip_serializing_if = "IllegalTargetsDisposition::is_does_not_resolve"
+    )]
+    pub illegal_targets_disposition: IllegalTargetsDisposition,
     /// CR 707.10 + CR 614.1a + CR 614.5: `Finalized` on a `repeat_for` iteration
     /// that the drain driver resumes after a per-copy pause, so the "copy an
     /// additional time" replacement bonus (Twinning Staff) is folded into the
@@ -33432,6 +33859,7 @@ impl PartialEq for ResolvedAbility {
             activation_cost_reduction: a_activation_cost_reduction,
             activation_record: a_activation_record,
             illegal_target_slots: a_illegal_target_slots,
+            illegal_local_target_slots: a_illegal_local_target_slots,
             controller: a_controller,
             original_controller: a_original_controller,
             scoped_player: a_scoped_player,
@@ -33456,6 +33884,7 @@ impl PartialEq for ResolvedAbility {
             min_x_value: a_min_x_value,
             announced_x: a_announced_x,
             cant_be_copied: a_cant_be_copied,
+            illegal_targets_disposition: a_illegal_targets_disposition,
             copy_count_status: a_copy_count_status,
             forward_result: a_forward_result,
             unless_pay: a_unless_pay,
@@ -33501,6 +33930,7 @@ impl PartialEq for ResolvedAbility {
             activation_cost_reduction: b_activation_cost_reduction,
             activation_record: b_activation_record,
             illegal_target_slots: b_illegal_target_slots,
+            illegal_local_target_slots: b_illegal_local_target_slots,
             controller: b_controller,
             original_controller: b_original_controller,
             scoped_player: b_scoped_player,
@@ -33525,6 +33955,7 @@ impl PartialEq for ResolvedAbility {
             min_x_value: b_min_x_value,
             announced_x: b_announced_x,
             cant_be_copied: b_cant_be_copied,
+            illegal_targets_disposition: b_illegal_targets_disposition,
             copy_count_status: b_copy_count_status,
             forward_result: b_forward_result,
             unless_pay: b_unless_pay,
@@ -33570,6 +34001,7 @@ impl PartialEq for ResolvedAbility {
             && a_activation_cost_reduction == b_activation_cost_reduction
             && a_activation_record == b_activation_record
             && a_illegal_target_slots == b_illegal_target_slots
+            && a_illegal_local_target_slots == b_illegal_local_target_slots
             && a_controller == b_controller
             && a_original_controller == b_original_controller
             && a_scoped_player == b_scoped_player
@@ -33594,6 +34026,7 @@ impl PartialEq for ResolvedAbility {
             && a_min_x_value == b_min_x_value
             && a_announced_x == b_announced_x
             && a_cant_be_copied == b_cant_be_copied
+            && a_illegal_targets_disposition == b_illegal_targets_disposition
             && a_copy_count_status == b_copy_count_status
             && a_forward_result == b_forward_result
             && a_unless_pay == b_unless_pay
@@ -33630,10 +34063,253 @@ impl PartialEq for ResolvedAbility {
 impl Eq for ResolvedAbility {}
 
 impl ResolvedAbility {
+    /// CR 610.3: The "until" event bounding this node's own zone change, for
+    /// every bounded zone-move shape (single-object `ChangeZone` and mass
+    /// `ChangeZoneAll`). The single classifier the CR 610.3b latch, the
+    /// resolvers' refusal, and stack-reach readers share.
+    pub(crate) fn bounded_zone_change_event(&self) -> Option<DurationEvent> {
+        match self.effect {
+            Effect::ChangeZone { .. } | Effect::ChangeZoneAll { .. } => {
+                self.duration.as_ref().and_then(Duration::zone_change_event)
+            }
+            Effect::StartYourEngines { .. }
+            | Effect::ChangeSpeed { .. }
+            | Effect::DealDamage { .. }
+            | Effect::ApplyPostReplacementDamage { .. }
+            | Effect::EachDealsDamageEqualToPower { .. }
+            | Effect::EachSourceDealsDamage { .. }
+            | Effect::Draw { .. }
+            | Effect::Pump { .. }
+            | Effect::PairWith { .. }
+            | Effect::Destroy { .. }
+            | Effect::Regenerate { .. }
+            | Effect::RemoveAllDamage { .. }
+            | Effect::Counter { .. }
+            | Effect::CounterAll { .. }
+            | Effect::Token { .. }
+            | Effect::GainLife { .. }
+            | Effect::LoseLife { .. }
+            | Effect::SetTapState { .. }
+            | Effect::RemoveCounter { .. }
+            | Effect::Sacrifice { .. }
+            | Effect::DiscardCard { .. }
+            | Effect::Mill { .. }
+            | Effect::Scry { .. }
+            | Effect::PumpAll { .. }
+            | Effect::DamageAll { .. }
+            | Effect::DamageEachPlayer { .. }
+            | Effect::DestroyAll { .. }
+            | Effect::Dig { .. }
+            | Effect::GainControl { .. }
+            | Effect::GainControlAll { .. }
+            | Effect::ControlNextTurn { .. }
+            | Effect::Attach { .. }
+            | Effect::UnattachAll { .. }
+            | Effect::Surveil { .. }
+            | Effect::Fight { .. }
+            | Effect::Bounce { .. }
+            | Effect::BounceAll { .. }
+            | Effect::Explore
+            | Effect::ExploreAll { .. }
+            | Effect::Investigate
+            | Effect::Tribute { .. }
+            | Effect::TimeTravel
+            | Effect::BecomeMonarch { .. }
+            | Effect::NoOp
+            | Effect::Proliferate
+            | Effect::ProliferateTarget { .. }
+            | Effect::Populate
+            | Effect::Clash
+            | Effect::Behold { .. }
+            | Effect::EndTheTurn
+            | Effect::EndCombatPhase
+            | Effect::Vote { .. }
+            | Effect::SeparateIntoPiles { .. }
+            | Effect::SwitchPT { .. }
+            | Effect::CopySpell { .. }
+            | Effect::EpicCopy { .. }
+            | Effect::CastCopyOfCard { .. }
+            | Effect::CopyTokenOf { .. }
+            | Effect::CreateTokenCopyFromPool { .. }
+            | Effect::Myriad
+            | Effect::Encore
+            | Effect::CombineHost { .. }
+            | Effect::ChooseAugmentAndCombineWithHost { .. }
+            | Effect::Meld { .. }
+            | Effect::ExileHaunting { .. }
+            | Effect::HideawayConceal { .. }
+            | Effect::CopyTokenBlockingAttacker { .. }
+            | Effect::BecomeCopy { .. }
+            | Effect::ChoosePermanent { .. }
+            | Effect::GainActivatedAbilitiesOfTarget { .. }
+            | Effect::ChooseCard { .. }
+            | Effect::PutCounter { .. }
+            | Effect::ChooseCounterKind { .. }
+            | Effect::PutChosenCounter { .. }
+            | Effect::PutCounterAll { .. }
+            | Effect::MultiplyCounter { .. }
+            | Effect::ChooseCounterAdjustment { .. }
+            | Effect::DoublePT { .. }
+            | Effect::DoublePTAll { .. }
+            | Effect::MoveCounters { .. }
+            | Effect::ReproduceEventCounters { .. }
+            | Effect::Animate { .. }
+            | Effect::ReturnAsAura { .. }
+            | Effect::RegisterBending { .. }
+            | Effect::GenericEffect { .. }
+            | Effect::Cleanup { .. }
+            | Effect::Mana { .. }
+            | Effect::Discard { .. }
+            | Effect::Shuffle { .. }
+            | Effect::Transform { .. }
+            | Effect::FlipPermanent { .. }
+            | Effect::SearchLibrary { .. }
+            | Effect::SearchOutsideGame { .. }
+            | Effect::OpenBoosterPack { .. }
+            | Effect::RevealHand { .. }
+            | Effect::RevealFromHand { .. }
+            | Effect::Reveal { .. }
+            | Effect::RevealChosenNumbers { .. }
+            | Effect::RevealTop { .. }
+            | Effect::ExileTop { .. }
+            | Effect::ExileFaceDownPile { .. }
+            | Effect::TargetOnly { .. }
+            | Effect::Choose { .. }
+            | Effect::OpponentGuess { .. }
+            | Effect::SwapChosenLabels { .. }
+            | Effect::ChooseDamageSource { .. }
+            | Effect::Suspect { .. }
+            | Effect::Unsuspect { .. }
+            | Effect::Connive { .. }
+            | Effect::PhaseOut { .. }
+            | Effect::PhaseIn { .. }
+            | Effect::ForceBlock { .. }
+            | Effect::ForceAttack { .. }
+            | Effect::SolveCase
+            | Effect::BecomePrepared { .. }
+            | Effect::BecomeUnprepared { .. }
+            | Effect::BecomeSaddled { .. }
+            | Effect::SetClassLevel { .. }
+            | Effect::CreateDelayedTrigger { .. }
+            | Effect::AddTargetReplacement { .. }
+            | Effect::AddRestriction { .. }
+            | Effect::ReduceNextSpellCost { .. }
+            | Effect::GrantNextSpellAbility { .. }
+            | Effect::AddPendingETBCounters { .. }
+            | Effect::AddPendingEntersModifications { .. }
+            | Effect::CreateEmblem { .. }
+            | Effect::PayCost { .. }
+            | Effect::CastFromZone { .. }
+            | Effect::FreeCastFromZones { .. }
+            | Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
+            | Effect::PreventDamage { .. }
+            | Effect::CreateDamageReplacement { .. }
+            | Effect::CreateDrawReplacement { .. }
+            | Effect::CreatePlaneswalkReplacement { .. }
+            | Effect::LoseTheGame { .. }
+            | Effect::WinTheGame { .. }
+            | Effect::RollDie { .. }
+            | Effect::FlipCoin { .. }
+            | Effect::FlipCoins { .. }
+            | Effect::FlipCoinUntilLose { .. }
+            | Effect::RingTemptsYou
+            | Effect::VentureIntoDungeon
+            | Effect::VentureInto { .. }
+            | Effect::TakeTheInitiative
+            | Effect::ArrangePlanarDeckTop { .. }
+            | Effect::Planeswalk
+            | Effect::ChaosEnsues
+            | Effect::ReverseTurnOrder
+            | Effect::RedistributeLifeTotals
+            | Effect::OpenAttractions { .. }
+            | Effect::RollToVisitAttractions
+            | Effect::AssembleContraptions { .. }
+            | Effect::AssembleContraptionsFromRollDifference
+            | Effect::CrankContraptions { .. }
+            | Effect::ReassembleContraption { .. }
+            | Effect::AssembleContraptionOnSprocket { .. }
+            | Effect::ReassembleContraptionOnSprocket { .. }
+            | Effect::PutSticker { .. }
+            | Effect::ApplySticker { .. }
+            | Effect::ProcessRadCounters
+            | Effect::GrantCastingPermission { .. }
+            | Effect::ChooseFromZone { .. }
+            | Effect::RememberCard { .. }
+            | Effect::NoteManaSpent
+            | Effect::ForEachCategory { .. }
+            | Effect::ChooseObjectsIntoTrackedSet { .. }
+            | Effect::ChooseAndSacrificeRest { .. }
+            | Effect::EachPlayerCopyChosen { .. }
+            | Effect::Exploit { .. }
+            | Effect::GainEnergy { .. }
+            | Effect::GivePlayerCounter { .. }
+            | Effect::LoseAllPlayerCounters { .. }
+            | Effect::ExileFromTopUntil { .. }
+            | Effect::RevealUntil { .. }
+            | Effect::Discover { .. }
+            | Effect::Heist { .. }
+            | Effect::HeistExile
+            | Effect::Cascade
+            | Effect::Ripple { .. }
+            | Effect::MiracleCast { .. }
+            | Effect::MadnessCast { .. }
+            | Effect::PutAtLibraryPosition { .. }
+            | Effect::ChooseDrawnThisTurnPayOrTopdeck { .. }
+            | Effect::PutOnTopOrBottom { .. }
+            | Effect::GiftDelivery { .. }
+            | Effect::Goad { .. }
+            | Effect::GoadAll { .. }
+            | Effect::Detain { .. }
+            | Effect::SetRoomDoorLock { .. }
+            | Effect::ExchangeControl { .. }
+            | Effect::ChangeTargets { .. }
+            | Effect::Manifest { .. }
+            | Effect::ManifestDread
+            | Effect::Cloak { .. }
+            | Effect::TurnFaceUp { .. }
+            | Effect::TurnFaceDown { .. }
+            | Effect::ExtraTurn { .. }
+            | Effect::GrantExtraLoyaltyActivations { .. }
+            | Effect::SkipNextTurn { .. }
+            | Effect::SkipNextStep { .. }
+            | Effect::AdditionalPhase { .. }
+            | Effect::Double { .. }
+            | Effect::RuntimeHandled { .. }
+            | Effect::Incubate { .. }
+            | Effect::Amass { .. }
+            | Effect::EmpowerJace { .. }
+            | Effect::Monstrosity { .. }
+            | Effect::Specialize
+            | Effect::Renown { .. }
+            | Effect::Bolster { .. }
+            | Effect::Adapt { .. }
+            | Effect::Learn
+            | Effect::Forage
+            | Effect::CompletePlayerAction { .. }
+            | Effect::Harness
+            | Effect::CollectEvidence { .. }
+            | Effect::Endure { .. }
+            | Effect::BlightEffect { .. }
+            | Effect::Seek { .. }
+            | Effect::SetLifeTotal { .. }
+            | Effect::ExchangeLifeWithStat { .. }
+            | Effect::ExchangeLifeTotals { .. }
+            | Effect::SetDayNight { .. }
+            | Effect::GiveControl { .. }
+            | Effect::RemoveFromCombat { .. }
+            | Effect::BecomeBlocked { .. }
+            | Effect::Conjure { .. }
+            | Effect::ApplyPerpetual { .. }
+            | Effect::Intensify { .. }
+            | Effect::DraftFromSpellbook { .. }
+            | Effect::ChooseOneOf { .. }
+            | Effect::Unimplemented { .. } => None,
+        }
+    }
+
     /// Whether this ability chain contains a zone change bounded by `event`.
     pub(crate) fn contains_duration_event(&self, event: DurationEvent) -> bool {
-        (matches!(self.effect, Effect::ChangeZone { .. })
-            && self.duration.as_ref().and_then(Duration::zone_change_event) == Some(event))
+        self.bounded_zone_change_event() == Some(event)
             || self
                 .sub_ability
                 .as_ref()
@@ -33645,8 +34321,7 @@ impl ResolvedAbility {
     }
 
     pub(crate) fn record_duration_event_recursive(&mut self, event: DurationEvent) {
-        if matches!(self.effect, Effect::ChangeZone { .. })
-            && self.duration.as_ref().and_then(Duration::zone_change_event) == Some(event)
+        if self.bounded_zone_change_event() == Some(event)
             && !self.context.duration_events.contains(&event)
         {
             self.context.duration_events.push(event);
@@ -33699,6 +34374,7 @@ impl ResolvedAbility {
             min_x_value: 0,
             announced_x: None,
             cant_be_copied: false,
+            illegal_targets_disposition: IllegalTargetsDisposition::DoesNotResolve,
             copy_count_status: CopyCountStatus::Pending,
             forward_result: false,
             unless_pay: None,
@@ -33731,6 +34407,7 @@ impl ResolvedAbility {
             activation_cost_reduction: None,
             activation_record: None,
             illegal_target_slots: Vec::new(),
+            illegal_local_target_slots: Vec::new(),
             modal: None,
             mode_abilities: Vec::new(),
             parent_target_missing_reason: None,
@@ -34326,6 +35003,24 @@ impl ResolvedAbility {
                 && Some(r.current_incarnation) == current_incarnation)
     }
 
+    /// CR 113.7 + CR 400.7: the ability's source as the object it was when the ability was
+    /// created; a spell, which captures no incarnation, is its current stack object.
+    pub fn source_ref(
+        &self,
+        state: &crate::types::game_state::GameState,
+    ) -> Option<crate::types::identifiers::ObjectIncarnationRef> {
+        let incarnation = self.source_incarnation.or_else(|| {
+            state
+                .objects
+                .get(&self.source_id)
+                .map(|obj| obj.incarnation)
+        })?;
+        Some(crate::types::identifiers::ObjectIncarnationRef::of(
+            self.source_id,
+            incarnation,
+        ))
+    }
+
     /// CR 400.7: True if the ability's source is still the same object instance it
     /// was when the ability was created. Full triggered-source provenance takes
     /// precedence; activated and delayed self-transform abilities fall back to
@@ -34361,8 +35056,31 @@ impl ResolvedAbility {
         &self,
         state: &crate::types::game_state::GameState,
     ) -> bool {
-        let Some(source) = self.trigger_source.as_ref() else {
+        if self.trigger_source.is_none() {
             return true;
+        }
+        state
+            .objects
+            .get(&self.source_id)
+            .is_some_and(|object| self.is_own_departure_successor_in(state, object.zone, None))
+    }
+
+    /// CR 400.7e: True when the source, sitting in public `zone`, is the
+    /// immediate successor of its own triggering zone change: the triggering
+    /// event moved this exact captured identity into `zone`, and no later zone
+    /// change of the same storage id has been recorded. A trigger cannot find
+    /// the new object in a hidden zone. Callers pass the zone the source
+    /// occupies, or, for a move still being applied, the zone it is leaving
+    /// plus that move's departing incarnation: an incarnation departs only
+    /// once, so a record carrying it is that in-flight move, not an earlier one.
+    pub(crate) fn is_own_departure_successor_in(
+        &self,
+        state: &crate::types::game_state::GameState,
+        zone: Zone,
+        in_flight_departure: Option<u64>,
+    ) -> bool {
+        let Some(source) = self.trigger_source.as_ref() else {
+            return false;
         };
         let Some(crate::types::GameEvent::ZoneChanged {
             object_id,
@@ -34377,10 +35095,8 @@ impl ResolvedAbility {
             || record.trigger_source_context().is_none_or(|event_source| {
                 event_source.identity.reference != source.identity.reference
             })
-            || state
-                .objects
-                .get(object_id)
-                .is_none_or(|object| object.zone != *to)
+            || zone != *to
+            || !zone.is_public()
         {
             return false;
         }
@@ -34400,7 +35116,14 @@ impl ResolvedAbility {
                 .zone_changes_this_turn
                 .iter()
                 .skip(record.turn_zone_change_index + 1)
-                .all(|later| later.object_id != self.source_id)
+                .all(|later| {
+                    later.object_id != self.source_id
+                        || in_flight_departure.is_some_and(|departing| {
+                            later.trigger_source_context().is_some_and(|context| {
+                                context.identity.reference.incarnation == departing
+                            })
+                        })
+                })
     }
 
     /// CR 400.7e: True when an off-battlefield zone-match would mis-latch SelfRef
@@ -37910,8 +38633,8 @@ mod tests {
         assert_eq!(ability, deserialized);
     }
 
-    /// CR 608.2b: a resolution carrier's illegal-slot stamp survives a
-    /// persist/restore round trip, and an unstamped ability omits the field.
+    /// CR 608.2b: resolution legality stamps survive a persist/restore round
+    /// trip, while unstamped abilities omit both fields.
     #[test]
     fn resolved_ability_illegal_target_slots_roundtrip() {
         let mut ability = ResolvedAbility::new(
@@ -37927,14 +38650,25 @@ mod tests {
         );
         let unstamped = serde_json::to_string(&ability).unwrap();
         assert!(
-            !unstamped.contains("illegal_target_slots"),
-            "an empty stamp is not serialized"
+            !unstamped.contains("illegal_target_slots")
+                && !unstamped.contains("illegal_local_target_slots"),
+            "empty stamps are not serialized"
         );
 
         ability.illegal_target_slots = vec![1];
+        let legacy_json = serde_json::to_string(&ability).unwrap();
+        let legacy: ResolvedAbility = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(legacy.illegal_target_slots, vec![1]);
+        assert!(
+            legacy.illegal_local_target_slots.is_empty(),
+            "a legacy payload without the local stamp defaults empty"
+        );
+
+        ability.illegal_local_target_slots = vec![0];
         let json = serde_json::to_string(&ability).unwrap();
         let deserialized: ResolvedAbility = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.illegal_target_slots, vec![1]);
+        assert_eq!(deserialized.illegal_local_target_slots, vec![0]);
         assert_eq!(ability, deserialized);
     }
 
@@ -38084,6 +38818,7 @@ mod tests {
             mana_ability_produced: None,
             clash_result: None,
             room_door: Some(crate::game::game_object::RoomDoor::Left),
+            granting_object: None,
         };
         let json = serde_json::to_string(&trigger).unwrap();
         let deserialized: TriggerDefinition = serde_json::from_str(&json).unwrap();
@@ -38144,6 +38879,7 @@ mod tests {
             bypass_beneficiary: None,
             protection_does_not_remove: None,
             room_door: None,
+            granting_object: None,
         };
         let json = serde_json::to_string(&static_def).unwrap();
         let deserialized: StaticDefinition = serde_json::from_str(&json).unwrap();
@@ -38406,6 +39142,77 @@ mod tests {
         );
     }
 
+    /// SHAPE: a quoted trigger whose `execute` fully parsed (Jessie Zane's
+    /// "When this creature enters, draw a card.") is installable — the
+    /// `GrantTrigger` accept arm. Paired positive for the two rejection pins
+    /// below: removing the gate must not change this arm's verdict.
+    #[test]
+    fn perpetual_grant_trigger_try_from_accepts_clean_trigger() {
+        let granted =
+            TriggerDefinition::new(TriggerMode::ChangesZone).execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: default_quantity_one(),
+                    target: default_target_filter_controller(),
+                },
+            ));
+        let modification = ContinuousModification::GrantTrigger {
+            trigger: Box::new(granted),
+        };
+        assert!(
+            matches!(
+                PerpetualGrantModification::try_from(modification),
+                Ok(PerpetualGrantModification::GrantTrigger { .. })
+            ),
+            "a fully-parsed quoted trigger must be accepted as installable"
+        );
+    }
+
+    /// SHAPE (V2N gate pin): a quoted trigger with NO `execute` body never
+    /// parsed its effect half, so the whole grant fails closed rather than
+    /// install a trigger that does nothing.
+    #[test]
+    fn perpetual_grant_trigger_try_from_rejects_missing_execute() {
+        let granted = TriggerDefinition::new(TriggerMode::ChangesZone);
+        let modification = ContinuousModification::GrantTrigger {
+            trigger: Box::new(granted.clone()),
+        };
+        assert_eq!(
+            PerpetualGrantModification::try_from(modification),
+            Err(ContinuousModification::GrantTrigger {
+                trigger: Box::new(granted),
+            }),
+            "a quoted trigger with no execute body must fail the whole perpetual grant closed"
+        );
+    }
+
+    /// SHAPE (V2N gate pin): a quoted trigger whose nested `execute` tree still
+    /// carries `Effect::Unimplemented` (Racketeer Boss's "... and this spell
+    /// perpetually loses this ability." — the loses class has no model) fails
+    /// the WHOLE grant closed rather than install half a multi-quote grant
+    /// while reporting the card supported.
+    #[test]
+    fn perpetual_grant_trigger_try_from_rejects_unimplemented_content() {
+        let granted =
+            TriggerDefinition::new(TriggerMode::ChangesZone).execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Unimplemented {
+                    name: "loses".to_string(),
+                    description: Some("this spell perpetually loses this ability".to_string()),
+                },
+            ));
+        let modification = ContinuousModification::GrantTrigger {
+            trigger: Box::new(granted.clone()),
+        };
+        assert_eq!(
+            PerpetualGrantModification::try_from(modification),
+            Err(ContinuousModification::GrantTrigger {
+                trigger: Box::new(granted),
+            }),
+            "a quoted trigger with unparsed inner content must fail the whole perpetual grant closed"
+        );
+    }
+
     #[test]
     fn effect_unimplemented_variant_roundtrip() {
         let effect = Effect::Unimplemented {
@@ -38577,6 +39384,7 @@ mod tests {
                 bypass_beneficiary: None,
                 protection_does_not_remove: None,
                 room_door: None,
+                granting_object: None,
             }],
             duration: Some(Duration::UntilEndOfTurn),
             target: None,
