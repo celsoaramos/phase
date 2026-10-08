@@ -7609,7 +7609,7 @@ mod tests {
         };
         assert!(typed.properties.iter().any(|property| matches!(property,
             FilterProp::Cmc { comparator: Comparator::EQ, value: QuantityExpr::Ref {
-                qty: QuantityRef::Variable(name)
+                qty: QuantityRef::Variable { name }
             }} if name == "X")));
         let resolved = build_resolved_from_def(definition, source, P0);
         assert!(resolved.chosen_x.is_none());
@@ -7881,7 +7881,9 @@ mod tests {
                                     vec![FilterProp::Cmc {
                                         comparator: Comparator::EQ,
                                         value: QuantityExpr::Ref {
-                                            qty: QuantityRef::Variable("X".to_string()),
+                                            qty: QuantityRef::Variable {
+                                                name: "X".to_string(),
+                                            },
                                         },
                                     }],
                                 )),
