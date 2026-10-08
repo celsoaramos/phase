@@ -275,6 +275,7 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
         detached_remainder: _,
         min_x_value: _,                  // u32
         cant_be_copied: _,               // bool
+        illegal_targets_disposition: _,  // CR 608.2b resolution disposition, not a dynamic read
         copy_count_status: _,            // status tag
         forward_result: _,               // bool
         distribution: _,                 // concrete pre-assigned (TargetRef, u32) portions
@@ -475,6 +476,9 @@ fn scan_zone_choice_candidate_source(
         // record, narrowed by live zone membership. Both are ability/state reads
         // this local node cannot see; fail closed.
         ZoneChoiceCandidateSource::CostPaidObjects => Axes::CONSERVATIVE,
+        // CR 608.2c: the pool is the ability's handed-over targets, narrowed by
+        // live zone membership; fail closed like the cost-paid record.
+        ZoneChoiceCandidateSource::ParentTargets => Axes::CONSERVATIVE,
     }
 }
 
@@ -2398,6 +2402,7 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
         // pattern can only over-report, never under-report. The population axis is
         // not decomposed here because no caller needs a narrower answer.
         QuantityRef::DistinctCardTypes { .. } => Axes::CONSERVATIVE,
+        QuantityRef::SharedCardTypes { .. } => Axes::CONSERVATIVE,
         QuantityRef::DistinctSubtypes { .. } => Axes::CONSERVATIVE,
         QuantityRef::CardsExiledBySource => Axes::NONE,
         QuantityRef::ExiledCardPower { index: _ } => Axes::NONE,
@@ -2448,9 +2453,10 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
         // `last_effect_excess_amount` / `last_effect_counts_by_player` /
         // `clause_minimum_snapshot`, the last read FIRST (`game/quantity.rs`,
         // the `PreviousEffectAmount` arm) as the CR 608.2h frozen value. All are
-        // cleared at depth-0 chain entry (`resolve_ability_chain`); `apply()`
-        // additionally clears `last_effect_count` and the per-player table at
-        // every player action. None is a triggering-event characteristic
+        // cleared at depth-0 chain entry (`resolve_ability_chain`);
+        // `stack::resolve_top` additionally clears `last_effect_count` and the
+        // per-player table as each stack object begins resolving, and `apply()`
+        // at every player action. None is a triggering-event characteristic
         // (event), a board-scoped mutable aggregate a sibling copy could mutate
         // (sibling), or a player-level per-turn projected resource (projected).
         // Destructured without `..` so a future field forces re-classification.
@@ -3255,7 +3261,7 @@ fn scan_target_filter(x: &TargetFilter, ctx: FilterReadContext, mode: ScanMode) 
         TargetFilter::SelfRef => Axes::NONE,
         // CR 201.5a: a source-relative object ref (the granting object), like
         // SelfRef — no event/sibling/projected resource axis.
-        TargetFilter::GrantingObject => Axes::NONE,
+        TargetFilter::GrantingObject { .. } => Axes::NONE,
         // CR 608.2c: source-relative object ref (concretized to SpecificObject),
         // like SelfRef — no event/sibling/projected resource axis.
         TargetFilter::OriginalSource => Axes::NONE,
@@ -3487,6 +3493,9 @@ fn scan_object_scope(x: &ObjectScope) -> Axes {
         // resolving ability's context — no event/sibling projected axis
         // (mirrors Target/Demonstrative).
         ObjectScope::ChainRootTarget => Axes::NONE,
+        // CR 201.5a: both name one fixed object — the stamped granter or the bound
+        // incarnation. Neither has an event/sibling axis.
+        ObjectScope::GrantingObject | ObjectScope::SpecificObject { .. } => Axes::NONE,
         ObjectScope::EventTarget => Axes {
             event: true,
             sibling: false,
@@ -3606,6 +3615,7 @@ fn scan_trigger_definition(t: &TriggerDefinition, mode: ScanMode) -> Axes {
         taps_for_mana_produced: _,
         mana_ability_produced: _,
         clash_result: _,
+        granting_object: _,
     } = t;
 
     let mut acc = Axes::NONE;
@@ -4725,7 +4735,7 @@ fn scan_player_filter(x: &PlayerFilter, mode: ScanMode) -> Axes {
             acc
         }
         PlayerFilter::ChosenPlayer { index: _ } => Axes::NONE,
-        PlayerFilter::ParentObjectTargetOwner => Axes {
+        PlayerFilter::ParentObjectTargetOwner | PlayerFilter::GrantingObjectCaster => Axes {
             event: true,
             sibling: false,
             projected: false,
@@ -5128,6 +5138,7 @@ fn ability_definition_axes(def: &AbilityDefinition, mode: ScanMode) -> Axes {
         target_choice_timing: _,
         min_x_value: _,
         cant_be_copied: _,
+        illegal_targets_disposition: _, // CR 608.2b resolution disposition, not a dynamic read
         forward_result: _,
         target_selection_mode: _,
         sub_link: _,
@@ -5143,6 +5154,7 @@ fn ability_definition_axes(def: &AbilityDefinition, mode: ScanMode) -> Axes {
         // `types::ability::UnloweredGuard`.)
         unlowered_guard: _,
         face_down_in_exile: _,
+        granting_object: _,
     } = def;
 
     let mut acc = scan_effect(effect, mode);
@@ -5994,6 +6006,7 @@ fn scan_continuous_modification(m: &ContinuousModification, mode: ScanMode) -> A
         | ContinuousModification::SetBasicLandType { .. }
         | ContinuousModification::SetChosenBasicLandType
         | ContinuousModification::SetChosenName
+        | ContinuousModification::SubstituteTextWord { .. }
         // CR 612.8 / CR 613.1c: a literal-name text-changing effect reads no board
         // aggregate or projected resource (sibling of `SetChosenName`).
         | ContinuousModification::SetTextName { .. }
@@ -9386,7 +9399,9 @@ mod tests {
         // Pin the legacy shape's classification so the delta is explicit and a
         // future retirement of `ManaColorSpent` cannot silently change it.
         let legacy = AbilityCondition::ManaColorSpent {
-            color: ManaColor::Red,
+            color: crate::types::ability::SpentColor::ColorWord {
+                color: ManaColor::Red,
+            },
             minimum: 3,
         };
         let legacy_axes = scan_ability_condition(&legacy, ScanMode::Conservative);

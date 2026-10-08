@@ -91,7 +91,6 @@ fn abandon_pending_spell_casts(
             | PendingCostMoveResume::WardSacrificePayment { .. }
             | PendingCostMoveResume::ReplacementMayCost { .. }
             | PendingCostMoveResume::Foretell { .. }
-            | PendingCostMoveResume::DelveManaPayment { .. }
             | PendingCostMoveResume::UnlessBouncePayment { .. }
             | PendingCostMoveResume::ManaAbilityPayment { .. }
             | PendingCostMoveResume::LoyaltyActivation { .. }
@@ -597,9 +596,10 @@ pub fn eliminate_players_simultaneously(
 }
 
 /// CR 103.5 + CR 800.4a: Prune eliminated players from the in-flight
-/// mulligan pending list. If pruning empties it, finish the mulligan flow
-/// directly — bottoming is now resolved per-entry at the declare point, so
-/// there is no separate batch bottoms phase left to advance to.
+/// mulligan pending list and held declarations. If pruning empties the pending
+/// list, the mulligan flow advances (closing the declare round or finishing) —
+/// bottoming is now resolved per-entry at the declare point, so there is no
+/// separate batch bottoms phase left to advance to.
 fn prune_mulligan_pending(state: &mut GameState, events: &mut Vec<GameEvent>) {
     let alive: HashSet<PlayerId> = state
         .prepaid_mulligan_bottoms
@@ -615,6 +615,7 @@ fn prune_mulligan_pending(state: &mut GameState, events: &mut Vec<GameEvent>) {
         WaitingFor::MulliganDecision {
             pending,
             free_first_mulligan,
+            declared,
         } => {
             // CR 800.4a: A pruned player whose entry was mid-`BottomCards
             // { then: UseSerumPowder { object_id } }` needs no special
@@ -623,20 +624,23 @@ fn prune_mulligan_pending(state: &mut GameState, events: &mut Vec<GameEvent>) {
             // `eliminate_players_simultaneously` has already exiled every
             // object the leaving player owned, including the Serum Powder
             // itself. A plain is_alive-filtered removal of the whole entry
-            // is sufficient.
+            // is sufficient. A held declaration is dropped the same way, and
+            // the round still closes for the players who remain.
             let alive: Vec<_> = pending
                 .into_iter()
                 .filter(|e| players::is_alive(state, e.player))
                 .collect();
-            if alive.is_empty() {
-                state.prepaid_mulligan_bottoms.clear();
-                state.waiting_for = super::mulligan::finish_mulligans_public(state, events);
-            } else {
-                state.waiting_for = WaitingFor::MulliganDecision {
-                    pending: alive,
-                    free_first_mulligan,
-                };
-            }
+            let declared: Vec<_> = declared
+                .into_iter()
+                .filter(|d| players::is_alive(state, d.player))
+                .collect();
+            state.waiting_for = super::mulligan::advance_after_decision(
+                state,
+                alive,
+                declared,
+                free_first_mulligan,
+                events,
+            );
         }
         WaitingFor::OpeningHandBottomCards { pending, reason } => {
             let alive: Vec<_> = pending
@@ -2249,6 +2253,7 @@ mod tests {
             candidates: Vec::new(),
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
         state.push_batch_delivery(crate::types::game_state::PendingBatchDeliveries {
             logical_zone_change_group: group,
@@ -2316,6 +2321,7 @@ mod tests {
             candidates: Vec::new(),
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
         state.push_change_zone_iteration(pending_change_zone_iteration(
             group,
@@ -3522,6 +3528,7 @@ mod tests {
             candidates: vec![],
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
         // Coupled continuation slots the resume drain would clear on a normal answer.
         state.replacement_may_cost_paused = true;
@@ -3663,6 +3670,7 @@ mod tests {
             candidates: Vec::new(),
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
         state.push_connive_reentry(PendingConniveReentry {
             conniver: state
@@ -3717,6 +3725,7 @@ mod tests {
             candidates: Vec::new(),
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
         state.push_batch_delivery(pending_search_found_zone_delivery(found));
         assert!(state.active_batch_delivery().is_some());
@@ -3763,6 +3772,7 @@ mod tests {
             candidates: vec![],
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
         let parked_found = ObjectId(77);
         state.pending_search_found_batch =
@@ -3839,6 +3849,7 @@ mod tests {
             candidates: Vec::new(),
             kind: Default::default(),
             last_applied_decides: false,
+            remember_identity: None,
         };
         let source = create_object(
             &mut state,
