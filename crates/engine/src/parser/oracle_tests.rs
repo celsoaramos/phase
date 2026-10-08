@@ -3921,9 +3921,16 @@ fn turtle_van_attack_trigger_conditional_double_counters() {
         );
     let trigger = r.triggers.first().expect("attack trigger");
     let execute = trigger.execute.as_deref().expect("execute ability");
+    // CR 115.1 + CR 601.2c: "that crewed it this turn" restricts which creature
+    // is a legal target. No filter expresses the crewer set yet, so the head is
+    // an explicit counter-tail gap instead of a placement onto ANY creature.
     assert!(
-        matches!(&*execute.effect, Effect::PutCounter { .. }),
-        "head clause must be PutCounter, got {:?}",
+        matches!(
+            &*execute.effect,
+            Effect::Unimplemented { name, description: Some(fragment) }
+                if name == "put_counter_tail" && fragment.contains("that crewed it")
+        ),
+        "head clause must surface the crewer restriction as a gap, got {:?}",
         execute.effect
     );
     let sub = execute
@@ -25589,6 +25596,40 @@ fn banner_of_kinship_composes_choose_and_chosen_dependent_counters() {
         } if name == "fellowship"
     ));
 }
+
+/// Production-parser regression for Cemetery Prowler #6898. The isolated
+/// static-line parser is insufficient: the generated card-data path must carry
+/// the shared-card-type quantity into the exported static definition too.
+#[test]
+fn cemetery_prowler_production_parse_exports_shared_card_types() {
+    let parsed = parse(
+        "Vigilance\nWhenever this creature enters or attacks, exile a card from a graveyard.\nSpells you cast cost {1} less to cast for each card type they share with cards exiled with this creature.",
+        "Cemetery Prowler",
+        &[Keyword::Vigilance],
+        &["Creature"],
+        &["Wolf"],
+    );
+    let static_def = parsed
+        .statics
+        .iter()
+        .find(|def| matches!(def.mode, StaticMode::ModifyCost { .. }))
+        .expect("Cemetery Prowler must export a cost modifier");
+    let StaticMode::ModifyCost {
+        dynamic_count: Some(QuantityRef::SharedCardTypes { source }),
+        ..
+    } = &static_def.mode
+    else {
+        panic!(
+            "production parser must export SharedCardTypes, got {:?}",
+            static_def.mode
+        );
+    };
+    assert!(matches!(
+        source,
+        crate::types::ability::CardTypeSetSource::ExiledBySource
+    ));
+}
+
 #[test]
 fn oubliette_host_bound_parse_structure() {
     let text = "When this enchantment enters, target creature phases out until this enchantment leaves the battlefield. Tap that creature as it phases in this way.";
@@ -26340,7 +26381,7 @@ fn rider_declaring_its_own_target_fails_closed() {
 }
 
 /// CR 608.2c: an "if that creature has <predicate>," gate whose predicate is not
-/// a keyword (a counter or power threshold) cannot be evaluated by the
+/// a keyword (a counter threshold) cannot be evaluated by the
 /// keyword check, so it must fail closed as a named `Unimplemented` rather than
 /// ship as an inert `TargetHasKeywordInstead{Unknown}` that reads as supported.
 /// Real keyword gates (Toxic, Flying) are unchanged.
@@ -26353,9 +26394,9 @@ fn unknown_keyword_gate_fails_closed() {
             &["Instant"][..],
         ),
         (
-            "Strider, Ranger of the North",
-            "Landfall — Whenever a land you control enters, target creature gets +1/+1 until end of turn. Then if that creature has power 4 or greater, it gains first strike until end of turn.",
-            &["Creature"][..],
+            "Hadana's Climb",
+            "At the beginning of combat on your turn, put a +1/+1 counter on target creature you control. Then if that creature has three or more +1/+1 counters on it, transform Hadana's Climb.",
+            &["Enchantment"][..],
         ),
         (
             "Urdnan, Dromoka Warrior",
@@ -26410,6 +26451,509 @@ fn unknown_keyword_gate_fails_closed() {
             .unwrap_or_else(|| panic!("{name}: keyword gate must survive: {r:#?}"));
         assert!(keyword_matches(gate), "{name}: wrong keyword {gate:?}");
     }
+}
+
+/// CR 208.1 + CR 608.2c + CR 608.2h: "Then if that creature has power/toughness
+/// N or greater, …" names the earlier instruction's target and reads its current
+/// power/toughness at resolution. It lowers to a Target-scoped live
+/// `TargetMatchesFilter{PtComparison}` on the gated sub-ability — not the
+/// fail-closed `target_has_unknown_keyword_condition` (Strider, Dormant Grove,
+/// Yavimaya Bloomsage).
+#[test]
+fn target_has_pt_threshold_gate_lowers_to_target_filter() {
+    fn find_pt_gate(def: &AbilityDefinition) -> Option<(&AbilityDefinition, PtStat, i32)> {
+        if let Some(AbilityCondition::TargetMatchesFilter {
+            filter: TargetFilter::Typed(tf),
+            use_lki: false,
+            subject_slot: None,
+        }) = &def.condition
+        {
+            if let [FilterProp::PtComparison {
+                stat,
+                scope: PtValueScope::Current,
+                comparator: Comparator::GE,
+                value: QuantityExpr::Fixed { value },
+            }] = tf.properties.as_slice()
+            {
+                return Some((def, *stat, *value));
+            }
+        }
+        def.sub_ability.as_deref().and_then(find_pt_gate)
+    }
+    for (name, text, types, expected_stat, expected_n) in [
+        (
+            "Strider, Ranger of the North",
+            "Landfall — Whenever a land you control enters, target creature gets +1/+1 until end of turn. Then if that creature has power 4 or greater, it gains first strike until end of turn.",
+            &["Creature"][..],
+            PtStat::Power,
+            4,
+        ),
+        (
+            "Dormant Grove",
+            "At the beginning of combat on your turn, put a +1/+1 counter on target creature you control. Then if that creature has toughness 6 or greater, transform this enchantment.",
+            &["Enchantment"][..],
+            PtStat::Toughness,
+            6,
+        ),
+        (
+            "Yavimaya Bloomsage",
+            "At the beginning of your end step, put a +1/+1 counter on target creature you control. Then if that creature has power 7 or greater, this creature becomes prepared. (While it's prepared, you may cast a copy of its spell. Doing so unprepares it.)",
+            &["Creature"][..],
+            PtStat::Power,
+            7,
+        ),
+    ] {
+        let r = parse(text, name, &[], types, &[]);
+        assert!(
+            !format!("{r:?}").contains("Unimplemented"),
+            "{name}: the threshold gate must parse with no gap: {r:#?}"
+        );
+        let [trigger] = r.triggers.as_slice() else {
+            panic!("{name}: expected exactly one trigger: {r:#?}");
+        };
+        let execute = trigger
+            .execute
+            .as_deref()
+            .unwrap_or_else(|| panic!("{name}: trigger must have an execute body"));
+        let (gated, stat, n) = find_pt_gate(execute)
+            .unwrap_or_else(|| panic!("{name}: Target-scoped PtComparison gate: {execute:#?}"));
+        assert_eq!((stat, n), (expected_stat, expected_n), "{name}");
+
+        if name == "Strider, Ranger of the North" {
+            assert!(
+                matches!(
+                    &*execute.effect,
+                    Effect::Pump {
+                        target: TargetFilter::Typed(_),
+                        ..
+                    }
+                ),
+                "{name}: root is the targeted pump: {execute:#?}"
+            );
+            match &*gated.effect {
+                Effect::GenericEffect {
+                    static_abilities, ..
+                } => {
+                    // "it" binds to the pump's target: the first-strike grant
+                    // affects `ParentTarget`, not the trigger source.
+                    assert!(
+                        static_abilities.iter().any(|s| s.affected
+                            == Some(TargetFilter::ParentTarget)
+                            && s.modifications.iter().any(|m| matches!(
+                                m,
+                                ContinuousModification::AddKeyword {
+                                    keyword: Keyword::FirstStrike
+                                }
+                            ))),
+                        "{name}: gated body grants first strike to the parent target: \
+                         {static_abilities:?}"
+                    );
+                }
+                other => panic!("{name}: expected GenericEffect gated body, got {other:?}"),
+            }
+        }
+        // "this enchantment" / "this creature" in the gated body refers to the
+        // trigger source, not the gate's target: the body must stay `SelfRef`.
+        if name == "Dormant Grove" {
+            assert!(
+                matches!(
+                    &*gated.effect,
+                    Effect::Transform {
+                        target: TargetFilter::SelfRef,
+                        ..
+                    }
+                ),
+                "{name}: gated body transforms the source: {:?}",
+                gated.effect
+            );
+        }
+        if name == "Yavimaya Bloomsage" {
+            assert!(
+                matches!(
+                    &*gated.effect,
+                    Effect::BecomePrepared {
+                        target: TargetFilter::SelfRef,
+                    }
+                ),
+                "{name}: gated body prepares the source: {:?}",
+                gated.effect
+            );
+        }
+    }
+}
+
+/// CR 115.1 + CR 608.2c: the target P/T threshold gate's "that creature" names
+/// the earlier instruction's target, but `TargetMatchesFilter { subject_slot:
+/// None }` reads the gated node's own first object target. A rider that
+/// announces its own target ("…, destroy target creature") would have the gate
+/// test the rider's object, so it fails closed as
+/// `target_pt_threshold_rider_declares_target` — in both surface forms of the
+/// recognizer (present-tense "has power N" and possessive "'s power is N").
+#[test]
+fn target_pt_threshold_rider_declaring_its_own_target_fails_closed() {
+    fn has_target_matches_filter(def: &AbilityDefinition) -> bool {
+        matches!(
+            def.condition,
+            Some(AbilityCondition::TargetMatchesFilter { .. })
+        ) || def
+            .sub_ability
+            .as_deref()
+            .is_some_and(has_target_matches_filter)
+    }
+    for text in [
+        "Whenever a land you control enters, put a +1/+1 counter on target creature you control. Then if that creature has power 4 or greater, destroy target creature.",
+        "Whenever a land you control enters, put a +1/+1 counter on target creature you control. Then if that creature's power is 4 or greater, destroy target creature.",
+    ] {
+        let r = parse(text, "Test Warden", &[], &["Creature"], &[]);
+        let [trigger] = r.triggers.as_slice() else {
+            panic!("{text}: expected exactly one trigger: {r:#?}");
+        };
+        let execute = trigger
+            .execute
+            .as_deref()
+            .unwrap_or_else(|| panic!("{text}: trigger must have an execute body"));
+        // REACH GUARD: the first instruction parsed normally.
+        assert!(
+            matches!(
+                &*execute.effect,
+                Effect::PutCounter {
+                    target: TargetFilter::Typed(_),
+                    ..
+                }
+            ),
+            "{text}: root is the targeted counter placement: {execute:#?}"
+        );
+        let rider = execute
+            .sub_ability
+            .as_deref()
+            .unwrap_or_else(|| panic!("{text}: the rider must follow: {execute:#?}"));
+        assert!(
+            matches!(
+                &*rider.effect,
+                Effect::Unimplemented { name, .. }
+                    if name == "target_pt_threshold_rider_declares_target"
+            ),
+            "{text}: a rider with its own target must fail closed: {rider:#?}"
+        );
+        assert!(
+            !has_target_matches_filter(execute),
+            "{text}: no misbinding TargetMatchesFilter gate may survive: {execute:#?}"
+        );
+    }
+}
+
+/// The execute body of a one-trigger landfall card whose first instruction is
+/// "put a +1/+1 counter on target creature you control" — asserted as the
+/// REACH GUARD that the chain parsed past its first instruction.
+fn pt_threshold_landfall_execute(text: &str) -> AbilityDefinition {
+    let r = parse(text, "Test Warden", &[], &["Creature"], &[]);
+    let [trigger] = r.triggers.as_slice() else {
+        panic!("{text}: expected exactly one trigger: {r:#?}");
+    };
+    let execute = trigger
+        .execute
+        .as_deref()
+        .unwrap_or_else(|| panic!("{text}: trigger must have an execute body"))
+        .clone();
+    assert!(
+        matches!(
+            &*execute.effect,
+            Effect::PutCounter {
+                target: TargetFilter::Typed(_),
+                ..
+            }
+        ),
+        "{text}: root is the targeted counter placement: {execute:#?}"
+    );
+    execute
+}
+
+/// Whether `condition` is, or has anywhere in its `And` / `Or` tree, the target
+/// P/T threshold gate's `TargetMatchesFilter { subject_slot: None }`.
+fn condition_tree_has_target_matches_filter(condition: &AbilityCondition) -> bool {
+    match condition {
+        AbilityCondition::TargetMatchesFilter {
+            subject_slot: None, ..
+        } => true,
+        AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => conditions
+            .iter()
+            .any(condition_tree_has_target_matches_filter),
+        _ => false,
+    }
+}
+
+fn assert_target_pt_threshold_rider_gap(text: &str, rider: &AbilityDefinition) {
+    assert!(
+        matches!(
+            &*rider.effect,
+            Effect::Unimplemented { name, .. }
+                if name == "target_pt_threshold_rider_declares_target"
+        ),
+        "{text}: a rider with its own target must fail closed: {rider:#?}"
+    );
+    assert!(
+        rider.condition.is_none(),
+        "{text}: no misbinding gate may survive on the gap: {rider:#?}"
+    );
+}
+
+/// CR 115.1 + CR 608.2c: a leading target P/T threshold scopes over every
+/// clause of a ", then …" body (the multi-clause conditional path), so the
+/// body clause that announces its own target fails closed there too, while a
+/// targetless sibling clause keeps the gate.
+#[test]
+fn target_pt_threshold_multi_clause_body_refuses_own_target_clause() {
+    let text = "Whenever a land you control enters, put a +1/+1 counter on target creature you control. Then if that creature has power 4 or greater, destroy target creature, then you gain 2 life.";
+    let execute = pt_threshold_landfall_execute(text);
+    let rider = execute
+        .sub_ability
+        .as_deref()
+        .unwrap_or_else(|| panic!("{text}: the rider must follow: {execute:#?}"));
+    assert_target_pt_threshold_rider_gap(text, rider);
+    // REACH GUARD: the targetless tail clause was split off the same gated body
+    // and still carries the P/T threshold gate.
+    let tail = rider
+        .sub_ability
+        .as_deref()
+        .unwrap_or_else(|| panic!("{text}: the tail clause must follow: {rider:#?}"));
+    assert!(
+        matches!(&*tail.effect, Effect::GainLife { .. }),
+        "{text}: tail is the life gain: {tail:#?}"
+    );
+    assert!(
+        tail.condition
+            .as_ref()
+            .is_some_and(condition_tree_has_target_matches_filter),
+        "{text}: the targetless tail keeps the gate: {tail:#?}"
+    );
+}
+
+/// CR 115.1 + CR 608.2c: a target P/T threshold conjunct or disjunct carries
+/// its binding hazard to the whole `And` / `Or` gate, so a rider with its own
+/// target fails closed; the same compound gate over a targetless rider lowers
+/// with the threshold member intact.
+#[test]
+fn target_pt_threshold_compound_gate_refuses_own_target_rider() {
+    for connective in [" and you control a Forest", " or if you control a Forest"] {
+        let refused = format!(
+            "Whenever a land you control enters, put a +1/+1 counter on target creature you control. Then if that creature has power 4 or greater{connective}, destroy target creature."
+        );
+        let execute = pt_threshold_landfall_execute(&refused);
+        let rider = execute
+            .sub_ability
+            .as_deref()
+            .unwrap_or_else(|| panic!("{refused}: the rider must follow: {execute:#?}"));
+        assert_target_pt_threshold_rider_gap(&refused, rider);
+
+        // REACH GUARD: the same compound gate is recognized, with the threshold
+        // member inside it, when the rider announces no target.
+        let kept = format!(
+            "Whenever a land you control enters, put a +1/+1 counter on target creature you control. Then if that creature has power 4 or greater{connective}, draw a card."
+        );
+        let execute = pt_threshold_landfall_execute(&kept);
+        let rider = execute
+            .sub_ability
+            .as_deref()
+            .unwrap_or_else(|| panic!("{kept}: the rider must follow: {execute:#?}"));
+        assert!(
+            matches!(&*rider.effect, Effect::Draw { .. }),
+            "{kept}: rider is the draw: {rider:#?}"
+        );
+        assert!(
+            matches!(
+                rider.condition,
+                Some(AbilityCondition::And { .. } | AbilityCondition::Or { .. })
+            ) && rider
+                .condition
+                .as_ref()
+                .is_some_and(condition_tree_has_target_matches_filter),
+            "{kept}: the compound gate keeps its threshold member: {rider:#?}"
+        );
+    }
+}
+
+/// CR 115.1 + CR 608.2c: Reptilian Recruiter (verbatim Oracle text) is the one
+/// printed card whose target P/T threshold sits in an `Or` gate over a
+/// multi-clause body. Every body clause reads "that creature" / "it" — none
+/// announces its own target — so the now-routed gate refuses nothing and each
+/// clause keeps the `Or`.
+#[test]
+fn target_pt_threshold_or_gate_over_context_target_body_refuses_nothing() {
+    let text = "Trample\nWhen this creature enters, choose target creature. If that creature's power is 2 or less or if you control another Lizard, gain control of that creature until end of turn, untap it, and it gains haste until end of turn.";
+    let r = parse(
+        text,
+        "Reptilian Recruiter",
+        &[],
+        &["Creature"],
+        &["Lizard", "Warrior"],
+    );
+    let [trigger] = r.triggers.as_slice() else {
+        panic!("expected exactly one trigger: {r:#?}");
+    };
+    let execute = trigger
+        .execute
+        .as_deref()
+        .unwrap_or_else(|| panic!("trigger must have an execute body"));
+    let chain: Vec<&AbilityDefinition> =
+        std::iter::successors(Some(execute), |def| def.sub_ability.as_deref()).collect();
+    assert!(
+        chain
+            .iter()
+            .all(|def| !matches!(&*def.effect, Effect::Unimplemented { .. })),
+        "no Reptilian clause fails closed: {execute:#?}"
+    );
+    // REACH GUARD: the gain-control clause is gated by the Or with the P/T
+    // threshold disjunct, so the routed multi-clause path was taken.
+    let gain = chain
+        .iter()
+        .find(|def| matches!(&*def.effect, Effect::GainControl { .. }))
+        .unwrap_or_else(|| panic!("Reptilian must produce a GainControl: {execute:#?}"));
+    assert!(
+        matches!(gain.condition, Some(AbilityCondition::Or { .. }))
+            && gain
+                .condition
+                .as_ref()
+                .is_some_and(condition_tree_has_target_matches_filter),
+        "GainControl keeps the Or gate with its threshold disjunct: {gain:#?}"
+    );
+}
+
+/// CR 603.12 + CR 115.1 + CR 608.2c: a `When you do, if <guard>, <body>`
+/// reflexive guard is stamped on the reflexive body, so a target P/T threshold
+/// guard over a body that announces its own target fails closed there exactly as
+/// a leading one does — in both surface forms of the recognizer. The same guard
+/// over a targetless body still lowers as `WhenYouDo` + the threshold gate.
+#[test]
+fn target_pt_threshold_reflexive_guard_refuses_own_target_body() {
+    for subject in ["that creature has power", "that creature's power is"] {
+        let refused = format!(
+            "Whenever a land you control enters, put a +1/+1 counter on target creature you control. When you do, if {subject} 4 or greater, destroy target creature."
+        );
+        let execute = pt_threshold_landfall_execute(&refused);
+        let rider = execute
+            .sub_ability
+            .as_deref()
+            .unwrap_or_else(|| panic!("{refused}: the rider must follow: {execute:#?}"));
+        assert_target_pt_threshold_rider_gap(&refused, rider);
+
+        // REACH GUARD: the same reflexive guard is recognized, and kept beside
+        // the reflexive marker, when the body announces no target.
+        let kept = format!(
+            "Whenever a land you control enters, put a +1/+1 counter on target creature you control. When you do, if {subject} 4 or greater, draw a card."
+        );
+        let execute = pt_threshold_landfall_execute(&kept);
+        let rider = execute
+            .sub_ability
+            .as_deref()
+            .unwrap_or_else(|| panic!("{kept}: the rider must follow: {execute:#?}"));
+        assert!(
+            matches!(&*rider.effect, Effect::Draw { .. }),
+            "{kept}: rider is the draw: {rider:#?}"
+        );
+        assert!(
+            rider
+                .condition
+                .as_ref()
+                .is_some_and(AbilityCondition::has_when_you_do_marker)
+                && rider
+                    .condition
+                    .as_ref()
+                    .is_some_and(condition_tree_has_target_matches_filter),
+            "{kept}: the reflexive body keeps WhenYouDo and the threshold gate: {rider:#?}"
+        );
+    }
+}
+
+/// CR 115.1 + CR 608.2c: a trailing "<instruction> if that creature's power is
+/// N or greater" gate is stamped on that instruction, so one that announces its
+/// own target fails closed; the same suffix gate on a targetless instruction
+/// still lowers to the threshold gate.
+#[test]
+fn target_pt_threshold_suffix_gate_refuses_own_target_instruction() {
+    let refused = "Whenever a land you control enters, put a +1/+1 counter on target creature you control. Destroy target creature if that creature's power is 4 or greater.";
+    let execute = pt_threshold_landfall_execute(refused);
+    let rider = execute
+        .sub_ability
+        .as_deref()
+        .unwrap_or_else(|| panic!("{refused}: the rider must follow: {execute:#?}"));
+    assert_target_pt_threshold_rider_gap(refused, rider);
+
+    // REACH GUARD: the suffix strip recognizes the same gate on a targetless
+    // instruction.
+    let kept = "Whenever a land you control enters, put a +1/+1 counter on target creature you control. Draw a card if that creature's power is 4 or greater.";
+    let execute = pt_threshold_landfall_execute(kept);
+    let rider = execute
+        .sub_ability
+        .as_deref()
+        .unwrap_or_else(|| panic!("{kept}: the rider must follow: {execute:#?}"));
+    assert!(
+        matches!(&*rider.effect, Effect::Draw { .. }),
+        "{kept}: rider is the draw: {rider:#?}"
+    );
+    assert!(
+        rider
+            .condition
+            .as_ref()
+            .is_some_and(condition_tree_has_target_matches_filter),
+        "{kept}: the targetless instruction keeps the threshold gate: {rider:#?}"
+    );
+}
+
+/// CR 603.12 + CR 115.1 + CR 608.2c: a target P/T threshold guard between a
+/// reflexive connector and a modal header ("When you do, if that creature has
+/// power 4 or greater, choose one —") would gate modes that may announce their
+/// own targets, so the reflexive modal fails closed as
+/// `modal_reflexive_condition` in both surface forms. A guard of another family
+/// in the same position still lowers to the guarded reflexive modal.
+#[test]
+fn target_pt_threshold_reflexive_modal_guard_fails_closed() {
+    let modes = "choose one —\n• Destroy target creature.\n• Draw a card.";
+    for subject in ["that creature has power", "that creature's power is"] {
+        let refused = format!(
+            "Whenever a land you control enters, put a +1/+1 counter on target creature you control. When you do, if {subject} 4 or greater, {modes}"
+        );
+        let r = parse(&refused, "Test Warden", &[], &["Creature"], &[]);
+        let [trigger] = r.triggers.as_slice() else {
+            panic!("{refused}: expected exactly one trigger: {r:#?}");
+        };
+        let execute = trigger
+            .execute
+            .as_deref()
+            .unwrap_or_else(|| panic!("{refused}: trigger must have an execute body"));
+        assert!(
+            matches!(
+                &*execute.effect,
+                Effect::Unimplemented { name, description: Some(fragment) }
+                    if name == "modal_reflexive_condition"
+                        && fragment.contains(&format!("if {subject} 4 or greater")) // allow-noncombinator: assertion over diagnostic output, not parsing dispatch
+            ),
+            "{refused}: the threshold-guarded reflexive modal must fail closed: {execute:#?}"
+        );
+        assert!(
+            execute.sub_ability.is_none(),
+            "{refused}: no modal may hang beneath the gap: {execute:#?}"
+        );
+    }
+
+    // REACH GUARD: the same reflexive modal entry lowers a guard of another
+    // family, so the refusal above is the threshold route, not the position.
+    let kept = format!(
+        "Whenever a land you control enters, put a +1/+1 counter on target creature you control. When you do, if you control a Forest, {modes}"
+    );
+    let execute = pt_threshold_landfall_execute(&kept);
+    let modal = execute
+        .sub_ability
+        .as_deref()
+        .unwrap_or_else(|| panic!("{kept}: the reflexive modal must follow: {execute:#?}"));
+    assert!(
+        modal.modal.is_some()
+            && modal
+                .condition
+                .as_ref()
+                .is_some_and(AbilityCondition::has_when_you_do_marker)
+            && matches!(modal.condition, Some(AbilityCondition::And { .. })),
+        "{kept}: the reflexive modal keeps WhenYouDo with its guard: {modal:#?}"
+    );
 }
 
 /// CR 508.6 + CR 608.2c: The Commander 2017 "whenever enchanted player is
@@ -28221,6 +28765,44 @@ fn bbfu10_ledger_variant_reaches_filter_prop_scan() {
     );
 }
 
+/// CR 109.4 + CR 608.2c: a persisted as-enters counter whose count is a
+/// `PlayerCount` must retain a chosen-property dependency nested in
+/// `PlayerFilter::ControlsCount`. The negative twin proves the relation is not
+/// reported for an otherwise identical prop-free player filter.
+#[test]
+fn chosen_etb_counter_player_count_reaches_nested_filter_prop_scan() {
+    use crate::types::ability::{
+        Comparator, FilterProp, PlayerFilter, PlayerRelation, QuantityExpr, QuantityRef,
+        TargetFilter, TypeFilter, TypedFilter,
+    };
+
+    let player_count = |properties| QuantityExpr::Ref {
+        qty: QuantityRef::PlayerCount {
+            filter: PlayerFilter::ControlsCount {
+                relation: PlayerRelation::All,
+                filter: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature],
+                    controller: None,
+                    properties,
+                }),
+                comparator: Comparator::GE,
+                count: Box::new(QuantityExpr::Fixed { value: 1 }),
+            },
+        },
+    };
+
+    assert!(
+        super::quantity_expr_uses_chosen_filter(&player_count(vec![
+            FilterProp::IsChosenCreatureType,
+        ])),
+        "a persisted ETB counter count must see chosen properties nested in ControlsCount"
+    );
+    assert!(
+        !super::quantity_expr_uses_chosen_filter(&player_count(Vec::new())),
+        "a prop-free nested player filter must remain an independent negative case"
+    );
+}
+
 /// CR 205.2a + CR 205.2b + CR 608.2c (issue #518): every shipped card printing a
 /// card-type DISJUNCTION in an "If it's a[n] X or Y card" reveal gate must carry
 /// BOTH printed legs.
@@ -29796,7 +30378,7 @@ fn you_attack_trigger_binds_its_attacked_player_object() {
 /// Revert-to-red: removing the `GrantReplacement` arm (falling through to the
 /// wildcard `_ => {}`) leaves the raw placeholder character in the nested
 /// definition's description, so the `assert_eq!` below prints the escaped
-/// `\u{e0002}` where the granting card's printed name belongs.
+/// `\u{e0004}` where the granting card's printed name belongs.
 #[test]
 fn render_modification_descriptions_reaches_grant_replacement() {
     let mut replacement = ReplacementDefinition::new(ReplacementEvent::Moved);
@@ -30719,16 +31301,16 @@ fn guard_walk_reaches_every_continuous_modification_carrier() {
 /// resolution-time grant onto a target. This route is a PRE-EXISTING PARSER
 /// LEAK at BASE_SHA: `try_parse_gain_quoted_ability` sets the description
 /// directly and never went through `parse_quoted_ability`'s old sanitizer, so
-/// the parser would emit a raw U+E0002 into `client/public/card-data.json` for
+/// the parser would emit a raw U+E0004 into `client/public/card-data.json` for
 /// any card with this shape. MEASURED: no card in the current corpus parses to
-/// that shape — a scan of the exported `card-data.json` finds zero U+E0002,
+/// that shape — a scan of the exported `card-data.json` finds zero U+E0004,
 /// raw or escaped, on either side of the change — so the leak is LATENT IN
 /// THE PARSER, not shipped. The `GenericEffect | Token` arm is what closes it;
 /// the arm is load-bearing for this fixture regardless of corpus coverage.
 ///
 /// Revert-to-red: delete the `GenericEffect | Token` arm from
 /// `render_effect_descriptions` — the outer description reverts to
-/// `gain "{T}, Sacrifice \u{e0002}: Draw a card."`.
+/// `gain "{T}, Sacrifice \u{e0004}: Draw a card."`.
 #[test]
 fn resolution_time_grant_renders_the_granter_in_both_descriptions() {
     let parsed = parse(
@@ -30787,7 +31369,7 @@ fn resolution_time_grant_renders_the_granter_in_both_descriptions() {
 /// leaking.
 ///
 /// Revert-to-red: delete that arm — the token static's description reverts to
-/// `Sacrifice \u{e0002}: Draw a card.`.
+/// `Sacrifice \u{e0004}: Draw a card.`.
 #[test]
 fn token_body_grant_renders_the_granter() {
     let parsed = parse(
@@ -30828,7 +31410,7 @@ fn token_body_grant_renders_the_granter() {
 ///
 /// Revert-to-red: delete the `render_modal_descriptions` call from
 /// `render_granting_self_descriptions` — `mode_descriptions[0]` reverts to
-/// `Target creature gains "Sacrifice \u{e0002}: Draw a card." until end of turn.`
+/// `Target creature gains "Sacrifice \u{e0004}: Draw a card." until end of turn.`
 #[test]
 fn modal_mode_description_renders_the_granter() {
     let parsed = parse(
@@ -32667,4 +33249,27 @@ fn lich_as_enters_life_loss_parses_as_moved_self_replacement() {
         .statics
         .iter()
         .any(|def| matches!(def.mode, StaticMode::CantLoseTheGame)));
+}
+
+/// CR 201.5a: the two-layer IR facade lowers a refused quoted granter name to the same
+/// unsupported residual as the production pipeline.
+#[test]
+fn ir_facade_demotes_a_refused_granter_name() {
+    let mut ir = parse_oracle_ir(
+        "Equipped creature gets +2/+1 and has \"{T}, Unattach Heartseeker: Destroy target creature.\"\nEquip {5}",
+        "Heartseeker",
+        &[],
+        &["Artifact".to_string()],
+        &["Equipment".to_string()],
+    );
+    assert!(
+        ir.granter_name_refusals.contains(&0),
+        "reach-guard: {ir:#?}"
+    );
+    let parsed = lower_oracle_ir(&mut ir);
+    assert!(parsed.statics.is_empty(), "{parsed:#?}");
+    assert!(parsed.abilities.iter().any(|def| matches!(
+        &*def.effect,
+        Effect::Unimplemented { name, .. } if name == "granter_reference_unreached"
+    )));
 }
