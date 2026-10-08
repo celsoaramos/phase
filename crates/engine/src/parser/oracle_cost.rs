@@ -4765,7 +4765,7 @@ mod tests {
             )),
             AbilityCost::Reveal {
                 count: 1,
-                filter: Some(TargetFilter::GrantingObject),
+                filter: Some(TargetFilter::GrantingObject { bound: None }),
             }
         );
     }
