@@ -169,11 +169,7 @@
     "branch": "ai/focus-fire-damage-triggers"
   },
   {
-    "branch": "card/soul-scar-mage-damage-to-counters",
-    "pr": 9670
-  },
-  {
-    "branch": "card/szadek-combat-damage-to-counters",
+    "branch": "fix/damage-to-counters-substitution",
     "pr": 9670
   }
 ]
