@@ -830,6 +830,10 @@ mod tests {
         let token_def = AbilityDefinition::new(AbilityKind::Spell, Effect::Investigate); // simple stand-in
 
         let ability = ResolvedAbility {
+            declares_chosen_group: None,
+            reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::Vote {
                 choices: vec!["evidence".to_string(), "bribery".to_string()],
@@ -850,6 +854,7 @@ mod tests {
             target_incarnations: Vec::new(),
             selected_target_incarnations: Vec::new(),
             illegal_target_slots: Vec::new(),
+            illegal_local_target_slots: Vec::new(),
             controller,
             original_controller: None,
             scoped_player: None,
@@ -874,6 +879,7 @@ mod tests {
             min_x_value: 0,
             announced_x: None,
             cant_be_copied: false,
+            illegal_targets_disposition: Default::default(),
             copy_count_status: crate::types::ability::CopyCountStatus::Pending,
             forward_result: false,
             unless_pay: None,
@@ -894,10 +900,14 @@ mod tests {
             repeat_until: None,
             replacement_applied: Default::default(),
             sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
+            target_reads: Default::default(),
             sibling_condition: crate::types::ability::SiblingCondition::Dependent,
             modal: None,
             mode_abilities: vec![],
             parent_target_missing_reason: None,
+
+            activation_cost_reduction: None,
+            activation_record: None,
         };
 
         let mut events = Vec::new();
@@ -947,6 +957,10 @@ mod tests {
             })
             .collect();
         ResolvedAbility {
+            declares_chosen_group: None,
+            reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::Vote {
                 choices,
@@ -967,6 +981,7 @@ mod tests {
             target_incarnations: Vec::new(),
             selected_target_incarnations: Vec::new(),
             illegal_target_slots: Vec::new(),
+            illegal_local_target_slots: Vec::new(),
             controller,
             original_controller: None,
             scoped_player: None,
@@ -991,6 +1006,7 @@ mod tests {
             min_x_value: 0,
             announced_x: None,
             cant_be_copied: false,
+            illegal_targets_disposition: Default::default(),
             copy_count_status: crate::types::ability::CopyCountStatus::Pending,
             forward_result: false,
             unless_pay: None,
@@ -1011,10 +1027,13 @@ mod tests {
             repeat_until: None,
             replacement_applied: Default::default(),
             sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
+            target_reads: Default::default(),
             sibling_condition: crate::types::ability::SiblingCondition::Dependent,
             modal: None,
             mode_abilities: vec![],
             parent_target_missing_reason: None,
+            activation_cost_reduction: None,
+            activation_record: None,
         }
     }
 
@@ -1242,6 +1261,25 @@ mod tests {
         let options = vec!["choice".to_string()];
         let ballots = crate::im::Vector::from(vec![(controller, 0), (opponent, 0)]);
         let mut events = Vec::new();
+        crate::game::stack::begin_resolving_stack_entry(
+            &mut state,
+            crate::types::game_state::StackEntry {
+                id: ObjectId(91_710),
+                source_id: source,
+                controller,
+                kind: crate::types::game_state::StackEntryKind::ActivatedAbility {
+                    source_id: source,
+                    ability: Box::new(crate::types::ability::ResolvedAbility::new(
+                        Effect::NoOp,
+                        vec![],
+                        source,
+                        controller,
+                    )),
+                },
+            },
+            None,
+        )
+        .expect("the vote resolves inside its own carrier");
 
         resolve_tally(
             &mut state,
@@ -1272,15 +1310,24 @@ mod tests {
             "the remaining ballot owner must be below its complete child stack"
         );
 
-        for expected in [first, second, first, second] {
+        for _ballot in 0..2 {
+            // CR 101.4c: the controller orders each ballot body's two choices.
             crate::game::engine::apply(
                 &mut state,
                 controller,
-                GameAction::SelectCards {
-                    cards: vec![expected],
-                },
+                GameAction::ChooseZoneOpponentChooser { opponent },
             )
-            .expect("each production choice action advances the per-ballot body");
+            .expect("the controller orders the opponent's graveyard first");
+            for expected in [second, first] {
+                crate::game::engine::apply(
+                    &mut state,
+                    controller,
+                    GameAction::SelectCards {
+                        cards: vec![expected],
+                    },
+                )
+                .expect("each production choice action advances the per-ballot body");
+            }
         }
 
         assert_eq!(state.players[0].life, 22, "one tail per resolved ballot");
@@ -1401,6 +1448,10 @@ mod tests {
 
         // Build a ResolvedAbility from the parsed AbilityDefinition.
         let ability = ResolvedAbility {
+            declares_chosen_group: None,
+            reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: (*parsed_def.effect).clone(),
             targets: vec![],
@@ -1413,6 +1464,7 @@ mod tests {
             target_incarnations: Vec::new(),
             selected_target_incarnations: Vec::new(),
             illegal_target_slots: Vec::new(),
+            illegal_local_target_slots: Vec::new(),
             controller,
             original_controller: None,
             scoped_player: None,
@@ -1437,6 +1489,7 @@ mod tests {
             min_x_value: 0,
             announced_x: None,
             cant_be_copied: false,
+            illegal_targets_disposition: Default::default(),
             copy_count_status: crate::types::ability::CopyCountStatus::Pending,
             forward_result: false,
             unless_pay: None,
@@ -1457,10 +1510,14 @@ mod tests {
             repeat_until: None,
             replacement_applied: Default::default(),
             sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
+            target_reads: Default::default(),
             sibling_condition: crate::types::ability::SiblingCondition::Dependent,
             modal: None,
             mode_abilities: vec![],
             parent_target_missing_reason: None,
+
+            activation_cost_reduction: None,
+            activation_record: None,
         };
 
         // Resolution parks on VoteChoice with controller as first subject.
@@ -1567,6 +1624,10 @@ mod tests {
             })
             .collect();
         let ability = ResolvedAbility {
+            declares_chosen_group: None,
+            reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::Vote {
                 choices: vec!["friend".to_string(), "foe".to_string()],
@@ -1587,6 +1648,7 @@ mod tests {
             target_incarnations: Vec::new(),
             selected_target_incarnations: Vec::new(),
             illegal_target_slots: Vec::new(),
+            illegal_local_target_slots: Vec::new(),
             controller,
             original_controller: None,
             scoped_player: None,
@@ -1611,6 +1673,7 @@ mod tests {
             min_x_value: 0,
             announced_x: None,
             cant_be_copied: false,
+            illegal_targets_disposition: Default::default(),
             copy_count_status: crate::types::ability::CopyCountStatus::Pending,
             forward_result: false,
             unless_pay: None,
@@ -1631,10 +1694,14 @@ mod tests {
             repeat_until: None,
             replacement_applied: Default::default(),
             sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
+            target_reads: Default::default(),
             sibling_condition: crate::types::ability::SiblingCondition::Dependent,
             modal: None,
             mode_abilities: vec![],
             parent_target_missing_reason: None,
+
+            activation_cost_reduction: None,
+            activation_record: None,
         };
         let mut events = Vec::new();
         resolve(&mut state, &ability, &mut events).expect("vote initiates");

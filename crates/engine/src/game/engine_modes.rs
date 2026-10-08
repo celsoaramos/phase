@@ -4,10 +4,10 @@ use crate::types::identifiers::ObjectId;
 use crate::types::mana::ManaCost;
 
 use super::ability_utils::{
-    assign_targets_in_chain, auto_select_targets_for_ability, begin_target_selection_for_ability,
-    build_chained_resolved, build_target_slots_labelled, cap_distribution_target_slots,
-    random_select_targets_for_ability, record_modal_mode_choices, selected_mode_labels,
-    target_constraints_from_modal, validate_modal_indices,
+    assign_selected_slots_in_chain, auto_select_targets_for_ability,
+    begin_target_selection_for_ability, build_chained_resolved, build_target_slots_labelled,
+    cap_distribution_target_slots, random_select_targets_for_ability, record_modal_mode_choices,
+    selected_mode_labels, target_constraints_from_modal, validate_modal_indices,
 };
 use super::engine::EngineError;
 use super::engine_stack;
@@ -123,7 +123,7 @@ fn handle_activated_mode_choice(
     let ActivatedModeChoice {
         player,
         source_id,
-        resolved,
+        mut resolved,
         ability_index,
         ability_cost,
         activation_cost_snapshot,
@@ -131,6 +131,14 @@ fn handle_activated_mode_choice(
         mode_abilities,
         indices,
     } = choice;
+    // CR 602.2 + CR 601.2c (capture A, modal): the chosen modes' chain is built
+    // here, after the announcement returned for the mode choice, so its journal
+    // facts are captured now, before any cost is paid. Target settlement adds
+    // the committed targets. CR 700.2a: modes are chosen as part of
+    // activating; no game action can intervene while `AbilityModeChoice` is
+    // pending, so this is still the announcement layout (CR 602.2a: provenance
+    // too).
+    casting::record_activation_announcement(state, player, source_id, ability_index, &mut resolved);
 
     let target_constraints = target_constraints_from_modal(&modal);
 
@@ -237,12 +245,12 @@ fn handle_activated_mode_choice(
 
         if let Some(targets) = resolved_targets {
             let mut resolved = resolved;
-            assign_targets_in_chain(state, &mut resolved, &targets)?;
+            assign_selected_slots_in_chain(state, &mut resolved, &targets)?;
             // CR 602.2b + CR 601.2c: automatic target assignment is still a
             // declaration before activation costs are paid.
             casting::emit_targeting_events(
                 state,
-                &super::ability_utils::flatten_targets_in_chain(&resolved),
+                &super::ability_utils::declared_targets_in_chain(&resolved),
                 source_id,
                 player,
                 events,
@@ -291,7 +299,16 @@ fn handle_activated_mode_choice(
         pending.activation_cost = ability_cost;
         pending.target_constraints = target_constraints;
         pending.distribute = mode_distribute;
-        casting_costs::finish_activated_ability_at_payment_boundary(state, player, pending, events)
+        // CR 601.2f + CR 602.2b: the chosen modes declare no target, so no target
+        // settlement will follow. A lock the announcement deferred (because another
+        // mode could target) runs here instead, where the modes are known.
+        casting::settle_activation_cost(
+            state,
+            player,
+            pending,
+            crate::types::casting_costs::SettledTail::Boundary,
+            events,
+        )
     }
 }
 
@@ -477,7 +494,7 @@ fn handle_triggered_mode_choice(
             // optimized, which is why the mechanical `(*b).clone()` rewrite was
             // reverted at this call site.
             let mut resolved = trigger.ability.clone();
-            assign_targets_in_chain(state, &mut resolved, &targets)?;
+            assign_selected_slots_in_chain(state, &mut resolved, &targets)?;
             // CR 113.2c + CR 603.2 + CR 603.3b: `finalize_trigger_target_selection`
             // already drains the deferred-trigger queue and surfaces the next
             // WaitingFor if a sibling trigger needs input; use that result

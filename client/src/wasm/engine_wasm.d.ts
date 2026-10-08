@@ -9,6 +9,11 @@
 export function apply_seat_mutation(state_json: string, mutation_json: string): any;
 
 /**
+ * The longest match structure `format` may be played as; the lobby offers Bo3 only when this is Bo3.
+ */
+export function bestOfThreeCeilingForFormat(format: any): any;
+
+/**
  * Build the HTTP request for one LLM-driven AI decision.
  *
  * `endpoint_json` is the player's configured `LlmEndpointConfig`. `history_json`
@@ -36,6 +41,13 @@ export function buildLlmProbeRequest(endpoint_json: string): any;
  * main engine remains the only authority that owns the full card database.
  */
 export function build_ai_card_subset(): string;
+
+/**
+ * The canonical printed name of each of `names`, index-aligned, `null` where
+ * `CardDatabase::canonical_name` has none. Errors if the card database is
+ * not loaded.
+ */
+export function canonicalCardNames(names: any): any;
 
 /**
  * Classify a deck's archetype (Aggro / Midrange / Control / Combo / Ramp) using
@@ -335,8 +347,9 @@ export function get_stack_pressure(): any;
 export function get_viewer_snapshot_js(player_id: number): any;
 
 /**
- * Get the viewer-filtered state, legal actions, interaction projection, and
- * event slice associated with one engine transition.
+ * Combined viewer projection and event slice for one engine transition.
+ * Unlike the legacy state-only endpoint, this path validates the viewer id
+ * before narrowing it to the engine's representable PlayerId domain.
  */
 export function get_viewer_transition_snapshot_js(player_id: number, events: any): any;
 
@@ -701,9 +714,11 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly apply_seat_mutation: (a: number, b: number, c: number, d: number) => [number, number, number];
+    readonly bestOfThreeCeilingForFormat: (a: any) => any;
     readonly buildLlmDecisionRequest: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
     readonly buildLlmProbeRequest: (a: number, b: number) => [number, number, number];
     readonly build_ai_card_subset: () => [number, number, number, number];
+    readonly canonicalCardNames: (a: any) => [number, number, number];
     readonly classify_deck_js: (a: any) => [number, number, number];
     readonly clear_game_state: () => void;
     readonly commanderPartnerCandidates: (a: number, b: number, c: any, d: any) => [number, number, number];

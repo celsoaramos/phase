@@ -15,6 +15,9 @@
   "manaSourceSelection": {
     "title": "マナ源を選択",
     "description": "このマナ能力にはパーマネントの生け贄が必要です。",
+    "baseOutput_one": "基本生成量：{{count}}マナ",
+    "baseOutput_other": "基本生成量：{{count}}マナ",
+    "baseOutputVariable": "基本量は起動時に決定",
     "sacrifice": "生け贄",
     "back": "マナの支払いに戻る",
     "unknownSource": "マナ源"
@@ -316,6 +319,10 @@
     "eligibleCount": "適正{{count}}",
     "attackingCount": "攻撃 {{count}}",
     "selectedCount": "選択 {{count}}",
+    "directBlockTargetCount": "ブロック対象 {{count}}",
+    "blockingWith": "{{name}}でブロック中",
+    "blockedBy": "{{names}}にブロックされている",
+    "unblocked": "ブロックされていない",
     "pickAll": "すべて",
     "pickNone": "なし",
     "underAttack_one": "{{count}}体のクリーチャーから攻撃されています",
@@ -806,6 +813,8 @@
     "mustAttackSatisfiedBadge": "攻撃中 ✓",
     "mustBlockBadge": "ブロックしなければならない",
     "mustBlockExactBadge": "{{attacker}}をブロックしなければならない",
+    "mustBeBlockedBadge": "ブロックされなければならない",
+    "bandBadge": "バンド {{n}}",
     "mustBlockSatisfiedBadge": "ブロック中 ✓",
     "cantAttackBadge": "攻撃できない",
     "cantBlockBadge": "ブロックできない",
@@ -840,6 +849,7 @@
     "titleTargets": "対象: {{targets}}",
     "titlePaid": "支払い: {{paid}}",
     "titleContext": "文脈: {{context}}",
+    "revealedCards": "公開中: {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}}マナ",
     "paidColorsSpent": "{{count}}色",
@@ -1162,6 +1172,8 @@
       "usePowder": "{{name}}を使う",
       "powderDescription": "手札をすべて追放して同じ枚数を引く（マリガンではない）",
       "powderTooltip": "手札をすべて追放し、同じ枚数を引きます。マリガンではないため、回数や一番下に置く枚数は変わりません。",
+      "freeReveal": "公開して引き直す（無料）",
+      "freeRevealDescription": "手札を公開して切り直し、7枚引く — 無料、ライブラリーの下に置くカードなし、マリガンではない",
       "eyebrowMulligan": "マリガン{{count}}回目・ロンドン方式",
       "eyebrowOpening": "初手・ロンドン・マリガン",
       "reviewTitle": "初手を確認",
@@ -1419,6 +1431,7 @@
       "target": "対象",
       "return": "戻す",
       "discard": "捨てる",
+      "reveal": "公開",
       "evidence": "証拠",
       "manifest": "予示",
       "untap": "アンタップ",
@@ -1469,7 +1482,16 @@
       "subtitleUpTo_other": "最大{{count}}枚のカードを選択して{{destination}}",
       "destinationTop": "上に置く の あなたの ライブラリー",
       "destinationBattlefield": "の上へ 戦場",
-      "destinationHand": "へ あなたの 手札"
+      "destinationHand": "あなたの手札へ",
+      "titleSplit": "残りのカードを分ける",
+      "subtitleSplit_one": "{{count}}枚をライブラリーの一番上に置く順に並べ、残りの{{remaining}}枚を一番下に置く",
+      "subtitleSplit_other": "{{count}}枚をライブラリーの一番上に置く順に並べ、残りの{{remaining}}枚を一番下に置く",
+      "badgeTop": "上から{{order}}番目",
+      "badgeBottom": "一番下",
+      "hintSplit": "ドラッグして並べ替え · 緑のカードは一番上（左端が最上）、灰色のカードは一番下に置く",
+      "moveEarlier": "{{card}}を前に移動",
+      "moveLater": "{{card}}を後ろに移動",
+      "hintSplitOrderOnly": "ドラッグまたは矢印ボタンで各グループ内の順番を変更 · 一番上に置くカードは別のプレイヤーが選択済み"
     },
     "surveil": {
       "title": "諜報",
@@ -1721,6 +1743,10 @@
     "empowerJace": {
       "title": "ジェイスを強化する",
       "subtitle": "あなたがコントロールするジェイス・トークンを1つ選び、忠誠度を+{{count}}する"
+    },
+    "spellCopyOrder": {
+      "title": "コピーの順番",
+      "subtitle": "次にコピーをスタックに置く呪文を選ぶ"
     },
     "collectEvidence": {
       "title": "証拠収集",
@@ -1986,6 +2012,8 @@
     "additionalExile": "+ カード1枚を追放",
     "additionalSacrifice": "+ パーマネント1つを生け贄に捧げる",
     "additionalPayLife": "+ ライフを支払う",
+    "additionalPayLifeAmount": "+ {{amount}}点のライフを支払う",
+    "additionalCollectEvidence": "+ 証拠収集{{amount}}",
     "additionalDiscard": "+ カード1枚を捨てる",
     "additionalTapCreatures": "+ クリーチャーをタップ",
     "additionalGeneric": "+ {{type}}"
@@ -2030,7 +2058,11 @@
   },
   "zoneOpponentChooser": {
     "title": "対戦相手を選択",
-    "subtitle": "選択を行う対戦相手を選択"
+    "subtitle": "選択を行う対戦相手を選択",
+    "orderTitle": "次のプレイヤーを選択",
+    "orderSubtitle": "次に選択を行う対象のプレイヤーを選択",
+    "substituteTitle": "プレイヤーを選択",
+    "substituteSubtitle": "この選択を行うプレイヤーを選択"
   },
   "pileOpponent": {
     "title": "対戦相手を選択",
@@ -2113,6 +2145,7 @@
     "variantForetell": "予顕から唱える",
     "variantOverload": "超過で唱える",
     "variantBestow": "授与で唱える",
+    "variantBlitz": "奇襲で唱える",
     "variantFreerunning": "Freerunningで唱える",
     "variantFuse": "融合で唱える",
     "variantMutate": "変容で唱える",
@@ -2122,7 +2155,14 @@
     "variantMoreThanMeetsTheEye": "変身した状態で唱える",
     "variantPrototype": "試作で唱える",
     "variantFaceDown": "裏向きで唱える",
-    "variantFallback": "{{type}}で唱える"
+    "variantFallback": "{{type}}で唱える",
+    "viaSource": "{{name}}による",
+    "extraCostAdditional": "+ {{cost}}",
+    "extraCostAlternative": "マナ・コストの代わりに：{{cost}}",
+    "entersWithCounter": "{{counter}}カウンターが置かれた状態で戦場に出る",
+    "slotPerType": "{{type}}の枠を使う",
+    "slotChooseType": "パーマネント・タイプを選ぶ",
+    "slotOncePerTurn": "このターンに1回"
   },
   "categoryChoice": {
     "title": "保持するパーマネントを選択",
@@ -2280,7 +2320,9 @@
     "accept": "はい",
     "decline": "いいえ",
     "sourceFallback": "効果",
-    "entryLabel": "{{source}} — {{decision}}"
+    "entryLabel": "{{source}} — {{decision}}",
+    "optionalTriggers": "任意の誘発型能力（{{count, number}}）",
+    "replacementChoices": "置換効果の選択（{{count, number}}）"
   },
   "optionalEffect": {
     "sourceFallback": "効果",
@@ -2289,6 +2331,12 @@
     "no": "いいえ",
     "dontAskAgain": "このゲームでは再度確認しない",
     "dontAskAgainForSameCard": "このゲームではこのカードのすべてのコピーにこの選択を使用"
+  },
+  "keywordDetail": {
+    "selfManaCost": "そのマナ・コスト",
+    "selfManaValue": "そのマナ総量",
+    "manaCostReduced": "そのマナ・コストから{{reduction}}少ないコスト",
+    "spliceOnto": "{{subtype}}へ {{cost}}"
   },
   "resolutionOptionalPayment": {
     "title": "任意の支払いを選択",
@@ -2307,7 +2355,8 @@
       "zoneExile": "追放領域",
       "zoneHand": "あなたの手札",
       "discard": "{{count}}{{cards}}を捨てる",
-      "exile": "{{zone}}から{{count}}{{cards}}を追放"
+      "exile": "{{zone}}から{{count}}{{cards}}を追放",
+      "reveal": "{{zone}}から{{count}}{{cards}}を公開する"
     }
   },
   "topOrBottom": {
@@ -2353,6 +2402,8 @@
     "confirm": "確認"
   },
   "replacement": {
+    "remember": "このゲーム中はこの選択を記憶する",
+    "savedChoice": "置換：{{choice}}",
     "eyebrow": "解決順",
     "title": "置換効果",
     "orderSubtitle": "これらの効果はすべてこのイベントの起こり方を変更します。適用順をドラッグで設定してください — 最後に適用されたものが結果になります（CR 616.1）。",

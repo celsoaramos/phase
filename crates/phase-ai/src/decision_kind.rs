@@ -123,6 +123,9 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         // selection; route to the ability catch-all bucket.
         | WaitingFor::RedistributeLifeTotals { .. }
         | WaitingFor::DigChoice { .. }
+        // CR 401.2: the remainder split is a forced mid-resolution selection,
+        // same bucket as the keep selection it follows.
+        | WaitingFor::DigRestSplitChoice { .. }
         | WaitingFor::SurveilChoice { .. }
         | WaitingFor::RevealChoice { .. }
         | WaitingFor::DrawnThisTurnTopdeckChoice { .. }
@@ -133,6 +136,7 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::ChooseFromZoneChoice { .. }
         | WaitingFor::BeholdChoice { .. }
         | WaitingFor::EmpowerJaceChoice { .. }
+        | WaitingFor::SpellCopyOrderChoice { .. }
         | WaitingFor::ConniveDiscard { .. }
         | WaitingFor::DiscardChoice { .. }
         | WaitingFor::EffectZoneChoice { .. }
@@ -269,6 +273,7 @@ mod tests {
                         phase: engine::types::game_state::MulliganDecisionPhase::Declare,
                     }],
                     free_first_mulligan: false,
+                    declared: Vec::new(),
                 },
                 &dummy_action
             ),
@@ -332,6 +337,8 @@ mod tests {
                     valid_block_targets: std::collections::HashMap::new(),
                     block_requirements: std::collections::HashMap::new(),
                     blocker_constraints: Default::default(),
+                    must_be_blocked_targets: Default::default(),
+                    block_capacities: Default::default(),
                 },
                 &dummy_action
             ),

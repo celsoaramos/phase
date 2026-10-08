@@ -275,7 +275,25 @@ mod external_format_config_tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use engine::types::custom_format::CustomFormatId;
     use engine::types::format::RangeOfInfluenceConfig;
+
+    #[test]
+    fn best_of_three_ceiling_reads_the_format_axis_and_fails_closed() {
+        assert_eq!(
+            best_of_three_ceiling_or_bo1(Some(GameFormat::Standard)),
+            MatchType::Bo3
+        );
+        assert_eq!(
+            best_of_three_ceiling_or_bo1(Some(GameFormat::Custom(CustomFormatId(1)))),
+            MatchType::Bo3
+        );
+        assert_eq!(
+            best_of_three_ceiling_or_bo1(Some(GameFormat::Dandan)),
+            MatchType::Bo1
+        );
+        assert_eq!(best_of_three_ceiling_or_bo1(None), MatchType::Bo1);
+    }
 
     #[test]
     fn restore_refuses_only_legacy_paused_casting_variant_menu_without_face() {
@@ -984,6 +1002,26 @@ pub fn get_card_face_data(name: &str) -> JsValue {
     })
 }
 
+/// The canonical printed name of each of `names`, index-aligned, `null` where
+/// `CardDatabase::canonical_name` has none. Errors if the card database is
+/// not loaded.
+#[wasm_bindgen(js_name = canonicalCardNames)]
+pub fn canonical_card_names(names: JsValue) -> Result<JsValue, JsValue> {
+    let names: Vec<String> = serde_wasm_bindgen::from_value(names)
+        .map_err(|e| JsValue::from_str(&format!("Invalid card name list: {e}")))?;
+    CARD_DB.with(|cell| {
+        let db = cell.borrow();
+        let Some(db) = db.as_ref() else {
+            return Err(JsValue::from_str(
+                "Card database not loaded. Call load_card_database first.",
+            ));
+        };
+        let canonical: Vec<Option<String>> =
+            names.iter().map(|name| db.canonical_name(name)).collect();
+        Ok(to_js(&canonical))
+    })
+}
+
 /// Search the loaded card database. The engine is the single authority for the
 /// rules data search filters on — format legality, set membership, card types,
 /// mana value, and colors — so deck-builder search runs here, never as a
@@ -1079,6 +1117,19 @@ pub fn max_deck_copies_for_format(name: &str, format_config: JsValue) -> JsValue
     })
 }
 
+/// The longest match structure `format` may be played as; the lobby offers Bo3 only when this is Bo3.
+#[wasm_bindgen(js_name = bestOfThreeCeilingForFormat)]
+pub fn best_of_three_ceiling_for_format(format: JsValue) -> JsValue {
+    to_js(&best_of_three_ceiling_or_bo1(
+        serde_wasm_bindgen::from_value::<GameFormat>(format).ok(),
+    ))
+}
+
+/// An undecodable format identifies no format whose ceiling admits Bo3, so it answers Bo1.
+fn best_of_three_ceiling_or_bo1(format: Option<GameFormat>) -> MatchType {
+    format.map_or(MatchType::Bo1, GameFormat::best_of_three_ceiling)
+}
+
 /// Whether the named card can serve as this format's command-zone leader.
 /// Reads the engine's MTGJSON-derived `CardFace` leadership fields and
 /// format-specific deck-validation predicates.
@@ -1126,7 +1177,8 @@ pub fn is_card_commander_eligible_for_format(name: &str, format: JsValue) -> boo
             | GameFormat::FreeForAll
             | GameFormat::TwoHeadedGiant
             | GameFormat::Limited
-            | GameFormat::Freeform => false,
+            | GameFormat::Freeform
+            | GameFormat::Dandan => false,
             // Phase 1d wired a real custom-format deck-legality evaluator
             // (`evaluate_custom_format`), but it is scoped to non-command-zone
             // (constructed-shaped) custom formats — a command-zone custom
@@ -1880,10 +1932,9 @@ fn initialize_game_impl(
         // ends up with a deck while a missing seat would silently have an
         // empty library). Surface it as a hard error instead of starting.
         let empty_seats: Vec<u8> = state
-            .players
-            .iter()
-            .filter(|p| p.library.is_empty())
-            .map(|p| p.id.0)
+            .seats_with_empty_library()
+            .into_iter()
+            .map(|seat| seat.0)
             .collect();
         if !empty_seats.is_empty() {
             return to_js(&serde_json::json!({
@@ -2277,6 +2328,8 @@ pub fn get_filtered_game_state(viewer: u8) -> JsValue {
 pub fn get_legal_actions_js() -> JsValue {
     match with_state_mut(|state| {
         engine::game::layers::flush_layers(state);
+        // Seat-agnostic: carries no seat-only action (Dandan `FreeReveal`); a
+        // surface serving a seat calls `get_legal_actions_for_viewer_js`.
         let (actions, spell_costs, legal_actions_by_object) = legal_actions_full(state);
         let auto_pass = auto_pass_recommended(state, &actions);
         let end_continuous_effect_offers = end_continuous_effect_offers(&actions);
@@ -2292,9 +2345,8 @@ pub fn get_legal_actions_js() -> JsValue {
                 engine::game::interaction::object_action_payloads(&legal_actions_by_object),
             ),
             // CR 117.1: the UNSCOPED sibling is correct here and only here —
-            // this entry point takes no viewer and serves a single-player local
-            // surface with exactly one recipient. Every multi-recipient
-            // transport must call `activation_block_reasons_for_viewer`.
+            // this entry point takes no viewer and has no client consumer. Every
+            // transport serving a seat must call `activation_block_reasons_for_viewer`.
             activation_block_reasons: object_id_record(
                 engine::ai_support::activation_block_reasons(state),
             ),
@@ -4898,6 +4950,7 @@ mod tests {
                 },
             ],
             free_first_mulligan: false,
+            declared: Vec::new(),
         };
         let keep = GameAction::MulliganDecision {
             choice: engine::types::actions::MulliganChoice::Keep,
@@ -7192,6 +7245,260 @@ mod deck_list_seat_validation_tests {
                  being a commander: Plains"
                     .to_string()
             ]),
+        );
+    }
+}
+
+/// CR 118.9b: a graveyard permission's required casting method survives the P2P
+/// host's own resume path, not only the persisted-state decoder. Tenacious
+/// Underdog's "using its blitz ability" permission, with its printed {1}{B}
+/// affordable and its blitz not: the host exports the trusted envelope, a fresh
+/// engine resumes it through `resume_multiplayer_host_state`, and the resumed
+/// host still carries `required_cast_keyword == Some(Blitz)` and still refuses
+/// the printed cast, exactly as a host that was never interrupted.
+#[cfg(test)]
+mod graveyard_cast_method_host_resume_tests {
+    use super::*;
+    use engine::game::scenario::{GameScenario, P0};
+    use engine::types::keywords::Keyword;
+    use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
+    use engine::types::phase::Phase;
+    use engine::types::statics::StaticMode;
+
+    const UNDERDOG: &str = "Blitz\u{2014}{2}{B}{B}, Pay 2 life. (If you cast this spell for its blitz cost, it gains haste and \"When this creature dies, draw a card.\" Sacrifice it at the beginning of the next end step.)\nYou may cast this card from your graveyard using its blitz ability.";
+
+    fn underdog_with_only_the_printed_cost_affordable() -> (GameState, ObjectId) {
+        let parsed = engine::parser::oracle::parse_oracle_text(
+            UNDERDOG,
+            "Tenacious Underdog",
+            &[],
+            &["Creature".into()],
+            &["Human".into(), "Warrior".into()],
+        );
+        let blitz = parsed
+            .extracted_keywords
+            .iter()
+            .find(|k| matches!(k, Keyword::Blitz(_)))
+            .expect("blitz parses")
+            .clone();
+        let rider = parsed.statics.first().expect("the rider parses").clone();
+        let mut s = GameScenario::new_n_player(2, 42);
+        s.at_phase(Phase::PreCombatMain);
+        let dog = s
+            .add_creature_to_graveyard(P0, "Tenacious Underdog", 3, 2)
+            .with_static_definition(rider)
+            .with_mana_cost(ManaCost::Cost {
+                generic: 1,
+                shards: vec![ManaCostShard::Black],
+            })
+            .with_keyword(blitz)
+            .id();
+        s.with_mana_pool(
+            P0,
+            (0..2)
+                .map(|_| ManaUnit::new(ManaType::Black, ObjectId(0), false, Vec::new()))
+                .collect(),
+        );
+        let mut state = s.build().state().clone();
+        state.players[0].life = 1;
+        (state, dog)
+    }
+
+    fn attempt_printed_cast(state: &mut GameState, dog: ObjectId) -> serde_json::Value {
+        let required = state.objects[&dog]
+            .static_definitions
+            .as_slice()
+            .iter()
+            .find_map(|def| match def.mode {
+                StaticMode::GraveyardCastPermission {
+                    required_cast_keyword,
+                    ..
+                } => Some(format!("{required_cast_keyword:?}")),
+                _ => None,
+            });
+        let card_id = state.objects[&dog].card_id;
+        let cast = engine::game::engine::apply_as_current(
+            state,
+            GameAction::CastSpell {
+                object_id: dog,
+                card_id,
+                targets: vec![],
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+            },
+        );
+        serde_json::json!({
+            "required": required,
+            "cast_accepted": cast.is_ok(),
+            "zone": format!("{:?}", state.objects[&dog].zone),
+            "pool": state.players[0].mana_pool.total(),
+            "life": state.players[0].life,
+        })
+    }
+
+    #[test]
+    fn a_blitz_only_permission_resumed_by_the_p2p_host_still_refuses_the_printed_cast() {
+        let (paused, dog) = underdog_with_only_the_printed_cost_affordable();
+
+        let mut uninterrupted = paused.clone();
+        let expected = attempt_printed_cast(&mut uninterrupted, dog);
+        assert_eq!(
+            expected["required"], "Some(Blitz)",
+            "reach guard: {expected}"
+        );
+        assert_eq!(expected["cast_accepted"], false, "{expected}");
+        assert_eq!(expected["zone"], "Graveyard", "{expected}");
+
+        let mut exported = paused.clone();
+        exported.capture_rng_word_pos();
+        let json = serde_json::to_string(&TrustedGameStateEnvelope::capture(exported))
+            .expect("the host exports its state");
+        clear_game_state();
+        set_multiplayer_mode(false);
+        load_minimal_test_card_database();
+        resume_multiplayer_host_state_inner(&json).expect("the P2P host resumes");
+        let resumed =
+            with_state_mut(|state| attempt_printed_cast(state, dog)).expect("a live game");
+        clear_game_state();
+        set_multiplayer_mode(false);
+
+        assert_eq!(
+            resumed, expected,
+            "the resumed host keeps the method and refuses the printed cast"
+        );
+    }
+}
+
+/// #9248 RT-2's P2P leg: an activation paused at its target-settlement
+/// election (CR 601.2c + CR 601.2f + CR 602.2b) survives the P2P host's own
+/// resume path, not just the persisted-state decoder: the host exports the
+/// trusted envelope, a fresh engine resumes it through
+/// `resume_multiplayer_host_state` (its separate `restore_runtime` hook and
+/// finalization), and the caster's non-default order then locks the same cost,
+/// on the same targets, with the same stack entry and activation journal as a
+/// host that was never interrupted.
+#[cfg(test)]
+mod settlement_election_host_resume_tests {
+    use super::*;
+    use engine::game::scenario::{GameScenario, P0, P1};
+    use engine::types::ability::TargetRef;
+    use engine::types::game_state::{TrustedGameStateEnvelope, WaitingFor};
+    use engine::types::mana::{ManaColor, ManaUnit};
+    use engine::types::phase::Phase;
+
+    const HOJO: &str = "The first activated ability you activate during your turn that targets a creature you control costs {2} less to activate.";
+    const GROUNDS: &str = "Activated abilities of creatures you control cost {2} less to activate. This effect can't reduce the mana in that cost to less than one mana.";
+
+    /// `{3}` under Hojo's unfloored `-2` and a floored `-2`, targeting your own
+    /// creature: the orders lock `{0}` and `{1}`. Paused at that election.
+    fn paused_at_settlement_election() -> (GameState, ObjectId) {
+        let mut s = GameScenario::new_n_player(2, 42);
+        s.at_phase(Phase::PreCombatMain);
+        s.add_artifact_from_oracle(P0, "Training Grounds", GROUNDS);
+        s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
+        let own = s.add_creature(P0, "Own", 1, 1).id();
+        s.add_creature(P1, "Bear", 2, 2);
+        let src = s
+            .add_creature_from_oracle(P0, "Tapper", 2, 2, "{3}: Tap target creature.")
+            .id();
+        s.with_mana_pool(
+            P0,
+            (0..5)
+                .map(|_| ManaUnit::new(ManaColor::Blue.into(), ObjectId(0), false, Vec::new()))
+                .collect(),
+        );
+        let mut state = s.build().state().clone();
+        state.objects.get_mut(&src).unwrap().has_summoning_sickness = false;
+        engine::game::engine::apply_as_current(
+            &mut state,
+            GameAction::ActivateAbility {
+                source_id: src,
+                ability_index: 0,
+            },
+        )
+        .expect("the activation starts");
+        engine::game::engine::apply_as_current(
+            &mut state,
+            GameAction::SelectTargets {
+                targets: vec![TargetRef::Object(own)],
+            },
+        )
+        .expect("targets settle");
+        assert!(
+            matches!(state.waiting_for, WaitingFor::OrderCostReductions { .. }),
+            "reach guard: paused at the settlement election, got {:?}",
+            state.waiting_for
+        );
+        (state, own)
+    }
+
+    /// The costlier order, then priority passes until the activation is on the
+    /// stack and paid. Returns what the comparison reads.
+    fn elect_costlier(state: &mut GameState) -> serde_json::Value {
+        let WaitingFor::OrderCostReductions { outcomes, .. } = state.waiting_for.clone() else {
+            panic!("expected the election, got {:?}", state.waiting_for);
+        };
+        let costly = outcomes
+            .iter()
+            .find(|o| o.locked_cost.mana_value() == 1)
+            .expect("the {1} order");
+        engine::game::engine::apply_as_current(
+            state,
+            GameAction::OrderCostReductions {
+                order: costly.order.clone(),
+                hybrid_announcement: Vec::new(),
+            },
+        )
+        .expect("the election resumes");
+        for _ in 0..4 {
+            if matches!(state.waiting_for, WaitingFor::ManaPayment { .. }) {
+                engine::game::engine::apply_as_current(state, GameAction::PassPriority)
+                    .expect("mana payment");
+            }
+        }
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+        serde_json::json!({
+            "pool": state.players[0].mana_pool.total(),
+            "stack": serde_json::to_value(&state.stack).unwrap(),
+            "journal": serde_json::to_value(&state.abilities_activated_this_turn_by_player)
+                .unwrap(),
+        })
+    }
+
+    #[test]
+    fn a_settlement_election_resumed_by_the_p2p_host_prices_like_an_uninterrupted_host() {
+        let (paused, own) = paused_at_settlement_election();
+
+        // The uninterrupted host.
+        let mut uninterrupted = paused.clone();
+        let expected = elect_costlier(&mut uninterrupted);
+        assert_eq!(
+            expected["pool"], 4,
+            "reach guard: the elected {{1}} was paid"
+        );
+        let placed = uninterrupted.stack.back().expect("placed");
+        let engine::types::game_state::StackEntryKind::ActivatedAbility { ability, .. } =
+            &placed.kind
+        else {
+            panic!("an activated ability");
+        };
+        assert_eq!(ability.targets, vec![TargetRef::Object(own)]);
+
+        // The P2P host: export, then resume on a fresh engine.
+        let mut exported = paused.clone();
+        exported.capture_rng_word_pos();
+        let json = serde_json::to_string(&TrustedGameStateEnvelope::capture(exported))
+            .expect("the host exports its state");
+        clear_game_state();
+        set_multiplayer_mode(false);
+        load_minimal_test_card_database();
+        resume_multiplayer_host_state_inner(&json).expect("the P2P host resumes");
+        let resumed = with_state_mut(elect_costlier).expect("a live game");
+        clear_game_state();
+        set_multiplayer_mode(false);
+
+        assert_eq!(
+            resumed, expected,
+            "the resumed host locks and places the same activation"
         );
     }
 }

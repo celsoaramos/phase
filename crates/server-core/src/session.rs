@@ -4565,6 +4565,8 @@ mod tests {
                 dynamic_count: None,
                 exemption: ActivationExemption::None,
                 activator: None,
+                targets: None,
+                frequency: None,
             })
             .affected(TargetFilter::Typed(
                 TypedFilter::creature().controller(ControllerRef::You),
@@ -5246,6 +5248,7 @@ mod tests {
                 phase: engine::types::game_state::MulliganDecisionPhase::Declare,
             }],
             free_first_mulligan: true,
+            declared: Vec::new(),
         };
 
         // Player 0 requests a takeback; with two human seats (0 and 1) it
@@ -7589,6 +7592,7 @@ mod tests {
             selectable_cards: top_three.clone(),
             kept_destination: Some(Zone::Library),
             rest_destination: Some(Zone::Library),
+            rest_split_top_count: None,
             rest_order: engine::types::ability::DigRestOrder::Preserve,
             source_id: None,
             enter_tapped: false,
@@ -7668,6 +7672,7 @@ mod tests {
                 },
             }],
             free_first_mulligan: false,
+            declared: Vec::new(),
         };
 
         let token = token.to_string();
@@ -7752,6 +7757,7 @@ mod tests {
         session.state.waiting_for = WaitingFor::MulliganDecision {
             pending: pending_before.clone(),
             free_first_mulligan: false,
+            declared: Vec::new(),
         };
 
         let token = token.to_string();
@@ -7771,6 +7777,7 @@ mod tests {
             WaitingFor::MulliganDecision {
                 pending: pending_before,
                 free_first_mulligan: false,
+                declared: Vec::new(),
             },
             "pending obligation must be unchanged after a rejected selection"
         );

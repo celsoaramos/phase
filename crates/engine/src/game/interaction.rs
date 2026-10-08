@@ -58,8 +58,8 @@ use crate::types::interaction::{
     MAX_INTERACTION_LIST_LEN, MAX_SHORTCUT_PREVIEW_ELEMENTS,
 };
 use crate::types::mana::{
-    AbilityActivationScope, ManaColor, ManaCost, ManaRestriction, ManaSourceSelection, ManaType,
-    SpecialAction, SpellCostCriterion, ZoneSpendPolarity,
+    AbilityActivationScope, ManaColor, ManaCost, ManaRestriction, ManaSourceOutput,
+    ManaSourceSelection, ManaType, SpecialAction, SpellCostCriterion, ZoneSpendPolarity,
 };
 use crate::types::match_config::DeckCardCount;
 use crate::types::player::PlayerId;
@@ -236,6 +236,7 @@ fn human_response_model(waiting_for: &WaitingFor, semantic_owner: PlayerId) -> H
         | WaitingFor::RevealUntilBottomOrder { .. }
         | WaitingFor::ArrangePlanarDeckTopChoice { .. }
         | WaitingFor::DigChoice { .. }
+        | WaitingFor::DigRestSplitChoice { .. }
         | WaitingFor::SurveilChoice { .. }
         | WaitingFor::SearchChoice { .. }
         | WaitingFor::SearchPartitionChoice { .. }
@@ -309,6 +310,7 @@ fn human_response_model(waiting_for: &WaitingFor, semantic_owner: PlayerId) -> H
         | WaitingFor::RevealChoice { .. }
         | WaitingFor::BeholdChoice { .. }
         | WaitingFor::EmpowerJaceChoice { .. }
+        | WaitingFor::SpellCopyOrderChoice { .. }
         | WaitingFor::ChooseOneOfBranch { .. }
         | WaitingFor::LearnChoice { .. }
         | WaitingFor::ManifestDreadChoice { .. }
@@ -530,6 +532,7 @@ fn classify_waiting_for(waiting_for: &WaitingFor) -> WaitingClassification {
         | WaitingFor::RevealUntilBottomOrder { .. }
         | WaitingFor::ArrangePlanarDeckTopChoice { .. }
         | WaitingFor::DigChoice { .. }
+        | WaitingFor::DigRestSplitChoice { .. }
         | WaitingFor::SurveilChoice { .. }
         | WaitingFor::SearchChoice { .. }
         | WaitingFor::SearchPartitionChoice { .. }
@@ -565,6 +568,7 @@ fn classify_waiting_for(waiting_for: &WaitingFor) -> WaitingClassification {
         | WaitingFor::RevealChoice { .. }
         | WaitingFor::BeholdChoice { .. }
         | WaitingFor::EmpowerJaceChoice { .. }
+        | WaitingFor::SpellCopyOrderChoice { .. }
         | WaitingFor::DiscardChoice {
             unless_filter: Some(_),
             ..
@@ -715,6 +719,33 @@ fn interaction_serial_is_valid(value: &str) -> bool {
 
 fn interaction_session_is_valid(session: &InteractionSessionId) -> bool {
     !session.0.is_empty() && session.0.len() <= MAX_INTERACTION_SESSION_ID_LEN
+}
+
+/// Read the authorized viewer's existing Scry identity independently of the
+/// bounded interaction payload. This getter never allocates or rotates a slot.
+pub(crate) fn scry_prompt_id_for_viewer(
+    state: &GameState,
+    viewer: PlayerId,
+) -> Option<InteractionId> {
+    let WaitingFor::ScryChoice { player, .. } = &state.waiting_for else {
+        return None;
+    };
+    if interaction_submitter_for_owner(state, *player) != viewer
+        || state
+            .interaction_session_id
+            .as_ref()
+            .is_none_or(|session| !interaction_session_is_valid(session))
+        || !interaction_serial_is_valid(&state.next_interaction_serial)
+    {
+        return None;
+    }
+    state
+        .active_interaction_slots
+        .iter()
+        .find(|slot| {
+            slot.semantic_owner == player.0 && slot.slot_kind == InteractionSlotKind::Single
+        })
+        .map(|slot| slot.interaction_id.clone())
 }
 
 fn increment_decimal(value: &str) -> Option<String> {
@@ -898,6 +929,7 @@ pub(crate) fn action_preserves_interaction(action: &GameAction) -> bool {
             | GameAction::SetPriorityPassingMode { .. }
             | GameAction::SetPriorityYield { .. }
             | GameAction::SetMayTriggerAutoChoice { .. }
+            | GameAction::SetReplacementAutoChoice { .. }
             | GameAction::SetTriggerOrderTemplate { .. }
             | GameAction::CancelAutoPass
             | GameAction::GrantDebugPermission { .. }
@@ -2157,8 +2189,8 @@ fn mana_payment_direct_actions(
     );
     if has_delve {
         actions.extend(state.objects.values().filter_map(|object| {
-            object
-                .is_delve_eligible(player)
+            state
+                .is_delve_selectable(player, object.id)
                 .then_some(GameAction::TapForConvoke {
                     object_id: object.id,
                     mana_type: ManaType::Colorless,
@@ -4161,6 +4193,7 @@ fn selection_projection(
         WaitingFor::DigChoice {
             selectable_cards, ..
         } => selectable_cards.len(),
+        WaitingFor::DigRestSplitChoice { cards, .. } => cards.len(),
         WaitingFor::SeparatePilesPartition { eligible, .. } => eligible.len(),
         WaitingFor::RippleBottomOrder { cards, .. }
         | WaitingFor::RevealUntilBottomOrder { cards, .. } => cards.len(),
@@ -4517,6 +4550,21 @@ fn selection_projection(
                 source_id: *source_id,
             })
         }
+        // CR 401.2 + CR 401.4 + CR 608.2d: the whole remainder pile is offered
+        // and the player submits a full permutation of it — the leading
+        // `top_count` entries take the top, the rest take the bottom, each in
+        // the submitted order. Exact bounds of `cards.len()`, identical to the
+        // sibling `RippleBottomOrder` arrangement projection above; the client
+        // never computes a second list and never computes the split point
+        // (`top_count` is engine-supplied on the prompt).
+        WaitingFor::DigRestSplitChoice { cards, source_id, .. } => Some(SelectionProjection {
+            object_ids: cards.clone(),
+            constraint: count_constraint(cards.len(), cards.len()),
+            confirm: ConfirmSemantics::Explicit,
+            intent: InteractionIntentCode::Choose,
+            action: SelectionAction::SelectCards,
+            source_id: *source_id,
+        }),
         WaitingFor::SearchChoice {
             cards,
             count,
@@ -4733,6 +4781,7 @@ fn selection_projection(
         | WaitingFor::OutsideGameChoice { .. }
         | WaitingFor::BeholdChoice { .. }
         | WaitingFor::EmpowerJaceChoice { .. }
+        | WaitingFor::SpellCopyOrderChoice { .. }
         | WaitingFor::ChooseOneOfBranch { .. }
         | WaitingFor::LearnChoice { .. }
         | WaitingFor::ManifestDreadChoice { .. }
@@ -5542,6 +5591,14 @@ fn push_produced_mana_surfaces(
     let Ok(option) = resolve(state, player, selection) else {
         return;
     };
+    // CR 106.1a + CR 106.1b: A deferred activation has no selected type yet. The
+    // post-cost mana-choice resolver remains the authority for its output.
+    if matches!(
+        selection.output,
+        ManaSourceOutput::DeferredColorChoice { .. }
+    ) {
+        return;
+    }
     for (index, unit) in mana_sources::live_mana_output_for_option(state, player, &option)
         .into_iter()
         .enumerate()
@@ -5706,6 +5763,9 @@ fn project_action_payload(
             MulliganChoice::Mulligan => {
                 push_value_surface(surfaces, InteractionRoleCode::Mulligan, "mulligan")
             }
+            MulliganChoice::FreeReveal => {
+                push_value_surface(surfaces, InteractionRoleCode::Mulligan, "freeReveal")
+            }
             MulliganChoice::UseSerumPowder { object_id } => {
                 push_value_surface(surfaces, InteractionRoleCode::Mulligan, "serumPowder");
                 push_object_surface(
@@ -5795,6 +5855,16 @@ fn project_action_payload(
                 push_value_surface(surfaces, InteractionRoleCode::Target, "none");
             }
         }
+        GameAction::ChooseReplacementAndRemember { choice } => match choice {
+            crate::types::actions::ReplacementAutoChoice::Order { order } => {
+                for index in order {
+                    push_value_surface(surfaces, InteractionRoleCode::OptionIndex, index);
+                }
+            }
+            crate::types::actions::ReplacementAutoChoice::Optional { index } => {
+                push_value_surface(surfaces, InteractionRoleCode::OptionIndex, index)
+            }
+        },
         GameAction::ChooseReplacement { index }
         | GameAction::ChooseBranch { index }
         | GameAction::ChooseCastingVariant { index }
@@ -6100,6 +6170,7 @@ fn project_action_payload(
         | GameAction::SetPriorityPassingMode { .. }
         | GameAction::SetPriorityYield { .. }
         | GameAction::SetMayTriggerAutoChoice { .. }
+        | GameAction::SetReplacementAutoChoice { .. }
         | GameAction::SetTriggerOrderTemplate { .. } => {}
         GameAction::AssignCombatDamage {
             assignments,
@@ -6480,6 +6551,12 @@ fn action_code(action: &GameAction) -> InteractionActionCode {
         GameAction::SelectTargets { .. } => InteractionActionCode::SelectTargets,
         GameAction::ChooseTarget { .. } => InteractionActionCode::ChooseTarget,
         GameAction::ChooseReplacement { .. } => InteractionActionCode::ChooseReplacement,
+        GameAction::ChooseReplacementAndRemember { .. } => {
+            InteractionActionCode::ChooseReplacementAndRemember
+        }
+        GameAction::SetReplacementAutoChoice { .. } => {
+            InteractionActionCode::SetReplacementAutoChoice
+        }
         GameAction::ChooseEntryController { .. } => InteractionActionCode::ChooseEntryController,
         GameAction::OrderTriggers { .. } => InteractionActionCode::OrderTriggers,
         GameAction::OrderCostReductions { .. } => InteractionActionCode::OrderCostReductions,

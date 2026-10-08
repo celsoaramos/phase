@@ -88,6 +88,10 @@ mod tests {
         controller: PlayerId,
     ) -> ResolvedAbility {
         ResolvedAbility {
+            declares_chosen_group: None,
+            reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::ExtraTurn { target, count },
             controller,
@@ -103,6 +107,7 @@ mod tests {
             target_incarnations: Vec::new(),
             selected_target_incarnations: Vec::new(),
             illegal_target_slots: Vec::new(),
+            illegal_local_target_slots: Vec::new(),
             targets: vec![],
             kind: AbilityKind::Spell,
             sub_ability: None,
@@ -134,6 +139,7 @@ mod tests {
             min_x_value: 0,
             announced_x: None,
             cant_be_copied: false,
+            illegal_targets_disposition: Default::default(),
             copy_count_status: crate::types::ability::CopyCountStatus::Pending,
             forward_result: false,
             unless_pay: None,
@@ -144,10 +150,13 @@ mod tests {
             repeat_until: None,
             replacement_applied: Default::default(),
             sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
+            target_reads: Default::default(),
             sibling_condition: crate::types::ability::SiblingCondition::Dependent,
             modal: None,
             mode_abilities: vec![],
             parent_target_missing_reason: None,
+            activation_cost_reduction: None,
+            activation_record: None,
         }
     }
 

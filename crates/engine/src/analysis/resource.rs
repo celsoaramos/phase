@@ -1344,7 +1344,7 @@ impl ResourceVector {
             v.life.insert(player.id, player.life as i64);
             // CR 401: per-player library size.
             v.library_delta
-                .insert(player.id, player.library.len() as i64);
+                .insert(player.id, state.library_of(player.id).len() as i64);
             // CR 704.5c: poison counters, keyed by the VICTIM's `PlayerId` (10 ⇒ that
             // player loses) — mirrors the per-player `life`/`library_delta` maps above.
             v.poison.insert(player.id, player.poison_counters as i64);
@@ -1875,7 +1875,7 @@ impl ResourceVector {
             .iter()
             .filter(|p| !p.is_eliminated)
             .filter_map(|p| {
-                self.seat_headroom_bound(p, seat_life_charge)
+                self.seat_headroom_bound(state, p, seat_life_charge)
                     .map(|bound| (p.id, bound))
             })
             .collect();
@@ -1927,6 +1927,7 @@ impl ResourceVector {
     /// caller's relief guard has to refuse.
     fn seat_headroom_bound(
         &self,
+        state: &GameState,
         p: &crate::types::player::Player,
         seat_life_charge: &[(PlayerId, i64)],
     ) -> Option<i64> {
@@ -1968,7 +1969,7 @@ impl ResourceVector {
         // CR 104.3c + CR 121.4 (drawing from an empty library loses): a negative
         // library delta is the per-period drain.
         narrow(
-            p.library.len() as i64,
+            state.library_of(p.id).len() as i64,
             -self.library_delta.get(&p.id).copied().unwrap_or(0),
         );
 
@@ -5017,15 +5018,7 @@ fn counters_on_source_provably_excludes_class(
     }
     // (d) ARG-EQUIVALENCE — `game::quantity::object_id_for_scope`. Fail closed on
     // `None`: an unresolvable scope proves nothing about which object is read.
-    let ctx = crate::game::quantity::QuantityContext {
-        entering: None,
-        source: source.id,
-        trigger_source: None,
-        recipient: None,
-        scoped_player: None,
-        damage_source: None,
-        event_amount: None,
-    };
+    let ctx = crate::game::quantity::QuantityContext::new(source.id);
     crate::game::quantity::object_id_for_scope(state, ObjectScope::Source, ctx, &[])
         .is_some_and(|read_id| read_id != class_member)
 }
@@ -5750,7 +5743,7 @@ fn node_reads_mutable_resolution_local_state(node: &crate::types::ability::Targe
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::Opponent
         | TargetFilter::SelfRef
-        | TargetFilter::GrantingObject
+        | TargetFilter::GrantingObject { .. }
         | TargetFilter::SpecificObject { .. }
         | TargetFilter::SpecificPlayer { .. }
         | TargetFilter::PlayerWhoChoseLabel { .. }
@@ -5882,7 +5875,7 @@ fn node_has_non_arrival_invariant_property(node: &crate::types::ability::TargetF
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::Opponent
         | TargetFilter::SelfRef
-        | TargetFilter::GrantingObject
+        | TargetFilter::GrantingObject { .. }
         | TargetFilter::SourceOrPaired
         | TargetFilter::SpecificObject { .. }
         | TargetFilter::SpecificPlayer { .. }
@@ -6000,7 +5993,7 @@ fn prop_is_arrival_invariant(prop: &crate::types::ability::FilterProp) -> bool {
         | FilterProp::Blocking
         | FilterProp::BlockingSource
         | FilterProp::CombatRelation { .. }
-        | FilterProp::Unblocked
+        | FilterProp::BlockStatus { .. }
         // CR 506.5 + CR 506.3b: an arriving attacker ends a pre-existing creature's
         // "attacking alone".
         | FilterProp::AttackingAlone
@@ -6102,6 +6095,7 @@ fn player_filter_is_arrival_invariant(filter: &crate::types::ability::PlayerFilt
         | PlayerFilter::OpponentOfTriggeringPlayer
         | PlayerFilter::ParentObjectTargetController
         | PlayerFilter::ParentObjectTargetOwner
+        | PlayerFilter::GrantingObjectCaster
         | PlayerFilter::ChosenPlayer { .. } => true,
         PlayerFilter::AllExcept { exclude } => player_filter_is_arrival_invariant(exclude),
         // ── REFUSED: board-census and ledger-derived designations ──
@@ -8104,6 +8098,9 @@ pub(crate) fn project_object_for_loop(object: &mut crate::game::game_object::Gam
 
 fn project_out_resources(state: &GameState) -> GameState {
     bump_loop_detect_cost(|cost| cost.projected_clones += 1);
+    // Read from the unprojected state: the cost gates judge recorded facts
+    // against the live statics, before any object is projected below.
+    let observable_journal = crate::game::casting::cost_observable_activation_journal(state);
     let mut s = state.normalize_for_loop();
 
     for player in &mut s.players {
@@ -8200,6 +8197,14 @@ fn project_out_resources(state: &GameState) -> GameState {
     s.spells_cast_this_turn_by_player.clear();
     s.spells_cast_this_game.clear();
     s.spells_cast_this_game_by_player.clear();
+    // CR 602.2 + CR 611.3a: the per-turn activation journal is the activation
+    // analog of the cast journal above, and every row of it is pumped history
+    // EXCEPT the one fact a "first activated ability … each turn" cost reads:
+    // each such modifier's first qualifying row. That is kept (see
+    // `cost_observable_activation_journal`), so a period that spends a one-time
+    // discount compares UNEQUAL and can never be certified as repeatable, while
+    // periods after it keep the same row and still compare equal.
+    *s.abilities_activated_this_turn_by_player = observable_journal;
     // CR 400 (zones) / CR 603.6a (ETB) / CR 701.21 (sacrifice) / CR 111 (tokens):
     // append-only event journals a loop pumps.
     s.zone_changes_this_turn.clear();
@@ -8207,6 +8212,7 @@ fn project_out_resources(state: &GameState) -> GameState {
     s.created_tokens_this_turn.clear();
     s.players_who_created_token_this_turn.clear();
     s.sacrificed_permanents_this_turn.clear();
+    s.creatures_exploited_this_turn.clear();
     s.players_who_sacrificed_artifact_this_turn.clear();
     s.counter_added_this_turn.clear();
     s.player_actions_this_turn.clear();
@@ -9547,6 +9553,362 @@ mod tests {
             loop_states_equal_modulo_resources(&c, &d),
             "an unrestricted ability's tally is pure history and must be projected out (EQUAL)"
         );
+    }
+
+    /// CR 611.3a + CR 732.2a: a "first activated ability … each turn" discount
+    /// (Professor Hojo) is one-time within the turn, so a period that SPENDS it
+    /// must not compare modulo-equal to one that hasn't: a certificate over that
+    /// period would repeat the one-time discount. The journal is projected to
+    /// the modifier's first qualifying row. PAIRED CONTROLS: without the
+    /// once-per-turn modifier the same pair is pure history (EQUAL), and two
+    /// positions after the discount was spent share that row (EQUAL).
+    #[test]
+    fn a_spent_first_activation_discount_breaks_modulo_equality() {
+        use crate::game::scenario::GameScenario;
+        use crate::types::ability::TargetRef;
+        const HOJO: &str = "The first activated ability you activate during your turn that targets a creature you control costs {2} less to activate.";
+
+        let board = |with_hojo: bool| {
+            let mut s = GameScenario::new_n_player(2, 7);
+            s.at_phase(Phase::PreCombatMain);
+            let own = s.add_creature(PlayerId(0), "Own", 1, 1).id();
+            let src = s
+                .add_artifact_from_oracle(PlayerId(0), "Tapper", "{2}: Tap target creature.")
+                .id();
+            if with_hojo {
+                s.add_creature_from_oracle(PlayerId(0), "Professor Hojo", 2, 2, HOJO);
+            }
+            (s.build().state().clone(), own, src)
+        };
+        let row = |state: &GameState, own: ObjectId, src: ObjectId| {
+            crate::game::casting::capture_activation_record_from(
+                state,
+                PlayerId(0),
+                src,
+                None,
+                &[TargetRef::Object(own)],
+            )
+            .expect("the source exists")
+        };
+        let journaled = |state: &GameState, rows: Vec<_>| {
+            let mut next = state.clone();
+            next.abilities_activated_this_turn_by_player
+                .insert(PlayerId(0), im::Vector::from(rows));
+            next.players[1].life -= 1; // the projected-out resource gain
+            next
+        };
+
+        // Negative: before vs after the discount is spent => UNEQUAL.
+        let (a, own, src) = board(true);
+        let first = row(&a, own, src);
+        let spent = journaled(&a, vec![first.clone()]);
+        assert!(
+            !loop_states_equal_modulo_resources(&a, &spent),
+            "a period that spends the one-time discount must compare UNEQUAL"
+        );
+        // Control: two positions after it was spent keep the same first row.
+        let later = journaled(&spent, vec![first.clone(), first.clone()]);
+        assert!(
+            loop_states_equal_modulo_resources(&spent, &later),
+            "after the discount is spent, later rows are pure history (EQUAL)"
+        );
+
+        // Control: no once-per-turn modifier reads the journal => EQUAL.
+        let (c, own, src) = board(false);
+        let d = journaled(&c, vec![row(&c, own, src)]);
+        assert!(
+            loop_states_equal_modulo_resources(&c, &d),
+            "without a reader the journal is pure history (EQUAL)"
+        );
+    }
+
+    /// CR 611.3a + CR 732.2a: a DORMANT first-activation modifier (Professor
+    /// Hojo in hand) reads the whole turn's journal the moment it takes effect,
+    /// so the journal is cost-relevant before it does. A (no earlier qualifying
+    /// activation) and B (one) must compare UNEQUAL: once Hojo is cast, the
+    /// same activation costs {0} in A and {2} in B. The pair is measured through
+    /// the production pipeline as the reach guard.
+    #[test]
+    fn a_dormant_first_activation_modifier_keeps_the_journal_in_the_loop_key() {
+        use crate::game::scenario::{GameRunner, GameScenario};
+        use crate::types::ability::TargetRef;
+        use crate::types::actions::GameAction;
+        use crate::types::mana::{ManaColor, ManaCost, ManaUnit};
+        const HOJO: &str = "The first activated ability you activate during your turn that targets a creature you control costs {2} less to activate.";
+
+        let build = || {
+            let mut s = GameScenario::new_n_player(2, 7);
+            s.at_phase(Phase::PreCombatMain);
+            let own = s.add_creature(PlayerId(0), "Own", 1, 1).id();
+            let src = s
+                .add_artifact_from_oracle(PlayerId(0), "Tapper", "{2}: Tap target creature.")
+                .id();
+            let hojo = s
+                .add_creature_to_hand_from_oracle(PlayerId(0), "Professor Hojo", 2, 2, HOJO)
+                .with_mana_cost(ManaCost::generic(1))
+                .id();
+            s.with_mana_pool(
+                PlayerId(0),
+                (0..10)
+                    .map(|_| ManaUnit::new(ManaColor::Blue.into(), ObjectId(0), false, Vec::new()))
+                    .collect(),
+            );
+            (s.build(), own, src, hojo)
+        };
+        let (a_runner, own, src, hojo) = build();
+        let a = a_runner.state().clone();
+        let mut b = a.clone();
+        b.abilities_activated_this_turn_by_player.insert(
+            PlayerId(0),
+            im::Vector::from(vec![crate::game::casting::capture_activation_record_from(
+                &a,
+                PlayerId(0),
+                src,
+                None,
+                &[TargetRef::Object(own)],
+            )
+            .expect("the source exists")]),
+        );
+        assert!(
+            !loop_states_equal_modulo_resources(&a, &b),
+            "a dormant Hojo makes the earlier qualifying activation cost-relevant (UNEQUAL)"
+        );
+
+        // Reach guard: after Hojo enters, the same activation is priced apart.
+        let paid_after_hojo = |state: GameState| {
+            let mut r = GameRunner::from_state(state);
+            r.cast(hojo).resolve();
+            let before = r.state().players[0].mana_pool.total();
+            r.act(GameAction::ActivateAbility {
+                source_id: src,
+                ability_index: 0,
+            })
+            .expect("activation");
+            r.act(GameAction::SelectTargets {
+                targets: vec![TargetRef::Object(own)],
+            })
+            .expect("target");
+            while matches!(
+                r.state().waiting_for,
+                crate::types::game_state::WaitingFor::ManaPayment { .. }
+            ) {
+                r.act(GameAction::PassPriority).expect("pay");
+            }
+            before - r.state().players[0].mana_pool.total()
+        };
+        assert_eq!((paid_after_hojo(a), paid_after_hojo(b)), (0, 2));
+    }
+
+    /// CR 611.3a + CR 701.27a: two first-activation definitions on ONE object
+    /// never mask each other. The object's front face carries active modifier A
+    /// (keyed to boast abilities), its back face dormant modifier B (Hojo's,
+    /// keyed to any activated ability). A tap activation targeting P0's creature
+    /// qualifies for B, not A: state B (which has that row) and state A (which
+    /// doesn't) must compare UNEQUAL, because once the object transforms the same
+    /// activation costs {0} in A and {2} in B (the production reach guard).
+    #[test]
+    fn two_first_activation_definitions_on_one_object_are_projected_separately() {
+        use crate::game::game_object::BackFaceData;
+        use crate::game::scenario::{GameRunner, GameScenario};
+        use crate::types::ability::TargetRef;
+        use crate::types::actions::GameAction;
+        use crate::types::card_type::{CardType, CoreType};
+        use crate::types::mana::{ManaColor, ManaUnit};
+        use crate::types::statics::StaticMode;
+        const HOJO: &str = "The first activated ability you activate during your turn that targets a creature you control costs {2} less to activate.";
+
+        let modifier_b =
+            crate::parser::oracle_static::parse_static_line(HOJO).expect("Hojo's line parses");
+        let mut modifier_a = modifier_b.clone();
+        let StaticMode::ReduceAbilityCost { keyword, .. } = &mut modifier_a.mode else {
+            panic!("reach guard: {:?}", modifier_a.mode);
+        };
+        *keyword = "boast".to_string();
+
+        let mut s = GameScenario::new_n_player(2, 7);
+        s.at_phase(Phase::PreCombatMain);
+        let own = s.add_creature(PlayerId(0), "Own", 1, 1).id();
+        let src = s
+            .add_artifact_from_oracle(PlayerId(0), "Tapper", "{2}: Tap target creature.")
+            .id();
+        let janus = s
+            .add_creature(PlayerId(0), "Janus Front", 2, 2)
+            .with_static_definition(modifier_a)
+            .id();
+        s.with_mana_pool(
+            PlayerId(0),
+            (0..10)
+                .map(|_| ManaUnit::new(ManaColor::Blue.into(), ObjectId(0), false, Vec::new()))
+                .collect(),
+        );
+        let mut runner = s.build();
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&janus)
+            .unwrap()
+            .back_face = Some(BackFaceData {
+            name: "Janus Back".to_string(),
+            power: Some(2),
+            toughness: Some(2),
+            card_types: CardType {
+                core_types: vec![CoreType::Creature],
+                ..Default::default()
+            },
+            static_definitions: vec![modifier_b].into(),
+            ..Default::default()
+        });
+        let a = runner.state().clone();
+        let mut b = a.clone();
+        b.abilities_activated_this_turn_by_player.insert(
+            PlayerId(0),
+            im::Vector::from(vec![crate::game::casting::capture_activation_record_from(
+                &a,
+                PlayerId(0),
+                src,
+                None,
+                &[TargetRef::Object(own)],
+            )
+            .expect("the source exists")]),
+        );
+        assert!(
+            !loop_states_equal_modulo_resources(&a, &b),
+            "the back face's modifier reads the row the front face's ignores (UNEQUAL)"
+        );
+
+        // Reach guard: transformed, the back face's modifier prices them apart.
+        let paid_after_transform = |state: GameState| {
+            let mut r = GameRunner::from_state(state);
+            crate::game::transform::transform_permanent(r.state_mut(), janus, &mut Vec::new())
+                .expect("the object transforms");
+            crate::game::layers::flush_layers(r.state_mut());
+            assert_eq!(r.state().objects[&janus].name, "Janus Back", "reach guard");
+            let before = r.state().players[0].mana_pool.total();
+            r.act(GameAction::ActivateAbility {
+                source_id: src,
+                ability_index: 0,
+            })
+            .expect("activation");
+            r.act(GameAction::SelectTargets {
+                targets: vec![TargetRef::Object(own)],
+            })
+            .expect("target");
+            while matches!(
+                r.state().waiting_for,
+                crate::types::game_state::WaitingFor::ManaPayment { .. }
+            ) {
+                r.act(GameAction::PassPriority).expect("pay");
+            }
+            before - r.state().players[0].mana_pool.total()
+        };
+        assert_eq!((paid_after_transform(a), paid_after_transform(b)), (0, 2));
+    }
+
+    /// CR 109.5 + CR 611.3a: "you" is the modifier's CURRENT controller, and
+    /// control can later pass to any player, not just its owner. It's P2's
+    /// turn in a three-player game; P0 owns and controls Hojo; P2 has a creature
+    /// and a tapper. State B has an earlier P2 activation targeting P2's own
+    /// creature, A doesn't. They must compare UNEQUAL: once P2 gains control of
+    /// Hojo (Control Magic), the same P2 activation costs {0} in A and {2} in B
+    /// (the production reach guard).
+    #[test]
+    fn a_first_activation_row_is_kept_for_every_possible_controller() {
+        use crate::game::scenario::{GameRunner, GameScenario};
+        use crate::types::ability::TargetRef;
+        use crate::types::actions::GameAction;
+        use crate::types::game_state::WaitingFor;
+        use crate::types::mana::{ManaColor, ManaUnit};
+        const HOJO: &str = "The first activated ability you activate during your turn that targets a creature you control costs {2} less to activate.";
+        let (p0, p2) = (PlayerId(0), PlayerId(2));
+
+        let mut s = GameScenario::new_n_player(3, 7);
+        s.at_phase(Phase::PreCombatMain);
+        let hojo = s
+            .add_creature_from_oracle(p0, "Professor Hojo", 2, 2, HOJO)
+            .id();
+        let theirs = s.add_creature(p2, "P2 Creature", 1, 1).id();
+        let src = s
+            .add_artifact_from_oracle(p2, "P2 Tapper", "{2}: Tap target creature.")
+            .id();
+        let magic = s
+            .add_enchantment_from_oracle(
+                p2,
+                "Control Magic",
+                "Enchant creature\nYou control enchanted creature.",
+            )
+            .with_subtypes(vec!["Aura"])
+            .id();
+        s.with_mana_pool(
+            p2,
+            (0..10)
+                .map(|_| ManaUnit::new(ManaColor::Blue.into(), ObjectId(0), false, Vec::new()))
+                .collect(),
+        );
+        let mut runner = s.build();
+        {
+            let state = runner.state_mut();
+            state.active_player = p2;
+            state.priority_player = p2;
+            state.waiting_for = WaitingFor::Priority { player: p2 };
+        }
+        let a = runner.state().clone();
+        assert_eq!(
+            a.objects[&hojo].controller, p0,
+            "reach guard: P0 controls Hojo"
+        );
+        let mut b = a.clone();
+        b.abilities_activated_this_turn_by_player.insert(
+            p2,
+            im::Vector::from(vec![crate::game::casting::capture_activation_record_from(
+                &a,
+                p2,
+                src,
+                None,
+                &[TargetRef::Object(theirs)],
+            )
+            .expect("the source exists")]),
+        );
+        assert!(
+            !loop_states_equal_modulo_resources(&a, &b),
+            "P2's qualifying row is cost-relevant should P2 gain Hojo (UNEQUAL)"
+        );
+
+        // Reach guard: P2 gains control of Hojo, then activates.
+        let paid_after_transfer = |state: GameState| {
+            let mut r = GameRunner::from_state(state);
+            {
+                let state = r.state_mut();
+                state.objects.get_mut(&magic).unwrap().attached_to = Some(hojo.into());
+                state
+                    .objects
+                    .get_mut(&hojo)
+                    .unwrap()
+                    .attachments
+                    .push(magic);
+                state.layers_dirty.mark_full();
+            }
+            crate::game::layers::flush_layers(r.state_mut());
+            assert_eq!(
+                r.state().objects[&hojo].controller,
+                p2,
+                "reach guard: P2 has Hojo"
+            );
+            let before = r.state().players[2].mana_pool.total();
+            r.act(GameAction::ActivateAbility {
+                source_id: src,
+                ability_index: 0,
+            })
+            .expect("activation");
+            r.act(GameAction::SelectTargets {
+                targets: vec![TargetRef::Object(theirs)],
+            })
+            .expect("target");
+            while matches!(r.state().waiting_for, WaitingFor::ManaPayment { .. }) {
+                r.act(GameAction::PassPriority).expect("pay");
+            }
+            before - r.state().players[2].mana_pool.total()
+        };
+        assert_eq!((paid_after_transfer(a), paid_after_transfer(b)), (0, 2));
     }
 
     /// CR 602.5b: per-GAME ("Activate only once") gate preserved; sibling
@@ -13326,6 +13688,9 @@ mod tests {
             dynamic_count,
             exemption: Default::default(),
             activator: None,
+
+            targets: None,
+            frequency: None,
         };
         assert!(
             !cover_with_static_on_stable(reduce(Some(object_count_ref()))),
@@ -15941,6 +16306,8 @@ mod tests {
                         .collect(),
                     block_requirements: Default::default(),
                     blocker_constraints: Default::default(),
+                    must_be_blocked_targets: Default::default(),
+                    block_capacities: Default::default(),
                 },
                 true,
             ),
@@ -16731,10 +17098,10 @@ mod tests {
         let c = delta.elimination_bounds(&second, &divisor);
         assert!(
             delta
-                .seat_headroom_bound(&second.players[1], &divisor)
+                .seat_headroom_bound(&second, &second.players[1], &divisor)
                 .is_some()
                 && delta
-                    .seat_headroom_bound(&second.players[2], &divisor)
+                    .seat_headroom_bound(&second, &second.players[2], &divisor)
                     .is_some(),
             "reach-guard: BOTH seats are in the reduction, so 'only one seat could ever be \
              named' does not satisfy the assertion below"
@@ -17808,13 +18175,13 @@ mod tests {
              divisors, so the bound below is a narrowing and not the un-narrowed cap"
         );
         assert_eq!(
-            delta.seat_headroom_bound(&board.players[1], &net_divisor),
+            delta.seat_headroom_bound(&board, &board.players[1], &net_divisor),
             None,
             "CR 704.5a: with the net term P1 reserves no headroom at all — the clamp disarms \
              its life axis and it leaves the reduction"
         );
         assert_eq!(
-            delta.seat_headroom_bound(&board.players[1], &frame_wise_divisor),
+            delta.seat_headroom_bound(&board, &board.players[1], &frame_wise_divisor),
             Some(2),
             "under the frame-wise term P1 is back in the reduction at `(7 - 1) / 3`"
         );
@@ -26821,15 +27188,7 @@ mod tests {
 
         let (state, member, host) = block2_fixture(vec![stockpile_counter_mana_ability()]);
         let host_obj = state.objects[&host].clone();
-        let ctx_no_trigger = crate::game::quantity::QuantityContext {
-            entering: None,
-            source: host,
-            trigger_source: None,
-            recipient: None,
-            scoped_player: None,
-            damage_source: None,
-            event_amount: None,
-        };
+        let ctx_no_trigger = crate::game::quantity::QuantityContext::new(host);
         assert_eq!(
             crate::game::quantity::object_id_for_scope(
                 &state,
@@ -26846,15 +27205,10 @@ mod tests {
         // The triggered branch: the captured incarnation's id, built through the SAME
         // production authority a triggered resolution uses.
         let ctx_triggered = crate::game::quantity::QuantityContext {
-            entering: None,
-            source: host,
             trigger_source: Some(crate::game::triggers::trigger_source_context_for_latch(
                 &state, &host_obj,
             )),
-            recipient: None,
-            scoped_player: None,
-            damage_source: None,
-            event_amount: None,
+            ..crate::game::quantity::QuantityContext::new(host)
         };
         assert_eq!(
             crate::game::quantity::object_id_for_scope(
@@ -31413,7 +31767,7 @@ mod tests {
     }
 
     /// **S6-A0 ⟨G⟩ (NEGATIVE — the totality check fails closed on ANY non-canonical axis).**
-    /// 22 inputs, each differing from the matched control on exactly ONE axis: the **19**
+    /// 23 inputs, each differing from the matched control on exactly ONE axis: the **20**
     /// constructible axes `ability_definition_axes` binds `_` (so a scanner-only inertness
     /// test is blind to every one of them), plus the **3** nested-ability axes the deleted
     /// `(a)` conjunct used to cover.
@@ -31422,22 +31776,23 @@ mod tests {
     /// arm IS consulted), and `(0)` is what refuses it. The matched control in the same fn is
     /// the UNMUTATED Snarl def, which is relieved — and since each mutant differs from it on
     /// one `_`-bound axis that no conjunct after `(0)` reads, deleting `(0)` admits every one
-    /// of the 22. That is what makes this row's mutation red rather than green.
+    /// of the 23. That is what makes this row's mutation red rather than green.
     ///
-    /// REVERT / MUTATION PROBE: delete conjunct `(0)` ⇒ **this row FAILS** on all 22 inputs.
+    /// REVERT / MUTATION PROBE: delete conjunct `(0)` ⇒ **this row FAILS** on all 23 inputs.
     /// Disagreeing input: each mutant below; the canonical control agrees under both designs.
     #[test]
     fn s6_arm_fails_closed_on_any_noncanonical_execute_axis() {
         use crate::types::ability::{
             AbilityCost, AbilityDefinition, AbilityTag, ActivationManaPaymentRestriction,
-            ActivationRestriction, IterationKindBinding, OpponentMayScope, PlayerFilter,
-            SiblingCondition, SubAbilityLink, TargetChoiceTiming, TargetSelectionMode,
+            ActivationRestriction, IllegalTargetsDisposition, IterationKindBinding,
+            OpponentMayScope, PlayerFilter, SiblingCondition, SubAbilityLink, TargetChoiceTiming,
+            TargetSelectionMode,
         };
 
         let hostile = s6_hostile_body();
         let (state, member, source) = s6_arm_board(&necroblossom_snarl_def());
 
-        // Matched control (same fn): the canonical def IS relieved. Without it the 22
+        // Matched control (same fn): the canonical def IS relieved. Without it the 23
         // refusals below could belong to some OTHER conjunct and deleting `(0)` would not
         // move them.
         assert!(
@@ -31446,12 +31801,12 @@ mod tests {
              attributable to the one axis that input moves"
         );
 
-        // The 18 capture-free `_`-bound axes. `cost` is the 19th and is built below because
+        // The 19 capture-free `_`-bound axes. `cost` is the 20th and is built below because
         // it carries a hostile PAYLOAD rather than an inert marker.
         // One `_`-bound axis moved off its constructor value. Aliased because the bare
         // fn-pointer-in-tuple-in-array type trips `clippy::type_complexity`.
         type AxisMutator = fn(&mut AbilityDefinition);
-        let inert: [(&str, AxisMutator); 18] = [
+        let inert: [(&str, AxisMutator); 19] = [
             ("description", |d| d.description = Some("C3b-2 axis".into())),
             ("target_prompt", |d| {
                 d.target_prompt = Some("C3b-2 axis".into())
@@ -31478,6 +31833,9 @@ mod tests {
             }),
             ("min_x_value", |d| d.min_x_value = 1),
             ("cant_be_copied", |d| d.cant_be_copied = true),
+            ("illegal_targets_disposition", |d| {
+                d.illegal_targets_disposition = IllegalTargetsDisposition::StillResolves
+            }),
             ("forward_result", |d| d.forward_result = true),
             ("target_selection_mode", |d| {
                 d.target_selection_mode = TargetSelectionMode::Random;
@@ -31498,7 +31856,7 @@ mod tests {
             .map(|(axis, f)| (axis, with_execute_axis(necroblossom_snarl_def(), axis, f)))
             .collect();
 
-        // The 19th `_`-bound axis. `AbilityCost::EffectCost { effect }` is routed to
+        // The 20th `_`-bound axis. `AbilityCost::EffectCost { effect }` is routed to
         // `scan_effect` by `scan_ability_cost`'s own arm, i.e. the codebase's OWN authority
         // says this payload can read the board — while `ability_definition_axes`
         // binds `cost` `_`. That pair is why `(0)` is a totality check and not a field list.
@@ -31533,8 +31891,8 @@ mod tests {
 
         assert_eq!(
             mutants.len(),
-            22,
-            "S6-A0 drives exactly 22 axes: 19 `_`-bound + the 3 the deleted `(a)` covered"
+            23,
+            "S6-A0 drives exactly 23 axes: 20 `_`-bound + the 3 the deleted `(a)` covered"
         );
 
         for (axis, mutant) in &mutants {
@@ -31550,7 +31908,7 @@ mod tests {
             );
             assert!(
                 !s6_arm(mutant, &state, member, &source),
-                "S6-A0 ({axis}): the firewall's scan binds 20 of this struct's 39 fields `_`, \
+                "S6-A0 ({axis}): the firewall's scan binds 21 of this struct's 40 fields `_`, \
                  so a non-constructor value on ANY of them is an unscanned payload and relief \
                  must be refused. Deleting conjunct `(0)` makes this FAIL"
             );
@@ -34177,6 +34535,130 @@ mod tests {
             gain_only.conforms(&gain_only.delta.clone(), &pins),
             "PAIRED POSITIVE: the same gain-only period against itself still conforms, so the \
              leg above cannot be satisfied by an always-refusing predicate"
+        );
+    }
+
+    fn shared_pile_state(cards: usize) -> GameState {
+        let mut state = GameState::new(crate::types::format::FormatConfig::dandan(), 2, 7);
+        for i in 0..cards {
+            crate::game::zones::create_object(
+                &mut state,
+                crate::types::identifiers::CardId(i as u64 + 1),
+                PlayerId(1),
+                "Pile Card".into(),
+                Zone::Library,
+            );
+        }
+        state
+    }
+
+    /// CR 400.1 as modified by a shared-zone format: each seat's library size is the pile's.
+    #[test]
+    fn snapshot_reads_the_shared_pile_for_every_seat() {
+        let state = shared_pile_state(5);
+        assert_eq!(
+            state.players[0].library.len(),
+            5,
+            "reach: pile is stored on P0"
+        );
+        assert!(
+            state.players[1].library.is_empty(),
+            "reach: P1's container is empty"
+        );
+        let v = ResourceVector::snapshot(&state);
+        assert_eq!(v.library_delta[&PlayerId(0)], 5);
+        assert_eq!(v.library_delta[&PlayerId(1)], 5);
+
+        let mut standard = GameState::new_two_player(7);
+        for (owner, count) in [(PlayerId(0), 3), (PlayerId(1), 5)] {
+            for i in 0..count {
+                crate::game::zones::create_object(
+                    &mut standard,
+                    crate::types::identifiers::CardId(i + 1),
+                    owner,
+                    "Card".into(),
+                    Zone::Library,
+                );
+            }
+        }
+        let v = ResourceVector::snapshot(&standard);
+        assert_eq!(
+            (v.library_delta[&PlayerId(0)], v.library_delta[&PlayerId(1)]),
+            (3, 5)
+        );
+    }
+
+    /// CR 104.3c + CR 121.4: the decking headroom of a seat is the library it draws from.
+    #[test]
+    fn seat_headroom_reads_the_shared_pile_for_every_seat() {
+        let drain = |seats: &[PlayerId]| {
+            let mut v = ResourceVector::default();
+            for seat in seats {
+                v.library_delta.insert(*seat, -1);
+            }
+            v
+        };
+        let state = shared_pile_state(5);
+        let v = drain(&[PlayerId(0), PlayerId(1)]);
+        assert_eq!(
+            v.seat_headroom_bound(&state, &state.players[0], &[]),
+            Some(5)
+        );
+        assert_eq!(
+            v.seat_headroom_bound(&state, &state.players[1], &[]),
+            Some(5)
+        );
+
+        let mut standard = GameState::new_two_player(7);
+        for i in 0..4 {
+            crate::game::zones::create_object(
+                &mut standard,
+                crate::types::identifiers::CardId(i + 1),
+                PlayerId(1),
+                "Card".into(),
+                Zone::Library,
+            );
+        }
+        let v = drain(&[PlayerId(1)]);
+        assert_eq!(
+            v.seat_headroom_bound(&standard, &standard.players[1], &[]),
+            Some(4)
+        );
+    }
+
+    /// The C1b residual compares STORED containers pairwise: a stray id in the seat
+    /// container that does not hold the pile must refuse, which reading the pile for
+    /// every seat would hide.
+    #[test]
+    fn certificate_residual_compares_stored_containers() {
+        let mut prior = shared_pile_state(0);
+        let card = crate::game::zones::create_object(
+            &mut prior,
+            crate::types::identifiers::CardId(900),
+            CERT_VICTIM,
+            "Library Card".into(),
+            Zone::Library,
+        );
+        let mut current = prior.clone();
+        current.objects.get_mut(&card).unwrap().zone = Zone::Graveyard;
+        current.players[0].library.retain(|id| *id != card);
+        current.players[0].graveyard.push_back(card);
+
+        let certified = certify(&prior, &current).expect("a pile departure certifies");
+        assert_eq!(certified.per_victim, BTreeMap::from([(CERT_VICTIM, 1)]));
+
+        let mut extra = current.clone();
+        extra.players[0].library.push_back(ObjectId(901));
+        assert!(
+            certify(&prior, &extra).is_none(),
+            "reach: an unaccounted id in the pile refuses"
+        );
+
+        let mut stray = current.clone();
+        stray.players[1].library.push_back(ObjectId(902));
+        assert!(
+            certify(&prior, &stray).is_none(),
+            "a stray id in the non-holder container refuses"
         );
     }
 }
