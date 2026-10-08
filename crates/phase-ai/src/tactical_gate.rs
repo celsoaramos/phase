@@ -4,6 +4,9 @@ use engine::ai_support::{
     is_targeted_exchange_root, targeted_exchange_verdict, AiDecisionContext, CandidateAction,
     TargetedExchangeVerdict,
 };
+use engine::game::ability_utils::{
+    ability_target_legality_needs_chosen_x, build_resolved_from_def, modal_spell_mode_ability_refs,
+};
 use engine::game::casting::{
     activated_ability_definitions, activation_source_and_activator_are_structurally_eligible,
     cast_spell_face_choice_available, effective_spell_cost,
@@ -48,7 +51,7 @@ use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 use std::ops::ControlFlow;
 
-use crate::cast_facts::CastCostMode;
+use crate::cast_facts::{collect_definition_effects_with, CastCostMode, ModeWalk};
 use crate::combat_ai::is_lethal_attack_available;
 use crate::config::AiConfig;
 use crate::context::AiContext;
@@ -340,17 +343,13 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject;
     }
 
+    if counter_reaches_nothing_foreign(ctx) {
+        return GateDecision::Reject;
+    }
+
     let effects = ctx.effects();
     if effects.is_empty() {
         return GateDecision::Allow;
-    }
-
-    if effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::Counter { .. }))
-        && counter_reaches_nothing_foreign(ctx, &effects)
-    {
-        return GateDecision::Reject;
     }
 
     if is_redundant_creature_only_removal(ctx, &effects) {
@@ -1228,12 +1227,44 @@ fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<G
 /// engine's own legal-target set for every plain counter effect, each target a
 /// spell the AI controls. Counter spells and activations alike — Glen Elendra
 /// Archmage's "{U}, Sacrifice: Counter target noncreature spell" walks into the
-/// same hole. A counter effect that exposes no target filter and a modal SPELL
-/// (CR 601.2b: at announcement `effects()` reports every mode at once) keep
-/// only the stack-wide check; an activation's `effects()` is already its root
-/// only (CR 700.2a), so its counter is committed.
-fn counter_reaches_nothing_foreign(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> bool {
-    if !is_pure_counter_payload(effects) {
+/// same hole. A counter effect that exposes no target filter and a modal spell
+/// keep only the stack-wide check. CR 601.2b + CR 700.2a: spell modes have not
+/// been selected at announcement; activation mode choices are separate roots.
+fn counter_reaches_nothing_foreign(ctx: &PolicyContext<'_>) -> bool {
+    let activated = ctx.effective_activated_ability();
+    let (source_id, definitions, modes) = match &ctx.candidate.action {
+        GameAction::CastSpell {
+            object_id, card_id, ..
+        } => {
+            let Some(object) = ctx.state.objects.get(object_id) else {
+                return false;
+            };
+            if object.card_id != *card_id {
+                return false;
+            }
+            (
+                *object_id,
+                modal_spell_mode_ability_refs(object).collect::<Vec<_>>(),
+                if object.modal.is_some() {
+                    ModeWalk::All
+                } else {
+                    ModeWalk::RootOnly
+                },
+            )
+        }
+        GameAction::ActivateAbility { source_id, .. } => {
+            let Some(definition) = activated.as_ref() else {
+                return false;
+            };
+            (*source_id, vec![definition], ModeWalk::RootOnly)
+        }
+        _ => return false,
+    };
+    let effects = definitions
+        .iter()
+        .flat_map(|definition| collect_definition_effects_with(definition, modes))
+        .collect::<Vec<_>>();
+    if !is_pure_counter_payload(&effects) {
         return false;
     }
     let ai = ctx.ai_player;
@@ -1245,21 +1276,17 @@ fn counter_reaches_nothing_foreign(ctx: &PolicyContext<'_>, effects: &[&Effect])
     {
         return true;
     }
-    let source_id = match &ctx.candidate.action {
-        GameAction::CastSpell { object_id, .. } => {
-            if ctx
-                .state
-                .objects
-                .get(object_id)
-                .is_none_or(|object| object.modal.is_some())
-            {
-                return false;
-            }
-            *object_id
-        }
-        GameAction::ActivateAbility { source_id, .. } => *source_id,
-        _ => return false,
-    };
+    // CR 107.3a + CR 601.2b + CR 601.2c + CR 602.2b: X is announced before
+    // targets. An empty context-free target set with unbound X is not proof
+    // that no foreign target will be legal after that announcement.
+    if modes == ModeWalk::All
+        || definitions.iter().any(|definition| {
+            let resolved = build_resolved_from_def(definition, source_id, ai);
+            ability_target_legality_needs_chosen_x(&resolved, definition.distribute.as_ref())
+        })
+    {
+        return false;
+    }
     effects
         .iter()
         .filter(|effect| matches!(effect, Effect::Counter { .. }))
@@ -7459,6 +7486,521 @@ mod tests {
 
     fn casts(action: &GameAction, spell: ObjectId) -> bool {
         matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == spell)
+    }
+
+    const SPELL_BLAST_ORACLE: &str = "Counter target spell with mana value X. (For example, if that spell's mana cost is {3}{U}{U}, X is 5.)";
+    const KOZILEK_COUNTER_ORACLE: &str =
+        "Discard a card with mana value X: Counter target spell with mana value X.";
+
+    /// Commit a real mana-value-two creature before giving P0 response priority.
+    /// The creature is a synthetic type/mana-value witness, not a printed card.
+    fn counter_response_board(
+        mut scenario: GameScenario,
+        controller: PlayerId,
+    ) -> (GameState, ObjectId) {
+        scenario.at_phase(Phase::PreCombatMain);
+        let victim = scenario
+            .add_creature_to_hand(controller, "Mana Value Two Witness", 2, 2)
+            .with_mana_cost(ManaCost::generic(2))
+            .id();
+        scenario.with_mana_pool(controller, pooled_mana(ManaType::Colorless, 2));
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        state.active_player = controller;
+        state.priority_player = controller;
+        state.waiting_for = WaitingFor::Priority { player: controller };
+        assert_eq!(state.objects[&victim].zone, Zone::Hand);
+        assert!(state.objects[&victim]
+            .card_types
+            .core_types
+            .contains(&CoreType::Creature));
+        let mut committed = runner.cast(victim).commit();
+        if controller == P1 {
+            committed.act(GameAction::PassPriority).unwrap();
+        }
+        let state = committed.state();
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::Priority { player: P0 }
+        ));
+        assert!(state.objects[&victim]
+            .card_types
+            .core_types
+            .contains(&CoreType::Creature));
+        assert_eq!(state.objects[&victim].spell_mana_value(), 2);
+        assert!(state.stack.iter().any(|entry| entry.id == victim
+            && entry.controller == controller
+            && matches!(entry.kind, StackEntryKind::Spell { .. })));
+        (state.clone(), victim)
+    }
+
+    /// Assert availability using actual engine candidates, then both AI pools.
+    fn assert_counter_in_pools(
+        state: &GameState,
+        source: ObjectId,
+        index: Option<usize>,
+        expected: GateDecision,
+    ) -> CandidateAction {
+        let issued = engine::ai_support::candidate_actions(state);
+        let root = issued
+            .iter()
+            .find(|candidate| match (&candidate.action, index) {
+                (GameAction::CastSpell { object_id, .. }, None) => *object_id == source,
+                (
+                    GameAction::ActivateAbility {
+                        source_id,
+                        ability_index,
+                    },
+                    Some(index),
+                ) => *source_id == source && *ability_index == index,
+                _ => false,
+            })
+            .expect("reach-guard: the engine issues this exact counter root")
+            .clone();
+        let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: issued.clone(),
+        };
+        let gated = gate_candidates(
+            state,
+            &decision,
+            issued,
+            P0,
+            &config,
+            &AiContext::empty(&config.weights),
+        );
+        let retained = expected != GateDecision::Reject;
+        assert_eq!(
+            gated
+                .iter()
+                .any(|candidate| candidate.candidate.action == root.action),
+            retained,
+            "the issued root must have the expected announcement gate verdict"
+        );
+        assert_eq!(
+            crate::search::score_candidates(state, P0, &config)
+                .iter()
+                .any(|(action, _)| *action == root.action),
+            retained,
+            "ordinary scoring must preserve the announcement gate verdict"
+        );
+        root
+    }
+
+    /// SHAPE reach guards only; the tests below also drive the reducer/AI pools.
+    fn assert_unannounced_x_counter(definition: &AbilityDefinition, source: ObjectId) {
+        let effects = collect_definition_effects_with(definition, ModeWalk::RootOnly);
+        assert!(
+            is_pure_counter_payload(&effects),
+            "no mixed or Unimplemented payload"
+        );
+        let filter = definition.effect.target_filter().unwrap();
+        let typed = match filter {
+            TargetFilter::Typed(typed) => typed,
+            TargetFilter::And { filters } => filters
+                .iter()
+                .find_map(|filter| match filter {
+                    TargetFilter::Typed(typed) => Some(typed),
+                    _ => None,
+                })
+                .expect("typed mana-value restriction under stack constraint"),
+            other => panic!("expected typed mana-value counter filter, got {other:?}"),
+        };
+        assert!(typed.properties.iter().any(|property| matches!(property,
+            FilterProp::Cmc { comparator: Comparator::EQ, value: QuantityExpr::Ref {
+                qty: QuantityRef::Variable(name)
+            }} if name == "X")));
+        let resolved = build_resolved_from_def(definition, source, P0);
+        assert!(resolved.chosen_x.is_none());
+        assert!(ability_target_legality_needs_chosen_x(
+            &resolved,
+            definition.distribute.as_ref()
+        ));
+    }
+
+    #[test]
+    fn affordable_x_counter_survives_before_x_and_counters_after_announcement() {
+        let mut scenario = GameScenario::new();
+        let blast = scenario
+            .add_spell_to_hand_from_oracle(P0, "Spell Blast", true, SPELL_BLAST_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::X, ManaCostShard::Blue],
+            })
+            .id();
+        scenario.with_mana_pool(P0, pooled_mana(ManaType::Blue, 3));
+        let (state, victim) = counter_response_board(scenario, P1);
+        assert_eq!(
+            state.objects[&blast].mana_cost,
+            ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::X, ManaCostShard::Blue],
+            }
+        );
+        let pool = &state
+            .players
+            .iter()
+            .find(|player| player.id == P0)
+            .unwrap()
+            .mana_pool;
+        assert_eq!(pool.count_color(ManaType::Blue), 3);
+        assert_eq!(pool.total(), 3);
+        let definition = &state.objects[&blast].abilities[0];
+        assert_eq!(definition.kind, AbilityKind::Spell);
+        assert_unannounced_x_counter(definition, blast);
+        assert!(find_legal_targets(
+            &state,
+            definition.effect.target_filter().unwrap(),
+            P0,
+            blast
+        )
+        .is_empty());
+        assert!(!is_own_stack_spell(&state, P0, victim));
+        let root = assert_counter_in_pools(&state, blast, None, GateDecision::Allow);
+        let mut announced = GameRunner::from_state(state.clone());
+        announced.act(root.action).unwrap();
+        // CR 107.3a + CR 601.2b + CR 601.2c: X precedes target selection.
+        let WaitingFor::ChooseXValue {
+            player,
+            min,
+            max,
+            pending_cast,
+            ..
+        } = &announced.state().waiting_for
+        else {
+            panic!("real cast must announce X");
+        };
+        assert_eq!(*player, P0);
+        assert!(*min <= 2 && *max >= 2);
+        assert_eq!(pending_cast.object_id, blast);
+        assert!(pending_cast.ability.chosen_x.is_none());
+        assert!(pending_cast.deferred_target_selection);
+        let choose_x = engine::ai_support::candidate_actions(announced.state())
+            .into_iter()
+            .find(|candidate| matches!(candidate.action, GameAction::ChooseX { value: 2 }))
+            .expect("engine offers affordable X=2");
+        announced.act(choose_x.action).unwrap();
+        assert!(announced.state().stack.iter().any(|entry| entry.id == blast
+            && matches!(&entry.kind, StackEntryKind::Spell { ability: Some(ability), .. }
+                if ability.chosen_x == Some(2) && ability.targets == vec![TargetRef::Object(victim)])));
+        let mut resolved = GameRunner::from_state(state);
+        let outcome = resolved.cast(blast).x(2).target_object(victim).resolve();
+        // CR 701.6a: countering prevents the creature from resolving to the battlefield.
+        outcome.assert_zone(&[victim], Zone::Graveyard);
+    }
+
+    #[test]
+    fn x_counter_keeps_the_independent_all_own_spell_and_empty_stack_proof() {
+        let mut scenario = GameScenario::new();
+        let blast = scenario
+            .add_spell_to_hand_from_oracle(P0, "Spell Blast", true, SPELL_BLAST_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::X, ManaCostShard::Blue],
+            })
+            .id();
+        scenario.with_mana_pool(P0, pooled_mana(ManaType::Blue, 3));
+        let mut empty = scenario.build().state().clone();
+        assert_unannounced_x_counter(&empty.objects[&blast].abilities[0], blast);
+        assert!(empty.stack.is_empty());
+        assert_eq!(gate_cast(&mut empty, blast), GateDecision::Reject);
+
+        let mut scenario = GameScenario::new();
+        let blast = scenario
+            .add_spell_to_hand_from_oracle(P0, "Spell Blast", true, SPELL_BLAST_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::X, ManaCostShard::Blue],
+            })
+            .id();
+        scenario.with_mana_pool(P0, pooled_mana(ManaType::Blue, 3));
+        let (state, victim) = counter_response_board(scenario, P0);
+        assert_unannounced_x_counter(&state.objects[&blast].abilities[0], blast);
+        assert!(is_own_stack_spell(&state, P0, victim));
+        assert_counter_in_pools(&state, blast, None, GateDecision::Reject);
+    }
+
+    #[test]
+    fn selected_nonzero_x_counter_activation_survives_and_pays_its_own_cost() {
+        let mut scenario = GameScenario::new();
+        // Synthetic two-ability source: fixed clause first, verbatim Kozilek clause second.
+        let oracle = format!("{{U}}: Counter target noncreature spell.\n{KOZILEK_COUNTER_ORACLE}");
+        let source = scenario
+            .add_creature_from_oracle(P0, "Counter Ability Witness", 12, 12, &oracle)
+            .id();
+        let discard = scenario
+            .add_spell_to_hand(P0, "Mana Value Two Discard", false)
+            .with_mana_cost(ManaCost::generic(2))
+            .id();
+        scenario.with_mana_pool(P0, pooled_mana(ManaType::Blue, 1));
+        let (state, victim) = counter_response_board(scenario, P1);
+        assert_eq!(state.objects[&discard].zone, Zone::Hand);
+        assert_eq!(state.objects[&discard].effective_mana_value(), 2);
+        assert!(!is_own_stack_spell(&state, P0, victim));
+        let definitions = activated_ability_definitions(&state, source);
+        assert_eq!(definitions.len(), 2);
+        assert_eq!(definitions[0].0, 0);
+        assert_eq!(definitions[1].0, 1);
+        assert!(is_pure_counter_payload(&collect_definition_effects_with(
+            &definitions[0].1,
+            ModeWalk::RootOnly
+        )));
+        assert!(!ability_target_legality_needs_chosen_x(
+            &build_resolved_from_def(&definitions[0].1, source, P0),
+            definitions[0].1.distribute.as_ref()
+        ));
+        assert_eq!(definitions[1].1.kind, AbilityKind::Activated);
+        assert_unannounced_x_counter(&definitions[1].1, source);
+        assert!(find_legal_targets(
+            &state,
+            definitions[1].1.effect.target_filter().unwrap(),
+            P0,
+            source
+        )
+        .is_empty());
+        let root = assert_counter_in_pools(&state, source, Some(1), GateDecision::Allow);
+        let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: vec![root.clone()],
+        };
+        let context = AiContext::empty(&config.weights);
+        let ctx = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &root,
+            ai_player: P0,
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        assert_unannounced_x_counter(&ctx.effective_activated_ability().unwrap(), source);
+        let mut announced = GameRunner::from_state(state.clone());
+        announced.act(root.action).unwrap();
+        // CR 107.3a + CR 602.2b: this activation announces its own X before targets/costs.
+        let WaitingFor::ChooseXValue {
+            pending_cast,
+            min,
+            max,
+            ..
+        } = &announced.state().waiting_for
+        else {
+            panic!("real activation must announce X");
+        };
+        assert_eq!(pending_cast.object_id, source);
+        assert_eq!(pending_cast.activation_ability_index, Some(1));
+        assert!(pending_cast.deferred_target_selection);
+        assert!(pending_cast.ability.chosen_x.is_none());
+        assert!(*min <= 2 && *max >= 2);
+        let choose_x = engine::ai_support::candidate_actions(announced.state())
+            .into_iter()
+            .find(|candidate| matches!(candidate.action, GameAction::ChooseX { value: 2 }))
+            .unwrap();
+        announced.act(choose_x.action).unwrap();
+        let mut resolved = GameRunner::from_state(state);
+        let outcome = resolved
+            .activate(source, 1)
+            .x(2)
+            .target_object(victim)
+            .pay_with(&[discard])
+            .resolve();
+        // CR 701.6a + CR 701.9a: countering removes the spell without resolution;
+        // the selected discard cost moves the matching hand card to its owner's graveyard.
+        outcome.assert_zone(&[discard, victim], Zone::Graveyard);
+    }
+
+    #[test]
+    fn unselected_x_activation_does_not_disable_the_fixed_counter_proof() {
+        for foreign_noncreature in [false, true] {
+            let mut scenario = GameScenario::new();
+            let oracle =
+                format!("{{U}}: Counter target noncreature spell.\n{KOZILEK_COUNTER_ORACLE}");
+            let source = scenario
+                .add_creature_from_oracle(P0, "Counter Ability Witness", 12, 12, &oracle)
+                .id();
+            scenario
+                .add_spell_to_hand(P0, "Mana Value Two Discard", false)
+                .with_mana_cost(ManaCost::generic(2));
+            scenario.with_mana_pool(P0, pooled_mana(ManaType::Blue, 1));
+            let (mut state, _) = counter_response_board(scenario, P1);
+            let own = push_stack_spell(&mut state, P0, "Own Instant Witness", CoreType::Instant);
+            if foreign_noncreature {
+                push_stack_spell(&mut state, P1, "Foreign Instant Witness", CoreType::Instant);
+            }
+            let definitions = activated_ability_definitions(&state, source);
+            assert_eq!(definitions[0].0, 0);
+            assert_eq!(definitions[1].0, 1);
+            assert_unannounced_x_counter(&definitions[1].1, source);
+            let fixed = &definitions[0].1;
+            assert!(is_pure_counter_payload(&collect_definition_effects_with(
+                fixed,
+                ModeWalk::RootOnly
+            )));
+            assert!(!ability_target_legality_needs_chosen_x(
+                &build_resolved_from_def(fixed, source, P0),
+                fixed.distribute.as_ref()
+            ));
+            let legal =
+                find_legal_targets(&state, fixed.effect.target_filter().unwrap(), P0, source);
+            assert!(legal.contains(&TargetRef::Object(own)));
+            assert_eq!(
+                legal
+                    .iter()
+                    .any(|target| matches!(target, TargetRef::Object(id)
+                if !is_own_stack_spell(&state, P0, *id))),
+                foreign_noncreature
+            );
+            assert_counter_in_pools(
+                &state,
+                source,
+                Some(0),
+                if foreign_noncreature {
+                    GateDecision::Allow
+                } else {
+                    GateDecision::Reject
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn later_spell_root_x_is_selected_but_an_activated_root_x_is_not() {
+        // Synthetic typed composition isolates root membership from printed card identity.
+        for x_kind in [AbilityKind::Spell, AbilityKind::Activated] {
+            for foreign_noncreature in [false, true] {
+                let mut scenario = GameScenario::new();
+                let mut x_definition = AbilityDefinition::new(
+                    x_kind,
+                    Effect::Counter {
+                        target: TargetFilter::And {
+                            filters: vec![
+                                TargetFilter::StackSpell,
+                                TargetFilter::Typed(TypedFilter::new(TypeFilter::Any).properties(
+                                    vec![FilterProp::Cmc {
+                                        comparator: Comparator::EQ,
+                                        value: QuantityExpr::Ref {
+                                            qty: QuantityRef::Variable("X".to_string()),
+                                        },
+                                    }],
+                                )),
+                            ],
+                        },
+                        source_rider: None,
+                        countered_spell_zone: None,
+                    },
+                );
+                if x_kind == AbilityKind::Activated {
+                    x_definition.cost = Some(AbilityCost::Mana {
+                        cost: ManaCost::zero(),
+                    });
+                }
+                let counter = scenario
+                    .add_spell_to_hand_from_oracle(
+                        P0,
+                        "Root Membership Witness",
+                        true,
+                        SPELL_PIERCE_ORACLE,
+                    )
+                    .with_mana_cost(ManaCost::Cost {
+                        generic: 0,
+                        shards: vec![ManaCostShard::X, ManaCostShard::Blue],
+                    })
+                    .with_ability_definition(x_definition)
+                    .id();
+                scenario.with_mana_pool(P0, pooled_mana(ManaType::Blue, 3));
+                let (mut state, _) = counter_response_board(scenario, P1);
+                let own =
+                    push_stack_spell(&mut state, P0, "Own Instant Witness", CoreType::Instant);
+                if foreign_noncreature {
+                    push_stack_spell(&mut state, P1, "Foreign Instant Witness", CoreType::Instant);
+                }
+                let object = &state.objects[&counter];
+                assert_eq!(object.abilities.len(), 2);
+                assert_eq!(object.abilities[0].kind, AbilityKind::Spell);
+                assert_eq!(object.abilities[1].kind, x_kind);
+                assert_unannounced_x_counter(&object.abilities[1], counter);
+                let selected = modal_spell_mode_ability_refs(object).collect::<Vec<_>>();
+                assert_eq!(
+                    selected.len(),
+                    if x_kind == AbilityKind::Spell { 2 } else { 1 }
+                );
+                assert!(selected.iter().all(|definition| is_pure_counter_payload(
+                    &collect_definition_effects_with(definition, ModeWalk::RootOnly)
+                )));
+                assert!(!ability_target_legality_needs_chosen_x(
+                    &build_resolved_from_def(selected[0], counter, P0),
+                    selected[0].distribute.as_ref()
+                ));
+                let legal = find_legal_targets(
+                    &state,
+                    selected[0].effect.target_filter().unwrap(),
+                    P0,
+                    counter,
+                );
+                assert!(legal.contains(&TargetRef::Object(own)));
+                assert_counter_in_pools(
+                    &state,
+                    counter,
+                    None,
+                    if x_kind == AbilityKind::Spell || foreign_noncreature {
+                        GateDecision::Allow
+                    } else {
+                        GateDecision::Reject
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn modal_counter_defers_foreign_target_proof_but_keeps_all_own_spell_bound() {
+        for controller in [P1, P0] {
+            let mut scenario = GameScenario::new();
+            // Synthetic two-mode plain counter, both modes fixed and noncreature-only.
+            let counter = scenario.add_spell_to_hand_from_oracle(P0, "Modal Counter Witness", true,
+                "Choose one —\n• Counter target noncreature spell.\n• Counter target noncreature spell unless its controller pays {2}.")
+                .with_mana_cost(ManaCost::Cost { generic: 0, shards: vec![ManaCostShard::Blue] }).id();
+            scenario.with_mana_pool(P0, pooled_mana(ManaType::Blue, 1));
+            let (mut state, _) = counter_response_board(scenario, controller);
+            push_stack_spell(&mut state, P0, "Own Instant Witness", CoreType::Instant);
+            let object = &state.objects[&counter];
+            assert!(object.modal.is_some());
+            let modes = modal_spell_mode_ability_refs(object).collect::<Vec<_>>();
+            assert_eq!(modes.len(), 2);
+            assert!(modes.iter().all(|mode| is_pure_counter_payload(
+                &collect_definition_effects_with(mode, ModeWalk::All)
+            )));
+            let root = assert_counter_in_pools(
+                &state,
+                counter,
+                None,
+                if controller == P1 {
+                    GateDecision::Allow
+                } else {
+                    GateDecision::Reject
+                },
+            );
+            if controller == P1 {
+                let mut runner = GameRunner::from_state(state);
+                runner.act(root.action).unwrap();
+                // CR 601.2b + CR 700.2a: actual mode selection precedes target choice.
+                assert!(
+                    matches!(&runner.state().waiting_for, WaitingFor::ModeChoice {
+                    pending_cast, ..
+                } if pending_cast.object_id == counter)
+                );
+                let select = engine::ai_support::candidate_actions(runner.state())
+                    .into_iter()
+                    .find(|candidate| {
+                        matches!(&candidate.action, GameAction::SelectModes { indices }
+                        if indices.as_slice() == [0])
+                    })
+                    .expect("engine offers the fixed counter mode");
+                runner.act(select.action).unwrap();
+            }
+        }
     }
 
     /// Production path for the field report: the engine issues the Spell
