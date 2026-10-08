@@ -331,3 +331,154 @@ fn affected_controller_orders_substitution_and_prevention() {
         );
     }
 }
+
+const DOUBLING_SEASON: &str = "If an effect would create one or more tokens under your \
+control, it creates twice that many of those tokens instead.\nIf an effect would put one or \
+more counters on a permanent you control, it puts twice that many of those counters on that \
+permanent instead.";
+const VIZIER: &str = "If one or more -1/-1 counters would be put on a creature you control, \
+that many -1/-1 counters minus one are put on it instead.";
+
+/// Answer every CR 616.1 prompt P1 is asked, taking the candidate from each
+/// source of `order` in turn, until the stack is empty. Returns how many
+/// prompts were answered.
+fn answer_p1_orderings(
+    runner: &mut engine::game::scenario::GameRunner,
+    order: &[ObjectId],
+) -> usize {
+    let mut answered = 0usize;
+    for _ in 0..16 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::ReplacementChoice {
+                player, candidates, ..
+            } => {
+                assert_eq!(player, P1, "the affected creature's controller orders");
+                let wanted = order[answered];
+                let index = candidates
+                    .iter()
+                    .position(|c| c.source_id == wanted)
+                    .unwrap_or_else(|| panic!("no candidate from {wanted:?} in {candidates:?}"));
+                answered += 1;
+                runner
+                    .act(GameAction::ChooseReplacement { index })
+                    .expect("choose replacement order");
+            }
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            other => panic!("unexpected prompt {other:?}"),
+        }
+    }
+    answered
+}
+
+fn minus_counters(runner: &engine::game::scenario::GameRunner, id: ObjectId) -> u32 {
+    runner
+        .state()
+        .objects
+        .get(&id)
+        .and_then(|obj| obj.counters.get(&CounterType::Minus1Minus1).copied())
+        .unwrap_or(0)
+}
+
+/// CR 616.1 + CR 616.1g: the counter event the substitution puts meets two
+/// counter replacements of the creature's controller (Doubling Season and
+/// Vizier of Remedies), so P1 orders them — once per creature of a sweep.
+/// Doubling Season first: 2 × 2 − 1 = 3. Vizier first: (2 − 1) × 2 = 2. The
+/// prompt for the first creature must not orphan the second creature's
+/// damage event: both are replaced, each with its own chosen order.
+#[test]
+fn counter_order_inside_the_substitution_is_asked_per_creature() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature_from_oracle(P0, "Soul-Scar Mage", 1, 2, SOUL_SCAR_ORACLE);
+    let first = scenario.add_creature(P1, "First Wall", 0, 10).id();
+    let second = scenario.add_creature(P1, "Second Wall", 0, 10).id();
+    let season = scenario
+        .add_enchantment_from_oracle(P1, "Doubling Season", DOUBLING_SEASON)
+        .id();
+    let vizier = scenario
+        .add_creature_from_oracle(P1, "Vizier of Remedies", 2, 1, VIZIER)
+        .id();
+    let sweep = scenario
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Wall Sweep",
+            false,
+            "Wall Sweep deals 2 damage to each creature your opponents control with power 0.",
+        )
+        .id();
+
+    let mut runner = scenario.build();
+    give_priority(&mut runner, P0);
+    runner.cast(sweep).commit();
+
+    // Doubling Season first for the first creature's prompt, Vizier first for
+    // the second's.
+    let answered = answer_p1_orderings(&mut runner, &[season, vizier]);
+    assert_eq!(answered, 2, "one ordering prompt per creature, each once");
+
+    let mut got = [
+        minus_counters(&runner, first),
+        minus_counters(&runner, second),
+    ];
+    got.sort_unstable();
+    assert_eq!(got, [2, 3], "one creature got (2-1)×2, the other 2×2-1");
+    for creature in [first, second] {
+        assert_eq!(
+            runner.state().objects[&creature].damage_marked,
+            0,
+            "replaced damage is never dealt"
+        );
+    }
+}
+
+/// CR 616.1 + CR 616.1g: after P1 orders Soul-Scar Mage's substitution ahead
+/// of a prevention shield, the substitute's counter event meets Doubling
+/// Season and Vizier of Remedies and P1 orders those too. The nested prompt is
+/// surfaced, not skipped: Doubling Season first → 3 × 2 − 1 = 5; Vizier first →
+/// (3 − 1) × 2 = 4.
+#[test]
+fn counter_order_after_choosing_the_substitution_is_still_asked() {
+    for (season_first, expected) in [(true, 5u32), (false, 4u32)] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let mage = scenario
+            .add_creature_from_oracle(P0, "Soul-Scar Mage", 1, 2, SOUL_SCAR_ORACLE)
+            .id();
+        let ogre = scenario
+            .add_creature_from_oracle(
+                P1,
+                "Shielded Ogre",
+                4,
+                10,
+                "Prevent all damage that would be dealt to Shielded Ogre.",
+            )
+            .id();
+        let season = scenario
+            .add_enchantment_from_oracle(P1, "Doubling Season", DOUBLING_SEASON)
+            .id();
+        let vizier = scenario
+            .add_creature_from_oracle(P1, "Vizier of Remedies", 2, 1, VIZIER)
+            .id();
+        let bolt = scenario.add_bolt_to_hand(P0);
+        scenario.with_mana_pool(P0, red_mana());
+
+        let mut runner = scenario.build();
+        give_priority(&mut runner, P0);
+        runner.cast(bolt).target_object(ogre).commit();
+        let inner = if season_first { season } else { vizier };
+        let answered = answer_p1_orderings(&mut runner, &[mage, inner]);
+        assert_eq!(
+            answered, 2,
+            "substitution-vs-shield, then the counter order"
+        );
+        assert_eq!(
+            minus_counters(&runner, ogre),
+            expected,
+            "season_first={season_first}"
+        );
+        assert_eq!(runner.state().objects[&ogre].damage_marked, 0);
+    }
+}

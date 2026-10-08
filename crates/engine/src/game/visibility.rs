@@ -8620,6 +8620,7 @@ mod tests {
                 prevention_tally: Vec::new(),
                 lives_before: vec![20, 20],
                 sub_step: crate::types::game_state::CombatDamageSubStep::Regular,
+                replacement: None,
             }));
 
         let authoritative = serde_json::to_string(&state.pending_combat_lifelink)

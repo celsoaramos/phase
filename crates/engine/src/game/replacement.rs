@@ -24,10 +24,10 @@ use super::filter::{
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     DrainStatus, GameState, LiminalEntry, LiminalEntryKind, NamedChoiceSource,
-    NamedChoiceSourceBinding, PendingReplacement, PostReplacementDrain, ReplacementAutoChoiceId,
-    ReplacementAutoChoiceIdentity, ReplacementAutoChoiceKey, ReplacementAutoChoiceRecord,
-    ReplacementAutoChoiceTail, ReplacementCandidateSummary, ReplacementChoiceKind,
-    ReplacementIndexEntry, ResidentDrainPolicy, WaitingFor,
+    NamedChoiceSourceBinding, PendingCombatDamageAwait, PendingReplacement, PostReplacementDrain,
+    ReplacementAutoChoiceId, ReplacementAutoChoiceIdentity, ReplacementAutoChoiceKey,
+    ReplacementAutoChoiceRecord, ReplacementAutoChoiceTail, ReplacementCandidateSummary,
+    ReplacementChoiceKind, ReplacementIndexEntry, ResidentDrainPolicy, WaitingFor,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::mana::{StepEndManaAction, UnitDisposition};
@@ -12208,62 +12208,185 @@ pub fn replace_event(
 /// player-choice path is not modeled — the shields apply per-event in pipeline
 /// order instead.
 ///
-/// Returns a vector aligned 1:1 with `proposed`: `Some(event)` is a survivor
-/// post-replacement `Damage` event for `combat_damage.rs` Phase C to apply;
-/// `None` means that source's damage was fully prevented or skipped. The
-/// `HashMap` is the per-`Prevention::All`-shield aggregate prevented amount.
+/// The batch is resumable. A CR 616.1 ordering choice on one of its events, or
+/// a prompt raised by a replacement's own continuation (CR 616.1g: the
+/// substitute's counters or mill), parks the pass — `pass` keeps every settled
+/// outcome, every unstarted event and the tally so far — and the caller parks
+/// the batch around it (`combat_damage::CombatDamageBatch::Paused`). CR 510.2
+/// rules out a priority window here, not these choices.
+///
+/// When the pass completes, `pass.resolved` is aligned 1:1 with the batch's
+/// events: `Some(event)` is a survivor post-replacement `Damage` event for
+/// `combat_damage.rs` Phase C to apply; `None` means that source's damage was
+/// fully prevented or replaced. `pass.tally` is the per-`Prevention::All`-shield
+/// aggregate prevented amount.
 pub(crate) fn replace_combat_damage_batch(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
-    proposed: Vec<ProposedEvent>,
-) -> (
-    Vec<Option<ProposedEvent>>,
-    HashMap<AppliedReplacementKey, i32>,
-) {
-    let registry = replacement_registry();
-
+    pass: &mut CombatDamageReplacementPass,
+    resume: Option<CombatDamageReplacementResume>,
+) -> CombatDamageReplacementOutcome {
     // CR 510.2: Activate the batch tally so the applier aggregates per shield.
+    // A parked pass carries its tally out (`pass.tally`) and the state field is
+    // restored, so nothing outside the batch aggregates while it waits.
     let restore_tally = state.combat_prevention_tally.take();
-    state.combat_prevention_tally = Some(HashMap::new());
+    state.combat_prevention_tally = Some(std::mem::take(&mut pass.tally));
 
-    let mut survivors = Vec::with_capacity(proposed.len());
-    for event in proposed {
-        prepare_replacement_index_for_pipeline(state);
-        let result = pipeline_loop(state, event, 0, registry, events);
-        clear_replacement_index_pipeline(state);
-        // CR 615.5: A `Prevention::Next(N)` shield's rider is stashed per-event
-        // by the applier (the `Prevention::All` batch path suppresses its stash
-        // and fires once post-batch instead). Resolve any such per-event
-        // continuation inline — for both full prevention (`Prevented`) and
-        // partial prevention (`Modified` → `Execute`) — so a depletion-shield
-        // rider fires "immediately afterward" and never leaks past the batch.
-        if !matches!(result, ReplacementResult::NeedsChoice(_))
-            && state.has_post_replacement_drain()
+    let mut step = resume.map(|resume| match resume {
+        CombatDamageReplacementResume::Choice(Some(index))
+            if state.pending_replacement.is_some() =>
         {
-            let _ = crate::game::engine_replacement::apply_pending_post_replacement_effect(
-                state, None, None, None, events,
-            );
+            let result = continue_replacement(state, index, events);
+            settle_combat_damage_replacement(state, result, events)
         }
-        match result {
-            ReplacementResult::Execute(survivor) => survivors.push(Some(survivor)),
-            ReplacementResult::Prevented => {
-                survivors.push(None);
+        // CR 800.4a + CR 800.4e: no answer can arrive — the seat that owed it
+        // left the game and `elimination` cleared the pending event. Combat
+        // damage to a player who has left is not dealt, so the event settles
+        // with no survivor. strict-failure: when the departed seat only
+        // CONTROLLED a damaged permanent it does not own, CR 800.4h would have
+        // the next player choose; that event is skipped here as well, exactly
+        // as every combat-damage ordering choice was before the batch could
+        // park.
+        CombatDamageReplacementResume::Choice(_) => {
+            state.pending_replacement = None;
+            CombatDamageReplacementStep::Settled(None)
+        }
+        CombatDamageReplacementResume::ContinuationSettled(survivor) => {
+            drain_combat_damage_continuation(state, survivor, events)
+        }
+    });
+
+    let outcome = loop {
+        let current = match step.take() {
+            Some(current) => current,
+            None => match pass.unstarted.pop_front() {
+                Some(event) => {
+                    prepare_replacement_index_for_pipeline(state);
+                    let result = pipeline_loop(state, event, 0, replacement_registry(), events);
+                    clear_replacement_index_pipeline(state);
+                    settle_combat_damage_replacement(state, result, events)
+                }
+                None => break CombatDamageReplacementOutcome::Complete,
+            },
+        };
+        match current {
+            CombatDamageReplacementStep::Settled(survivor) => pass.resolved.push(survivor),
+            // CR 616.1: the affected player chooses which replacement applies
+            // first. `state.pending_replacement` holds the event; the batch
+            // parks until `ChooseReplacement` answers it.
+            CombatDamageReplacementStep::NeedsChoice(player) => {
+                break CombatDamageReplacementOutcome::Paused {
+                    awaiting: PendingCombatDamageAwait::ReplacementChoice,
+                    waiting_for: Box::new(replacement_choice_waiting_for(player, state)),
+                };
             }
-            ReplacementResult::NeedsChoice(_) => {
-                // CR 510.2: Combat damage cannot pause for a replacement
-                // ordering choice. Mirror the legacy per-event behavior
-                // (`apply_damage_to_target`'s combat `NeedsChoice` arm) — skip
-                // this source's damage. Clear the pending pause so it does not
-                // leak out of the batch.
-                state.pending_replacement = None;
-                survivors.push(None);
+            // CR 616.1g: the event settled, but its substitute raised a prompt.
+            CombatDamageReplacementStep::ContinuationPaused {
+                survivor,
+                waiting_for,
+            } => {
+                break CombatDamageReplacementOutcome::Paused {
+                    awaiting: PendingCombatDamageAwait::Continuation { survivor },
+                    waiting_for,
+                };
             }
+        }
+    };
+
+    pass.tally = state.combat_prevention_tally.take().unwrap_or_default();
+    state.combat_prevention_tally = restore_tally;
+    outcome
+}
+
+/// CR 510.2 + CR 616.1: the progress of one combat-damage batch's replacement
+/// pass. `resolved` holds the settled outcome of each event in batch order;
+/// `unstarted` the events not yet proposed; `tally` the `Prevention::All`
+/// aggregate so far.
+#[derive(Debug, Default)]
+pub(crate) struct CombatDamageReplacementPass {
+    pub(crate) resolved: Vec<Option<ProposedEvent>>,
+    pub(crate) unstarted: std::collections::VecDeque<ProposedEvent>,
+    pub(crate) tally: HashMap<AppliedReplacementKey, i32>,
+}
+
+/// How a parked [`CombatDamageReplacementPass`] resumes.
+#[derive(Debug)]
+pub(crate) enum CombatDamageReplacementResume {
+    /// CR 616.1: the answer to the parked event's ordering choice. `None` when
+    /// no answer can arrive (the chooser left the game).
+    Choice(Option<usize>),
+    /// CR 616.1g: the parked event settled to this survivor and its
+    /// continuation's prompt has been answered.
+    ContinuationSettled(Option<ProposedEvent>),
+}
+
+/// Result of driving a [`CombatDamageReplacementPass`].
+#[derive(Debug)]
+pub(crate) enum CombatDamageReplacementOutcome {
+    /// Every event of the batch has a settled outcome in `pass.resolved`.
+    Complete,
+    /// The entry after `pass.resolved` is waiting on `waiting_for` (boxed, as
+    /// in `combat_damage::CombatDamageBatch::Paused`: `WaitingFor` dwarfs the
+    /// other variants).
+    Paused {
+        awaiting: PendingCombatDamageAwait,
+        waiting_for: Box<WaitingFor>,
+    },
+}
+
+/// One damage event's progress through the combat replacement pass.
+enum CombatDamageReplacementStep {
+    Settled(Option<ProposedEvent>),
+    NeedsChoice(PlayerId),
+    ContinuationPaused {
+        survivor: Option<ProposedEvent>,
+        waiting_for: Box<WaitingFor>,
+    },
+}
+
+/// CR 615.5 + CR 614.6: a settled combat damage event's replacement
+/// continuation — a `Prevention::Next(N)` shield's rider (the `Prevention::All`
+/// batch path suppresses its stash and fires once post-batch instead), or a
+/// damage substitution's substitute (Szadek's counters and mill) — runs
+/// inline, "immediately afterward", for full replacement (`Prevented`) and
+/// partial prevention (`Execute`) alike, and never leaks past the batch.
+fn settle_combat_damage_replacement(
+    state: &mut GameState,
+    result: ReplacementResult,
+    events: &mut Vec<GameEvent>,
+) -> CombatDamageReplacementStep {
+    let survivor = match result {
+        ReplacementResult::Execute(survivor) => Some(survivor),
+        ReplacementResult::Prevented => None,
+        ReplacementResult::NeedsChoice(player) => {
+            return CombatDamageReplacementStep::NeedsChoice(player)
+        }
+    };
+    drain_combat_damage_continuation(state, survivor, events)
+}
+
+/// CR 616.1g: drain the settled event's continuation. A prompt it raises (a
+/// counter-replacement ordering choice inside the substitute, a per-card zone
+/// replacement choice inside its mill) is surfaced, never discarded: the
+/// continuation stays resident and paused, and the batch waits for it.
+fn drain_combat_damage_continuation(
+    state: &mut GameState,
+    survivor: Option<ProposedEvent>,
+    events: &mut Vec<GameEvent>,
+) -> CombatDamageReplacementStep {
+    if state.has_post_replacement_drain() {
+        if let Some(waiting_for) =
+            crate::game::engine_replacement::apply_pending_post_replacement_effect(
+                state, None, None, None, events,
+            )
+        {
+            return CombatDamageReplacementStep::ContinuationPaused {
+                survivor,
+                waiting_for: Box::new(waiting_for),
+            };
         }
     }
-
-    let tally = state.combat_prevention_tally.take().unwrap_or_default();
-    state.combat_prevention_tally = restore_tally;
-    (survivors, tally)
+    CombatDamageReplacementStep::Settled(survivor)
 }
 
 /// Resume a frozen SearchFound candidate set after one optional candidate was
@@ -25252,7 +25375,11 @@ mod tests {
 
         let mut events = Vec::new();
         let batch_recorded = record_proposed_events(|| {
-            let _ = replace_combat_damage_batch(&mut state, &mut events, vec![damage.clone()]);
+            let mut pass = CombatDamageReplacementPass {
+                unstarted: [damage.clone()].into(),
+                ..Default::default()
+            };
+            let _ = replace_combat_damage_batch(&mut state, &mut events, &mut pass, None);
         });
         assert!(
             batch_recorded.iter().any(is_our_damage),

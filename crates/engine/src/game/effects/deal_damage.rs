@@ -614,9 +614,22 @@ pub(crate) fn apply_damage_to_target(
                 // can resolve against the prevented event's damage source. Clear
                 // after the call to prevent leakage into unrelated later
                 // replacements.
-                let _ = crate::game::engine_replacement::apply_pending_post_replacement_effect(
-                    state, None, None, None, events,
-                );
+                //
+                // CR 616.1g: the continuation — a prevention rider, or a damage
+                // substitution's substitute (Soul-Scar Mage's counters) — can
+                // raise a prompt of its own (two counter replacements to order).
+                // The damage event is settled, but the caller must stop exactly
+                // as it does for `NeedsChoice` and stash its remaining work
+                // (further targets of a sweep), which resumes once the prompt's
+                // round trip settles. Continuing would orphan the prompt.
+                if let Some(waiting_for) =
+                    crate::game::engine_replacement::apply_pending_post_replacement_effect(
+                        state, None, None, None, events,
+                    )
+                {
+                    state.waiting_for = waiting_for;
+                    return Ok(DamageResult::NeedsChoice);
+                }
             }
             Ok(DamageResult::Applied(0))
         }
