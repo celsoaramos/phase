@@ -482,3 +482,124 @@ fn counter_order_after_choosing_the_substitution_is_still_asked() {
         assert_eq!(runner.state().objects[&ogre].damage_marked, 0);
     }
 }
+
+/// P1's 0/20 wall guarded by Doubling Season and Vizier of Remedies, and P0's
+/// Soul-Scar Mage plus two Birds of power 3 and 2.
+fn multi_source_board() -> (GameScenario, ObjectId, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature_from_oracle(P0, "Soul-Scar Mage", 1, 2, SOUL_SCAR_ORACLE);
+    let bird3 = scenario
+        .add_creature(P0, "Big Bird", 3, 3)
+        .with_subtypes(vec!["Bird"])
+        .id();
+    let bird2 = scenario
+        .add_creature(P0, "Small Bird", 2, 2)
+        .with_subtypes(vec!["Bird"])
+        .id();
+    let wall = scenario.add_creature(P1, "Great Wall", 0, 20).id();
+    let season = scenario
+        .add_enchantment_from_oracle(P1, "Doubling Season", DOUBLING_SEASON)
+        .id();
+    scenario.add_creature_from_oracle(P1, "Vizier of Remedies", 2, 1, VIZIER);
+    (scenario, bird3, bird2, wall, season)
+}
+
+/// CR 616.1g + CR 120.1: several sources each deal damage equal to their own
+/// power to one creature (`DamageSource::EachTarget`, Allies at Last). Each
+/// source's damage is substituted, and each substitute's counter event asks
+/// P1 for the Doubling Season / Vizier order. The first prompt must not orphan
+/// the second source: Doubling Season first both times → (2·3 − 1) + (2·2 − 1).
+#[test]
+fn targeted_sources_each_ask_their_counter_order() {
+    let (mut scenario, bird3, bird2, wall, season) = multi_source_board();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Allies at Last",
+            false,
+            "Up to two target creatures you control each deal damage equal to their power to \
+             target creature an opponent controls.",
+        )
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    give_priority(&mut runner, P0);
+    runner
+        .cast(spell)
+        .target_objects(&[bird3, bird2, wall])
+        .commit();
+
+    let answered = answer_p1_orderings(&mut runner, &[season, season]);
+    assert_eq!(answered, 2, "one ordering prompt per source, each once");
+    assert_eq!(minus_counters(&runner, wall), 5 + 3);
+    assert_eq!(runner.state().objects[&wall].damage_marked, 0);
+}
+
+/// CR 616.1g + CR 120.1: the filter-source form ("each Bird you control deals
+/// damage equal to its power", `Effect::EachSourceDealsDamage`) — same
+/// expectation as the targeted form above.
+#[test]
+fn filtered_sources_each_ask_their_counter_order() {
+    let (mut scenario, _bird3, _bird2, wall, season) = multi_source_board();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Bird Volley",
+            false,
+            "Each Bird you control deals damage equal to its power to target creature an \
+             opponent controls.",
+        )
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    give_priority(&mut runner, P0);
+    runner.cast(spell).target_object(wall).commit();
+
+    let answered = answer_p1_orderings(&mut runner, &[season, season]);
+    assert_eq!(answered, 2, "one ordering prompt per source, each once");
+    assert_eq!(minus_counters(&runner, wall), 5 + 3);
+    assert_eq!(runner.state().objects[&wall].damage_marked, 0);
+}
+
+/// CR 608.2c + CR 616.1g: pausing the sweep behind the first creature's
+/// counter prompt keeps the rest of the sweep AND runs the instruction after it
+/// ("Draw a card.") exactly once — the pause stashes only the remaining
+/// recipients, because `resolve_ability_chain` parks the parent's own tail.
+#[test]
+fn sweep_tail_runs_once_after_the_counter_prompts() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature_from_oracle(P0, "Soul-Scar Mage", 1, 2, SOUL_SCAR_ORACLE);
+    let first = scenario.add_creature(P1, "First Wall", 0, 10).id();
+    let second = scenario.add_creature(P1, "Second Wall", 0, 10).id();
+    let season = scenario
+        .add_enchantment_from_oracle(P1, "Doubling Season", DOUBLING_SEASON)
+        .id();
+    scenario.add_creature_from_oracle(P1, "Vizier of Remedies", 2, 1, VIZIER);
+    scenario.with_library_top(P0, &["L1", "L2", "L3"]);
+    let sweep = scenario
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Wall Sweep",
+            false,
+            "Wall Sweep deals 2 damage to each creature your opponents control with power 0. \
+             Draw a card.",
+        )
+        .id();
+
+    let mut runner = scenario.build();
+    give_priority(&mut runner, P0);
+    let hand_before = runner.state().players[0].hand.len();
+    runner.cast(sweep).commit();
+    let answered = answer_p1_orderings(&mut runner, &[season, season]);
+
+    assert_eq!(answered, 2, "one ordering prompt per creature");
+    assert_eq!(minus_counters(&runner, first), 3);
+    assert_eq!(minus_counters(&runner, second), 3);
+    assert_eq!(
+        runner.state().players[0].hand.len(),
+        hand_before - 1 + 1,
+        "the spell left the hand and the trailing draw ran once"
+    );
+}
