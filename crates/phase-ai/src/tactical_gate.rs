@@ -1547,19 +1547,49 @@ fn counter_announcement_domain(
         return concrete_counter_verdict(state, &pending.ability, Some(pending), ai);
     }
 
-    // CR 601.2h + CR 602.2b: automatic payment may already have committed
-    // the carrier. An activation drops its index on the stack, so retain the
-    // authenticated pre-transition index and require one NEW matching entry.
+    let ability = committed_counter_ability(before, state, root, owner)?;
+    concrete_counter_verdict(state, ability, None, ai)
+}
+
+fn committed_counter_ability<'a>(
+    before: &GameState,
+    state: &'a GameState,
+    root: CounterAnnouncementRoot,
+    owner: PlayerId,
+) -> Option<&'a ResolvedAbility> {
+    // CR 601.2a + CR 601.2i: finalization retags the spell's existing
+    // announcement entry. Only an absent or exact unfinalized entry can bind.
+    // CR 602.2b: retain the authenticated activation index from reducer replay;
+    // newness excludes old instances, even with the same originating index.
     let mut matching = state.stack.iter().filter(|entry| {
-        !before.stack.iter().any(|old| old.id == entry.id)
-            && entry.source_id == root.0
+        entry.source_id == root.0
             && entry.controller == owner
             && match (&entry.kind, root.1, root.2) {
-                (StackEntryKind::Spell { card_id, .. }, Some(expected), None) => {
-                    entry.id == root.0 && *card_id == expected
+                (
+                    StackEntryKind::Spell {
+                        card_id,
+                        ability: Some(_),
+                        ..
+                    },
+                    Some(expected),
+                    None,
+                ) => {
+                    entry.id == root.0
+                        && *card_id == expected
+                        && before
+                            .stack
+                            .iter()
+                            .find(|old| old.id == entry.id)
+                            .is_none_or(|old| {
+                                old.source_id == root.0
+                                    && old.controller == owner
+                                    && matches!(&old.kind,
+                                    StackEntryKind::Spell { card_id, ability: None, .. }
+                                        if *card_id == expected)
+                            })
                 }
                 (StackEntryKind::ActivatedAbility { source_id, .. }, None, Some(_)) => {
-                    *source_id == root.0
+                    *source_id == root.0 && !before.stack.iter().any(|old| old.id == entry.id)
                 }
                 _ => false,
             }
@@ -1572,7 +1602,7 @@ fn counter_announcement_domain(
     if ability.source_id != root.0 || ability.controller != owner {
         return None;
     }
-    concrete_counter_verdict(state, ability, None, ai)
+    Some(ability)
 }
 
 fn concrete_counter_verdict(
@@ -1751,6 +1781,12 @@ fn is_redundant_creature_only_removal(ctx: &PolicyContext<'_>, effects: &[&Effec
     let Some(source) = ctx.source_object() else {
         return false;
     };
+
+    // CR 700.2a + CR 601.2b: printed modes are alternatives until announced;
+    // an unavailable damage mode cannot prove the whole cast redundant.
+    if matches!(ctx.candidate.action, GameAction::CastSpell { .. }) && source.modal.is_some() {
+        return false;
+    }
 
     // A MIXED spell carrying a useful MASS wipe is never "redundant creature-only
     // removal": the wipe's NON-targeted population (CR 115.10a) is an independent
@@ -7959,22 +7995,17 @@ mod tests {
             .clone();
         let successor = replay_counter_announcement(state, &candidate, P0)
             .expect("reach-guard: this issued response is reducer-valid and affordable");
-        let source = counter_choice_root(state).unwrap().0;
+        let root = counter_choice_root(state).unwrap();
+        let owner = candidate.metadata.semantic_owner.unwrap();
         let ability = successor
             .waiting_for
             .pending_cast_ref()
             .or(successor.pending_cast.as_deref())
-            .map(|pending| pending.ability.as_ref())
-            .or_else(|| {
-                successor
-                    .stack
-                    .iter()
-                    .find(|entry| {
-                        entry.source_id == source
-                            && !state.stack.iter().any(|old| old.id == entry.id)
-                    })
-                    .and_then(|entry| entry.ability())
+            .filter(|pending| {
+                counter_pending_matches(root, pending) && pending.ability.controller == owner
             })
+            .map(|pending| pending.ability.as_ref())
+            .or_else(|| committed_counter_ability(state, &successor, root, owner))
             .expect("reach-guard: the response has an actual selected engine carrier");
         assert!(
             collect_ability_effects(ability)
@@ -8120,6 +8151,18 @@ mod tests {
                 announced.state().waiting_for,
                 WaitingFor::ChooseXValue { min: 0, max: 2, .. }
             ));
+            // CR 601.2a + CR 601.2i: the exact announcement is finalized in place.
+            let announcement = announced
+                .state()
+                .stack
+                .iter()
+                .find(|entry| entry.id == blast)
+                .unwrap();
+            assert_eq!(announcement.source_id, blast);
+            assert_eq!(announcement.controller, P0);
+            assert!(matches!(&announcement.kind,
+                StackEntryKind::Spell { card_id, ability: None, .. }
+                    if *card_id == state.objects[&blast].card_id));
             let (bad_x, own, good_x, foreign) = if bolt_controller == P1 {
                 (2, counter, 1, bolt)
             } else {
@@ -8140,13 +8183,20 @@ mod tests {
                 hostile.waiting_for,
                 WaitingFor::TargetSelection { .. }
             ));
-            let bound = hostile
+            let entry = hostile
                 .stack
                 .iter()
                 .find(|entry| entry.id == blast)
-                .unwrap()
-                .ability()
                 .unwrap();
+            assert_eq!(entry.id, announcement.id);
+            assert_eq!(entry.source_id, announcement.source_id);
+            assert_eq!(entry.controller, announcement.controller);
+            assert!(matches!(&entry.kind,
+                StackEntryKind::Spell { card_id, ability: Some(_), .. }
+                    if *card_id == state.objects[&blast].card_id));
+            let bound = entry.ability().unwrap();
+            assert_eq!(bound.source_id, blast);
+            assert_eq!(bound.controller, P0);
             assert!(is_pure_counter_payload(&collect_ability_effects(bound)));
             assert_eq!(bound.chosen_x, Some(bad_x));
             assert_eq!(
@@ -8312,6 +8362,18 @@ mod tests {
             announced.state().waiting_for,
             WaitingFor::ModeChoice { .. }
         ));
+        // CR 601.2a + CR 601.2i: the exact announcement is finalized in place.
+        let announcement = announced
+            .state()
+            .stack
+            .iter()
+            .find(|entry| entry.id == charm)
+            .unwrap();
+        assert_eq!(announcement.source_id, charm);
+        assert_eq!(announcement.controller, P0);
+        assert!(matches!(&announcement.kind,
+            StackEntryKind::Spell { card_id, ability: None, .. }
+                if *card_id == state.objects[&charm].card_id));
         let bad = assert_counter_response_in_pools(
             announced.state(),
             GameAction::SelectModes { indices: vec![0] },
@@ -8327,13 +8389,21 @@ mod tests {
             reference.waiting_for,
             WaitingFor::TargetSelection { .. }
         ));
-        let ability = reference
+        let entry = reference
             .stack
             .iter()
             .find(|entry| entry.id == charm)
-            .unwrap()
-            .ability()
             .unwrap();
+        assert_eq!(entry.id, announcement.id);
+        assert_eq!(entry.source_id, announcement.source_id);
+        assert_eq!(entry.controller, announcement.controller);
+        assert!(matches!(&entry.kind,
+            StackEntryKind::Spell { card_id, ability: Some(_), .. }
+                if *card_id == state.objects[&charm].card_id));
+        let ability = entry.ability().unwrap();
+        assert_eq!(ability.source_id, charm);
+        assert_eq!(ability.controller, P0);
+        assert_eq!(ability.context.chosen_modes, vec![0]);
         assert!(is_pure_counter_payload(&collect_ability_effects(ability)));
         assert!(ability.unless_pay.is_some());
         assert_eq!(
@@ -8476,11 +8546,17 @@ mod tests {
             assert!(matches!(hostile.waiting_for, WaitingFor::PayCost { .. }));
             assert_eq!(pending.activation_ability_index, Some(1));
             assert_eq!(pending.ability.chosen_x, Some(2));
+            assert_eq!(pending.ability.source_id, source);
+            assert_eq!(pending.ability.controller, P0);
             assert_eq!(
                 declared_targets_in_chain(&pending.ability),
                 vec![TargetRef::Object(counter)]
             );
             assert!(hostile.stack.iter().any(|entry| entry.id == old_entry));
+            assert_eq!(
+                hostile.stack.iter().find(|entry| entry.id == old_entry),
+                next.stack.iter().find(|entry| entry.id == old_entry),
+            );
             let one = candidate_actions(&next)
                 .into_iter()
                 .find(|candidate| candidate.action == GameAction::ChooseX { value: 1 })
@@ -8572,20 +8648,26 @@ mod tests {
                 target: TargetFilter::Controller,
             },
         )));
-        let mut modal = AbilityDefinition::new(AbilityKind::Activated, Effect::NoOp);
-        modal.cost = Some(AbilityCost::Mana {
-            cost: ManaCost::Cost {
-                generic: 0,
-                shards: vec![ManaCostShard::X, ManaCostShard::Blue],
-            },
-        });
-        modal.modal = Some(ModalChoice {
-            min_choices: 1,
-            max_choices: 1,
-            mode_count: 2,
-            ..ModalChoice::default()
-        });
-        modal.mode_abilities = vec![pure, mixed];
+        let modal = AbilityDefinition::new(AbilityKind::Activated, Effect::NoOp)
+            .cost(AbilityCost::Mana {
+                cost: ManaCost::Cost {
+                    generic: 0,
+                    shards: vec![ManaCostShard::X, ManaCostShard::Blue],
+                },
+            })
+            .with_modal(
+                ModalChoice {
+                    min_choices: 1,
+                    max_choices: 1,
+                    mode_count: 2,
+                    mode_descriptions: vec![
+                        "Counter target spell with mana value X.".to_string(),
+                        "Counter target spell with mana value X. Draw a card.".to_string(),
+                    ],
+                    ..ModalChoice::default()
+                },
+                vec![pure, mixed],
+            );
         let object = state.objects.get_mut(&source).unwrap();
         Arc::make_mut(&mut object.abilities)[1] = modal.clone();
         Arc::make_mut(&mut object.base_abilities)[1] = modal;
@@ -8643,6 +8725,14 @@ mod tests {
                 x_prompt.waiting_for,
                 WaitingFor::ChooseXValue { .. }
             ));
+            assert_eq!(
+                x_prompt
+                    .waiting_for
+                    .pending_cast_ref()
+                    .unwrap()
+                    .chosen_modes,
+                vec![index],
+            );
             let two = assert_counter_response_in_pools(
                 &x_prompt,
                 GameAction::ChooseX { value: 2 },
@@ -8661,11 +8751,21 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(additions.len(), 1);
+            assert_eq!(additions[0].controller, P0);
+            let selected = additions[0].ability().unwrap();
+            assert_eq!(selected.source_id, source);
+            assert_eq!(selected.controller, P0);
+            assert_eq!(selected.ability_index, Some(1));
+            assert_eq!(selected.chosen_x, Some(2));
             assert_eq!(
                 declared_targets_in_chain(additions[0].ability().unwrap()),
                 vec![TargetRef::Object(own)]
             );
             assert!(next.stack.iter().any(|entry| entry.id == old_entry));
+            assert_eq!(
+                next.stack.iter().find(|entry| entry.id == old_entry),
+                state.stack.iter().find(|entry| entry.id == old_entry),
+            );
         }
     }
 
