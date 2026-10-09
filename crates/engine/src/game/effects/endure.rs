@@ -1,4 +1,5 @@
 use crate::game::effects::choose_one_of;
+use crate::game::players;
 use crate::game::quantity::resolve_quantity_with_targets;
 use crate::game::targeting::{extract_source_from_event, resolve_effect_player_ref};
 use crate::types::ability::{
@@ -14,10 +15,10 @@ use crate::types::mana::ManaColor;
 /// CR 701.63a: Endure N.
 ///
 /// The enduring permanent's controller creates an N/N white Spirit creature
-/// token unless they put N +1/+1 counters on that permanent. This is a
-/// two-branch "choose one" keyword action, so the resolver composes the
-/// existing `ChooseOneOf` modal machine rather than reimplementing the
-/// branch-choice state machine.
+/// token unless they put N +1/+1 counters on that permanent. CR 118.12a:
+/// the counter placement is an optional resolving cost. For living
+/// controllers, the existing `ChooseOneOf` modal machine represents that
+/// payment decision and its default token effect.
 ///
 /// CR 701.63b: Endure 0 does nothing — no token is created and no counters are
 /// put on the permanent.
@@ -98,12 +99,24 @@ pub fn resolve(
         ),
         // CR 608.2h + CR 113.7a + CR 701.63a: a departed performer uses its
         // exact incarnation's last controller for both choice and token creation.
-        None => (
-            ability.source_id,
-            resolve_effect_player_ref(state, ability, &TargetFilter::SourceController)
-                .ok_or(EffectError::ObjectNotFound(ability.source_id))?,
-            vec![token_branch],
-        ),
+        None => {
+            let controller =
+                resolve_effect_player_ref(state, ability, &TargetFilter::SourceController)
+                    .ok_or(EffectError::ObjectNotFound(ability.source_id))?;
+            // CR 701.63a + CR 118.12a + CR 800.4f: a departed controller's
+            // optional counter cost is unpaid, without a payment choice.
+            // CR 800.4b + CR 800.4d: that player cannot create the default token.
+            // CR 609.3: complete normally, doing only as much as possible.
+            if !players::is_alive(state, controller) {
+                events.push(GameEvent::EffectResolved {
+                    kind: EffectKind::Endure,
+                    source_id: ability.source_id,
+                    subject: None,
+                });
+                return Ok(());
+            }
+            (ability.source_id, controller, vec![token_branch])
+        }
     };
 
     // CR 701.63a: "that permanent's controller" makes the choice — a single

@@ -587,7 +587,7 @@ fn hand_size(runner: &GameRunner, player: engine::types::player::PlayerId) -> us
 /// Pass priority (with the stack non-empty) until `player` holds it, so the
 /// next `cast` is theirs.
 fn give_priority_to(runner: &mut GameRunner, player: engine::types::player::PlayerId) {
-    for _ in 0..2 {
+    for _ in 0..runner.state().players.len() {
         if matches!(runner.state().waiting_for, WaitingFor::Priority { player: p } if p == player) {
             return;
         }
@@ -1186,6 +1186,183 @@ fn krumar_endure_departed_control_change_uses_last_controller_not_activator() {
     choose_krumar_endure(&mut runner, P1, true, false);
     assert_krumar_spirit(&runner, P1);
     assert_eq!(p1p1(&runner, source), 0);
+}
+
+fn krumar_endure_departed_controller_lifetime(concede_last_controller: bool) {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario
+        .add_creature_from_oracle(P0, "Krumar Initiate", 2, 2, KRUMAR_INITIATE)
+        .with_subtypes(vec!["Human", "Cleric"])
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Black],
+            generic: 1,
+        })
+        .controlled_by(P0)
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        [
+            ManaType::Black,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::White,
+            ManaType::Colorless,
+        ]
+        .into_iter()
+        .map(|kind| ManaUnit::new(kind, ObjectId(0), false, vec![]))
+        .collect(),
+    );
+    scenario.with_mana_pool(
+        P1,
+        [
+            ManaType::Red,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+        ]
+        .into_iter()
+        .map(|kind| ManaUnit::new(kind, ObjectId(0), false, vec![]))
+        .collect(),
+    );
+    let turn_against = costed_turn_against(&mut scenario);
+    let flicker = costed_flicker_of_fate(&mut scenario);
+    let mut runner = scenario.build();
+    assert!(runner.state().objects[&turn_against].color.is_empty());
+    let ability = activate_krumar_onto_stack(&mut runner, source, 2);
+    let original_incarnation = ability.source_incarnation.unwrap();
+    assert_eq!(runner.state().players[0].mana_pool.total(), 2);
+    give_priority_to(&mut runner, P1);
+    let response = runner.cast(turn_against).target_object(source).commit();
+    assert_eq!(response.state().players[1].mana_pool.total(), 0);
+    runner.resolve_top();
+    assert_eq!(runner.state().stack.len(), 1);
+    assert_eq!(runner.state().stack[0].controller, P0);
+    assert_eq!(runner.state().objects[&source].controller, P1);
+    assert_eq!(
+        runner.state().objects[&source].incarnation,
+        original_incarnation
+    );
+    assert_eq!(ability.self_ref_binding(runner.state()), Some(source));
+    give_priority_to(&mut runner, P0);
+    let response = runner.cast(flicker).target_object(source).commit();
+    assert_eq!(response.state().players[0].mana_pool.total(), 0);
+    runner.resolve_top();
+    // CR 400.7 + CR 608.2h: the returned P0 object is distinct from the
+    // departed performer whose exact last controller was P1.
+    assert_eq!(runner.state().objects[&source].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&source].owner, P0);
+    assert_eq!(runner.state().objects[&source].controller, P0);
+    assert_ne!(
+        runner.state().objects[&source].incarnation,
+        original_incarnation
+    );
+    assert_eq!(ability.controller, P0);
+    assert_eq!(ability.self_ref_binding(runner.state()), None);
+    assert_eq!(
+        runner.state().lki_by_incarnation[&source][&original_incarnation].controller,
+        P1
+    );
+    if concede_last_controller {
+        // CR 104.3a + CR 800.4a: P1 leaves immediately, while P0's
+        // activation and P0-owned returned permanent remain in the game.
+        runner.act(GameAction::Concede { player_id: P1 }).unwrap();
+    }
+    assert_eq!(
+        runner.state().players[1].is_eliminated,
+        concede_last_controller
+    );
+    assert!(!runner.state().players[0].is_eliminated);
+    assert!(!runner.state().players[2].is_eliminated);
+    assert_eq!(runner.state().players[2].id, PlayerId(2));
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { .. }
+    ));
+    assert_eq!(runner.state().stack.len(), 1);
+    let entry = &runner.state().stack[0];
+    assert_eq!(entry.controller, P0);
+    match &entry.kind {
+        StackEntryKind::ActivatedAbility {
+            ability: retained, ..
+        } => {
+            assert_eq!(retained.source_id, source);
+            assert_eq!(retained.source_incarnation, Some(original_incarnation));
+            assert_eq!(retained.controller, P0);
+            assert_eq!(retained.chosen_x, Some(2));
+            assert_eq!(retained.self_ref_binding(runner.state()), None);
+        }
+        other => panic!("expected retained Krumar activation, got {other:?}"),
+    }
+    assert_eq!(runner.state().players[0].life, 18);
+    assert_eq!(runner.state().players[0].mana_pool.total(), 0);
+    assert_eq!(runner.state().objects[&source].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&source].owner, P0);
+    assert_eq!(runner.state().objects[&source].controller, P0);
+    assert_ne!(
+        runner.state().objects[&source].incarnation,
+        original_incarnation
+    );
+    assert_eq!(
+        runner.state().lki_by_incarnation[&source][&original_incarnation].controller,
+        P1
+    );
+    if concede_last_controller {
+        let mut events = Vec::new();
+        for _ in 0..8 {
+            if runner.state().stack.is_empty() {
+                break;
+            }
+            assert!(matches!(
+                runner.state().waiting_for,
+                WaitingFor::Priority { .. }
+            ));
+            events.extend(runner.act(GameAction::PassPriority).unwrap().events);
+        }
+        // CR 701.63a + CR 118.12a + CR 800.4f: the departed player's
+        // optional counter cost is unpaid; no dead-player choice is required.
+        let player = match runner.state().waiting_for {
+            WaitingFor::Priority { player } => player,
+            ref other => panic!("Endure must complete to live priority, got {other:?}"),
+        };
+        assert!([P0, PlayerId(2)].contains(&player));
+        assert_eq!(runner.state().priority_player, player);
+        assert_eq!(runner.state().waiting_for.acting_players(), vec![player]);
+        assert_eq!(
+            engine::game::turn_control::authorized_submitters(runner.state()),
+            vec![player]
+        );
+        assert!(runner.state().stack.is_empty());
+        assert!(runner.state().resolution_stack.is_empty());
+        // Normal no-op leaf completion is an engine contract (CR 609.3).
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GameEvent::EffectResolved {
+                kind: EffectKind::Endure, source_id, subject: None,
+            } if *source_id == source))
+                .count(),
+            1
+        );
+        // CR 800.4b + CR 800.4d: no token may be created for departed P1.
+        assert_eq!(spirit_tokens(&runner), 0);
+    } else {
+        choose_krumar_endure(&mut runner, P1, true, false);
+        assert_krumar_spirit(&runner, P1);
+    }
+    // CR 400.7: the returned incarnation cannot receive the old counters.
+    assert_eq!(p1p1(&runner, source), 0);
+}
+
+#[test]
+fn krumar_endure_departed_eliminated_controller_completes_without_choice() {
+    krumar_endure_departed_controller_lifetime(true);
+}
+
+#[test]
+fn krumar_endure_departed_living_controller_still_creates_spirit() {
+    krumar_endure_departed_controller_lifetime(false);
 }
 
 // CR 400.7 + CR 608.2h: two departures of one storage id must not contaminate
