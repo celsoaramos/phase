@@ -31,14 +31,20 @@
 
 use engine::game::game_object::AttachTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::TargetRef;
+use engine::types::ability::{
+    AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, Duration, Effect,
+    EffectKind, GrantedAbilityScope, QuantityExpr, QuantityRef, ResolvedAbility, TargetFilter,
+    TargetRef,
+};
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::counter::CounterType;
-use engine::types::game_state::WaitingFor;
+use engine::types::events::GameEvent;
+use engine::types::game_state::{StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::{ManaType, ManaUnit};
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
+use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
 const CARRION_FEEDER: &str =
@@ -807,4 +813,730 @@ fn endure_after_its_source_is_flickered_only_creates_the_token() {
         0,
         "the returned creature gets no counters"
     );
+}
+
+// Verbatim printed cards, with their real costs, for the announced-X and
+// controller-provenance cases. The older ENDURER remains a fixed-amount fixture.
+const KRUMAR_INITIATE: &str = "{X}{B}, {T}, Pay X life: This creature endures X. Activate only as a sorcery. (Put X +1/+1 counters on it or create an X/X white Spirit creature token.)";
+const FLICKER_OF_FATE: &str = "Exile target creature or enchantment, then return it to the battlefield under its owner's control.";
+const TURN_AGAINST: &str = "Devoid (This card has no color.)\nGain control of target creature until end of turn. Untap that creature. It gains haste until end of turn.";
+const UNSUMMON: &str = "Return target creature to its owner's hand.";
+
+fn krumar_scenario(owner: PlayerId) -> (GameScenario, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario
+        .add_creature_from_oracle(owner, "Krumar Initiate", 2, 2, KRUMAR_INITIATE)
+        .with_subtypes(vec!["Human", "Cleric"])
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Black],
+            generic: 1,
+        })
+        .controlled_by(P0)
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        [
+            ManaType::Black,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::White,
+            ManaType::Colorless,
+            ManaType::White,
+            ManaType::Colorless,
+            ManaType::Blue,
+        ]
+        .into_iter()
+        .map(|kind| ManaUnit::new(kind, ObjectId(0), false, vec![]))
+        .collect(),
+    );
+    scenario.with_mana_pool(
+        P1,
+        [
+            ManaType::Red,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+            ManaType::Colorless,
+        ]
+        .into_iter()
+        .map(|kind| ManaUnit::new(kind, ObjectId(0), false, vec![]))
+        .collect(),
+    );
+    (scenario, source)
+}
+
+fn costed_flicker_of_fate(scenario: &mut GameScenario) -> ObjectId {
+    scenario
+        .add_spell_to_hand_from_oracle(P0, "Flicker of Fate", true, FLICKER_OF_FATE)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::White],
+            generic: 1,
+        })
+        .id()
+}
+
+fn costed_turn_against(scenario: &mut GameScenario) -> ObjectId {
+    scenario
+        .add_spell_to_hand_from_oracle(P1, "Turn Against", true, TURN_AGAINST)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Red],
+            generic: 4,
+        })
+        // Apply the keyword-aware face last: with_mana_cost derives colors.
+        .from_oracle_text_with_keywords(&["Devoid"], TURN_AGAINST)
+        .id()
+}
+
+// CR 107.3a + CR 602.2b + CR 119.4: announce X through the production action;
+// mana, tap and life must all be paid before the captured ability is readable.
+fn activate_krumar_onto_stack(
+    runner: &mut GameRunner,
+    source: ObjectId,
+    x: u32,
+) -> ResolvedAbility {
+    let index = costed_ability(runner, source);
+    assert!(
+        matches!(runner.state().objects[&source].abilities[index].effect.as_ref(), Effect::Endure {
+        amount: QuantityExpr::Ref { qty: QuantityRef::Variable { name } }, subject: TargetFilter::SelfRef,
+    } if name == "X")
+    );
+    let life_before = runner.state().players[0].life;
+    let mana_before = runner.state().players[0].mana_pool.total();
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: index,
+        })
+        .unwrap();
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::ChooseXValue { player: P0, .. }
+    ));
+    let result = runner.act(GameAction::ChooseX { value: x }).unwrap();
+    assert!(result
+        .events
+        .iter()
+        .any(|event| matches!(event, GameEvent::XValueChosen {
+        player: P0, object_id, value,
+    } if *object_id == source && *value == x)));
+    for _ in 0..8 {
+        match runner.state().waiting_for {
+            WaitingFor::Priority { .. } => break,
+            WaitingFor::ManaPayment { .. } => {
+                runner.act(GameAction::PassPriority).unwrap();
+            }
+            ref other => panic!("unexpected Krumar payment prompt: {other:?}"),
+        }
+    }
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { .. }
+    ));
+    assert_eq!(runner.state().stack.len(), 1);
+    let ability = match &runner.state().stack.last().unwrap().kind {
+        StackEntryKind::ActivatedAbility { ability, .. } => ability.clone(),
+        other => panic!("expected committed activation, got {other:?}"),
+    };
+    assert_eq!(ability.source_id, source);
+    assert_eq!(
+        ability.source_incarnation,
+        Some(runner.state().objects[&source].incarnation)
+    );
+    assert_eq!(ability.controller, P0);
+    let mut current = Some(&ability);
+    while let Some(def) = current {
+        assert_eq!(def.chosen_x, Some(x));
+        current = def.sub_ability.as_deref();
+    }
+    assert!(runner.state().objects[&source].tapped);
+    assert_eq!(runner.state().players[0].life, life_before - x as i32);
+    assert_eq!(runner.state().players[1].life, 20);
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        mana_before - (x as usize + 1)
+    );
+    assert_eq!(
+        runner.state().players[0]
+            .mana_pool
+            .count_color(ManaType::Black),
+        0
+    );
+    ability
+}
+
+// CR 701.63a: inspect both authorities stored by the existing choice machine,
+// then submit its typed branch through the real reducer.
+fn choose_krumar_endure(
+    runner: &mut GameRunner,
+    chooser: PlayerId,
+    departed: bool,
+    counters: bool,
+) {
+    for _ in 0..8 {
+        if matches!(
+            runner.state().waiting_for,
+            WaitingFor::ChooseOneOfBranch { .. }
+        ) {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("Endure reaches its choice");
+    }
+    let index = match &runner.state().waiting_for {
+        WaitingFor::ChooseOneOfBranch {
+            player,
+            controller,
+            branches,
+            ..
+        } => {
+            assert_eq!(*player, chooser);
+            assert_eq!(*controller, chooser);
+            assert_eq!(branches.len(), if departed { 1 } else { 2 });
+            assert!(branches
+                .iter()
+                .any(|b| matches!(b.effect.as_ref(), Effect::Token { .. })));
+            assert_eq!(
+                branches
+                    .iter()
+                    .any(|b| matches!(b.effect.as_ref(), Effect::PutCounter { .. })),
+                !departed
+            );
+            branches
+                .iter()
+                .position(|b| {
+                    if counters {
+                        matches!(b.effect.as_ref(), Effect::PutCounter { .. })
+                    } else {
+                        matches!(b.effect.as_ref(), Effect::Token { .. })
+                    }
+                })
+                .unwrap()
+        }
+        other => panic!("expected positive Endure choice, got {other:?}"),
+    };
+    assert_eq!(runner.state().waiting_for.acting_player(), Some(chooser));
+    assert_eq!(runner.state().waiting_for.acting_players(), vec![chooser]);
+    let actions = engine::ai_support::legal_actions(runner.state());
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|a| matches!(a, GameAction::ChooseBranch { .. }))
+            .count(),
+        if departed { 1 } else { 2 }
+    );
+    assert!(actions
+        .iter()
+        .any(|a| matches!(a, GameAction::ChooseBranch { index: i } if *i == index)));
+    runner.act(GameAction::ChooseBranch { index }).unwrap();
+    assert!(runner.state().stack.is_empty());
+    assert!(runner.state().pending_continuation.is_none());
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { .. }
+    ));
+}
+
+// CR 701.63a + CR 111.2: exactly one Spirit, whose creator owns and controls it.
+fn assert_krumar_spirit(runner: &GameRunner, creator: PlayerId) {
+    let tokens: Vec<_> = runner
+        .state()
+        .objects
+        .values()
+        .filter(|o| o.zone == Zone::Battlefield && o.is_token)
+        .collect();
+    assert_eq!(tokens.len(), 1);
+    let token = tokens[0];
+    assert_eq!(token.power, Some(2));
+    assert_eq!(token.toughness, Some(2));
+    assert_eq!(token.color, vec![ManaColor::White]);
+    assert!(token.card_types.core_types.contains(&CoreType::Creature));
+    assert!(token.card_types.subtypes.iter().any(|s| s == "Spirit"));
+    assert_eq!(token.owner, creator);
+    assert_eq!(token.controller, creator);
+}
+
+#[test]
+fn krumar_endure_uses_announced_x_for_counters() {
+    let (scenario, source) = krumar_scenario(P0);
+    let mut runner = scenario.build();
+    let index = costed_ability(&runner, source);
+    let outcome = runner.activate(source, index).x(2).resolve();
+    outcome.assert_life_delta(P0, -2);
+    outcome.assert_life_delta(P1, 0);
+    assert!(outcome.state().objects[&source].tapped);
+    assert_eq!(outcome.mana_pool_total(P0), 5);
+    assert_eq!(outcome.mana_pool_color(P0, ManaType::Black), 0);
+    assert!(matches!(
+        outcome.final_waiting_for(),
+        WaitingFor::ChooseOneOfBranch { .. }
+    ));
+    assert!(outcome
+        .events()
+        .iter()
+        .any(|e| matches!(e, GameEvent::XValueChosen { value: 2, .. })));
+    choose_krumar_endure(&mut runner, P0, false, true);
+    // CR 701.63a + CR 122.1a: two counters on the enduring incarnation.
+    assert_eq!(p1p1(&runner, source), 2);
+    assert_eq!(spirit_tokens(&runner), 0);
+}
+
+#[test]
+fn krumar_endure_uses_announced_x_for_spirit() {
+    let (scenario, source) = krumar_scenario(P0);
+    let mut runner = scenario.build();
+    activate_krumar_onto_stack(&mut runner, source, 2);
+    choose_krumar_endure(&mut runner, P0, false, false);
+    assert_krumar_spirit(&runner, P0);
+    assert_eq!(p1p1(&runner, source), 0);
+}
+
+// CR 608.2h + CR 701.63a: a live permanent supplies its current controller.
+#[test]
+fn krumar_endure_live_control_change_uses_current_controller_for_both_branches() {
+    for counters in [true, false] {
+        let (mut scenario, source) = krumar_scenario(P0);
+        let turn_against = costed_turn_against(&mut scenario);
+        let mut runner = scenario.build();
+        assert!(runner.state().objects[&turn_against].color.is_empty());
+        assert!(runner.state().objects[&turn_against]
+            .keywords
+            .iter()
+            .any(|keyword| matches!(keyword, engine::types::keywords::Keyword::Devoid)));
+        let ability = activate_krumar_onto_stack(&mut runner, source, 2);
+        give_priority_to(&mut runner, P1);
+        let response = runner.cast(turn_against).target_object(source).commit();
+        assert_eq!(response.mana_pool_total(P1), 0);
+        runner.resolve_top();
+        assert_eq!(runner.state().stack.len(), 1);
+        assert_eq!(runner.state().objects[&source].controller, P1);
+        assert_eq!(
+            runner.state().objects[&source].incarnation,
+            ability.source_incarnation.unwrap()
+        );
+        assert_eq!(ability.self_ref_binding(runner.state()), Some(source));
+        choose_krumar_endure(&mut runner, P1, false, counters);
+        if counters {
+            assert_eq!(p1p1(&runner, source), 2);
+            assert_eq!(spirit_tokens(&runner), 0);
+        } else {
+            assert_krumar_spirit(&runner, P1);
+            assert_eq!(p1p1(&runner, source), 0);
+        }
+    }
+}
+
+// CR 400.7 + CR 608.2h: returned ownership does not replace the old controller.
+#[test]
+fn krumar_endure_flickered_under_owners_control_uses_last_controller() {
+    let (mut scenario, source) = krumar_scenario(P1);
+    let flicker = costed_flicker_of_fate(&mut scenario);
+    let mut runner = scenario.build();
+    assert_eq!(runner.state().objects[&source].owner, P1);
+    assert_eq!(runner.state().objects[&source].controller, P0);
+    let ability = activate_krumar_onto_stack(&mut runner, source, 2);
+    runner.cast(flicker).target_object(source).commit();
+    runner.resolve_top();
+    assert_eq!(runner.state().objects[&source].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&source].controller, P1);
+    assert_ne!(
+        runner.state().objects[&source].incarnation,
+        ability.source_incarnation.unwrap()
+    );
+    assert_eq!(ability.self_ref_binding(runner.state()), None);
+    assert_eq!(
+        runner.state().lki_by_incarnation[&source][&ability.source_incarnation.unwrap()].controller,
+        P0
+    );
+    choose_krumar_endure(&mut runner, P0, true, false);
+    assert_krumar_spirit(&runner, P0);
+    assert_eq!(p1p1(&runner, source), 0);
+}
+
+// CR 113.7a + CR 608.2h + CR 701.63a: the departure controller, distinct
+// from activator and owner, supplies both chooser and Spirit creator.
+#[test]
+fn krumar_endure_departed_control_change_uses_last_controller_not_activator() {
+    let (mut scenario, source) = krumar_scenario(P0);
+    let turn_against = costed_turn_against(&mut scenario);
+    let flicker = costed_flicker_of_fate(&mut scenario);
+    let mut runner = scenario.build();
+    let ability = activate_krumar_onto_stack(&mut runner, source, 2);
+    give_priority_to(&mut runner, P1);
+    let response = runner.cast(turn_against).target_object(source).commit();
+    assert_eq!(response.mana_pool_total(P1), 0);
+    runner.resolve_top();
+    assert_eq!(runner.state().objects[&source].controller, P1);
+    give_priority_to(&mut runner, P0);
+    runner.cast(flicker).target_object(source).commit();
+    runner.resolve_top();
+    assert_eq!(runner.state().objects[&source].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&source].controller, P0);
+    assert_ne!(
+        runner.state().objects[&source].incarnation,
+        ability.source_incarnation.unwrap()
+    );
+    assert_eq!(ability.controller, P0);
+    assert_eq!(ability.self_ref_binding(runner.state()), None);
+    assert_eq!(
+        runner.state().lki_by_incarnation[&source][&ability.source_incarnation.unwrap()].controller,
+        P1
+    );
+    choose_krumar_endure(&mut runner, P1, true, false);
+    assert_krumar_spirit(&runner, P1);
+    assert_eq!(p1p1(&runner, source), 0);
+}
+
+// CR 400.7 + CR 608.2h: two departures of one storage id must not contaminate
+// the original activation's incarnation-qualified last-known controller.
+#[test]
+fn krumar_endure_second_departure_does_not_replace_original_lki() {
+    let (mut scenario, source) = krumar_scenario(P0);
+    let turn_against = costed_turn_against(&mut scenario);
+    let flicker = costed_flicker_of_fate(&mut scenario);
+    let second_flicker = costed_flicker_of_fate(&mut scenario);
+    let mut runner = scenario.build();
+    let ability = activate_krumar_onto_stack(&mut runner, source, 2);
+    give_priority_to(&mut runner, P1);
+    let response = runner.cast(turn_against).target_object(source).commit();
+    assert_eq!(response.mana_pool_total(P1), 0);
+    runner.resolve_top();
+    assert_eq!(runner.state().objects[&source].controller, P1);
+    give_priority_to(&mut runner, P0);
+    runner.cast(flicker).target_object(source).commit();
+    runner.resolve_top();
+    let first_return = runner.state().objects[&source].incarnation;
+    assert_eq!(runner.state().objects[&source].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&source].controller, P0);
+    assert_ne!(first_return, ability.source_incarnation.unwrap());
+    give_priority_to(&mut runner, P0);
+    runner.cast(second_flicker).target_object(source).commit();
+    runner.resolve_top();
+    assert_eq!(runner.state().objects[&source].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&source].controller, P0);
+    assert_ne!(runner.state().objects[&source].incarnation, first_return);
+    assert_ne!(
+        runner.state().objects[&source].incarnation,
+        ability.source_incarnation.unwrap()
+    );
+    assert_eq!(
+        runner.state().lki_by_incarnation[&source][&first_return].controller,
+        P0
+    );
+    assert_eq!(
+        runner.state().lki_by_incarnation[&source][&ability.source_incarnation.unwrap()].controller,
+        P1
+    );
+    assert_eq!(ability.self_ref_binding(runner.state()), None);
+    choose_krumar_endure(&mut runner, P1, true, false);
+    assert_krumar_spirit(&runner, P1);
+    assert_eq!(p1p1(&runner, source), 0);
+}
+
+// CR 400.7 + CR 608.2h: the departed incarnation need not return to endure.
+#[test]
+fn krumar_endure_unsummoned_source_uses_departure_controller() {
+    let (mut scenario, source) = krumar_scenario(P0);
+    let turn_against = costed_turn_against(&mut scenario);
+    let unsummon = scenario
+        .add_spell_to_hand_from_oracle(P0, "Unsummon", true, UNSUMMON)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue],
+            generic: 0,
+        })
+        .id();
+    let mut runner = scenario.build();
+    let ability = activate_krumar_onto_stack(&mut runner, source, 2);
+    give_priority_to(&mut runner, P1);
+    let response = runner.cast(turn_against).target_object(source).commit();
+    assert_eq!(response.mana_pool_total(P1), 0);
+    runner.resolve_top();
+    assert_eq!(runner.state().objects[&source].controller, P1);
+    give_priority_to(&mut runner, P0);
+    runner.cast(unsummon).target_object(source).commit();
+    runner.resolve_top();
+    assert_eq!(runner.state().objects[&source].zone, Zone::Hand);
+    assert!(runner.state().players[0].hand.contains(&source));
+    assert_ne!(
+        runner.state().objects[&source].incarnation,
+        ability.source_incarnation.unwrap()
+    );
+    assert_eq!(
+        runner.state().lki_by_incarnation[&source][&ability.source_incarnation.unwrap()].controller,
+        P1
+    );
+    assert_eq!(ability.self_ref_binding(runner.state()), None);
+    choose_krumar_endure(&mut runner, P1, true, false);
+    assert_krumar_spirit(&runner, P1);
+    assert_eq!(p1p1(&runner, source), 0);
+}
+
+// CR 701.63b + CR 119.4b: real X=0 pays black mana and taps, then completes
+// Endure without a choice or token, for both live and departed incarnations.
+#[test]
+fn krumar_endure_zero_completes_live_and_departed_without_choice() {
+    for departed in [false, true] {
+        let (mut scenario, source) = krumar_scenario(P0);
+        let flicker = costed_flicker_of_fate(&mut scenario);
+        let mut runner = scenario.build();
+        let ability = activate_krumar_onto_stack(&mut runner, source, 0);
+        if departed {
+            runner.cast(flicker).target_object(source).commit();
+            runner.resolve_top();
+            assert_eq!(runner.state().objects[&source].zone, Zone::Battlefield);
+            assert_ne!(
+                runner.state().objects[&source].incarnation,
+                ability.source_incarnation.unwrap()
+            );
+            assert_eq!(ability.self_ref_binding(runner.state()), None);
+        } else {
+            assert_eq!(ability.self_ref_binding(runner.state()), Some(source));
+        }
+        let mut events = Vec::new();
+        for _ in 0..8 {
+            if runner.state().stack.is_empty() {
+                break;
+            }
+            assert!(matches!(
+                runner.state().waiting_for,
+                WaitingFor::Priority { .. }
+            ));
+            events.extend(runner.act(GameAction::PassPriority).unwrap().events);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, GameEvent::EffectResolved {
+            kind: EffectKind::Endure, source_id, subject: None,
+        } if *source_id == source))
+                .count(),
+            1
+        );
+        assert_eq!(spirit_tokens(&runner), 0);
+        assert_eq!(p1p1(&runner, source), 0);
+        assert!(runner.state().stack.is_empty());
+        assert!(runner.state().pending_continuation.is_none());
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+    }
+}
+
+// Synthetic class/composition fixtures: these are not Spider-Man Oracle text.
+// The granting activation excludes itself, donates a distinct marker from a
+// live SelfRef, and independently draws for its original activator.
+fn self_ref_donor_completion_and_draw(stale: bool) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(
+        P0,
+        [ManaType::White, ManaType::Colorless]
+            .into_iter()
+            .map(|kind| ManaUnit::new(kind, ObjectId(0), false, vec![]))
+            .collect(),
+    );
+    let recipient = scenario
+        .add_creature(P0, "Independent Recipient", 2, 2)
+        .id();
+    let marker = AbilityDefinition::new(
+        AbilityKind::Activated,
+        Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 3 },
+            target: TargetFilter::Controller,
+        },
+    )
+    .cost(AbilityCost::Mana {
+        cost: ManaCost::generic(0),
+    });
+    let granting = AbilityDefinition::new(
+        AbilityKind::Activated,
+        Effect::GainActivatedAbilitiesOfTarget {
+            target: TargetFilter::SelfRef,
+            recipient: TargetFilter::SpecificObject { id: recipient },
+            scope: GrantedAbilityScope::AllOther,
+            duration: Some(Duration::UntilEndOfTurn),
+        },
+    )
+    .cost(AbilityCost::Mana {
+        cost: ManaCost::generic(0),
+    })
+    .sub_ability(AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        },
+    ));
+    let donor = scenario
+        .add_creature(P1, "Synthetic Donor", 2, 2)
+        .controlled_by(P0)
+        .with_ability_definition(granting)
+        .with_ability_definition(marker.clone())
+        .id();
+    let p0_top = scenario.add_card_to_library_top(P0, "P0 Independent Draw");
+    let p1_top = scenario.add_card_to_library_top(P1, "P1 Untouched Top");
+    let flicker = costed_flicker_of_fate(&mut scenario);
+    let mut runner = scenario.build();
+    let recipient_incarnation = runner.state().objects[&recipient].incarnation;
+    activate_onto_stack(&mut runner, donor, 0, None);
+    let ability = match &runner.state().stack.last().unwrap().kind {
+        StackEntryKind::ActivatedAbility { ability, .. } => ability.clone(),
+        other => panic!("expected donor activation, got {other:?}"),
+    };
+    assert_eq!(
+        ability.source_incarnation,
+        Some(runner.state().objects[&donor].incarnation)
+    );
+    assert_eq!(ability.controller, P0);
+    assert!(matches!(
+        ability.effect,
+        Effect::GainActivatedAbilitiesOfTarget {
+            target: TargetFilter::SelfRef,
+            ..
+        }
+    ));
+    assert!(matches!(
+        ability.sub_ability.as_ref().unwrap().effect,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        }
+    ));
+    if stale {
+        runner.cast(flicker).target_object(donor).commit();
+        runner.resolve_top();
+        assert_eq!(runner.state().stack.len(), 1);
+        assert_eq!(runner.state().objects[&donor].zone, Zone::Battlefield);
+        assert_eq!(runner.state().objects[&donor].controller, P1);
+        assert_ne!(
+            runner.state().objects[&donor].incarnation,
+            ability.source_incarnation.unwrap()
+        );
+        assert_eq!(ability.self_ref_binding(runner.state()), None);
+    } else {
+        assert_eq!(ability.self_ref_binding(runner.state()), Some(donor));
+    }
+    assert_eq!(runner.state().objects[&recipient].zone, Zone::Battlefield);
+    assert_eq!(
+        runner.state().objects[&recipient].incarnation,
+        recipient_incarnation
+    );
+    assert!(runner.state().objects[&donor]
+        .abilities
+        .iter()
+        .any(|a| a == &marker));
+    let mut events = Vec::new();
+    for _ in 0..8 {
+        if runner.state().stack.is_empty() {
+            break;
+        }
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+        events.extend(runner.act(GameAction::PassPriority).unwrap().events);
+    }
+    // Normal leaf completion is an engine contract. Even a stale-leaf error
+    // in a selective control still reaches independent Draw (CR 608.2c).
+    let completions: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, e)| {
+            matches!(e, GameEvent::EffectResolved {
+        kind: EffectKind::GainActivatedAbilitiesOfTarget, source_id, subject: None,
+    } if *source_id == donor)
+            .then_some(index)
+        })
+        .collect();
+    assert_eq!(completions.len(), 1);
+    let draw_completion = events
+        .iter()
+        .position(|e| {
+            matches!(e, GameEvent::EffectResolved {
+        kind: EffectKind::Draw, source_id, ..
+    } if *source_id == donor)
+        })
+        .expect("independent Draw completes");
+    assert!(completions[0] < draw_completion);
+    // CR 113.8 + CR 121.1: Draw Controller remains the original activator.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, GameEvent::CardDrawn {
+        player_id: P0, object_id, ..
+    } if *object_id == p0_top))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, GameEvent::CardDrawn { .. }))
+            .count(),
+        1
+    );
+    assert!(runner.state().players[0].hand.contains(&p0_top));
+    assert_eq!(runner.state().objects[&p0_top].zone, Zone::Hand);
+    assert_eq!(runner.state().players[1].library[0], p1_top);
+    assert_eq!(runner.state().objects[&p1_top].zone, Zone::Library);
+    assert!(runner.state().stack.is_empty());
+    assert!(runner.state().pending_continuation.is_none());
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { .. }
+    ));
+    if stale {
+        assert!(runner.state().objects[&recipient].abilities.is_empty());
+        assert!(!runner
+            .state()
+            .transient_continuous_effects
+            .iter()
+            .any(|tce| tce.source_id == donor
+                && tce
+                    .modifications
+                    .iter()
+                    .any(|m| matches!(m, ContinuousModification::GrantAbility { .. }))));
+    } else {
+        // CR 611.2c: AllOther snapshots only the independent marker.
+        assert_eq!(
+            runner.state().objects[&recipient].abilities.as_slice(),
+            &[marker]
+        );
+        let outcome = runner.activate(recipient, 0).resolve();
+        outcome.assert_life_delta(P0, 3);
+        outcome.assert_life_delta(P1, 0);
+        outcome.assert_hand_drawn(P0, 0);
+        assert!(!outcome.events().iter().any(|e| matches!(
+            e,
+            GameEvent::EffectResolved {
+                kind: EffectKind::GainActivatedAbilitiesOfTarget | EffectKind::Draw,
+                ..
+            }
+        )));
+        assert!(matches!(
+            outcome.final_waiting_for(),
+            WaitingFor::Priority { .. }
+        ));
+        assert!(outcome.state().stack.is_empty());
+        assert!(outcome.state().pending_continuation.is_none());
+    }
+    assert_eq!(runner.state().objects[&donor].abilities.len(), 2);
+    assert!(!runner
+        .state()
+        .transient_continuous_effects
+        .iter()
+        .any(|tce| tce.source_id == donor
+            && tce.affected == TargetFilter::SpecificObject { id: donor }));
+}
+
+#[test]
+fn stale_self_ref_donor_completes_and_draws_without_granting_returned_abilities() {
+    self_ref_donor_completion_and_draw(true);
+}
+
+#[test]
+fn live_self_ref_donor_grants_and_completes_independent_draw() {
+    self_ref_donor_completion_and_draw(false);
 }

@@ -1,6 +1,6 @@
 use crate::game::effects::choose_one_of;
 use crate::game::quantity::resolve_quantity_with_targets;
-use crate::game::targeting::extract_source_from_event;
+use crate::game::targeting::{extract_source_from_event, resolve_effect_player_ref};
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, Effect, EffectError, EffectKind, PtValue, QuantityExpr,
     ResolvedAbility, TargetFilter,
@@ -96,7 +96,14 @@ pub fn resolve(
                 .unwrap_or(ability.controller),
             vec![token_branch, counter_branch],
         ),
-        None => (ability.source_id, ability.controller, vec![token_branch]),
+        // CR 608.2h + CR 113.7a + CR 701.63a: a departed performer uses its
+        // exact incarnation's last controller for both choice and token creation.
+        None => (
+            ability.source_id,
+            resolve_effect_player_ref(state, ability, &TargetFilter::SourceController)
+                .ok_or(EffectError::ObjectNotFound(ability.source_id))?,
+            vec![token_branch],
+        ),
     };
 
     // CR 701.63a: "that permanent's controller" makes the choice — a single
