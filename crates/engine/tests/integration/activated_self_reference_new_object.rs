@@ -935,7 +935,7 @@ fn activate_krumar_onto_stack(
     ));
     assert_eq!(runner.state().stack.len(), 1);
     let ability = match &runner.state().stack.last().unwrap().kind {
-        StackEntryKind::ActivatedAbility { ability, .. } => ability.clone(),
+        StackEntryKind::ActivatedAbility { ability, .. } => ability.as_ref().clone(),
         other => panic!("expected committed activation, got {other:?}"),
     };
     assert_eq!(ability.source_id, source);
@@ -1031,7 +1031,7 @@ fn choose_krumar_endure(
         .any(|a| matches!(a, GameAction::ChooseBranch { index: i } if *i == index)));
     runner.act(GameAction::ChooseBranch { index }).unwrap();
     assert!(runner.state().stack.is_empty());
-    assert!(runner.state().pending_continuation.is_none());
+    assert!(runner.state().resolution_stack.is_empty());
     assert!(matches!(
         runner.state().waiting_for,
         WaitingFor::Priority { .. }
@@ -1107,7 +1107,7 @@ fn krumar_endure_live_control_change_uses_current_controller_for_both_branches()
         let ability = activate_krumar_onto_stack(&mut runner, source, 2);
         give_priority_to(&mut runner, P1);
         let response = runner.cast(turn_against).target_object(source).commit();
-        assert_eq!(response.mana_pool_total(P1), 0);
+        assert_eq!(response.state().players[1].mana_pool.total(), 0);
         runner.resolve_top();
         assert_eq!(runner.state().stack.len(), 1);
         assert_eq!(runner.state().objects[&source].controller, P1);
@@ -1165,7 +1165,7 @@ fn krumar_endure_departed_control_change_uses_last_controller_not_activator() {
     let ability = activate_krumar_onto_stack(&mut runner, source, 2);
     give_priority_to(&mut runner, P1);
     let response = runner.cast(turn_against).target_object(source).commit();
-    assert_eq!(response.mana_pool_total(P1), 0);
+    assert_eq!(response.state().players[1].mana_pool.total(), 0);
     runner.resolve_top();
     assert_eq!(runner.state().objects[&source].controller, P1);
     give_priority_to(&mut runner, P0);
@@ -1200,7 +1200,7 @@ fn krumar_endure_second_departure_does_not_replace_original_lki() {
     let ability = activate_krumar_onto_stack(&mut runner, source, 2);
     give_priority_to(&mut runner, P1);
     let response = runner.cast(turn_against).target_object(source).commit();
-    assert_eq!(response.mana_pool_total(P1), 0);
+    assert_eq!(response.state().players[1].mana_pool.total(), 0);
     runner.resolve_top();
     assert_eq!(runner.state().objects[&source].controller, P1);
     give_priority_to(&mut runner, P0);
@@ -1250,7 +1250,7 @@ fn krumar_endure_unsummoned_source_uses_departure_controller() {
     let ability = activate_krumar_onto_stack(&mut runner, source, 2);
     give_priority_to(&mut runner, P1);
     let response = runner.cast(turn_against).target_object(source).commit();
-    assert_eq!(response.mana_pool_total(P1), 0);
+    assert_eq!(response.state().players[1].mana_pool.total(), 0);
     runner.resolve_top();
     assert_eq!(runner.state().objects[&source].controller, P1);
     give_priority_to(&mut runner, P0);
@@ -1316,7 +1316,7 @@ fn krumar_endure_zero_completes_live_and_departed_without_choice() {
         assert_eq!(spirit_tokens(&runner), 0);
         assert_eq!(p1p1(&runner, source), 0);
         assert!(runner.state().stack.is_empty());
-        assert!(runner.state().pending_continuation.is_none());
+        assert!(runner.state().resolution_stack.is_empty());
         assert!(matches!(
             runner.state().waiting_for,
             WaitingFor::Priority { .. }
@@ -1344,7 +1344,7 @@ fn self_ref_donor_completion_and_draw(stale: bool) {
         AbilityKind::Activated,
         Effect::GainLife {
             amount: QuantityExpr::Fixed { value: 3 },
-            target: TargetFilter::Controller,
+            player: TargetFilter::Controller,
         },
     )
     .cost(AbilityCost::Mana {
@@ -1482,7 +1482,7 @@ fn self_ref_donor_completion_and_draw(stale: bool) {
     assert_eq!(runner.state().players[1].library[0], p1_top);
     assert_eq!(runner.state().objects[&p1_top].zone, Zone::Library);
     assert!(runner.state().stack.is_empty());
-    assert!(runner.state().pending_continuation.is_none());
+    assert!(runner.state().resolution_stack.is_empty());
     assert!(matches!(
         runner.state().waiting_for,
         WaitingFor::Priority { .. }
@@ -1520,7 +1520,7 @@ fn self_ref_donor_completion_and_draw(stale: bool) {
             WaitingFor::Priority { .. }
         ));
         assert!(outcome.state().stack.is_empty());
-        assert!(outcome.state().pending_continuation.is_none());
+        assert!(outcome.state().resolution_stack.is_empty());
     }
     assert_eq!(runner.state().objects[&donor].abilities.len(), 2);
     assert!(!runner
