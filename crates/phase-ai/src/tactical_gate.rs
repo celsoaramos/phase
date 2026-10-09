@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
 use engine::ai_support::{
-    is_targeted_exchange_root, targeted_exchange_verdict, AiDecisionContext, CandidateAction,
-    TargetedExchangeVerdict,
+    candidate_actions, is_targeted_exchange_root, targeted_exchange_verdict, AiDecisionContext,
+    CandidateAction, TargetedExchangeVerdict,
 };
 use engine::game::ability_utils::{
-    ability_target_legality_needs_chosen_x, build_resolved_from_def, modal_spell_mode_ability_refs,
+    ability_target_legality_needs_chosen_x, build_resolved_from_def, build_target_slots,
+    declared_targets_in_chain, has_legal_target_assignment_for_ability,
+    modal_spell_mode_ability_refs,
 };
 use engine::game::casting::{
     activated_ability_definitions, activation_source_and_activator_are_structurally_eligible,
@@ -16,6 +18,7 @@ use engine::game::casting::{
     StructurallySelectableAlternateSpellPayload,
 };
 use engine::game::combat::AttackTarget;
+use engine::game::engine::apply_interaction_for_simulation;
 use engine::game::functioning_abilities::{
     active_replacements, active_trigger_definitions, battlefield_active_triggers,
     game_active_statics, game_functioning_statics,
@@ -34,14 +37,16 @@ use engine::game::triggers::{
 };
 use engine::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction,
-    ContinuousModification, CostCategory, Effect, PtValue, TargetFilter, TargetRef, TypeFilter,
-    TypedFilter,
+    ContinuousModification, CostCategory, Effect, PtValue, ResolvedAbility, TargetFilter,
+    TargetRef, TargetSelectionMode, TypeFilter, TypedFilter,
 };
 use engine::types::ability_visit::visit_ability_def;
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
-use engine::types::game_state::{CastPaymentMode, DayNight, GameState, StackEntryKind, WaitingFor};
-use engine::types::identifiers::ObjectId;
+use engine::types::game_state::{
+    CastPaymentMode, DayNight, GameState, PendingCast, StackEntryKind, WaitingFor,
+};
+use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::keywords::{Keyword, KeywordKind};
 use engine::types::mana::{ManaSourcePenalty, ManaType};
 use engine::types::phase::Phase;
@@ -56,7 +61,9 @@ use crate::combat_ai::is_lethal_attack_available;
 use crate::config::AiConfig;
 use crate::context::AiContext;
 use crate::planner::PreparedCandidate;
-use crate::policies::context::{collect_ability_effects, PolicyContext};
+use crate::policies::context::{
+    collect_ability_effects, collect_resolved_abilities, PolicyContext,
+};
 use crate::policies::effect_classify::{
     effect_polarity, extract_target_filter, targets_creatures_only, EffectPolarity,
 };
@@ -204,6 +211,9 @@ pub(crate) fn gate_prepared_candidates(
 fn assess_candidate(ctx: &PolicyContext<'_>) -> GateDecision {
     match &ctx.candidate.action {
         GameAction::CastSpell { .. } | GameAction::ActivateAbility { .. } => assess_pre_cast(ctx),
+        GameAction::ChooseX { .. } | GameAction::SelectModes { .. } => {
+            assess_counter_announcement(ctx).unwrap_or(GateDecision::Allow)
+        }
         GameAction::ChooseTarget {
             target: Some(target),
         } => {
@@ -343,7 +353,9 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject;
     }
 
-    if counter_reaches_nothing_foreign(ctx) {
+    if counter_reaches_nothing_foreign(ctx)
+        || assess_counter_announcement(ctx) == Some(GateDecision::Reject)
+    {
         return GateDecision::Reject;
     }
 
@@ -1227,8 +1239,8 @@ fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<G
 /// engine's own legal-target set for every plain counter effect, each target a
 /// spell the AI controls. Counter spells and activations alike — Glen Elendra
 /// Archmage's "{U}, Sacrifice: Counter target noncreature spell" walks into the
-/// same hole. A counter effect that exposes no target filter and a modal spell
-/// keep only the stack-wide check. CR 601.2b + CR 700.2a: spell modes have not
+/// same hole. This fixed-filter shortcut defers unresolved X and modal payloads
+/// to `assess_counter_announcement`. CR 601.2b + CR 700.2a: spell modes have not
 /// been selected at announcement; activation mode choices are separate roots.
 fn counter_reaches_nothing_foreign(ctx: &PolicyContext<'_>) -> bool {
     let activated = ctx.effective_activated_ability();
@@ -1300,6 +1312,351 @@ fn counter_reaches_nothing_foreign(ctx: &PolicyContext<'_>) -> bool {
                     matches!(target, TargetRef::Object(id) if is_own_stack_spell(ctx.state, ai, *id))
                 })
         })
+}
+
+// The card id authenticates spells; the effective activation index authenticates
+// activations. Triggered mode choices have neither voluntary root contract.
+type CounterAnnouncementRoot = (ObjectId, Option<CardId>, Option<usize>);
+
+fn counter_pending_matches(root: CounterAnnouncementRoot, pending: &PendingCast) -> bool {
+    pending.object_id == root.0
+        && pending.activation_ability_index == root.2
+        && root.1.is_none_or(|card_id| pending.card_id == card_id)
+        && pending.ability.source_id == root.0
+}
+
+fn counter_choice_root(state: &GameState) -> Option<CounterAnnouncementRoot> {
+    match &state.waiting_for {
+        WaitingFor::ChooseXValue { pending_cast, .. } => {
+            // CR 107.3a + CR 107.3k: the reducer consumes the canonical pending
+            // activation/spell X, independently of the source object's cast X.
+            if state.pending_cast.as_deref()? != pending_cast.as_ref()
+                || pending_cast.ability.chosen_x.is_some()
+            {
+                return None;
+            }
+            Some((
+                pending_cast.object_id,
+                pending_cast
+                    .activation_ability_index
+                    .is_none()
+                    .then_some(pending_cast.card_id),
+                pending_cast.activation_ability_index,
+            ))
+        }
+        WaitingFor::ModeChoice { pending_cast, .. }
+            if pending_cast.activation_ability_index.is_none() =>
+        {
+            Some((pending_cast.object_id, Some(pending_cast.card_id), None))
+        }
+        WaitingFor::AbilityModeChoice {
+            source_id,
+            is_activated: true,
+            ability_index: Some(index),
+            ..
+        } => Some((*source_id, None, Some(*index))),
+        _ => None,
+    }
+}
+
+fn replay_counter_announcement(
+    state: &GameState,
+    candidate: &CandidateAction,
+    owner: PlayerId,
+) -> Option<GameState> {
+    if candidate.metadata.semantic_owner != Some(owner) {
+        return None;
+    }
+    let mut successor = state.clone();
+    let result = apply_interaction_for_simulation(
+        &mut successor,
+        candidate.metadata.actor?,
+        owner,
+        candidate.action.clone(),
+    )
+    .ok()?;
+    if !result.disposition.is_applied() {
+        return None;
+    }
+    Some(successor)
+}
+
+/// Strategic own-spell veto, not an additional targeting rule (CR 701.6a).
+/// Root commitment and concrete X/mode responses consume the same proof. A
+/// response is pruned only when another legal ordinary continuation remains;
+/// imported/indeterminate commitments must never empty the pool into fallback.
+fn assess_counter_announcement(ctx: &PolicyContext<'_>) -> Option<GateDecision> {
+    let root = match &ctx.candidate.action {
+        GameAction::CastSpell {
+            object_id, card_id, ..
+        } => {
+            let object = ctx.state.objects.get(object_id)?;
+            if object.card_id != *card_id
+                || !modal_spell_mode_ability_refs(object).any(|definition| {
+                    collect_definition_effects_with(definition, ModeWalk::All)
+                        .iter()
+                        .any(|effect| matches!(effect, Effect::Counter { .. }))
+                })
+            {
+                return None;
+            }
+            (*object_id, Some(*card_id), None)
+        }
+        GameAction::ActivateAbility {
+            source_id,
+            ability_index,
+        } => {
+            let definition = ctx.effective_activated_ability()?;
+            if !collect_definition_effects_with(&definition, ModeWalk::All)
+                .iter()
+                .any(|effect| matches!(effect, Effect::Counter { .. }))
+            {
+                return None;
+            }
+            (*source_id, None, Some(*ability_index))
+        }
+        GameAction::ChooseX { .. } | GameAction::SelectModes { .. } => {
+            let may_counter = match &ctx.state.waiting_for {
+                WaitingFor::ChooseXValue { pending_cast, .. } => {
+                    collect_ability_effects(&pending_cast.ability)
+                        .iter()
+                        .any(|effect| matches!(effect, Effect::Counter { .. }))
+                }
+                WaitingFor::ModeChoice { pending_cast, .. } => {
+                    modal_spell_mode_ability_refs(ctx.state.objects.get(&pending_cast.object_id)?)
+                        .any(|definition| {
+                            collect_definition_effects_with(definition, ModeWalk::All)
+                                .iter()
+                                .any(|effect| matches!(effect, Effect::Counter { .. }))
+                        })
+                }
+                WaitingFor::AbilityModeChoice {
+                    is_activated: true,
+                    mode_abilities,
+                    ..
+                } => mode_abilities.iter().any(|definition| {
+                    collect_definition_effects_with(definition, ModeWalk::All)
+                        .iter()
+                        .any(|effect| matches!(effect, Effect::Counter { .. }))
+                }),
+                _ => false,
+            };
+            if !may_counter {
+                return None;
+            }
+            counter_choice_root(ctx.state)?
+        }
+        _ => return None,
+    };
+    let owner = ctx.candidate.metadata.semantic_owner?;
+    let successor = replay_counter_announcement(ctx.state, ctx.candidate, owner)?;
+    let verdict = counter_announcement_domain(ctx.state, &successor, root, owner, ctx.ai_player);
+    if verdict != Some(GateDecision::Reject)
+        || matches!(
+            ctx.candidate.action,
+            GameAction::CastSpell { .. } | GameAction::ActivateAbility { .. }
+        )
+    {
+        return verdict;
+    }
+    // The entire actual issued sibling domain is eligible; no guessed X,
+    // sampled mode combinations, strategic CancelCast, or payment DFS.
+    for sibling in candidate_actions(ctx.state) {
+        if sibling.action == ctx.candidate.action
+            || !matches!(
+                sibling.action,
+                GameAction::ChooseX { .. } | GameAction::SelectModes { .. }
+            )
+        {
+            continue;
+        }
+        let Some(next) = replay_counter_announcement(ctx.state, &sibling, owner) else {
+            continue;
+        };
+        if counter_announcement_domain(ctx.state, &next, root, owner, ctx.ai_player)
+            != Some(GateDecision::Reject)
+        {
+            return Some(GateDecision::Reject);
+        }
+    }
+    None
+}
+
+fn counter_announcement_domain(
+    before: &GameState,
+    state: &GameState,
+    root: CounterAnnouncementRoot,
+    owner: PlayerId,
+    ai: PlayerId,
+) -> Option<GateDecision> {
+    if matches!(
+        state.waiting_for,
+        WaitingFor::ChooseXValue { .. }
+            | WaitingFor::ModeChoice { .. }
+            | WaitingFor::AbilityModeChoice { .. }
+    ) {
+        if counter_choice_root(state)? != root {
+            return None;
+        }
+        // CR 601.2b + CR 601.2c + CR 602.2b + CR 700.2a: consume the
+        // announcement edges before examining the selected target payload.
+        // Only a nonempty, complete reducer-valid domain can prove Reject.
+        let mut completed = false;
+        let mut indeterminate = false;
+        for candidate in candidate_actions(state) {
+            if !matches!(
+                candidate.action,
+                GameAction::ChooseX { .. } | GameAction::SelectModes { .. }
+            ) {
+                continue;
+            }
+            let Some(next) = replay_counter_announcement(state, &candidate, owner) else {
+                continue;
+            };
+            completed = true;
+            match counter_announcement_domain(before, &next, root, owner, ai) {
+                Some(GateDecision::Allow | GateDecision::AllowWithPenalty(_)) => {
+                    return Some(GateDecision::Allow)
+                }
+                Some(GateDecision::Reject) => {}
+                None => indeterminate = true,
+            }
+        }
+        return (completed && !indeterminate).then_some(GateDecision::Reject);
+    }
+
+    if let Some(pending) = state
+        .waiting_for
+        .pending_cast_ref()
+        .or(state.pending_cast.as_deref())
+    {
+        if !counter_pending_matches(root, pending) || pending.ability.controller != owner {
+            return None;
+        }
+        // Other cost/declaration choices may replace the payload; this proof
+        // deliberately consumes only X/modes, never those unresolved branches.
+        if !matches!(
+            state.waiting_for,
+            WaitingFor::TargetSelection { .. }
+                | WaitingFor::ManaPayment { .. }
+                | WaitingFor::ManaSourceSelection { .. }
+                | WaitingFor::PayCost { .. }
+        ) {
+            return None;
+        }
+        return concrete_counter_verdict(state, &pending.ability, Some(pending), ai);
+    }
+
+    // CR 601.2h + CR 602.2b: automatic payment may already have committed
+    // the carrier. An activation drops its index on the stack, so retain the
+    // authenticated pre-transition index and require one NEW matching entry.
+    let mut matching = state.stack.iter().filter(|entry| {
+        !before.stack.iter().any(|old| old.id == entry.id)
+            && entry.source_id == root.0
+            && entry.controller == owner
+            && match (&entry.kind, root.1, root.2) {
+                (StackEntryKind::Spell { card_id, .. }, Some(expected), None) => {
+                    entry.id == root.0 && *card_id == expected
+                }
+                (StackEntryKind::ActivatedAbility { source_id, .. }, None, Some(_)) => {
+                    *source_id == root.0
+                }
+                _ => false,
+            }
+    });
+    let entry = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    let ability = entry.ability()?;
+    if ability.source_id != root.0 || ability.controller != owner {
+        return None;
+    }
+    concrete_counter_verdict(state, ability, None, ai)
+}
+
+fn concrete_counter_verdict(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    pending: Option<&PendingCast>,
+    ai: PlayerId,
+) -> Option<GateDecision> {
+    let effects = collect_ability_effects(ability);
+    if effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Unimplemented { .. }))
+    {
+        return None;
+    }
+    if !is_pure_counter_payload(&effects) {
+        return Some(GateDecision::Allow);
+    }
+    let nodes = collect_resolved_abilities(ability);
+    if ability_target_legality_needs_chosen_x(
+        ability,
+        pending.and_then(|cast| cast.distribute.as_ref()),
+    ) || nodes.iter().any(|node| {
+        node.condition.is_some()
+            || node.optional
+            || node.optional_targeting
+            || node.optional_for.is_some()
+            || node.target_selection_mode != TargetSelectionMode::Chosen
+            || node.target_chooser.is_some()
+    }) {
+        return None;
+    }
+    // CR 601.2c + CR 115.5: targets come from the engine's chosen-X/source
+    // context and exclude the counter itself. Never reconstruct an X filter.
+    let bound = declared_targets_in_chain(ability);
+    if !bound.is_empty() && !matches!(state.waiting_for, WaitingFor::TargetSelection { .. }) {
+        return Some(
+            if bound.iter().all(|target| {
+                matches!(target,
+            TargetRef::Object(id) if is_own_stack_spell(state, ai, *id))
+            }) {
+                GateDecision::Reject
+            } else {
+                GateDecision::Allow
+            },
+        );
+    }
+    let pending = pending?;
+    let built;
+    let slots = if let WaitingFor::TargetSelection { target_slots, .. } = &state.waiting_for {
+        target_slots.as_slice()
+    } else {
+        built = build_target_slots(state, ability).ok()?;
+        built.as_slice()
+    };
+    if slots.is_empty()
+        || slots.iter().any(|slot| {
+            slot.legal_targets.is_empty()
+                || slot.optional
+                || slot.chooser.is_some_and(|chooser| chooser != ai)
+        })
+        || !has_legal_target_assignment_for_ability(
+            state,
+            ability,
+            slots,
+            &pending.target_constraints,
+        )
+    {
+        return None;
+    }
+    if slots.iter().all(|slot| {
+        slot.legal_targets.iter().all(|target| {
+            matches!(target,
+        TargetRef::Object(id) if is_own_stack_spell(state, ai, *id))
+        })
+    }) {
+        Some(GateDecision::Reject)
+    } else if pending.target_constraints.is_empty() {
+        Some(GateDecision::Allow)
+    } else {
+        // A foreign slot member may be unreachable under cross-slot constraints.
+        // The engine's assignment solver stays the sole authority.
+        None
+    }
 }
 
 /// Every effect is a plain `Counter` — no destination redirect and nothing
@@ -1826,6 +2183,7 @@ mod tests {
     };
     use engine::types::card::{CardFace, CleaveVariant, LayoutKind};
     use engine::types::counter::{CounterMatch, CounterType};
+    use engine::types::events::GameEvent;
     use engine::types::game_state::{
         CastingVariant, DelayedTrigger, NextSpellModifier, PendingCast, PendingNextSpellModifier,
         PlayerDeckPool, StackEntry, StackEntryKind, TargetEffectDetail, TargetSelectionProgress,
@@ -7588,6 +7946,822 @@ mod tests {
         root
     }
 
+    fn assert_counter_response_in_pools(
+        state: &GameState,
+        action: GameAction,
+        retained: bool,
+    ) -> CandidateAction {
+        let issued = candidate_actions(state);
+        let candidate = issued
+            .iter()
+            .find(|candidate| candidate.action == action)
+            .expect("reach-guard: actual engine-issued announcement response")
+            .clone();
+        let successor = replay_counter_announcement(state, &candidate, P0)
+            .expect("reach-guard: this issued response is reducer-valid and affordable");
+        let source = counter_choice_root(state).unwrap().0;
+        let ability = successor
+            .waiting_for
+            .pending_cast_ref()
+            .or(successor.pending_cast.as_deref())
+            .map(|pending| pending.ability.as_ref())
+            .or_else(|| {
+                successor
+                    .stack
+                    .iter()
+                    .find(|entry| {
+                        entry.source_id == source
+                            && !state.stack.iter().any(|old| old.id == entry.id)
+                    })
+                    .and_then(|entry| entry.ability())
+            })
+            .expect("reach-guard: the response has an actual selected engine carrier");
+        assert!(
+            collect_ability_effects(ability)
+                .iter()
+                .all(|effect| !matches!(effect, Effect::Unimplemented { .. })),
+            "reach-guard: no unsupported selected payload can certify these results"
+        );
+        let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: issued.clone(),
+        };
+        let gated = gate_candidates(
+            state,
+            &decision,
+            issued,
+            P0,
+            &config,
+            &AiContext::empty(&config.weights),
+        );
+        assert_eq!(
+            gated.iter().any(|item| item.candidate.action == action),
+            retained
+        );
+        assert_eq!(
+            crate::search::score_candidates(state, P0, &config)
+                .iter()
+                .any(|(scored, _)| *scored == action),
+            retained
+        );
+        if !retained {
+            assert_counter_never_chosen(state, &action);
+        }
+        candidate
+    }
+
+    fn assert_counter_never_chosen(state: &GameState, rejected: &GameAction) {
+        for search_enabled in [false, true] {
+            let mut config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+            config.search.enabled = search_enabled;
+            for seed in 0..8 {
+                let mut rng = ChaCha20Rng::seed_from_u64(seed);
+                assert_ne!(
+                    crate::search::choose_action(state, P0, &config, &mut rng),
+                    Some(rejected.clone()),
+                    "the {search_enabled:?} chooser route must retain the counter veto"
+                );
+            }
+        }
+    }
+
+    /// Commit printed Bolt and Counterspell with real mana values and targets.
+    /// Setup mana is replaced ONLY after both victims have committed, leaving
+    /// exactly the response pool under test and no payable battlefield sources.
+    fn printed_counter_stack(
+        mut scenario: GameScenario,
+        bolt_controller: PlayerId,
+        response_mana: Vec<ManaUnit>,
+    ) -> (GameState, ObjectId, ObjectId) {
+        scenario.at_phase(Phase::PreCombatMain);
+        let counter_controller = if bolt_controller == P0 { P1 } else { P0 };
+        let bolt = scenario
+            .add_spell_to_hand_from_oracle(
+                bolt_controller,
+                "Lightning Bolt",
+                true,
+                "Lightning Bolt deals 3 damage to any target.",
+            )
+            .with_mana_cost(ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::Red],
+            })
+            .id();
+        let counter = scenario
+            .add_spell_to_hand_from_oracle(
+                counter_controller,
+                "Counterspell",
+                true,
+                "Counter target spell.",
+            )
+            .with_mana_cost(ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::Blue, ManaCostShard::Blue],
+            })
+            .id();
+        scenario.with_mana_pool(bolt_controller, pooled_mana(ManaType::Red, 1));
+        scenario.with_mana_pool(counter_controller, pooled_mana(ManaType::Blue, 2));
+        let mut runner = scenario.build();
+        set_priority_window(runner.state_mut(), Phase::PreCombatMain, bolt_controller);
+        runner.state_mut().priority_player = bolt_controller;
+        runner.state_mut().waiting_for = WaitingFor::Priority {
+            player: bolt_controller,
+        };
+        runner.cast(bolt).target_player(counter_controller).commit();
+        runner.act(GameAction::PassPriority).unwrap();
+        assert!(
+            matches!(runner.state().waiting_for, WaitingFor::Priority { player } if player == counter_controller)
+        );
+        runner.cast(counter).target_object(bolt).commit();
+        let state = runner.state_mut();
+        state.players[P0.0 as usize].mana_pool.clear();
+        for unit in response_mana {
+            state.players[P0.0 as usize].mana_pool.add(unit);
+        }
+        set_priority_window(state, Phase::PreCombatMain, P1);
+        assert_eq!(state.stack.len(), 2);
+        for (id, controller, mv) in [(bolt, bolt_controller, 1), (counter, counter_controller, 2)] {
+            assert_eq!(state.objects[&id].spell_mana_value(), mv);
+            assert!(state.stack.iter().any(|entry| entry.id == id
+                && entry.controller == controller
+                && matches!(entry.kind, StackEntryKind::Spell { .. })));
+        }
+        (state.clone(), bolt, counter)
+    }
+
+    fn spell_blast_in_hand(scenario: &mut GameScenario) -> ObjectId {
+        scenario
+            .add_spell_to_hand_from_oracle(P0, "Spell Blast", true, SPELL_BLAST_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::X, ManaCostShard::Blue],
+            })
+            .id()
+    }
+
+    #[test]
+    fn concrete_x_counter_excludes_own_singleton_and_retains_foreign_sibling() {
+        for bolt_controller in [P1, P0] {
+            let mut scenario = GameScenario::new();
+            let blast = spell_blast_in_hand(&mut scenario);
+            let (mut state, bolt, counter) =
+                printed_counter_stack(scenario, bolt_controller, pooled_mana(ManaType::Blue, 3));
+            // Owner divergence is setup-only; the stack's live controller is
+            // the strategic authority for both the own and foreign victim.
+            state.objects.get_mut(&bolt).unwrap().owner =
+                if bolt_controller == P0 { P1 } else { P0 };
+            state.objects.get_mut(&counter).unwrap().owner = bolt_controller;
+            assert_unannounced_x_counter(&state.objects[&blast].abilities[0], blast);
+            let root = assert_counter_in_pools(&state, blast, None, GateDecision::Allow);
+            let mut announced = GameRunner::from_state(state.clone());
+            announced.act(root.action).unwrap();
+            assert!(matches!(
+                announced.state().waiting_for,
+                WaitingFor::ChooseXValue { min: 0, max: 2, .. }
+            ));
+            let (bad_x, own, good_x, foreign) = if bolt_controller == P1 {
+                (2, counter, 1, bolt)
+            } else {
+                (1, bolt, 2, counter)
+            };
+            let rejected = assert_counter_response_in_pools(
+                announced.state(),
+                GameAction::ChooseX { value: bad_x },
+                false,
+            );
+            assert_counter_response_in_pools(
+                announced.state(),
+                GameAction::ChooseX { value: good_x },
+                true,
+            );
+            let hostile = replay_counter_announcement(announced.state(), &rejected, P0).unwrap();
+            assert!(!matches!(
+                hostile.waiting_for,
+                WaitingFor::TargetSelection { .. }
+            ));
+            let bound = hostile
+                .stack
+                .iter()
+                .find(|entry| entry.id == blast)
+                .unwrap()
+                .ability()
+                .unwrap();
+            assert!(is_pure_counter_payload(&collect_ability_effects(bound)));
+            assert_eq!(bound.chosen_x, Some(bad_x));
+            assert_eq!(
+                declared_targets_in_chain(bound),
+                vec![TargetRef::Object(own)]
+            );
+            let mut runner = GameRunner::from_state(state);
+            let outcome = runner
+                .cast(blast)
+                .x(good_x)
+                .target_object(foreign)
+                .resolve();
+            // CR 701.6a: the event distinguishes countering from an instant's
+            // later normal resolution into the same graveyard.
+            assert!(outcome.events().iter().any(|event| matches!(event,
+                GameEvent::SpellCountered { object_id, countered_by, .. } if *object_id == foreign && *countered_by == blast)));
+            assert!(!outcome.events().iter().any(|event| matches!(event,
+                GameEvent::SpellCountered { object_id, countered_by, .. } if *object_id == own && *countered_by == blast)));
+            outcome.assert_zone(&[foreign], Zone::Graveyard);
+        }
+    }
+
+    #[test]
+    fn all_futile_affordable_x_counter_domain_is_rejected_before_fallback() {
+        let mut scenario = GameScenario::new();
+        let blast = spell_blast_in_hand(&mut scenario);
+        let (state, bolt, counter) =
+            printed_counter_stack(scenario, P0, pooled_mana(ManaType::Blue, 2));
+        assert_unannounced_x_counter(&state.objects[&blast].abilities[0], blast);
+        let root = assert_counter_in_pools(&state, blast, None, GateDecision::Reject);
+        assert_counter_never_chosen(&state, &root.action);
+        let mut reference = GameRunner::from_state(state.clone());
+        reference.act(root.action.clone()).unwrap();
+        assert!(matches!(
+            reference.state().waiting_for,
+            WaitingFor::ChooseXValue { min: 0, max: 1, .. }
+        ));
+        let issued = candidate_actions(reference.state());
+        assert_eq!(
+            issued
+                .iter()
+                .filter(|candidate| matches!(candidate.action, GameAction::ChooseX { .. }))
+                .count(),
+            2
+        );
+        let zero = issued
+            .iter()
+            .find(|candidate| candidate.action == GameAction::ChooseX { value: 0 })
+            .unwrap();
+        assert!(replay_counter_announcement(reference.state(), zero, P0).is_none());
+        assert!(!issued
+            .iter()
+            .any(|candidate| candidate.action == GameAction::ChooseX { value: 2 }));
+        // Imported/stale commitments retain their only legal ordinary response;
+        // normal play must reject the root, so max-X fallback never enters it.
+        let one = assert_counter_response_in_pools(
+            reference.state(),
+            GameAction::ChooseX { value: 1 },
+            true,
+        );
+        let bound = replay_counter_announcement(reference.state(), &one, P0).unwrap();
+        assert_eq!(
+            declared_targets_in_chain(
+                bound
+                    .stack
+                    .iter()
+                    .find(|entry| entry.id == blast)
+                    .unwrap()
+                    .ability()
+                    .unwrap()
+            ),
+            vec![TargetRef::Object(bolt)]
+        );
+        assert!(is_own_stack_spell(&bound, P0, bolt));
+        assert!(!is_own_stack_spell(&bound, P0, counter));
+        let mut no_assignment = state.clone();
+        no_assignment.players[P0.0 as usize].mana_pool.clear();
+        no_assignment.players[P0.0 as usize]
+            .mana_pool
+            .add(ManaUnit::new(ManaType::Blue, ObjectId(0), false, vec![]));
+        let impossible_root =
+            assert_counter_in_pools(&no_assignment, blast, None, GateDecision::Allow);
+        let impossible_prompt =
+            replay_counter_announcement(&no_assignment, &impossible_root, P0).unwrap();
+        assert!(matches!(
+            impossible_prompt.waiting_for,
+            WaitingFor::ChooseXValue { min: 0, max: 0, .. }
+        ));
+        let only = candidate_actions(&impossible_prompt)
+            .into_iter()
+            .find(|candidate| matches!(candidate.action, GameAction::ChooseX { value: 0 }))
+            .unwrap();
+        assert!(
+            replay_counter_announcement(&impossible_prompt, &only, P0).is_none(),
+            "zero legal completions must not become an empty-all strategic proof"
+        );
+        let mut affordable = state;
+        affordable.players[P0.0 as usize]
+            .mana_pool
+            .add(ManaUnit::new(ManaType::Blue, ObjectId(0), false, vec![]));
+        let root = assert_counter_in_pools(&affordable, blast, None, GateDecision::Allow);
+        let next = replay_counter_announcement(&affordable, &root, P0).unwrap();
+        assert_counter_response_in_pools(&next, GameAction::ChooseX { value: 2 }, true);
+        assert_counter_response_in_pools(&next, GameAction::ChooseX { value: 1 }, false);
+    }
+
+    const IZZET_CHARM_ORACLE: &str = "Choose one —\n• Counter target noncreature spell unless its controller pays {2}.\n• Izzet Charm deals 2 damage to target creature.\n• Draw two cards, then discard two cards.";
+
+    #[test]
+    fn concrete_counter_mode_excludes_own_singleton_and_retains_draw_discard() {
+        let mut scenario = GameScenario::new();
+        let charm = scenario
+            .add_spell_to_hand_from_oracle(P0, "Izzet Charm", true, IZZET_CHARM_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::Blue, ManaCostShard::Red],
+            })
+            .id();
+        let draw_one = scenario.add_card_to_library_top(P0, "First draw");
+        let draw_two = scenario.add_card_to_library_top(P0, "Second draw");
+        let creature = scenario
+            .add_creature_to_hand(P1, "Grizzly Bears", 2, 2)
+            .with_mana_cost(ManaCost::Cost {
+                generic: 1,
+                shards: vec![ManaCostShard::Green],
+            })
+            .id();
+        let counter = scenario
+            .add_spell_to_hand_from_oracle(P0, "Counterspell", true, "Counter target spell.")
+            .with_mana_cost(ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::Blue, ManaCostShard::Blue],
+            })
+            .id();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.with_mana_pool(P1, pooled_mana(ManaType::Green, 2));
+        scenario.with_mana_pool(P0, pooled_mana(ManaType::Blue, 2));
+        let mut runner = scenario.build();
+        runner.state_mut().active_player = P1;
+        runner.state_mut().priority_player = P1;
+        runner.state_mut().waiting_for = WaitingFor::Priority { player: P1 };
+        runner.cast(creature).commit();
+        runner.act(GameAction::PassPriority).unwrap();
+        assert_eq!(runner.state().objects[&creature].spell_mana_value(), 2);
+        assert!(runner.state().stack.iter().any(|entry| entry.id == creature
+            && entry.controller == P1
+            && matches!(entry.kind, StackEntryKind::Spell { .. })));
+        runner.cast(counter).target_object(creature).commit();
+        let state = runner.state_mut();
+        state.players[P0.0 as usize].mana_pool.clear();
+        for unit in [
+            ManaUnit::new(ManaType::Blue, ObjectId(0), false, vec![]),
+            ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]),
+        ] {
+            state.players[P0.0 as usize].mana_pool.add(unit);
+        }
+        set_priority_window(state, Phase::PreCombatMain, P1);
+        let state = state.clone();
+        let root = assert_counter_in_pools(&state, charm, None, GateDecision::Allow);
+        let mut announced = GameRunner::from_state(state.clone());
+        announced.act(root.action).unwrap();
+        assert!(matches!(
+            announced.state().waiting_for,
+            WaitingFor::ModeChoice { .. }
+        ));
+        let bad = assert_counter_response_in_pools(
+            announced.state(),
+            GameAction::SelectModes { indices: vec![0] },
+            false,
+        );
+        assert_counter_response_in_pools(
+            announced.state(),
+            GameAction::SelectModes { indices: vec![2] },
+            true,
+        );
+        let reference = replay_counter_announcement(announced.state(), &bad, P0).unwrap();
+        assert!(!matches!(
+            reference.waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ));
+        let ability = reference
+            .stack
+            .iter()
+            .find(|entry| entry.id == charm)
+            .unwrap()
+            .ability()
+            .unwrap();
+        assert!(is_pure_counter_payload(&collect_ability_effects(ability)));
+        assert!(ability.unless_pay.is_some());
+        assert_eq!(
+            declared_targets_in_chain(ability),
+            vec![TargetRef::Object(counter)]
+        );
+        assert_eq!(reference.players[P0.0 as usize].mana_pool.total(), 0);
+        let mut foreign_noncreature = state.clone();
+        foreign_noncreature
+            .stack
+            .iter_mut()
+            .find(|entry| entry.id == counter)
+            .unwrap()
+            .controller = P1;
+        foreign_noncreature
+            .objects
+            .get_mut(&counter)
+            .unwrap()
+            .controller = P1;
+        let root = assert_counter_in_pools(&foreign_noncreature, charm, None, GateDecision::Allow);
+        let next = replay_counter_announcement(&foreign_noncreature, &root, P0).unwrap();
+        assert_counter_response_in_pools(&next, GameAction::SelectModes { indices: vec![0] }, true);
+        let mut useful = GameRunner::from_state(state);
+        let outcome = useful.cast(charm).modes(&[2]).resolve();
+        outcome.assert_hand_drawn(P0, 2);
+        assert!(matches!(
+            outcome.final_waiting_for(),
+            WaitingFor::DiscardChoice { count: 2, .. }
+        ));
+        let discard = candidate_actions(useful.state()).into_iter().find(|candidate| matches!(&candidate.action,
+            GameAction::SelectCards { cards } if cards.len() == 2 && cards.contains(&draw_one) && cards.contains(&draw_two)))
+            .expect("engine offers the drawn cards for the real discard continuation");
+        useful.act(discard.action).unwrap();
+        assert_eq!(useful.state().objects[&draw_one].zone, Zone::Graveyard);
+        assert_eq!(useful.state().objects[&draw_two].zone, Zone::Graveyard);
+        assert!(matches!(
+            useful.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+    }
+
+    #[test]
+    fn concrete_x_activation_uses_selected_index_and_its_pay_cost_carrier() {
+        for payable_one in [true, false] {
+            let mut scenario = GameScenario::new();
+            let oracle =
+                format!("{{U}}: Counter target noncreature spell.\n{KOZILEK_COUNTER_ORACLE}");
+            let source = scenario
+                .add_creature_from_oracle(
+                    P0,
+                    "Synthetic selected-X counter source",
+                    12,
+                    12,
+                    &oracle,
+                )
+                .id();
+            let discard_two = scenario
+                .add_spell_to_hand(P0, "MV2 discard witness", false)
+                .with_mana_cost(ManaCost::generic(2))
+                .id();
+            let discard_one = payable_one.then(|| {
+                scenario
+                    .add_spell_to_hand(P0, "MV1 discard witness", false)
+                    .with_mana_cost(ManaCost::generic(1))
+                    .id()
+            });
+            let (state, bolt, counter) =
+                printed_counter_stack(scenario, P1, pooled_mana(ManaType::Blue, 1));
+            let definitions = activated_ability_definitions(&state, source);
+            assert_eq!(
+                definitions
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .collect::<Vec<_>>(),
+                vec![0, 1]
+            );
+            assert_unannounced_x_counter(&definitions[1].1, source);
+            // A real pre-existing activation on this very source must never be
+            // mistaken for index1's newly announced X payload.
+            let mut setup = GameRunner::from_state(state);
+            setup
+                .act(GameAction::ActivateAbility {
+                    source_id: source,
+                    ability_index: 0,
+                })
+                .unwrap();
+            let target = candidate_actions(setup.state())
+                .into_iter()
+                .find(|candidate| {
+                    matches!(&candidate.action,
+                GameAction::ChooseTarget { target: Some(TargetRef::Object(id)) } if *id == bolt)
+                })
+                .expect("the fixed counter's real target prompt offers the foreign Bolt");
+            setup.act(target.action).unwrap();
+            let old_entry = setup
+                .state()
+                .stack
+                .iter()
+                .find(|entry| {
+                    entry.source_id == source
+                        && matches!(entry.kind, StackEntryKind::ActivatedAbility { .. })
+                })
+                .unwrap()
+                .id;
+            let state = setup.state_mut();
+            state.players[P0.0 as usize].mana_pool.add(ManaUnit::new(
+                ManaType::Blue,
+                ObjectId(0),
+                false,
+                vec![],
+            ));
+            set_priority_window(state, Phase::PreCombatMain, P1);
+            let state = state.clone();
+            assert!(state.stack.iter().any(|entry| entry.id == old_entry));
+            let expected = if payable_one {
+                GateDecision::Allow
+            } else {
+                GateDecision::Reject
+            };
+            let root = assert_counter_in_pools(&state, source, Some(1), expected);
+            if !payable_one {
+                assert_counter_never_chosen(&state, &root.action);
+            }
+            let next = replay_counter_announcement(&state, &root, P0).unwrap();
+            let WaitingFor::ChooseXValue { pending_cast, .. } = &next.waiting_for else {
+                panic!("selected activation must announce its X");
+            };
+            assert_eq!(pending_cast.activation_ability_index, Some(1));
+            assert_eq!(pending_cast.object_id, source);
+            let two = assert_counter_response_in_pools(
+                &next,
+                GameAction::ChooseX { value: 2 },
+                !payable_one,
+            );
+            let hostile = replay_counter_announcement(&next, &two, P0).unwrap();
+            let pending = hostile
+                .waiting_for
+                .pending_cast_ref()
+                .expect("selected activation retained through actual PayCost");
+            assert!(matches!(hostile.waiting_for, WaitingFor::PayCost { .. }));
+            assert_eq!(pending.activation_ability_index, Some(1));
+            assert_eq!(pending.ability.chosen_x, Some(2));
+            assert_eq!(
+                declared_targets_in_chain(&pending.ability),
+                vec![TargetRef::Object(counter)]
+            );
+            assert!(hostile.stack.iter().any(|entry| entry.id == old_entry));
+            let one = candidate_actions(&next)
+                .into_iter()
+                .find(|candidate| candidate.action == GameAction::ChooseX { value: 1 })
+                .unwrap();
+            assert_eq!(
+                replay_counter_announcement(&next, &one, P0).is_some(),
+                payable_one,
+                "discard eligibility is validated by the reducer, not inferred from the max X"
+            );
+            if let Some(discard_one) = discard_one {
+                assert_counter_response_in_pools(&next, GameAction::ChooseX { value: 1 }, true);
+                let mut runner = GameRunner::from_state(state);
+                let outcome = runner
+                    .activate(source, 1)
+                    .x(1)
+                    .target_object(bolt)
+                    .pay_with(&[discard_one])
+                    .resolve();
+                // CR 701.6a + CR 701.9a: the chosen discard and foreign spell
+                // move to their respective owners' graveyards.
+                outcome.assert_zone(&[discard_one, bolt], Zone::Graveyard);
+                assert_eq!(outcome.state().objects[&discard_two].zone, Zone::Hand);
+                assert!(outcome.events().iter().any(|event| matches!(event,
+                    GameEvent::SpellCountered { object_id, countered_by, .. } if *object_id == bolt && *countered_by == source)));
+            }
+        }
+    }
+
+    #[test]
+    fn selected_modal_x_chain_preserves_repeated_modes_and_mixed_or_redirect_payloads() {
+        for rider in ["Draw a card.", "If that spell is countered this way, put it on top of its owner's library instead of into that player's graveyard."] {
+            let mut scenario = GameScenario::new();
+            let oracle = format!("Choose one or both —\n• Counter target spell with mana value X.\n• Counter target spell with mana value X. {rider}");
+            let counter = scenario.add_spell_to_hand_from_oracle(P0, "Synthetic modal-X counter", true, &oracle)
+                .with_mana_cost(ManaCost::Cost { generic: 0, shards: vec![ManaCostShard::X, ManaCostShard::Blue] }).id();
+            scenario.with_library_top(P0, &["Draw witness one", "Draw witness two"]);
+            let (mut state, bolt, own) = printed_counter_stack(scenario, P1, pooled_mana(ManaType::Blue, 3));
+            // Synthetic repeat parameter; the engine generates every sequence.
+            state.objects.get_mut(&counter).unwrap().modal.as_mut().unwrap().allow_repeat_modes = true;
+            let root = assert_counter_in_pools(&state, counter, None, GateDecision::Allow);
+            let modes = replay_counter_announcement(&state, &root, P0).unwrap();
+            assert!(matches!(modes.waiting_for, WaitingFor::ModeChoice { .. }));
+            let issued = candidate_actions(&modes);
+            assert!(issued.iter().any(|candidate| matches!(&candidate.action, GameAction::SelectModes { indices } if indices.as_slice() == [0, 0])));
+            for indices in [vec![0], vec![0, 0], vec![1], vec![0, 1]] {
+                let choice = assert_counter_response_in_pools(&modes, GameAction::SelectModes { indices: indices.clone() }, true);
+                let x_prompt = replay_counter_announcement(&modes, &choice, P0).unwrap();
+                let WaitingFor::ChooseXValue { pending_cast, .. } = &x_prompt.waiting_for else { panic!("mode selection must retain its X announcement"); };
+                let mut sorted = indices.clone();
+                sorted.sort_unstable();
+                assert_eq!(pending_cast.chosen_modes, sorted);
+                let pure = indices.iter().all(|index| *index == 0);
+                assert_eq!(is_pure_counter_payload(&collect_ability_effects(&pending_cast.ability)), pure);
+                assert_counter_response_in_pools(&x_prompt, GameAction::ChooseX { value: 2 }, !pure);
+                let useful = assert_counter_response_in_pools(&x_prompt, GameAction::ChooseX { value: 1 }, true);
+                let next = replay_counter_announcement(&x_prompt, &useful, P0).unwrap();
+                let ability = next.waiting_for.pending_cast_ref().map(|pending| pending.ability.as_ref())
+                    .or_else(|| next.stack.iter().find(|entry| entry.id == counter).and_then(|entry| entry.ability())).unwrap();
+                assert!(collect_resolved_abilities(ability).iter().all(|node| node.chosen_x == Some(1)));
+                assert!(declared_targets_in_chain(ability).iter().all(|target| *target == TargetRef::Object(bolt)));
+                assert!(is_own_stack_spell(&next, P0, own));
+            }
+            // The generator uses canonical sequences; out-of-order input is
+            // a reducer contract control, not a claimed issued AI candidate.
+            let mut out_of_order = GameRunner::from_state(modes);
+            out_of_order.act(GameAction::SelectModes { indices: vec![1, 0] }).unwrap();
+            let pending = out_of_order.state().waiting_for.pending_cast_ref().unwrap();
+            assert_eq!(pending.chosen_modes, vec![0, 1]);
+        }
+    }
+
+    #[test]
+    fn activated_modal_x_counter_authenticates_only_the_new_same_source_entry() {
+        let mut scenario = GameScenario::new();
+        let oracle = format!("{{U}}: Counter target noncreature spell.\n{KOZILEK_COUNTER_ORACLE}");
+        let source = scenario
+            .add_creature_from_oracle(P0, "Synthetic activated modal-X source", 12, 12, &oracle)
+            .id();
+        scenario.with_library_top(P0, &["Draw witness"]);
+        let (mut state, bolt, own) =
+            printed_counter_stack(scenario, P1, pooled_mana(ManaType::Blue, 1));
+        let mut pure = state.objects[&source].abilities[1].clone();
+        pure.cost = None;
+        let mut mixed = pure.clone();
+        mixed.sub_ability = Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        )));
+        let mut modal = AbilityDefinition::new(AbilityKind::Activated, Effect::NoOp);
+        modal.cost = Some(AbilityCost::Mana {
+            cost: ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::X, ManaCostShard::Blue],
+            },
+        });
+        modal.modal = Some(ModalChoice {
+            min_choices: 1,
+            max_choices: 1,
+            mode_count: 2,
+            ..ModalChoice::default()
+        });
+        modal.mode_abilities = vec![pure, mixed];
+        let object = state.objects.get_mut(&source).unwrap();
+        Arc::make_mut(&mut object.abilities)[1] = modal.clone();
+        Arc::make_mut(&mut object.base_abilities)[1] = modal;
+        let mut setup = GameRunner::from_state(state);
+        setup
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            })
+            .unwrap();
+        let target = candidate_actions(setup.state())
+            .into_iter()
+            .find(|candidate| {
+                matches!(&candidate.action,
+            GameAction::ChooseTarget { target: Some(TargetRef::Object(id)) } if *id == bolt)
+            })
+            .unwrap();
+        setup.act(target.action).unwrap();
+        let old_entry = setup
+            .state()
+            .stack
+            .iter()
+            .find(|entry| {
+                entry.source_id == source
+                    && matches!(entry.kind, StackEntryKind::ActivatedAbility { .. })
+            })
+            .unwrap()
+            .id;
+        let state = setup.state_mut();
+        for unit in pooled_mana(ManaType::Blue, 3) {
+            state.players[P0.0 as usize].mana_pool.add(unit);
+        }
+        set_priority_window(state, Phase::PreCombatMain, P1);
+        let state = state.clone();
+        let root = assert_counter_in_pools(&state, source, Some(1), GateDecision::Allow);
+        let modes = replay_counter_announcement(&state, &root, P0).unwrap();
+        assert!(matches!(
+            modes.waiting_for,
+            WaitingFor::AbilityModeChoice {
+                is_activated: true,
+                ability_index: Some(1),
+                ..
+            }
+        ));
+        for index in [0, 1] {
+            let choice = assert_counter_response_in_pools(
+                &modes,
+                GameAction::SelectModes {
+                    indices: vec![index],
+                },
+                true,
+            );
+            let x_prompt = replay_counter_announcement(&modes, &choice, P0).unwrap();
+            assert!(matches!(
+                x_prompt.waiting_for,
+                WaitingFor::ChooseXValue { .. }
+            ));
+            let two = assert_counter_response_in_pools(
+                &x_prompt,
+                GameAction::ChooseX { value: 2 },
+                index == 1,
+            );
+            assert_counter_response_in_pools(&x_prompt, GameAction::ChooseX { value: 1 }, true);
+            let next = replay_counter_announcement(&x_prompt, &two, P0).unwrap();
+            assert!(matches!(next.waiting_for, WaitingFor::Priority { .. }));
+            let additions = next
+                .stack
+                .iter()
+                .filter(|entry| {
+                    entry.source_id == source
+                        && entry.id != old_entry
+                        && matches!(entry.kind, StackEntryKind::ActivatedAbility { .. })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(additions.len(), 1);
+            assert_eq!(
+                declared_targets_in_chain(additions[0].ability().unwrap()),
+                vec![TargetRef::Object(own)]
+            );
+            assert!(next.stack.iter().any(|entry| entry.id == old_entry));
+        }
+    }
+
+    #[test]
+    fn concrete_counter_optional_random_and_opponent_target_authority_stays_indeterminate() {
+        for authority in 0..3 {
+            let mut scenario = GameScenario::new();
+            let counter = scenario
+                .add_spell_to_hand_from_oracle(
+                    P0,
+                    "Synthetic qualified modal-X counter",
+                    true,
+                    "Choose one —\n• Counter target spell with mana value X.\n• Draw a card.",
+                )
+                .with_mana_cost(ManaCost::Cost {
+                    generic: 0,
+                    shards: vec![ManaCostShard::X, ManaCostShard::Blue],
+                })
+                .id();
+            scenario.with_library_top(P0, &["Draw witness"]);
+            let (mut state, _, own) =
+                printed_counter_stack(scenario, P1, pooled_mana(ManaType::Blue, 3));
+            let object = state.objects.get_mut(&counter).unwrap();
+            for abilities in [&mut object.abilities, &mut object.base_abilities] {
+                let mode = &mut Arc::make_mut(abilities)[0];
+                match authority {
+                    0 => mode.optional_targeting = true,
+                    1 => mode.target_selection_mode = TargetSelectionMode::Random,
+                    2 => mode.target_chooser = Some(TargetFilter::Opponent),
+                    _ => unreachable!(),
+                }
+            }
+            let root = assert_counter_in_pools(&state, counter, None, GateDecision::Allow);
+            let modes = replay_counter_announcement(&state, &root, P0).unwrap();
+            let mode = assert_counter_response_in_pools(
+                &modes,
+                GameAction::SelectModes { indices: vec![0] },
+                true,
+            );
+            let x_prompt = replay_counter_announcement(&modes, &mode, P0).unwrap();
+            let two =
+                assert_counter_response_in_pools(&x_prompt, GameAction::ChooseX { value: 2 }, true);
+            let next = replay_counter_announcement(&x_prompt, &two, P0).unwrap();
+            let ability = next
+                .waiting_for
+                .pending_cast_ref()
+                .map(|cast| cast.ability.as_ref())
+                .or_else(|| {
+                    next.stack
+                        .iter()
+                        .find(|entry| entry.id == counter)
+                        .and_then(|entry| entry.ability())
+                })
+                .unwrap();
+            assert!(is_pure_counter_payload(&collect_ability_effects(ability)));
+            assert_eq!(ability.chosen_x, Some(2));
+            match authority {
+                0 => {
+                    let WaitingFor::TargetSelection { target_slots, .. } = &next.waiting_for else {
+                        panic!("optional target must retain its decline prompt");
+                    };
+                    assert!(target_slots.iter().all(|slot| slot.optional));
+                    let decline = candidate_actions(&next)
+                        .into_iter()
+                        .find(|candidate| {
+                            matches!(candidate.action, GameAction::ChooseTarget { target: None })
+                        })
+                        .expect("engine issues the all-decline target response");
+                    let mut runner = GameRunner::from_state(next);
+                    runner.act(decline.action).unwrap();
+                    let ability = runner
+                        .state()
+                        .stack
+                        .iter()
+                        .find(|entry| entry.id == counter)
+                        .unwrap()
+                        .ability()
+                        .unwrap();
+                    assert!(declared_targets_in_chain(ability).is_empty());
+                }
+                1 => {
+                    assert_eq!(ability.target_selection_mode, TargetSelectionMode::Random);
+                    assert_eq!(
+                        declared_targets_in_chain(ability),
+                        vec![TargetRef::Object(own)]
+                    );
+                }
+                2 => assert!(matches!(
+                    next.waiting_for,
+                    WaitingFor::TargetSelection { player: P1, .. }
+                )),
+                _ => unreachable!(),
+            }
+        }
+    }
+
     /// SHAPE reach guards only; the tests below also drive the reducer/AI pools.
     fn assert_unannounced_x_counter(definition: &AbilityDefinition, source: ObjectId) {
         let effects = collect_definition_effects_with(definition, ModeWalk::RootOnly);
@@ -7957,10 +9131,10 @@ mod tests {
     }
 
     #[test]
-    fn modal_counter_defers_foreign_target_proof_but_keeps_all_own_spell_bound() {
+    fn all_plain_modal_counter_rejects_ineligible_foreign_spell_and_keeps_useful_sibling() {
         for controller in [P1, P0] {
             let mut scenario = GameScenario::new();
-            // Synthetic two-mode plain counter, both modes fixed and noncreature-only.
+            // Synthetic two-mode plain counter, both modes noncreature-only.
             let counter = scenario.add_spell_to_hand_from_oracle(P0, "Modal Counter Witness", true,
                 "Choose one —\n• Counter target noncreature spell.\n• Counter target noncreature spell unless its controller pays {2}.")
                 .with_mana_cost(ManaCost::Cost { generic: 0, shards: vec![ManaCostShard::Blue] }).id();
@@ -7974,34 +9148,17 @@ mod tests {
             assert!(modes.iter().all(|mode| is_pure_counter_payload(
                 &collect_definition_effects_with(mode, ModeWalk::All)
             )));
-            let root = assert_counter_in_pools(
-                &state,
-                counter,
-                None,
-                if controller == P1 {
-                    GateDecision::Allow
-                } else {
-                    GateDecision::Reject
-                },
+            let root = assert_counter_in_pools(&state, counter, None, GateDecision::Reject);
+            assert_counter_never_chosen(&state, &root.action);
+            push_stack_spell(&mut state, P1, "Foreign Instant Witness", CoreType::Instant);
+            let root = assert_counter_in_pools(&state, counter, None, GateDecision::Allow);
+            let next = replay_counter_announcement(&state, &root, P0).unwrap();
+            assert!(matches!(next.waiting_for, WaitingFor::ModeChoice { .. }));
+            assert_counter_response_in_pools(
+                &next,
+                GameAction::SelectModes { indices: vec![0] },
+                true,
             );
-            if controller == P1 {
-                let mut runner = GameRunner::from_state(state);
-                runner.act(root.action).unwrap();
-                // CR 601.2b + CR 700.2a: actual mode selection precedes target choice.
-                assert!(
-                    matches!(&runner.state().waiting_for, WaitingFor::ModeChoice {
-                    pending_cast, ..
-                } if pending_cast.object_id == counter)
-                );
-                let select = engine::ai_support::candidate_actions(runner.state())
-                    .into_iter()
-                    .find(|candidate| {
-                        matches!(&candidate.action, GameAction::SelectModes { indices }
-                        if indices.as_slice() == [0])
-                    })
-                    .expect("engine offers the fixed counter mode");
-                runner.act(select.action).unwrap();
-            }
         }
     }
 
