@@ -1817,6 +1817,56 @@ pub(super) fn split_subject_elided_control_continuations(
     split
 }
 
+/// CR 608.2c + CR 118.12: split "If you do, <instruction> and repeat this process"
+/// (Cultivator Colossus) into the gated instruction and a bare "repeat this
+/// process" directive chunk. Left joined, the instruction's parser swallows the
+/// coordinated directive as an ignored tail and the process never loops. The tail
+/// stays a contiguous substring of the printed text; the chunk loop gives it the
+/// head's "if you do" gate (`repeat_directive_inherits_if_you_do`).
+pub(super) fn split_if_you_do_repeat_process_tail(chunks: Vec<ClauseChunk>) -> Vec<ClauseChunk> {
+    let mut split = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let lower = chunk.text.to_ascii_lowercase();
+        // "if you do<head> and repeat this process[.]" — `head` keeps its "if you
+        // do" gate; the tail is the bare directive.
+        let parsed = nom_on_lower(&chunk.text, &lower, |input| {
+            let (i, head) = recognize((
+                tag::<_, _, OracleError<'_>>("if you do"),
+                take_until(" and repeat this process"),
+            ))
+            .parse(input)?;
+            let (i, _) = tag(" and ").parse(i)?;
+            let (i, tail) = recognize((tag("repeat this process"), opt(tag(".")))).parse(i)?;
+            let (i, _) = nom::character::complete::space0(i)?;
+            let (i, _) = eof(i)?;
+            Ok((i, (head.len(), tail.len())))
+        });
+        let Some(((head_len, tail_len), _)) = parsed else {
+            split.push(chunk);
+            continue;
+        };
+        let tail_start = head_len + " and ".len();
+        let (Some(head), Some(tail)) = (
+            chunk.text.get(..head_len),
+            chunk.text.get(tail_start..tail_start + tail_len),
+        ) else {
+            split.push(chunk);
+            continue;
+        };
+        split.push(ClauseChunk {
+            text: head.trim().to_string(),
+            boundary_after: Some(ClauseBoundary::Comma),
+            leading_duration: chunk.leading_duration.clone(),
+        });
+        split.push(ClauseChunk {
+            text: tail.trim().to_string(),
+            boundary_after: chunk.boundary_after,
+            leading_duration: chunk.leading_duration,
+        });
+    }
+    split
+}
+
 /// CR 114.1: True when the clause-so-far begins with the emblem-creation head
 /// (`you get an emblem with "…"` or the subject-stripped `get an emblem with
 /// "…"`). Combinator-only dispatch mirroring `try_parse_emblem_creation`'s prefix

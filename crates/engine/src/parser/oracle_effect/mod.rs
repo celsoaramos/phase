@@ -37435,9 +37435,10 @@ fn try_parse_repeat_until_stop_conditions(
 ///   `repeat_for` root together with its own unless-payment / player-scope gate,
 ///   while a following sentence is an independent sibling that runs once after the
 ///   loop. A multi-clause process therefore keeps the consume-only outcome.
-/// - `ConsumeOnly` — the bare / "if you do" form (Primal Surge) is recognized so
-///   the directive is consumed rather than producing an `Unimplemented` gap, but
-///   it sets no predicate (its game-state-predicate semantics stay deferred).
+/// - `ConsumeOnly` — a bare / capped "if you do" form is recognized so the
+///   directive is consumed rather than producing an `Unimplemented` gap, but it
+///   sets no predicate. (The uncapped "if you do" form — Primal Surge, Cultivator
+///   Colossus — is a `Continuation` gated on `OptionalEffectPerformed`.)
 #[derive(Debug)]
 enum RepeatProcessOutcome {
     Continuation(crate::types::ability::RepeatContinuation),
@@ -37455,10 +37456,24 @@ enum RepeatProcessOutcome {
 /// stripped via the shared condition helpers and threaded into a
 /// `WhileCondition` predicate; the trailing "once"/"N times" sets its
 /// `max_iterations` cap. With no condition, "you may repeat …" maps to
-/// `ControllerChoice` and the bare / "if you do" forms are consumed only.
+/// `ControllerChoice`, "if you do, repeat …" to a `WhileCondition` on the
+/// process's own "you may" (`OptionalEffectPerformed`), and the bare form is
+/// consumed only.
+#[cfg(test)]
 fn try_parse_repeat_process_directive(
     text: &str,
     ctx: &mut ParseContext,
+) -> Option<RepeatProcessOutcome> {
+    try_parse_repeat_process_directive_inheriting(text, ctx, false)
+}
+
+/// As [`try_parse_repeat_process_directive`], with `inherited_if_you_do` set when
+/// the directive was coordinated with an "if you do"-gated instruction of the same
+/// sentence, so a bare "repeat this process" reads as "if you do, repeat …".
+fn try_parse_repeat_process_directive_inheriting(
+    text: &str,
+    ctx: &mut ParseContext,
+    inherited_if_you_do: bool,
 ) -> Option<RepeatProcessOutcome> {
     use crate::types::ability::RepeatContinuation;
 
@@ -37496,8 +37511,7 @@ fn try_parse_repeat_process_directive(
     let body_lower = body.to_lowercase();
     let (parsed_directive, _) = nom_on_lower(body.as_str(), &body_lower, |i| {
         let (i, you_may) = opt(tag::<_, _, OracleError<'_>>("you may ")).parse(i)?;
-        // The bare/"if you do" forms have no condition and no "you may" — keep
-        // them recognized (consume-only) so they don't leak Unimplemented gaps.
+        // The bare/"if you do" forms have no condition and no "you may".
         let (i, if_you_do) = opt(alt((
             tag::<_, _, OracleError<'_>>("if you do, "),
             tag("if you do "),
@@ -37534,6 +37548,7 @@ fn try_parse_repeat_process_directive(
     })?;
 
     let (cap, you_may, if_you_do, more_times) = parsed_directive;
+    let if_you_do = if_you_do || (inherited_if_you_do && !you_may);
     if let Some(condition) = condition {
         return Some(RepeatProcessOutcome::Continuation(
             RepeatContinuation::WhileCondition {
@@ -37552,6 +37567,22 @@ fn try_parse_repeat_process_directive(
     if you_may {
         return Some(RepeatProcessOutcome::Continuation(
             RepeatContinuation::ControllerChoice,
+        ));
+    }
+    // CR 608.2c + CR 118.12: "If you do, repeat this process" (Cultivator Colossus,
+    // Primal Surge) re-follows the process while the process's own "you may"
+    // instruction was performed. The loop gate is the same `OptionalEffectPerformed`
+    // signal the "if you do" rider reads; the runtime evaluates it against the
+    // iteration that just resolved (`should_repeat_while_condition`), so declining —
+    // or having nothing left to put — ends the process.
+    if if_you_do && cap.is_none() {
+        return Some(RepeatProcessOutcome::Continuation(
+            RepeatContinuation::WhileCondition {
+                condition: Box::new(AbilityCondition::EffectOutcome {
+                    signal: EffectOutcomeSignal::OptionalEffectPerformed,
+                }),
+                max_iterations: None,
+            },
         ));
     }
     // CR 608.2c: an unconditional, mandatory "repeat this process once / twice /
@@ -39685,6 +39716,7 @@ fn parse_effect_chain_ir_body(
             head_carries_player_subject(head, ctx)
         }),
     );
+    let chunks = sequence::split_if_you_do_repeat_process_tail(chunks);
     // CR 611.2a + CR 608.2c: expand any chunk whose leading duration governs conjuncts the
     // single-clause parse discarded. The expanded conjuncts become ORDINARY chunks of THIS
     // chain, which is the only construction under which chain-level anaphor state
@@ -40563,10 +40595,27 @@ fn parse_effect_chain_ir_body(
         //     while the leading condition holds, capped by the trailing count.
         //   - "you may repeat this process [any number of times]" → a
         //     per-iteration controller decision (`ControllerChoice`).
-        //   - bare / "if you do, repeat this process" — recognized and consumed
-        //     so the directive doesn't leak an `Unimplemented` gap, but it sets
-        //     no predicate (its game-state-predicate form stays deferred).
-        if let Some(outcome) = try_parse_repeat_process_directive(normalized_text, ctx) {
+        //   - "if you do, repeat this process" → `WhileCondition` on the
+        //     process's own "you may" (`OptionalEffectPerformed`).
+        //   - bare "repeat this process" — recognized and consumed so the
+        //     directive doesn't leak an `Unimplemented` gap; sets no predicate.
+        // CR 608.2c + CR 118.12: a bare directive coordinated in the SAME sentence
+        // with an "if you do"-gated instruction ("If you do, draw a card and
+        // repeat this process" — split by `split_if_you_do_repeat_process_tail`)
+        // carries that gate too.
+        let inherits_if_you_do = chunk_idx
+            .checked_sub(1)
+            .and_then(|prev| chunks.get(prev))
+            .is_some_and(|prev| prev.boundary_after == Some(ClauseBoundary::Comma))
+            && builder.clauses_mut().last().is_some_and(|clause| {
+                clause
+                    .condition
+                    .as_ref()
+                    .is_some_and(AbilityCondition::is_optional_effect_performed)
+            });
+        if let Some(outcome) =
+            try_parse_repeat_process_directive_inheriting(normalized_text, ctx, inherits_if_you_do)
+        {
             match outcome {
                 RepeatProcessOutcome::Continuation(continuation) => {
                     pending_repeat_until = Some(continuation);

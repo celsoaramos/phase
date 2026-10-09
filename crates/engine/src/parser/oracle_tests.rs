@@ -13858,20 +13858,24 @@ fn repeat_this_process_you_may_sets_controller_choice() {
 }
 
 #[test]
-fn repeat_this_process_if_you_do_stays_recognized_without_predicate() {
+fn repeat_this_process_if_you_do_loops_while_optional_performed() {
     use crate::parser::oracle_effect::parse_effect_chain;
-    // CR 608.2c: Primal Surge — "If you do, repeat this process." is the
-    // game-state-predicate form, a deferred unit. The directive is still
-    // recognized (no Unimplemented gap) but sets no `repeat_until`.
+    use crate::types::ability::{AbilityCondition, EffectOutcomeSignal, RepeatContinuation};
+    // CR 608.2c + CR 118.12: Primal Surge — "If you do, repeat this process."
+    // re-follows the process while its "you may" instruction was performed.
     let def = parse_effect_chain(
         "Exile the top card of your library. If it's a permanent card, you \
              may put it onto the battlefield. If you do, repeat this process.",
         AbilityKind::Spell,
     );
     assert_eq!(
-        def.repeat_until, None,
-        "the 'if you do' form is deferred — no predicate set, got {:?}",
         def.repeat_until,
+        Some(RepeatContinuation::WhileCondition {
+            condition: Box::new(AbilityCondition::EffectOutcome {
+                signal: EffectOutcomeSignal::OptionalEffectPerformed,
+            }),
+            max_iterations: None,
+        }),
     );
 }
 

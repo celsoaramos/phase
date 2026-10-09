@@ -4540,12 +4540,48 @@ pub(super) fn resolve_optional_effect_decision(
     ability.optional = false;
     match choice {
         AutoMayChoice::Accept => {
+            // CR 608.2c + CR 118.12: an "If you do, repeat this process" loop whose
+            // "you may" paused its iteration is parked as the repeat-until frame,
+            // which re-evaluates the gate once this accepted iteration drains.
+            let owning_loop = state.active_repeat_until().is_some_and(|frame| {
+                frame.ability.source_id == ability.source_id
+                    && matches!(
+                        &frame.ability.repeat_until,
+                        Some(RepeatContinuation::WhileCondition { condition, .. })
+                            if condition_depends_on_effect_performed(condition)
+                    )
+            });
+            // The process root carries the loop itself: resuming it with the loop
+            // attached would open a nested loop whose first iteration clears the
+            // acceptance the parked gate reads.
+            if owning_loop
+                && state
+                    .active_repeat_until()
+                    .is_some_and(|frame| frame.ability.repeat_until == ability.repeat_until)
+            {
+                ability.repeat_until = None;
+            }
             ability.context.optional_effect_performed = true;
             state
                 .player_actions_this_way
                 .insert((ability.controller, PlayerActionKind::AcceptedOptionalEffect));
             let producer_events_start = events.len();
             resolve_ability_chain(state, &ability, events, depth)?;
+            // CR 118.12: accepting is not doing. An accepted "you may" that neither
+            // paused for its choice nor did anything (Insatiable Frugivore with
+            // fewer than three cards to exile) does not repeat the process —
+            // otherwise a player who always accepts would loop forever.
+            if owning_loop
+                && !waits_for_resolution_choice(&state.waiting_for)
+                && !mandatory_parent_effect_performed(
+                    &ability.effect,
+                    &events[producer_events_start..],
+                )
+            {
+                state
+                    .player_actions_this_way
+                    .remove(&(ability.controller, PlayerActionKind::AcceptedOptionalEffect));
+            }
             // CR 608.2c: When an optional effect's prompt suspended the parent
             // chain, the "If you do" sibling continuation was stashed BEFORE the
             // player chose — so its context still carries
@@ -14746,6 +14782,15 @@ pub fn resolve_ability_chain(
                     // doesn't reach the flip can't satisfy the gate on a prior
                     // iteration's stale result.
                     state.resolution_coin_flip = None;
+                    // CR 608.2c + CR 118.12: same intra-loop boundary for an "If you
+                    // do, repeat this process" gate — it must read only THIS
+                    // iteration's acceptance of the process's "you may" instruction.
+                    if condition_depends_on_effect_performed(&condition) {
+                        state.player_actions_this_way.remove(&(
+                            ability.controller,
+                            PlayerActionKind::AcceptedOptionalEffect,
+                        ));
+                    }
                     let initial_waiting_for = state.waiting_for.clone();
                     let stack_depth_before_iteration =
                         state.resolution_stack.capture_child_boundary();
@@ -14957,6 +15002,22 @@ fn should_repeat_while_condition(
     if matches!(remaining, Some(0)) {
         return false;
     }
+    // CR 608.2c + CR 118.12: "If you do, repeat this process" — the loop ability is
+    // the process root, whose own context never records the iteration's "you may"
+    // outcome (the accept runs on a resumed copy). Seed the performed signal from
+    // the controller's acceptance in the iteration that just resolved (cleared at
+    // each iteration's start in `resolve_ability_chain`).
+    let seeded;
+    let ability = if condition_depends_on_effect_performed(condition) {
+        let mut owned = ability.clone();
+        owned.context.optional_effect_performed = state
+            .player_actions_this_way
+            .contains(&(ability.controller, PlayerActionKind::AcceptedOptionalEffect));
+        seeded = owned;
+        &seeded
+    } else {
+        ability
+    };
     if !evaluate_condition(condition, state, ability) {
         return false;
     }
