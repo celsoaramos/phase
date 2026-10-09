@@ -8317,6 +8317,7 @@ mod tests {
             .id();
         let draw_one = scenario.add_card_to_library_top(P0, "First draw");
         let draw_two = scenario.add_card_to_library_top(P0, "Second draw");
+        let spare = scenario.add_card_to_hand(P0, "Spare hand card");
         let creature = scenario
             .add_creature_to_hand(P1, "Grizzly Bears", 2, 2)
             .with_mana_cost(ManaCost::Cost {
@@ -8439,6 +8440,8 @@ mod tests {
         useful.act(discard.action).unwrap();
         assert_eq!(useful.state().objects[&draw_one].zone, Zone::Graveyard);
         assert_eq!(useful.state().objects[&draw_two].zone, Zone::Graveyard);
+        // CR 701.9b: the chosen discard leaves the unselected card in hand.
+        assert_eq!(useful.state().objects[&spare].zone, Zone::Hand);
         assert!(matches!(
             useful.state().waiting_for,
             WaitingFor::Priority { .. }
