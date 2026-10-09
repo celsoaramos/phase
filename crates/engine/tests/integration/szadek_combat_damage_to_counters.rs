@@ -844,3 +844,61 @@ fn departed_seat_gains_no_life_from_a_batch_parked_in_its_replacement_pass() {
         "the defender's answer still applies"
     );
 }
+
+const TORBRAN_ORACLE: &str = "If a red source you control would deal damage to an opponent or \
+a permanent an opponent controls, it deals that much damage plus 2 instead.";
+
+/// CR 616.1 + CR 510.2 + CR 704.6c: the ordering choice of a batch event that
+/// SURVIVES its replacements (two damage modifications, no substitution) is
+/// answered inside the batch, so the survivor is applied by Phase C with the
+/// batch's own bookkeeping. P1 orders Torbran's +2 against Furnace of Rath's
+/// doubling for a red 2/2 commander: Torbran first → (2 + 2) × 2 = 8, Furnace
+/// first → 2 × 2 + 2 = 6. Both the life loss and the commander-damage tally
+/// carry the chosen amount.
+#[test]
+fn surviving_event_ordered_by_defender_keeps_combat_bookkeeping() {
+    for torbran_first in [true, false] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let commander = {
+            let mut builder = scenario.add_creature(P0, "Red Commander", 2, 2);
+            builder
+                .commander()
+                .with_color(vec![engine::types::mana::ManaColor::Red]);
+            builder.id()
+        };
+        let torbran = scenario
+            .add_creature_from_oracle(P0, "Torbran Stand-In", 6, 4, TORBRAN_ORACLE)
+            .id();
+        let furnace = scenario
+            .add_enchantment_from_oracle(P1, "Furnace of Rath", FURNACE_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        attack_and_run_to_prompt(&mut runner, &[commander]);
+        choose_replacement_from(
+            &mut runner,
+            P1,
+            if torbran_first { torbran } else { furnace },
+        );
+        assert_batch_completed_by_the_answer(&runner);
+        finish_combat(&mut runner);
+
+        let dealt: u32 = if torbran_first { 8 } else { 6 };
+        assert_eq!(
+            runner.state().players[1].life,
+            20 - dealt as i32,
+            "torbran_first={torbran_first}"
+        );
+        let tally: u32 = runner
+            .state()
+            .commander_damage
+            .iter()
+            .filter(|entry| entry.player == P1 && entry.commander == commander)
+            .map(|entry| entry.damage)
+            .sum();
+        assert_eq!(
+            tally, dealt,
+            "CR 704.6c: Phase C books the chosen amount as commander damage"
+        );
+    }
+}
