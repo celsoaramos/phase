@@ -171,5 +171,8 @@
   {
     "branch": "fix/damage-to-counters-substitution",
     "pr": 9670
+  },
+  {
+    "branch": "card/if-you-do-repeat-process"
   }
 ]
