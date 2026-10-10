@@ -451,7 +451,11 @@ fn unique_recipient_from_filter(
     // event.
     if matches!(
         filter,
-        TargetFilter::TriggeringPlayer | TargetFilter::TriggeringSourceController
+        TargetFilter::TriggeringPlayer
+            | TargetFilter::TriggeringSourceController
+            // CR 113.8: "that spell or ability's controller" on a targeting
+            // trigger (Fractured Loyalty) — the targeter's controller.
+            | TargetFilter::TriggeringSpellController
     ) {
         return crate::game::targeting::resolve_event_context_target(
             state,
@@ -1456,6 +1460,7 @@ mod tests {
             amount: 2,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         });
         let ability = ResolvedAbility::new(
             Effect::GiveControl {
@@ -1534,6 +1539,7 @@ then lose that much life.";
             amount: 2,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         });
 
         let resolved = build_resolved_from_def(execute, kain, PlayerId(0));
