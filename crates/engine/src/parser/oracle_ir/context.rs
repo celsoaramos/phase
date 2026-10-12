@@ -5,8 +5,8 @@
 
 use super::diagnostic::OracleDiagnostic;
 use crate::types::ability::{
-    ControllerRef, Duration, MultiTargetSpec, PlayerFilter, PtValue, QuantityExpr, QuantityRef,
-    TargetChoiceTiming, TargetFilter, TargetSelectionMode, ZoneChoiceCandidateSource,
+    ChosenGroupId, ControllerRef, Duration, MultiTargetSpec, PlayerFilter, PtValue, QuantityExpr,
+    QuantityRef, TargetChoiceTiming, TargetFilter, TargetSelectionMode, ZoneChoiceCandidateSource,
 };
 use crate::types::card_type::CoreType;
 use crate::types::zones::Zone;
@@ -164,6 +164,55 @@ impl TriggerZoneChangeProvenance {
     }
 }
 
+/// CR 601.2c + CR 608.2c: the target slots announced by the earlier clauses of
+/// an effect chain, for resolving a demonstrative ("that creature") to the
+/// declared slot it names. Only the stable prefix is numbered: once a clause
+/// announces a variable number of targets ("up to one target …", "any number
+/// of target …"), a declined slot would renumber every later declared slot at
+/// runtime, so that clause's slots and every later slot are recorded without
+/// an index — they still take part in ambiguity checks but cannot be bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeclaredSlotRegistry {
+    /// A clause shape whose declared numbering this walk cannot reproduce
+    /// (multi-slot effects, else-branches, …). Nothing binds.
+    Indeterminate,
+    /// Every announced slot of the earlier clauses, in declared order.
+    Known(Vec<DeclaredSlotEntry>),
+}
+
+impl Default for DeclaredSlotRegistry {
+    fn default() -> Self {
+        DeclaredSlotRegistry::Known(Vec::new())
+    }
+}
+
+/// One announced target slot of an earlier clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclaredSlotEntry {
+    /// The declared-slot index (the `declared_targets_in_chain` numbering),
+    /// `None` past the stable prefix.
+    pub index: Option<usize>,
+    /// The slot's target filter, matched against a demonstrative's noun.
+    pub filter: TargetFilter,
+}
+
+/// CR 700.2: the body a [`ParseContext`] parses — a whole ability, or one mode
+/// of a modal spell or ability.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum BodyScope {
+    #[default]
+    WholeAbility,
+    ModalMode,
+}
+
+/// CR 608.2k: the object a trigger condition introduces for its body's bare
+/// object pronouns, where the pinned `TargetFilter` is ambiguous on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConditionObjectAntecedent {
+    /// CR 509.3c: the attacker of a bare "<creature> becomes blocked" condition.
+    BlockedAttacker,
+}
+
 /// Unified parsing context — threaded through all parser branches for
 /// pronoun/reference resolution ("it", "that creature", "that many").
 ///
@@ -264,6 +313,12 @@ pub(crate) struct ParseContext {
     /// set this to `TriggeringSource` so "Whenever you cast a spell, put it ..."
     /// moves the spell on the stack, not the trigger source or a parent target.
     pub object_pronoun_ref: Option<TargetFilter>,
+    /// CR 509.3c + CR 608.2k: what `object_pronoun_ref` names, when the pinned
+    /// `TargetFilter` alone doesn't say it. `ParentTarget` is also the ordinary
+    /// "it" of a spell's earlier target; under a bare "becomes blocked" trigger
+    /// condition it is the blocked attacker, which some slots (a damage source)
+    /// cannot express. Set only together with the matching pin.
+    pub condition_object_antecedent: Option<ConditionObjectAntecedent>,
     /// CR 608.2c (rules of English — number agreement) + CR 608.2k + CR 406.6:
     /// Antecedent for bare PLURAL object pronouns ("them"/"themselves") in the
     /// current trigger body, introduced by a plural noun phrase in the trigger's
@@ -551,6 +606,46 @@ pub(crate) struct ParseContext {
     /// lowered through them). `None` on the first chunk of every chain and on
     /// every standalone parse. Never serialized.
     pub chain_declared_object_target: Option<TargetFilter>,
+    /// CR 608.2c: the reference to the player slot an ENCLOSING effect chain
+    /// already declared, for a nested `parse_effect_chain_ir` whose own builder
+    /// starts empty (a conditional body re-parsed as its own chain: "If you do,
+    /// that player discards that card, then draws a card"). Set by the caller
+    /// immediately before that one call; the callee `take`s it on entry, so it is
+    /// `None` everywhere else. Never serialized.
+    pub enclosing_declared_player: Option<TargetFilter>,
+    /// Ordinal of the next player-declaring clause's `ChosenGroupId`
+    /// (`ChosenGroupId::declared_player`). `parse_effect_chain_ir_body` owns the
+    /// running count in a chain-level local and hands it across a nested chain
+    /// and each per-chunk context, so ids stay unique across one ability.
+    pub next_declared_player_group: u32,
+    /// CR 608.2c: the chain's nearest earlier clause announced exactly one player, so
+    /// a bare "they" subject names that player (`ParentTargetController`, the
+    /// spelling "that player" takes) instead of an earlier object. Seeded per chunk
+    /// from the chain; `false` on every standalone parse.
+    pub prior_player_declaration: bool,
+    /// CR 608.2c + CR 115.1a: the controller scope "that player controls" and "they
+    /// control" take after a player the chain already declared. Seeded per chunk from
+    /// the chain; `None` on every standalone parse, which keeps `relative_player_scope`
+    /// (then `You`) as the reading.
+    pub declared_player_scope: Option<ControllerRef>,
+    /// The group a damage clause minted for the player it announces itself, so its own
+    /// continuations ("... and 1 damage to each creature that player controls") can name it.
+    /// The chunk loop takes it onto the clause.
+    pub clause_declared_group: Option<ChosenGroupId>,
+    /// CR 601.2c + CR 608.2c: every target slot announced by the EARLIER clauses
+    /// of this effect chain, in declared order, with its declared-slot index
+    /// where that index is exactly computable (see [`DeclaredSlotRegistry`]).
+    /// Same lifecycle as `chain_declared_object_target`: taken before the chunk
+    /// loop, reassigned as the first statement of every iteration as a pure
+    /// function of the pushed clauses, restored after. Empty on every standalone
+    /// parse. Never serialized.
+    pub chain_declared_slots: DeclaredSlotRegistry,
+    /// CR 700.2: whether the text being parsed is one mode of a modal spell or
+    /// ability. Declared-slot numbering is mode-local at runtime
+    /// (`targeting::parent_slot_base`), so declared-slot referents are not
+    /// admitted inside a mode. Set to `ModalMode` on each mode's context by
+    /// `parse_modal_mode_irs`; `WholeAbility` everywhere else.
+    pub body_scope: BodyScope,
     /// CR 608.2c + CR 400.7: Source zone of the tracked set that a downstream
     /// "put those cards / put them onto the battlefield" anaphor (a
     /// `TargetFilter::TrackedSet`) must scan. Set by a producer clause that
@@ -633,6 +728,19 @@ pub(crate) struct ParseContext {
     /// lingering path. Mirrors `chain_has_prior_exile_producer`.
     // CR 608.2g + CR 701.20e
     pub chain_prior_self_library_peek: bool,
+    /// CR 608.2c: the stop filter of the most recent earlier same-chain
+    /// `ExileFromTopUntil { NextMatches }` loop. The loop ends on its last
+    /// match, so the cards it exiled that match this filter are exactly the
+    /// ones it found, and "the other cards exiled this way" are the rest
+    /// (Invasion of Alara). `None` when the chain has no such loop.
+    pub chain_prior_exile_until_match: Option<TargetFilter>,
+    /// CR 608.2c: the candidate source for cards the `NextMatches` loop found.
+    /// `Some(ParentTargets)` only when every
+    /// clause after the loop is the one-cast window over its batch (Invasion
+    /// of Alara's "You may cast one of those two cards …"), which hands those
+    /// targets on unchanged. Any other clause in between may target or choose
+    /// its own objects, so "put one of them into your hand" stays unbound.
+    pub chain_exile_until_hits_source: Option<ZoneChoiceCandidateSource>,
     /// CR 400.7j + CR 608.2c + CR 608.2d: the NEAREST earlier single-card exile
     /// partition in this same effect chain, carrying that pile's
     /// [`ZoneChoiceCandidateSource`] — `None` when the chain has none.

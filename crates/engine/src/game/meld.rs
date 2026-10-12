@@ -317,6 +317,7 @@ pub(crate) fn finish_meld_delivery(
                 entry.replacement_applied.clone(),
             )),
             LiminalEntryKind::Token => None,
+            LiminalEntryKind::TransformedEntry => None,
         })
         .unwrap_or((context, attack_target, Default::default()));
     state.liminal_entries.remove(&context.source_id);
@@ -375,7 +376,7 @@ pub(crate) fn commit_meld_battlefield(state: &mut GameState, context: &MeldSelec
         .get(&context.source_id)
         .map(|object| object.controller)
         .unwrap_or(context.controller);
-    let values = copiable_values_from_face(&result_face);
+    let values = copiable_values_from_face(&result_face, None);
     let printed_ref = printed_ref_from_face(&result_face);
     merge::install_merge_layer_effect(
         state,
@@ -384,6 +385,8 @@ pub(crate) fn commit_meld_battlefield(state: &mut GameState, context: &MeldSelec
         values,
         crate::game::game_object::DisplaySource::Card,
         printed_ref,
+        None,
+        // Meld results are nontoken cards rendering through `printed_ref`.
         None,
     );
     // CR 701.42a / CR 730.2: absorb the partner into the single melded permanent

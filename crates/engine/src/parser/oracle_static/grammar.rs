@@ -793,8 +793,7 @@ pub(crate) fn parse_enchanted_equipped_predicate(
                     // scoped-designation or payment-continuation leaf reaching
                     // THIS path would still be a false green.
                     def.condition = Some(
-                        parse_static_condition(condition_text)
-                            .or_else(|| parse_attached_static_condition(condition_text))
+                        parse_attached_static_condition(condition_text)
                             .map(|condition| gate_cant_untap_condition(condition, condition_text))
                             .unwrap_or_else(|| {
                                 unparsed_gate_condition(
@@ -856,7 +855,8 @@ pub(crate) fn parse_enchanted_equipped_predicate(
     {
         (
             body_tp,
-            super::shared::parse_unless_static_condition(&pred_tp, Some(&affected)),
+            super::shared::parse_unless_static_condition(&pred_tp, Some(&affected))
+                .map(rebind_source_object_quantities_to_recipient),
             condition_tp
                 .original
                 .trim()
@@ -2071,37 +2071,40 @@ pub(crate) fn parse_basic_landwalk_qualifier(input: &str) -> OracleResult<'_, &'
     .parse(input)
 }
 
-/// CR 601.3 + CR 113.6b: Parse the affected-card filter of a graveyard
+/// CR 601.3 + CR 604.6: Parse the affected-card filter of a graveyard
 /// cast-permission ability. When the filter text is a self-reference phrase
 /// ("this card", "this creature", "this permanent", ...), the permission
 /// applies only to the source card itself, so it lowers to
 /// `TargetFilter::SelfRef`. The returned `bool` is the `self_ref_permission`
-/// flag: when `true`, the caller restricts the static to
-/// `active_zones: [Graveyard]` (CR 113.6b — a zone-restricted ability functions
-/// only from the zones it names). A non-self-reference filter (e.g. a creature
+/// flag: when `true`, the caller sets the static's `active_zones` to the zones its
+/// permission names (CR 604.6 — the permission applies while the card is in a zone
+/// it could be cast from). A non-self-reference filter (e.g. a creature
 /// type) falls through to `parse_type_phrase_folding` and is not zone-restricted here.
 pub(crate) fn parse_graveyard_permission_filter(input: &str) -> (TargetFilter, bool) {
-    // The self-reference token `~` is substituted for type phrases ("this
-    // creature", "this permanent", ...) by `normalize_self_references` before
-    // this parser runs; `SELF_REF_PARSE_ONLY_PHRASES` (e.g. "this card") are
-    // *excluded* from that normalization and reach this function verbatim. Both
-    // forms denote the permission's own source card.
-    for phrase in std::iter::once("~").chain(SELF_REF_PARSE_ONLY_PHRASES.iter().copied()) {
-        if all_consuming(tag::<_, _, OracleError<'_>>(phrase))
-            .parse(input)
-            .is_ok()
-        {
-            return (TargetFilter::SelfRef, true);
-        }
+    if all_consuming(parse_self_subject).parse(input).is_ok() {
+        return (TargetFilter::SelfRef, true);
     }
     let (filter, _) = parse_type_phrase_folding(input);
     (filter, false)
 }
 
-/// CR 601.3 + CR 113.6b: Parse the trailing condition gate on a graveyard
+/// The permission's own source card as a cast-permission subject.
+pub(crate) fn parse_self_subject(input: &str) -> OracleResult<'_, &str> {
+    // `normalize_self_references` substitutes `~` for type phrases ("this
+    // creature", ...) but leaves `SELF_REF_PARSE_ONLY_PHRASES` ("this card")
+    // verbatim, so both forms denote the source card.
+    for phrase in std::iter::once("~").chain(SELF_REF_PARSE_ONLY_PHRASES.iter().copied()) {
+        if let Ok(parsed) = tag::<_, _, OracleError<'_>>(phrase).parse(input) {
+            return Ok(parsed);
+        }
+    }
+    Err(crate::parser::oracle_nom::error::oracle_err(input))
+}
+
+/// CR 601.3 + CR 604.6: Parse the trailing condition gate on a graveyard
 /// cast-permission ability ("You may cast this card from your graveyard
 /// [as long as|if] [condition]"). The permission is a zone-restricted ability
-/// (CR 113.6b) that allows a cast under CR 601.3; the condition restricts when
+/// (CR 604.6) that allows a cast under CR 601.3; the condition restricts when
 /// the permission applies. Both the durative "as long as" form and the
 /// turn-history "if" form (Oathsworn Vampire — "if you gained life this turn")
 /// are evaluated when the permission is queried, so they share the same

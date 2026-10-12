@@ -14,10 +14,11 @@ use crate::parser::oracle_effect::lower::strip_trailing_duration;
 use crate::parser::oracle_nom::filter::ChosenColorGrantReference;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
-    ActivationManaPaymentRestriction, ActivationRestriction, ChoiceType, ControllerRef,
-    CostReduction, DelayedTriggerCondition, Duration, Effect, ManaSpendPermission, MultiTargetSpec,
-    OpponentMayScope, PlayerFilter, QuantityExpr, QuantityRef, ReturnResultReadSpec, RoundingMode,
-    SubAbilityLink, TargetChoiceTiming, TargetFilter, TargetSelectionMode, UnlessPayModifier,
+    ActivationManaPaymentRestriction, ActivationRestriction, ChoiceType, ChosenGroupId,
+    ControllerRef, CostReduction, DelayedTriggerCondition, Duration, Effect, ManaSpendPermission,
+    MultiTargetSpec, OpponentMayScope, PlayerFilter, QuantityExpr, QuantityRef,
+    ReturnResultReadSpec, RoundingMode, SubAbilityLink, TargetChoiceTiming, TargetFilter,
+    TargetReadOrigin, TargetSelectionMode, UnlessPayModifier,
 };
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaExpiry;
@@ -878,6 +879,11 @@ pub(crate) struct ClauseIr {
     /// The exact choose instruction named by this selected-group consumer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reads_chosen_clause: Option<ClauseId>,
+    /// CR 115.1 + CR 608.2c: where this clause's `ObjectScope::Target` reads take
+    /// their object from. Written only by the comparative "that creature" gate
+    /// after it proves the immediately preceding clause announced the object.
+    #[serde(skip_serializing_if = "TargetReadOrigin::is_own")]
+    pub(crate) target_reads: TargetReadOrigin,
     /// The prior return instruction whose actual results a delayed clause names.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reads_return_result: Option<(ClauseId, ReturnResultReadSpec)>,
@@ -955,6 +961,11 @@ pub(crate) struct ClauseIr {
     /// chooser injected — a fail-closed, match-NOTHING filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) printed_color_choice: Option<ChoiceType>,
+    /// CR 608.2c: the group a later clause's `TargetFilter::DeclaredPlayer` names
+    /// this clause by; lowered onto its node's `declares_chosen_group`. Set by the
+    /// chunk loop after the clause is pushed, and propagated by `absorb_clause`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) declared_player_group: Option<ChosenGroupId>,
     /// CR 607.2d + CR 608.2d: which KIND of chosen-colour
     /// reference this clause's KEYWORD GRANT printed, DERIVED ONCE from this
     /// clause's own verbatim `source_text` at `ClauseDraft::push` — the sealed
@@ -986,6 +997,82 @@ pub(crate) struct ClauseIr {
     /// source, disposition, and provenance (Plan 01 §5 construction gate).
     #[serde(skip)]
     _sealed: (),
+}
+
+impl ClauseIr {
+    /// Turn this clause, in place, into an honest parser gap
+    /// (`Effect::unimplemented(name, <printed fragment>)`) that carries NO
+    /// executable metadata — exactly what [`ClauseIrBuilder::clause`] +
+    /// `Effect::unimplemented` would have minted for the same text. Identity,
+    /// printed source and boundary are kept; every field that assembly would
+    /// copy onto the lowered definition (optional gates, unless-payments,
+    /// repeat counts, player scopes, delayed markers, target metadata,
+    /// dispositions that patch other clauses, chosen-group links) is reset to
+    /// its draft default, so the gap resolves as nothing and prompts no one.
+    ///
+    /// Destructures every field without `..`, so a new `ClauseIr` field must be
+    /// classified here before this compiles.
+    pub(crate) fn replace_with_gap(&mut self, name: &str) {
+        let fragment = self.source.fragment().unwrap_or_default().to_string();
+        let ClauseIr {
+            id: _,
+            declares_chosen_clause,
+            reads_chosen_clause,
+            target_reads,
+            reads_return_result,
+            source: _,
+            disposition,
+            parsed,
+            boundary: _,
+            condition,
+            is_optional,
+            opponent_may_scope,
+            repeat_for,
+            player_scope,
+            starting_with,
+            delayed_condition,
+            prefix_delayed_condition,
+            multi_target,
+            where_x_expression,
+            unless_pay,
+            target_selection_mode,
+            target_chooser,
+            declared_target_choice_timing,
+            printed_color_choice,
+            declared_player_group,
+            chosen_color_grant,
+            placement,
+            _sealed: _,
+        } = self;
+        *declares_chosen_clause = None;
+        *reads_chosen_clause = None;
+        *target_reads = TargetReadOrigin::OwnAnnouncement;
+        *reads_return_result = None;
+        *disposition = ClauseDisposition::Emit {
+            followup: None,
+            intrinsic: None,
+        };
+        *parsed =
+            crate::parser::oracle_ir::ast::parsed_clause(Effect::unimplemented(name, fragment));
+        *condition = None;
+        *is_optional = false;
+        *opponent_may_scope = None;
+        *repeat_for = None;
+        *player_scope = None;
+        *starting_with = None;
+        *delayed_condition = None;
+        *prefix_delayed_condition = None;
+        *multi_target = None;
+        *where_x_expression = None;
+        *unless_pay = None;
+        *target_selection_mode = TargetSelectionMode::Chosen;
+        *target_chooser = None;
+        *declared_target_choice_timing = None;
+        *printed_color_choice = None;
+        *declared_player_group = None;
+        *chosen_color_grant = None;
+        *placement = ClausePlacement::Sibling;
+    }
 }
 
 impl ClauseDisposition {
@@ -1157,6 +1244,7 @@ impl ClauseIrBuilder {
             target_chooser: None,
             declared_target_choice_timing: None,
             printed_color_choice: None,
+            declared_player_group: None,
             placement: ClausePlacement::Sibling,
         }
     }
@@ -1234,7 +1322,11 @@ impl ClauseIrBuilder {
         .target_chooser(c.target_chooser)
         .declared_target_choice_timing(c.declared_target_choice_timing)
         .printed_color_choice(c.printed_color_choice)
+        .declared_player_group(c.declared_player_group)
         .push();
+        if let Some(absorbed) = self.clauses.last_mut() {
+            absorbed.target_reads = c.target_reads;
+        }
     }
 
     /// Consume the builder, yielding the source-ordered clause list.
@@ -1268,6 +1360,7 @@ pub(crate) struct ClauseDraft<'a> {
     target_chooser: Option<TargetFilter>,
     declared_target_choice_timing: Option<TargetChoiceTiming>,
     printed_color_choice: Option<ChoiceType>,
+    declared_player_group: Option<ChosenGroupId>,
     placement: ClausePlacement,
 }
 
@@ -1353,6 +1446,10 @@ impl ClauseDraft<'_> {
     /// filter with no `Effect::Unimplemented` and no parse warning.
     pub(crate) fn printed_color_choice(mut self, v: Option<ChoiceType>) -> Self {
         self.printed_color_choice = v;
+        self
+    }
+    pub(crate) fn declared_player_group(mut self, v: Option<ChosenGroupId>) -> Self {
+        self.declared_player_group = v;
         self
     }
 
@@ -1575,6 +1672,7 @@ impl ClauseDraft<'_> {
             id,
             declares_chosen_clause,
             reads_chosen_clause,
+            target_reads: TargetReadOrigin::OwnAnnouncement,
             reads_return_result,
             source,
             disposition: self.disposition,
@@ -1598,6 +1696,7 @@ impl ClauseDraft<'_> {
             chosen_color_grant: crate::parser::oracle_nom::filter::classify_chosen_color_grant(
                 &self.source_text,
             ),
+            declared_player_group: self.declared_player_group,
             placement: self.placement,
             _sealed: (),
         });
@@ -1659,7 +1758,7 @@ mod tests {
 
     #[test]
     fn delayed_return_reader_after_a_repeat_is_not_a_single_iteration_result() {
-        let text = "Choose target creature you own. Return each chosen creature to your hand. Repeat this process once. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each creature returned to your hand this way.";
+        let text = "Choose target creature you own. Return each chosen creature to your hand. Repeat this process any number of times. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each creature returned to your hand this way.";
         let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
             text,
             AbilityKind::Spell,
@@ -1714,7 +1813,7 @@ mod tests {
 
     #[test]
     fn delayed_return_reader_inside_repeated_process_keeps_its_instruction_link() {
-        let text = "Choose target creature you own. Return each chosen creature to your hand. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each creature returned to your hand this way. Repeat this process once.";
+        let text = "Choose target creature you own. Return each chosen creature to your hand. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each creature returned to your hand this way. Repeat this process any number of times.";
         let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
             text,
             AbilityKind::Spell,
@@ -1755,7 +1854,7 @@ mod tests {
     #[test]
     fn delayed_return_reader_cannot_bind_across_any_repeated_process_boundary() {
         for (directive, expect_count, expect_stop) in [
-            ("Repeat this process once.", false, false),
+            ("Repeat this process any number of times.", false, false),
             ("Repeat this process one more time.", true, false),
             (
                 "Repeat this process until you put a card into your hand.",
@@ -1821,7 +1920,7 @@ mod tests {
 
     #[test]
     fn a_second_repeated_process_boundary_advances_the_reader_cutoff() {
-        let text = "Choose target creature you own. Return each chosen creature to your hand. Repeat this process once. Choose target artifact you own. Return each chosen artifact to your hand. Repeat this process once. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each artifact returned to your hand this way.";
+        let text = "Choose target creature you own. Return each chosen creature to your hand. Repeat this process any number of times. Choose target artifact you own. Return each chosen artifact to your hand. Repeat this process any number of times. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each artifact returned to your hand this way.";
         let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
             text,
             AbilityKind::Spell,
@@ -1845,7 +1944,7 @@ mod tests {
 
     #[test]
     fn later_independent_return_after_repeat_can_bind_its_own_reader() {
-        let text = "Choose target creature you own. Return each chosen creature to your hand. Repeat this process once. Choose target artifact you own. Return each chosen artifact to your hand. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each artifact returned to your hand this way.";
+        let text = "Choose target creature you own. Return each chosen creature to your hand. Repeat this process any number of times. Choose target artifact you own. Return each chosen artifact to your hand. At the beginning of the next upkeep, create a 1/1 white Soldier creature token for each artifact returned to your hand this way.";
         let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
             text,
             AbilityKind::Spell,
