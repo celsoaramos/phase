@@ -1282,6 +1282,8 @@ fn play_land_from_graveyard_with_permission() {
                 graveyard_destination_replacement: None,
                 extra_cost: None,
                 enters_with_counter: None,
+                required_cast_keyword: None,
+                pool: engine::types::statics::GraveyardPermissionPool::OwnGraveyard,
             })
             .affected(TargetFilter::Typed(
                 engine::types::ability::TypedFilter::new(TypeFilter::Land),
@@ -1350,6 +1352,8 @@ fn play_land_from_graveyard_respects_land_drop_limit() {
                 graveyard_destination_replacement: None,
                 extra_cost: None,
                 enters_with_counter: None,
+                required_cast_keyword: None,
+                pool: engine::types::statics::GraveyardPermissionPool::OwnGraveyard,
             })
             .affected(TargetFilter::Typed(
                 engine::types::ability::TypedFilter::new(TypeFilter::Land),
@@ -1419,6 +1423,8 @@ fn muldrotha_per_permanent_type_blocks_second_land_from_graveyard() {
                 graveyard_destination_replacement: None,
                 extra_cost: None,
                 enters_with_counter: None,
+                required_cast_keyword: None,
+                pool: engine::types::statics::GraveyardPermissionPool::OwnGraveyard,
             })
             .affected(TargetFilter::Typed(
                 engine::types::ability::TypedFilter::new(TypeFilter::Permanent),
@@ -1499,6 +1505,8 @@ fn muldrotha_per_permanent_type_resets_at_turn_start() {
                 graveyard_destination_replacement: None,
                 extra_cost: None,
                 enters_with_counter: None,
+                required_cast_keyword: None,
+                pool: engine::types::statics::GraveyardPermissionPool::OwnGraveyard,
             })
             .affected(TargetFilter::Typed(
                 engine::types::ability::TypedFilter::new(TypeFilter::Permanent),
@@ -2360,7 +2368,7 @@ fn miracle_accept_casts_for_miracle_cost() {
     }
     // The {W} was paid — pool should be empty.
     assert!(
-        runner.state().players[0].mana_pool.mana.is_empty(),
+        runner.state().players[0].mana_pool.is_empty(),
         "miracle cost of {{W}} should have consumed the white mana"
     );
 }
@@ -2555,9 +2563,9 @@ fn miracle_cost_is_reduced_by_medallion_static() {
         "spell should be on the stack via Miracle variant"
     );
     assert!(
-        runner.state().players[0].mana_pool.mana.is_empty(),
+        runner.state().players[0].mana_pool.is_empty(),
         "the reduced miracle cost {{R}} should consume the single red mana, got {:?}",
-        runner.state().players[0].mana_pool.mana
+        runner.state().players[0].mana_pool
     );
 }
 
