@@ -153,7 +153,12 @@ pub fn resolve(
                                     .is_some_and(|obj| obj.zone == Zone::Exile)
                             })
                             .collect();
-                    if linked.is_empty() && !crate::game::exile_links::source_is_linked_exile_consumer(state, ability.source_id) {
+                    if linked.is_empty()
+                        && !crate::game::exile_links::source_is_linked_exile_consumer(
+                            state,
+                            ability.source_id,
+                        )
+                    {
                         return Err(EffectError::MissingParam(
                             "CopyTokenOf requires a cost-paid object".to_string(),
                         ));

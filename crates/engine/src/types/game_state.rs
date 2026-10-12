@@ -851,6 +851,12 @@ impl PromptSourceBinding {
 pub enum NamedChoiceSourceBinding {
     ResolutionContext,
     ExactObjectAndResolution,
+    /// CR 614.12a: the answer belongs to the battlefield entry parked in
+    /// `GameState::pending_replacement` — an "As ~ enters, choose …"
+    /// replacement whose choice is made before the permanent enters. The answer
+    /// rides the entry event (`ProposedEvent::ZoneChange::enter_with_choices`)
+    /// and is never written onto a live object or resolution projection.
+    PendingEntry,
 }
 
 /// Exact source authority carried by a source-bound `NamedChoice` prompt.
@@ -20304,8 +20310,8 @@ pub struct StackPaidSnapshot {
 /// OR in `unclassified`. Over-approximation is correctness-preserving; under-
 /// approximation is a silent trigger drop.
 ///
-/// CR 603.6a + CR 611.2e: Granted triggers (sliver lords, Cairn Wanderer,
-/// Bramble Sovereign) are materialized by `evaluate_layers` into
+/// CR 613.1f: Granted triggers (sliver lords) are materialized by
+/// `evaluate_layers` into
 /// `obj.trigger_definitions`. The index's battlefield-scoped portion is
 /// rebuilt at the end of `evaluate_layers` so it always reflects post-layer
 /// trigger sets. That rebuild is the **authoritative correctness path**; the
@@ -20325,6 +20331,24 @@ pub struct TriggerIndex {
     /// Consulted on every event regardless of `keys_from_event` output.
     /// Empty for the common case where every trigger's mode is known.
     pub unclassified: smallvec::SmallVec<[ObjectId; 4]>,
+    /// `Built` once `TriggerIndex::rebuild_from_battlefield` has populated this
+    /// value; `Unbuilt` from `Default`, which is also what a deserialize produces
+    /// (the `GameState` field is `#[serde(skip)]`). `add` and `remove` (and
+    /// `reindex_object_triggers`, which composes them) leave it unchanged.
+    pub readiness: DerivedIndexReadiness,
+}
+
+/// Whether a derived index has been populated by a full scan of the state it
+/// indexes. Distinguishes "never built" from "built and legitimately empty",
+/// which bucket emptiness cannot. `Unbuilt` is the default, so a
+/// `#[serde(skip)]` index restores as `Unbuilt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DerivedIndexReadiness {
+    /// Not populated by a full scan since this index value was created.
+    #[default]
+    Unbuilt,
+    /// Populated by a full scan since this index value was created.
+    Built,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21296,9 +21320,8 @@ declare_game_state! {
     #[serde(skip)]
     pub static_gate_truth: im::HashMap<StaticGateKey, bool>,
     /// CR 603.2: Candidate pre-filter for `collect_pending_triggers`. Rebuilt
-    /// lazily after deserialize via a sentinel check at the top of the consult
-    /// site; rebuilt eagerly at the end of `evaluate_layers` (CR 611.2e) so the
-    /// post-layer trigger set is reflected. `#[serde(skip)]` because the index
+    /// eagerly at the end of `evaluate_layers` so the post-layer
+    /// trigger set is reflected. `#[serde(skip)]` because the index
     /// is derived state — reconstructed from `state.battlefield` + per-object
     /// `trigger_definitions` whenever needed.
     #[serde(skip)]
@@ -25294,6 +25317,55 @@ pub struct PendingReplacement {
     /// before the replacement is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub may_cost_remaining: Option<AbilityCost>,
+    /// The event the logical zone-change owner parked on, when it differs from
+    /// `proposed`. An answered pre-entry choice (CR 614.12a) writes into
+    /// `proposed`, and a CR 616.1f re-park replaces it, but the owner's paused
+    /// delivery is keyed on the exact event it first parked on
+    /// (`PendingZoneChangeDelivery::captures`). `None` means `proposed` is that
+    /// boundary. Read and written only through the `PendingReplacement`
+    /// boundary methods below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_boundary: Option<Box<ProposedEvent>>,
+}
+
+impl PendingReplacement {
+    /// The event the logical owner of this paused zone-change delivery parked
+    /// on. The single authority every owner match reads — capture
+    /// (`GameState::pending_zone_change_delivery_from_replacement`),
+    /// settlement, and CR 800.4a abandonment — so none of them compares the
+    /// mutable `proposed` directly.
+    pub fn delivery_boundary_event(&self) -> &ProposedEvent {
+        self.delivery_boundary.as_deref().unwrap_or(&self.proposed)
+    }
+
+    /// Whether this record is the paused delivery its owner parked on as
+    /// `expected_event`.
+    pub fn parks_delivery(&self, expected_event: &ProposedEvent) -> bool {
+        self.delivery_boundary_event() == expected_event
+    }
+
+    /// Pin the current boundary before an answer changes `proposed` (CR
+    /// 614.12a pre-entry choice, CR 616.1b entry-controller choice).
+    pub fn pin_delivery_boundary(&mut self) {
+        if self.delivery_boundary.is_none() {
+            self.delivery_boundary = Some(Box::new(self.proposed.clone()));
+        }
+    }
+
+    /// CR 616.1f: a fresh record re-parked for the SAME zone change keeps the
+    /// boundary its predecessor answered to.
+    pub fn inherit_delivery_boundary(&mut self, predecessor: &ProposedEvent) {
+        let same_zone_change = matches!(
+            (&self.proposed, predecessor),
+            (
+                ProposedEvent::ZoneChange { object_id: now, .. },
+                ProposedEvent::ZoneChange { object_id: was, .. },
+            ) if now == was
+        );
+        if self.delivery_boundary.is_none() && same_zone_change && self.proposed != *predecessor {
+            self.delivery_boundary = Some(Box::new(predecessor.clone()));
+        }
+    }
 }
 
 /// CR 701.21a: The subject and controller of a sacrifice whose inner zone
@@ -27761,7 +27833,10 @@ impl GameState {
     pub fn pending_zone_change_delivery_from_replacement(
         &self,
     ) -> Option<PendingZoneChangeDelivery> {
-        let expected_event = self.pending_replacement.as_ref()?.proposed.clone();
+        let pending = self.pending_replacement.as_ref()?;
+        // The owner parked on the record's boundary, which an answered
+        // pre-entry choice or a CR 616.1f re-park may have left behind `proposed`.
+        let expected_event = pending.delivery_boundary_event().clone();
         let object_id = match &expected_event {
             ProposedEvent::ZoneChange { object_id, .. } => *object_id,
             _ => return None,

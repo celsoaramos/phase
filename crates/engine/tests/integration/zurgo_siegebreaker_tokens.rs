@@ -33,7 +33,10 @@ fn advance_through_combat_to(runner: &mut super::rules::GameRunner, phase: Phase
             other => panic!("unexpected window advancing to {phase:?}: {other:?}"),
         }
     }
-    panic!("never reached {phase:?}; stuck at {:?}", runner.state().waiting_for);
+    panic!(
+        "never reached {phase:?}; stuck at {:?}",
+        runner.state().waiting_for
+    );
 }
 
 #[test]
@@ -67,12 +70,24 @@ fn zurgo_warrior_tokens_survive_the_mobilize_sacrifice() {
         .filter(|o| o.is_token && o.zone == Zone::Battlefield && o.name == "Warrior")
         .map(|o| o.id)
         .collect();
-    assert_eq!(warriors.len(), 2, "both Warrior tokens must survive the end step");
+    assert_eq!(
+        warriors.len(),
+        2,
+        "both Warrior tokens must survive the end step"
+    );
     for id in warriors {
-        assert!(object_has_static_other(runner.state(), id, "CantBeSacrificed"));
+        assert!(object_has_static_other(
+            runner.state(),
+            id,
+            "CantBeSacrificed"
+        ));
     }
     // Zurgo itself is not a token: the grant must not be a self-reference.
-    assert!(!object_has_static_other(runner.state(), zurgo, "CantBeSacrificed"));
+    assert!(!object_has_static_other(
+        runner.state(),
+        zurgo,
+        "CantBeSacrificed"
+    ));
 }
 
 #[test]
