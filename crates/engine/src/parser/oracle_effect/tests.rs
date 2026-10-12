@@ -15,8 +15,8 @@ use crate::parser::parse_oracle_text;
 use crate::types::ability::CardPlayMode::{Cast, Play};
 use crate::types::ability::CastFromZoneDriver::{DuringResolution, LingeringPermission};
 use crate::types::ability::{
-    AbilityUseTally, AttachSelection, AttachmentKind, CardSelectionMode, CastCostModifier,
-    CastManaObjectScope, CastManaSpentMetric, CommanderOwnership, CountBinding,
+    AbilityUseTally, ActivationRestriction, AttachSelection, AttachmentKind, CardSelectionMode,
+    CastCostModifier, CastManaObjectScope, CastManaSpentMetric, CommanderOwnership, CountBinding,
     CounterTransferMode, DigRestOrder, ExcessRecipient, ForEachCategoryAction,
     MassLibraryShuffleMode, ModalChoice, PerpetualModification, PileSource, SeatDirection,
     TurnJournalKind, VoteTally, VoteVisibility, VoterScope,
@@ -2529,7 +2529,8 @@ fn stensian_class_builds_whenever_event_this_combat_delayed_trigger() {
         matches!(
             effect.effect.as_ref(),
             Effect::BecomePrepared {
-                target: TargetFilter::SelfRef
+                target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
             }
         ),
         "expected BecomePrepared{{SelfRef}}, got {:?}",
@@ -2545,6 +2546,103 @@ fn stensian_class_builds_whenever_event_this_combat_delayed_trigger() {
         !json.contains("\"Unimplemented\""),
         "parsed tree must contain no Effect::Unimplemented"
     );
+}
+
+/// CR 115.10a + CR 722.3a/b: the scope of "<subject> becomes (un)prepared"
+/// follows the subject's shape. An untargeted population ("each creature you
+/// control") is `All` and keeps its filter; a declared target is `Single`.
+/// Each `All` positive is paired with a `Single` negative of the same verb.
+#[test]
+fn becomes_prepared_scope_follows_subject_shape() {
+    use crate::types::ability::{ControllerRef, TypedFilter};
+    let yours = || TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You));
+
+    assert_eq!(
+        parse_effect("Each creature you control becomes prepared."),
+        Effect::BecomePrepared {
+            target: yours(),
+            scope: EffectScope::All,
+        }
+    );
+    assert_eq!(
+        parse_effect("Each creature you control becomes unprepared."),
+        Effect::BecomeUnprepared {
+            target: yours(),
+            scope: EffectScope::All,
+        }
+    );
+    // Paired negatives (reach guard: the parse produced the effect, not
+    // `Unimplemented`): a declared target is the single scope.
+    assert!(matches!(
+        parse_effect("Target creature becomes prepared."),
+        Effect::BecomePrepared {
+            scope: EffectScope::Single,
+            ..
+        }
+    ));
+    assert!(matches!(
+        parse_effect("Target creature becomes unprepared."),
+        Effect::BecomeUnprepared {
+            scope: EffectScope::Single,
+            ..
+        }
+    ));
+    // Grammar sibling (building-block row, no printed card): another
+    // population is also `All`, keeping its own controller.
+    match parse_effect("Each creature your opponents control becomes unprepared.") {
+        Effect::BecomeUnprepared {
+            target: TargetFilter::Typed(typed),
+            scope: EffectScope::All,
+        } => assert_ne!(typed.controller, Some(ControllerRef::You)),
+        other => panic!("expected a mass BecomeUnprepared, got {other:?}"),
+    }
+}
+
+/// CR 115.10a + CR 722.3a: the mass (`All`) reading of "<subject> becomes
+/// (un)prepared" is fail-closed. Only an untargeted subject that names an
+/// enumerable population ("each creature you control") is `All`; a subject the
+/// parser could not classify (`Any`, a contentless `Typed`, a player filter)
+/// matches no bounded population, so it keeps its filter under `Single` instead
+/// of sweeping both players' battlefields.
+#[test]
+fn prepared_designation_subject_unclassified_subject_stays_single() {
+    use super::subject::prepared_designation_subject;
+    use crate::parser::oracle_ir::ast::SubjectApplication;
+    use crate::types::ability::{ControllerRef, TypedFilter};
+    let untargeted = |affected: TargetFilter| SubjectApplication {
+        affected,
+        target: None,
+        multi_target: None,
+        inherits_parent: false,
+        is_optional: false,
+    };
+    let yours = TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You));
+
+    // Positive reach guard: the Codie subject shape is an enumerable
+    // population, through the helper and through the real parse.
+    assert_eq!(
+        prepared_designation_subject(&untargeted(yours.clone())),
+        (yours.clone(), EffectScope::All)
+    );
+    assert_eq!(
+        parse_effect("Each creature you control becomes prepared."),
+        Effect::BecomePrepared {
+            target: yours,
+            scope: EffectScope::All,
+        }
+    );
+
+    // Unclassified subjects: no enumerable population, so `Single`.
+    for unclassified in [
+        TargetFilter::Any,
+        TargetFilter::Typed(TypedFilter::default()),
+        TargetFilter::Player,
+    ] {
+        assert_eq!(
+            prepared_designation_subject(&untargeted(unclassified.clone())),
+            (unclassified, EffectScope::Single)
+        );
+    }
 }
 
 /// CR 601.2c + CR 508.1d + CR 509.1c: A dual-target combat compound —
@@ -3782,7 +3880,7 @@ fn compound_mass_counter_first_conjunct_stays_put_counter_all() {
     assert!(!matches!(*sub.effect, Effect::Unimplemented { .. }));
 }
 
-/// CR 603.7 + issue #6065: Inspiring Call — "Draw a card for each creature you
+/// CR 608.2c + issue #6065: Inspiring Call — "Draw a card for each creature you
 /// control with a +1/+1 counter on it. Those creatures gain indestructible until
 /// end of turn." Unlike Nalia (whose `PutCounterAll` publishes a tracked set),
 /// the `Draw` clause publishes NO tracked set — its target is the drawing player
@@ -3914,7 +4012,7 @@ fn nalia_de_arnise_counters_then_deathtouch_lowers_correctly() {
                 Some(Duration::UntilEndOfTurn),
                 "deathtouch grant must be UntilEndOfTurn"
             );
-            // CR 603.7: "those creatures" lowers to `ParentTarget` in the
+            // CR 608.2c: "those creatures" lowers to `ParentTarget` in the
             // subject-predicate parser, then the chain assembler rewrites
             // it to `TrackedSet(0)` because the prior clause
             // (`PutCounterAll`) publishes a tracked set at resolution.
@@ -4956,7 +5054,9 @@ fn whiplash_where_x_binds_equipment_count_to_life_loss_and_gain() {
             filter: TargetFilter::Typed(
                 TypedFilter::default()
                     .subtype("Equipment".to_string())
-                    .properties(vec![FilterProp::AttachedToSource]),
+                    .properties(vec![FilterProp::AttachedTo {
+                        to: crate::types::ability::AttachmentReferent::Source,
+                    }]),
             ),
         },
     };
@@ -4980,7 +5080,9 @@ fn whiplash_where_x_binds_equipment_count_to_life_loss_and_gain() {
                             filter: TargetFilter::Typed(tf),
                         },
                 } => assert!(
-                    tf.properties.contains(&FilterProp::AttachedToSource),
+                    tf.properties.contains(&FilterProp::AttachedTo {
+                        to: crate::types::ability::AttachmentReferent::Source
+                    }),
                     "amount filter must carry AttachedToSource, got {:?}",
                     tf.properties
                 ),
@@ -10304,7 +10406,12 @@ fn damage_all_for_each_aura_attached_to_that_creature() {
                         }) => {
                             assert_eq!(controller, None);
                             assert_eq!(type_filters, vec![TypeFilter::Subtype("Aura".into())]);
-                            assert_eq!(properties, vec![FilterProp::AttachedToRecipient]);
+                            assert_eq!(
+                                properties,
+                                vec![FilterProp::AttachedTo {
+                                    to: crate::types::ability::AttachmentReferent::Recipient
+                                }]
+                            );
                         }
                         other => panic!("expected typed attachment filter, got {other:?}"),
                     },
@@ -10760,7 +10867,7 @@ fn effect_bounce() {
     assert!(matches!(e, Effect::Bounce { .. }));
 }
 
-/// CR 400.7 + CR 611.2c: Mass-bounce class — "return all/each [filter]"
+/// CR 400.7: Mass-bounce class — "return all/each [filter]"
 /// must lower to `Effect::BounceAll`, not single-target `Effect::Bounce`,
 /// so the runtime resolver iterates every matching permanent instead of
 /// prompting for one.
@@ -12251,20 +12358,82 @@ fn effect_self_ref_endures_strips_subject_to_endure() {
     );
 }
 
+// SHAPE: CR 107.3a + CR 701.63a: bare X retains the announced amount.
 #[test]
-fn effect_endure_dynamic_x_degrades_gracefully_without_binding() {
-    // CR 701.63b: bare "it endures X" without a defining clause still
-    // degrades to endure 0 (nothing happens).
-    let e = parse_effect("it endures X");
+fn effect_endure_dynamic_x_preserves_announced_variable() {
+    for text in ["it endures X", "this creature endures X", "~ endures X"] {
+        let e = parse_effect(text);
+        assert!(
+            matches!(
+                &e,
+                Effect::Endure {
+                    amount: QuantityExpr::Ref { qty: QuantityRef::Variable { name } },
+                    ..
+                } if name == "X"
+            ),
+            "expected symbolic Endure X, got {e:?}"
+        );
+    }
+}
+
+// SHAPE: literal amounts remain literals, including Endure 0 (CR 701.63b).
+#[test]
+fn effect_endure_literal_zero_and_two_remain_fixed() {
+    for (text, expected) in [
+        ("this creature endures 0", 0),
+        ("this creature endures 2", 2),
+    ] {
+        assert!(matches!(parse_effect(text), Effect::Endure {
+            amount: QuantityExpr::Fixed { value }, subject: TargetFilter::SelfRef,
+        } if value == expected));
+    }
+}
+
+// SHAPE: CR 602.2b + CR 602.5d: preserve the full printed cost and restriction.
+#[test]
+fn krumar_initiate_full_activation_preserves_x_cost_and_endure_shape() {
+    let parsed = parse_oracle_text(
+        "{X}{B}, {T}, Pay X life: This creature endures X. Activate only as a sorcery. (Put X +1/+1 counters on it or create an X/X white Spirit creature token.)",
+        "Krumar Initiate", &[], &["Creature".to_string()], &["Human".to_string(), "Cleric".to_string()],
+    );
+    assert_eq!(parsed.abilities.len(), 1);
+    let def = &parsed.abilities[0];
+    assert_eq!(def.kind, AbilityKind::Activated);
+    assert!(matches!(def.effect.as_ref(), Effect::Endure {
+        amount: QuantityExpr::Ref { qty: QuantityRef::Variable { name } },
+        subject: TargetFilter::SelfRef,
+    } if name == "X"));
+    assert_eq!(
+        def.cost,
+        Some(AbilityCost::Composite {
+            costs: vec![
+                AbilityCost::Mana {
+                    cost: ManaCost::Cost {
+                        shards: vec![ManaCostShard::X, ManaCostShard::Black],
+                        generic: 0
+                    }
+                },
+                AbilityCost::Tap,
+                AbilityCost::PayLife {
+                    amount: QuantityExpr::Ref {
+                        qty: QuantityRef::Variable {
+                            name: "X".to_string()
+                        }
+                    }
+                },
+            ]
+        })
+    );
+    assert_eq!(
+        def.activation_restrictions,
+        vec![ActivationRestriction::AsSorcery]
+    );
+    assert!(def.sub_ability.is_none());
+    assert!(def.else_ability.is_none());
     assert!(
-        matches!(
-            e,
-            Effect::Endure {
-                amount: QuantityExpr::Fixed { value: 0 },
-                ..
-            } | Effect::Unimplemented { .. }
-        ),
-        "bare dynamic endure X must degrade to Endure{{0}} or Unimplemented, got {e:?}"
+        parsed.parse_warnings.is_empty(),
+        "all printed clauses must survive: {:?}",
+        parsed.parse_warnings
     );
 }
 
@@ -16035,7 +16204,7 @@ fn hunger_tide_rises_chapter_iv_sacrifice_search_put_chain() {
     );
 }
 
-/// CR 608.2c + CR 117.3a + CR 701.23a + CR 603.7: Winds of
+/// CR 608.2c + CR 117.3a + CR 701.23a: Winds of
 /// Abandon — iterated subject-anchored search. The structure mirrors
 /// Assassin's Trophy but the search step carries `repeat_for:
 /// TrackedSetSize` so each exiled creature's controller searches their own
@@ -16175,8 +16344,8 @@ fn winds_of_abandon_iterated_subject_search_chain() {
 /// may search …, then shuffle") is a CASTER-subject switch (CR 109.5: "you"
 /// is the activator), so its `SearchLibrary`/`Shuffle` must route to the
 /// activator — NOT inherit the prior clause's `ParentTargetController` anchor.
-/// Pre-fix, `anchor_subject` was set once by clause (1) and never reset, so
-/// clause (2)'s caster-default search wrongly inherited the opponent.
+/// The carried non-caster player must not survive into clause (2), or its
+/// caster-default search would inherit the opponent.
 #[test]
 fn demolition_field_you_clause_routes_search_to_activator_not_opponent() {
     use crate::types::ability::AbilityKind;
@@ -20307,7 +20476,7 @@ fn look_at_top_then_exile_it_face_down_rewrites_dig_to_exile_top() {
     );
 }
 
-/// CR 400.7i + CR 603.7: The Gonti impulse-play grant ("You may play that
+/// CR 400.7i + CR 608.2c: The Gonti impulse-play grant ("You may play that
 /// card for as long as it remains exiled, and mana of any type can be spent
 /// to cast that spell") must bind to the card the preceding face-down
 /// `ExileTop` published into the tracked set — without it the grant would
@@ -20353,7 +20522,7 @@ fn exile_then_play_from_exile_grant_binds_to_tracked_set() {
     );
 }
 
-/// CR 603.7 + CR 400.7h + CR 118.9: The free-cast cross-clause grant —
+/// CR 608.2c + CR 400.7h + CR 118.9: The free-cast cross-clause grant —
 /// "exile the top card. Until end of turn, you may play that card without
 /// paying its mana cost." (Urza, Lord High Artificer's {5}) — must rebind
 /// the cast clause's `ParentTarget` to the tracked set the exile published.
@@ -26811,7 +26980,7 @@ fn parse_play_the_exiled_card_this_turn_targets_tracked_set() {
     ));
 }
 
-/// CR 118.5 + CR 118.9 + CR 603.7 + CR 608.2c: Fallen Shinobi class —
+/// CR 118.5 + CR 118.9 + CR 608.2c: Fallen Shinobi class —
 /// "Until end of turn, you may play those cards without paying their mana
 /// costs" must lower to `CastFromZone { without_paying_mana_cost: true,
 /// target: TrackedSet(0), mode: Play }` (a free-cast alternative cost
@@ -27064,7 +27233,7 @@ fn exiled_cause_publishers_all_stamp_exiled_at_runtime() {
     }
 }
 
-/// CR 603.7 + CR 611.2a + CR 118.9: Daxos of Meletis class — "Until end
+/// CR 608.2c + CR 611.2a + CR 118.9: Daxos of Meletis class — "Until end
 /// of turn, you may cast that card" (single-card anaphor, no "without
 /// paying"). Without `without paying` this is a normal casting permission
 /// for the exiled card — i.e. `GrantCastingPermission { PlayFromExile }`
@@ -27108,7 +27277,7 @@ fn parse_daxos_shape_emits_play_from_exile_with_tracked_set() {
     }
 }
 
-/// CR 603.7 + CR 611.2a: Act on Impulse class — "Until end of turn, you
+/// CR 608.2c + CR 611.2a: Act on Impulse class — "Until end of turn, you
 /// may play those cards" (no "without paying" clause) keeps the
 /// `GrantCastingPermission { PlayFromExile }` shape but its target must
 /// be the tracked exile set, not `TargetFilter::Any` (which would cause
@@ -27568,7 +27737,7 @@ fn exile_then_investigate_then_return_exiled_cards_uses_tracked_set() {
 /// tracked set, followed by "create a token that's a copy of that card,
 /// except it's an enchantment and loses all other card types." The copy
 /// clause must (a) rebind its `that card` anaphor to the tracked set
-/// (CR 603.7) and (b) carry the `SetCardTypes` exception so the token is an
+/// (CR 608.2c) and (b) carry the `SetCardTypes` exception so the token is an
 /// enchantment, not a creature (CR 205.1a + CR 707.9d). Uses an explicit
 /// exile target so the chain stitches without trigger-subject context.
 #[test]
@@ -28011,7 +28180,7 @@ fn parse_impulse_draw_chain_next_turn() {
         def.effect
     );
     let sub = def.sub_ability.as_ref().expect("Expected sub_ability");
-    // CR 603.7 + CR 611.2a: target must be the tracked exile set, not `Any`.
+    // CR 608.2c + CR 611.2a: target must be the tracked exile set, not `Any`.
     assert!(
         matches!(
             *sub.effect,
@@ -64512,7 +64681,7 @@ fn is_unimplemented_def(def: &AbilityDefinition) -> bool {
 /// `V-PAIR`'s whole subject. So the compile-error net is total over the variant
 /// dimension of all three enums and over their filter-field dimension; it is
 /// NOT total over that quantity-field dimension, which is written down here
-/// rather than claimed away. The 49 leaf variants in this function's final arm
+/// rather than claimed away. The leaf variants in this function's final arm
 /// carry no nested filter at all, so `false` is their answer, not a default.
 fn filter_has_chosen_color(f: &TargetFilter) -> bool {
     match f {
@@ -64564,6 +64733,7 @@ fn filter_has_chosen_color(f: &TargetFilter) -> bool {
         | TargetFilter::ParentTargetSlot { .. }
         | TargetFilter::ParentTargetController
         | TargetFilter::ParentTargetOwner
+        | TargetFilter::DeclaredPlayer { .. }
         | TargetFilter::SourceChosenPlayer
         | TargetFilter::OriginalController
         | TargetFilter::OriginalSource
@@ -64643,9 +64813,18 @@ fn prop_has_chosen_color(p: &FilterProp) -> bool {
         | FilterProp::HasAdventure
         | FilterProp::EnchantedBy
         | FilterProp::EquippedBy
-        | FilterProp::AttachedToSource
-        | FilterProp::AttachedToRecipient
-        | FilterProp::AttachedToPlayer { .. }
+        | FilterProp::AttachedTo {
+            to: crate::types::ability::AttachmentReferent::Source,
+        }
+        | FilterProp::AttachedTo {
+            to: crate::types::ability::AttachmentReferent::Recipient,
+        }
+        | FilterProp::AttachedTo {
+            to: crate::types::ability::AttachmentReferent::Player { .. },
+        }
+        | FilterProp::AttachedTo {
+            to: crate::types::ability::AttachmentReferent::DeclaredTarget { .. },
+        }
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::Another
@@ -64663,6 +64842,7 @@ fn prop_has_chosen_color(p: &FilterProp) -> bool {
         | FilterProp::MatchesLastChosenCardPredicate
         | FilterProp::HasSingleTarget
         | FilterProp::Modal
+        | FilterProp::PrepareSpell
         | FilterProp::NotColor { .. }
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
@@ -77543,7 +77723,7 @@ fn revealed_this_way_arm_ignores_mass_and_from_it_forms() {
     );
     assert_json_eq(
         &fall.abilities[0],
-        r#"{"kind":"Spell","effect":{"type":"RevealHand","target":{"type":"Player"},"card_filter":{"type":"None"},"count":null,"reveal":true},"cost":null,"sub_ability":{"kind":"Spell","effect":{"type":"Unimplemented","name":"unparsed_verb_arguments","description":"discard each nonland card revealed this way"},"cost":null,"sub_ability":null,"duration":null,"description":null,"target_prompt":null,"condition":null,"optional_targeting":false,"optional":false,"forward_result":false},"duration":null,"description":"Target player reveals two cards at random from their hand, then discards each nonland card revealed this way.","target_prompt":null,"condition":null,"optional_targeting":false,"optional":false,"forward_result":false}"#,
+        r#"{"kind":"Spell","effect":{"type":"RevealHand","target":{"type":"Player"},"card_filter":{"type":"None"},"count":null,"reveal":true},"declares_chosen_group":2147483648,"cost":null,"sub_ability":{"kind":"Spell","effect":{"type":"Unimplemented","name":"unparsed_verb_arguments","description":"discard each nonland card revealed this way"},"cost":null,"sub_ability":null,"duration":null,"description":null,"target_prompt":null,"condition":null,"optional_targeting":false,"optional":false,"forward_result":false},"duration":null,"description":"Target player reveals two cards at random from their hand, then discards each nonland card revealed this way.","target_prompt":null,"condition":null,"optional_targeting":false,"optional":false,"forward_result":false}"#,
         "Fall",
     );
 
@@ -77580,7 +77760,7 @@ fn kitesail_freebooter_unscoped_from_it_choice_is_unchanged() {
     assert!(non_controller_gaps(execute).is_empty());
     assert_json_eq(
         execute,
-        r#"{"kind":"Spell","effect":{"type":"RevealHand","target":{"type":"Typed","type_filters":[],"controller":"Opponent","properties":[]},"card_filter":{"type":"Typed","type_filters":[{"Non":"Creature"},{"Non":"Land"}],"controller":null,"properties":[]},"count":null,"reveal":true},"cost":null,"sub_ability":{"kind":"Spell","effect":{"type":"ChangeZone","origin":null,"destination":"Exile","target":{"type":"ParentTarget"},"owner_library":false,"enter_transformed":false,"enter_tapped":false,"enters_attacking":false},"cost":null,"sub_ability":null,"duration":"UntilHostLeavesPlay","description":null,"target_prompt":null,"condition":null,"optional_targeting":false,"optional":false,"forward_result":false,"sub_link":"SequentialSibling"},"duration":null,"description":null,"target_prompt":null,"condition":null,"optional_targeting":false,"optional":false,"forward_result":false}"#,
+        r#"{"kind":"Spell","effect":{"type":"RevealHand","target":{"type":"Typed","type_filters":[],"controller":"Opponent","properties":[]},"card_filter":{"type":"Typed","type_filters":[{"Non":"Creature"},{"Non":"Land"}],"controller":null,"properties":[]},"count":null,"reveal":true},"declares_chosen_group":2147483648,"cost":null,"sub_ability":{"kind":"Spell","effect":{"type":"ChangeZone","origin":null,"destination":"Exile","target":{"type":"ParentTarget"},"owner_library":false,"enter_transformed":false,"enter_tapped":false,"enters_attacking":false},"cost":null,"sub_ability":null,"duration":"UntilHostLeavesPlay","description":null,"target_prompt":null,"condition":null,"optional_targeting":false,"optional":false,"forward_result":false,"sub_link":"SequentialSibling"},"duration":null,"description":null,"target_prompt":null,"condition":null,"optional_targeting":false,"optional":false,"forward_result":false}"#,
         "Kitesail Freebooter's ETB",
     );
 }
@@ -81081,6 +81261,427 @@ fn self_cost_modification_after_closed_quote_is_its_own_chunk() {
     assert_eq!(anaphoric.len(), 1, "{anaphoric:?}");
 }
 
+mod carried_player_reference_tests {
+    use super::*;
+    use crate::types::ability::TypedFilter;
+    use crate::types::zones::Zone;
+
+    fn declared() -> TargetFilter {
+        TargetFilter::DeclaredPlayer {
+            group: ChosenGroupId::declared_player(0),
+        }
+    }
+
+    fn opponent_filter() -> TargetFilter {
+        TargetFilter::Typed(TypedFilter {
+            controller: Some(ControllerRef::Opponent),
+            ..Default::default()
+        })
+    }
+
+    fn search(target_player: TargetFilter) -> Effect {
+        Effect::SearchLibrary {
+            source_zones: vec![Zone::Library],
+            filter: TargetFilter::Any,
+            count: QuantityExpr::Fixed { value: 1 },
+            reveal: false,
+            target_player: Some(target_player),
+            selection_constraint: Default::default(),
+            split: None,
+        }
+    }
+
+    fn application(affected: TargetFilter, target: Option<TargetFilter>) -> SubjectApplication {
+        SubjectApplication {
+            affected,
+            target,
+            multi_target: None,
+            inherits_parent: false,
+            is_optional: false,
+        }
+    }
+
+    fn gain_life_controller() -> Effect {
+        Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            player: TargetFilter::Controller,
+        }
+    }
+
+    /// CR 115.1: only a declaring search names the declared player (consulting the builder
+    /// once); a Shuffle or ChangeZoneAll player filter is not a declaration, is returned
+    /// unchanged, and never consults it.
+    #[test]
+    fn extract_player_anchor_converts_only_a_declaring_search() {
+        let mut consulted = 0;
+        let mut declare = || {
+            consulted += 1;
+            declared()
+        };
+        for filter in [TargetFilter::Player, opponent_filter()] {
+            assert_eq!(
+                extract_player_anchor(&search(filter), &mut declare),
+                Some(declared())
+            );
+        }
+        assert_eq!(
+            extract_player_anchor(&search(TargetFilter::ParentTargetController), &mut declare),
+            Some(TargetFilter::ParentTargetController)
+        );
+        assert_eq!(
+            extract_player_anchor(
+                &Effect::Shuffle {
+                    target: TargetFilter::Player
+                },
+                &mut declare
+            ),
+            Some(TargetFilter::Player)
+        );
+        let mut sweep: Effect = serde_json::from_value(serde_json::json!({
+            "type": "ChangeZoneAll",
+            "destination": "Exile"
+        }))
+        .unwrap();
+        if let Effect::ChangeZoneAll { target, .. } = &mut sweep {
+            *target = opponent_filter();
+        }
+        assert_eq!(
+            extract_player_anchor(&sweep, &mut declare),
+            Some(opponent_filter())
+        );
+        assert_eq!(
+            consulted, 2,
+            "one consultation per declaring search, none otherwise"
+        );
+    }
+
+    /// One row per carry form: the reference, the phrase it re-supplies, its lifetime.
+    #[test]
+    fn carry_forms_supply_their_reference_and_lifetime() {
+        let carried = CarriedPlayerSubject::Declared;
+        assert_eq!(carried.reference(), &TargetFilter::ParentTarget);
+        let phrase = carried.subject_phrase(None);
+        assert_eq!(phrase.affected, Some(TargetFilter::ParentTarget));
+        assert_eq!(phrase.target, Some(TargetFilter::ParentTarget));
+        assert!(phrase.inherits_parent);
+        assert!(!carried.persists_across_sentences());
+        assert_eq!(carried.chain_reference(), None);
+
+        let scoped = CarriedPlayerSubject::from_leading_subject(&application(
+            TargetFilter::ScopedPlayer,
+            None,
+        ))
+        .expect("a scoped player subject carries");
+        let phrase = scoped.subject_phrase(None);
+        assert_eq!(phrase.affected, Some(TargetFilter::ScopedPlayer));
+        assert_eq!(phrase.target, None);
+        assert!(!phrase.inherits_parent);
+        assert!(!scoped.persists_across_sentences());
+
+        for antecedent in [declared(), TargetFilter::ParentTarget] {
+            let carry = CarriedPlayerSubject::antecedent(antecedent.clone());
+            let phrase = carry.subject_phrase(None);
+            assert_eq!(phrase.affected, Some(antecedent.clone()));
+            assert_eq!(phrase.target, None);
+            assert!(!phrase.inherits_parent);
+            assert!(carry.persists_across_sentences());
+            assert_eq!(carry.chain_reference(), Some(&antecedent));
+        }
+    }
+
+    #[test]
+    fn anaphoric_subject_carry_prefers_the_declared_slot() {
+        let event_player = application(TargetFilter::TriggeringPlayer, None);
+        assert_eq!(
+            CarriedPlayerSubject::from_anaphoric_subject(&event_player, Some(declared())),
+            Some(CarriedPlayerSubject::Reference {
+                filter: declared(),
+                lifetime: CarryLifetime::Sentence,
+            })
+        );
+        assert_eq!(
+            CarriedPlayerSubject::from_anaphoric_subject(&event_player, None),
+            Some(CarriedPlayerSubject::Reference {
+                filter: TargetFilter::TriggeringPlayer,
+                lifetime: CarryLifetime::Sentence,
+            })
+        );
+        let targeted = application(TargetFilter::ParentTarget, Some(TargetFilter::ParentTarget));
+        for refused in [
+            targeted,
+            application(TargetFilter::Controller, None),
+            application(TargetFilter::ScopedPlayer, None),
+        ] {
+            assert_eq!(
+                CarriedPlayerSubject::from_anaphoric_subject(&refused, Some(declared())),
+                None
+            );
+        }
+    }
+
+    /// CR 608.2c: the carried player is a player by construction, so a `Declared` or slot
+    /// phrase reaches the player-typed arms; a printed non-carry `ParentTarget` does not.
+    #[test]
+    fn carried_phrase_rewrites_player_arms_a_printed_object_reference_does_not() {
+        let carries = [
+            CarriedPlayerSubject::Declared,
+            CarriedPlayerSubject::antecedent(declared()),
+        ];
+        for carry in &carries {
+            let phrase = carry.subject_phrase(None);
+            let mut gain = gain_life_controller();
+            inject_subject_target(&mut gain, &phrase, "that player gains 1 life");
+            assert_eq!(
+                gain,
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: phrase.target.clone().or(phrase.affected.clone()).unwrap(),
+                }
+            );
+            let mut lib = search(TargetFilter::Player);
+            if let Effect::SearchLibrary { target_player, .. } = &mut lib {
+                *target_player = None;
+            }
+            inject_subject_target(&mut lib, &phrase, "that player searches their library");
+            let expected = match carry {
+                CarriedPlayerSubject::Declared => TargetFilter::ParentTargetController,
+                CarriedPlayerSubject::Reference { filter, .. } => filter.clone(),
+            };
+            assert!(matches!(
+                lib,
+                Effect::SearchLibrary { target_player: Some(ref searched), .. } if *searched == expected
+            ));
+        }
+        let printed_object = SubjectPhraseAst {
+            affected: Some(TargetFilter::ParentTarget),
+            target: None,
+            multi_target: None,
+            inherits_parent: false,
+            is_optional: false,
+        };
+        let mut gain = gain_life_controller();
+        inject_subject_target(
+            &mut gain,
+            &printed_object,
+            "that creature's controller gains 1 life",
+        );
+        assert_eq!(gain, gain_life_controller());
+    }
+}
+
+mod bare_player_pronoun_declaration_tests {
+    use super::bare_pronoun_after_object_creation_tests::effect_nodes;
+    use super::*;
+
+    /// The parsed chain plus its `Draw` nodes.
+    fn draws_of(text: &str) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let json = serde_json::to_value(parse_effect_chain(text, AbilityKind::Spell)).unwrap();
+        let mut nodes = Vec::new();
+        effect_nodes(&json, "Draw", &mut nodes);
+        let draws = nodes.into_iter().cloned().collect::<Vec<_>>();
+        (json, draws)
+    }
+
+    /// CR 115.1a + CR 608.2c: a bare "they"/"that player" after a clause that declares an object
+    /// (a type-less filter carrying a property, e.g. a token) has no declared player to refer to.
+    #[test]
+    fn a_property_carrying_object_clause_declares_no_player() {
+        for object_clause in ["Exile target token you control.", "Exile target token."] {
+            for (follow, reference) in [
+                ("They draw a card.", "ParentTarget"),
+                ("That player draws a card.", "ParentTargetController"),
+            ] {
+                let text = format!("{object_clause} {follow}");
+                let (json, draws) = draws_of(&text);
+                assert_eq!(draws.len(), 1, "reach guard: the Draw node: {text}: {json}");
+                assert_eq!(
+                    draws[0]["target"],
+                    serde_json::json!({ "type": reference }),
+                    "{text}: {json}"
+                );
+                assert!(
+                    json.get("declares_chosen_group").is_none(),
+                    "{text}: {json}"
+                );
+            }
+        }
+        for follow in ["They draw a card.", "That player draws a card."] {
+            let text = format!("Target player gains 2 life. {follow}");
+            let (json, draws) = draws_of(&text);
+            assert_eq!(draws.len(), 1, "reach guard: the Draw node: {text}: {json}");
+            let group = &json["declares_chosen_group"];
+            assert!(
+                group.is_number(),
+                "reach: the declaring node: {text}: {json}"
+            );
+            assert_eq!(
+                draws[0]["target"],
+                serde_json::json!({ "type": "DeclaredPlayer", "group": group }),
+                "{text}: {json}"
+            );
+        }
+    }
+}
+
+mod bare_pronoun_after_object_creation_tests {
+    use super::*;
+
+    pub(super) fn effect_nodes<'a>(
+        value: &'a serde_json::Value,
+        ty: &str,
+        out: &mut Vec<&'a serde_json::Value>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("type").and_then(|t| t.as_str()) == Some(ty) {
+                    out.push(value);
+                }
+                map.values().for_each(|v| effect_nodes(v, ty, out));
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|v| effect_nodes(v, ty, out)),
+            _ => {}
+        }
+    }
+
+    /// CR 608.2c: a bare "They" binds to the nearest clause that produces a referent; a token-creating
+    /// clause is one, a player-only "you gain" clause is not (Essence Feed).
+    #[test]
+    fn they_after_a_token_clause_reads_the_created_tokens_not_the_declared_player() {
+        let parsed = parse_oracle_text(
+            "Target player loses 3 life. You gain 3 life and create three 0/1 colorless Eldrazi Spawn creature tokens. They have \"Sacrifice this token: Add {C}.\"",
+            "Essence Feed",
+            &[],
+            &["Sorcery".to_string()],
+            &[],
+        );
+        let json = serde_json::to_value(&parsed.abilities).unwrap();
+        let (mut tokens, mut grants) = (Vec::new(), Vec::new());
+        effect_nodes(&json, "Token", &mut tokens);
+        effect_nodes(&json, "GenericEffect", &mut grants);
+        assert_eq!(tokens.len(), 1, "reach guard: the Token node: {json}");
+        assert_eq!(grants.len(), 1, "reach guard: the grant node: {json}");
+        assert_eq!(
+            grants[0]["static_abilities"][0]["affected"]["type"], "LastCreated",
+            "{}",
+            grants[0]
+        );
+        assert!(
+            !grants[0].to_string().contains("DeclaredPlayer"),
+            "{}",
+            grants[0]
+        );
+    }
+
+    fn chain_json(text: &str) -> serde_json::Value {
+        let parsed = parse_oracle_text(text, "Row", &[], &["Sorcery".to_string()], &[]);
+        serde_json::to_value(&parsed.abilities).unwrap()
+    }
+
+    /// CR 608.2c: "that player" and "<object> that player controls" take players only, so an
+    /// object-creating clause between the declaration and the reader does not stop them.
+    #[test]
+    fn player_only_readers_cross_a_token_clause_to_the_declared_player() {
+        for (text, reader, controller_scoped) in [
+            (
+                "Target opponent loses 2 life. Create a Treasure token. Destroy target creature that player controls.",
+                "Destroy",
+                true,
+            ),
+            (
+                "Target opponent loses 2 life. Create a Treasure token. That player discards a card.",
+                "Discard",
+                false,
+            ),
+        ] {
+            let json = chain_json(text);
+            let mut tokens = Vec::new();
+            effect_nodes(&json, "Token", &mut tokens);
+            assert_eq!(tokens.len(), 1, "reach guard: the Token node: {text}: {json}");
+            let mut readers = Vec::new();
+            effect_nodes(&json, reader, &mut readers);
+            assert_eq!(readers.len(), 1, "reach guard: the {reader} node: {text}: {json}");
+            let group = &json[0]["declares_chosen_group"];
+            assert!(group.is_number(), "reach: the declaring node: {text}: {json}");
+            let reference = if controller_scoped {
+                &readers[0]["target"]["controller"]
+            } else {
+                &readers[0]["target"]
+            };
+            let expected = if controller_scoped {
+                serde_json::json!({ "DeclaredPlayer": { "group": group } })
+            } else {
+                serde_json::json!({ "type": "DeclaredPlayer", "group": group })
+            };
+            assert_eq!(*reference, expected, "{text}: {json}");
+        }
+    }
+
+    /// With no declaration, the same token clause leaves nothing for "that player" to bind.
+    #[test]
+    fn player_only_readers_bind_no_player_across_a_token_clause_without_a_declaration() {
+        for (text, reader, expected) in [
+            (
+                "Destroy target creature. Create a Treasure token. That player discards a card.",
+                "Discard",
+                serde_json::json!({ "type": "ParentTargetController" }),
+            ),
+            (
+                "Create a Treasure token. Destroy target creature that player controls.",
+                "Destroy",
+                serde_json::json!("You"),
+            ),
+        ] {
+            let json = chain_json(text);
+            let mut tokens = Vec::new();
+            effect_nodes(&json, "Token", &mut tokens);
+            assert_eq!(
+                tokens.len(),
+                1,
+                "reach guard: the Token node: {text}: {json}"
+            );
+            let mut readers = Vec::new();
+            effect_nodes(&json, reader, &mut readers);
+            assert_eq!(
+                readers.len(),
+                1,
+                "reach guard: the {reader} node: {text}: {json}"
+            );
+            let target = &readers[0]["target"];
+            let reference = if reader == "Destroy" {
+                &target["controller"]
+            } else {
+                target
+            };
+            assert_eq!(*reference, expected, "{text}: {json}");
+            assert!(
+                !json.to_string().contains("declares_chosen_group"),
+                "{text}: {json}"
+            );
+        }
+    }
+
+    /// CR 608.2c: a bare "they" takes the tokens just created, however the declaration reached it.
+    #[test]
+    fn bare_they_after_a_token_clause_reads_the_tokens_with_a_non_caster_clause_between() {
+        let json = chain_json(
+            "Target player loses 3 life. Create two 1/1 white Spirit creature tokens. They have flying.",
+        );
+        let mut grants = Vec::new();
+        effect_nodes(&json, "GenericEffect", &mut grants);
+        assert_eq!(grants.len(), 1, "reach guard: the grant node: {json}");
+        assert_eq!(
+            grants[0]["static_abilities"][0]["affected"]["type"], "LastCreated",
+            "{}",
+            grants[0]
+        );
+        assert!(
+            !grants[0].to_string().contains("DeclaredPlayer"),
+            "{}",
+            grants[0]
+        );
+    }
+}
+
 const FINALE_OF_PROMISE: &str = "You may cast up to one target instant card and/or up to one target sorcery card from your graveyard each with mana value X or less without paying their mana costs. If a spell cast this way would be put into your graveyard, exile it instead. If X is 10 or more, copy each of those spells twice. You may choose new targets for the copies.";
 
 fn graveyard_cast_slot(card_type: TypeFilter) -> TargetFilter {
@@ -81177,4 +81778,147 @@ fn copy_each_of_those_spells_twice_is_a_member_loop_over_the_tracked_set() {
             }),
         })
     );
+}
+
+// SHAPE: CR 608.2k + CR 701.63a: the entering subject and source-derived
+// where-X amount remain distinct from the activated Endure-X route.
+#[test]
+fn warden_endure_where_x_preserves_entering_subject_and_source_counters_shape() {
+    let parsed = parse_oracle_text(
+        "At the beginning of your end step, put a +1/+1 counter on this creature.\nWhenever another nontoken creature you control enters, it endures X, where X is the number of counters on this creature. (Put X +1/+1 counters on the creature that entered or create an X/X white Spirit creature token.)",
+        "Warden of the Grove", &[], &["Creature".to_string()], &[],
+    );
+    assert_eq!(parsed.triggers.len(), 2);
+    let def = parsed.triggers[1]
+        .execute
+        .as_ref()
+        .expect("entering creature payoff");
+    assert!(matches!(
+        def.effect.as_ref(),
+        Effect::Endure {
+            amount: QuantityExpr::Ref {
+                qty: QuantityRef::CountersOn {
+                    scope: ObjectScope::Source,
+                    counter_type: None
+                }
+            },
+            subject: TargetFilter::TriggeringSource,
+        }
+    ));
+    assert!(def.sub_ability.is_none());
+    assert!(parsed.parse_warnings.is_empty());
+}
+
+const CURSE_OF_HOSPITALITY_GRANT: &str = "That player exiles the top card of their library. \
+Until end of turn, that creature's controller may play that card and they may spend mana as \
+though it were mana of any color to cast that spell.";
+
+fn trigger_chain(text: &str) -> AbilityDefinition {
+    let mut ctx = ParseContext {
+        in_trigger: true,
+        ..ParseContext::default()
+    };
+    parse_effect_chain_with_context(text, AbilityKind::Spell, &mut ctx)
+}
+
+fn play_grant(def: &AbilityDefinition) -> Option<(&CastingPermission, &PermissionGrantee)> {
+    std::iter::successors(Some(def), |link| link.sub_ability.as_deref()).find_map(|link| match link
+        .effect
+        .as_ref()
+    {
+        Effect::GrantCastingPermission {
+            permission: permission @ CastingPermission::PlayFromExile { .. },
+            grantee,
+            ..
+        } => Some((permission, grantee)),
+        _ => None,
+    })
+}
+
+/// CR 603.2 + CR 109.4 + CR 609.4b: inside a trigger, "that creature's
+/// controller may play that card" binds the grant to the triggering object's
+/// controller, the leading "until end of turn" is its duration, and the
+/// comma-less "and they may spend mana …" rider is folded onto it.
+#[test]
+fn a_triggering_creatures_controller_play_grant_keeps_its_grantee_and_rider() {
+    let def = trigger_chain(CURSE_OF_HOSPITALITY_GRANT);
+    let (permission, grantee) = play_grant(&def).expect("the play grant");
+    assert_eq!(*grantee, PermissionGrantee::TriggeringSourceController);
+    let CastingPermission::PlayFromExile {
+        duration,
+        mana_spend_permission,
+        ..
+    } = permission
+    else {
+        unreachable!()
+    };
+    assert_eq!(*duration, Duration::UntilEndOfTurn);
+    assert_eq!(*mana_spend_permission, Some(ManaSpendPermission::AnyColor));
+    assert!(
+        std::iter::successors(Some(&def), |link| link.sub_ability.as_deref())
+            .all(|link| !matches!(link.effect.as_ref(), Effect::Unimplemented { .. })),
+        "no gap is left: {def:?}"
+    );
+}
+
+/// The grantee form is read only inside a trigger, where "that creature" is
+/// the triggering object; elsewhere the clause is not claimed by it.
+#[test]
+fn a_triggering_creatures_controller_play_grant_is_not_read_outside_a_trigger() {
+    let def = parse_effect_chain(CURSE_OF_HOSPITALITY_GRANT, AbilityKind::Spell);
+    // The clause is reached and reported as the unbound-subject gap: the player
+    // subject has no slot here, so it is not lowered as the controller's grant.
+    assert!(
+        std::iter::successors(Some(&def), |link| link.sub_ability.as_deref()).any(|link| matches!(
+            link.effect.as_ref(),
+            Effect::Unimplemented { name, description: Some(text) }
+                if name == "unbound_subject" && text.contains("that creature's controller may play that card")
+        )),
+        "{def:?}"
+    );
+    assert!(play_grant(&def).is_none(), "{def:?}");
+}
+
+/// The grantee form is read whole: a longer predicate after "that card" is not
+/// shortened into the grant.
+#[test]
+fn a_triggering_creatures_controller_play_grant_is_read_whole() {
+    assert!(parses_triggering_creature_controller_grant(
+        "that creature's controller may play that card"
+    ));
+    assert!(parses_triggering_creature_controller_grant(
+        "that creature's controller may cast it."
+    ));
+    assert!(!parses_triggering_creature_controller_grant(
+        "that creature's controller may play that card without paying its mana cost"
+    ));
+    assert!(!parses_triggering_creature_controller_grant(
+        "that creature's controller may draw a card"
+    ));
+    // A period ends the clause only at the end of the input.
+    assert!(!parses_triggering_creature_controller_grant(
+        "that creature's controller may play that card. draw a card"
+    ));
+}
+
+/// CR 609.4b: the mana-rider conjunct is cut off only when it runs to the end
+/// of its sentence.
+#[test]
+fn a_mana_rider_conjunct_must_end_its_sentence() {
+    let rider = "and they may spend mana as though it were mana of any color to cast that spell";
+    assert!(starts_mana_spend_rider_conjunct(rider));
+    // The comma path reads the rest of the paragraph: the rider ends at its
+    // sentence's period, and a later sentence may follow.
+    assert!(starts_mana_spend_rider_conjunct(&format!(
+        "{rider}. draw a card"
+    )));
+    assert!(!starts_mana_spend_rider_conjunct(&format!(
+        "{rider} and draw a card"
+    )));
+    // The comma-less split reads the same rider after the bare "and ".
+    let bare = "they may spend mana as though it were mana of any color to cast that spell";
+    assert!(super::sequence::starts_bare_and_clause(bare));
+    assert!(!super::sequence::starts_bare_and_clause(&format!(
+        "{bare}. draw a card"
+    )));
 }
