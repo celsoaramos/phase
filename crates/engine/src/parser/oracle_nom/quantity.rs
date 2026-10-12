@@ -27,12 +27,12 @@ use crate::parser::oracle_target::{
 };
 use crate::parser::oracle_util::parse_subtype;
 use crate::types::ability::{
-    AggregateFunction, CardTypeSetSource, CastManaObjectScope, CastManaSpentMetric, Comparator,
-    ControllerRef, CountBinding, CountScope, DamageChannel, DamageKindFilter, DevotionColors,
-    FilterProp, LetterQuery, NameStickerSet, ObjectProperty, ObjectScope, PlayerFilter,
-    PlayerRelation, PlayerScope, PropertyAggregate, PtStat, QuantityExpr, QuantityRef,
-    RoundingMode, SharedQuality, SubtypeExclusion, TargetFilter, ThisWayCause,
-    TrackedAnaphorSource, TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
+    AggregateFunction, AttachmentReferent, CardTypeSetSource, CastManaObjectScope,
+    CastManaSpentMetric, Comparator, ControllerRef, CountBinding, CountScope, DamageChannel,
+    DamageKindFilter, DevotionColors, FilterProp, LetterQuery, NameStickerSet, ObjectProperty,
+    ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PropertyAggregate, PtStat,
+    QuantityExpr, QuantityRef, RoundingMode, SharedQuality, SubtypeExclusion, TargetFilter,
+    ThisWayCause, TrackedAnaphorSource, TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::keywords::Keyword;
@@ -123,6 +123,24 @@ pub(in crate::parser) fn parse_player_property_keyword(
         value(PlayerProperty::HandSize, tag("cards in hand")),
     ))
     .parse(input)
+}
+
+/// CR 102.1: the superlative-or-tie tail "most `<property>` or [are] tied for
+/// most `<property>`" — read by both the defender qualifier ("attacks the
+/// player with the most life or tied for most life") and the controller gate
+/// ("while you have the most life or are tied for most life"). Both property
+/// words must agree; `Speed` declines, like `player_property_leader_filter`,
+/// because `candidate_player_scalar` has no speed arm.
+pub(in crate::parser) fn parse_most_or_tied_for_most(
+    input: &str,
+) -> OracleResult<'_, PlayerProperty> {
+    let (rest, property) = preceded(tag("most "), parse_player_property_keyword).parse(input)?;
+    let (rest, _) = (tag(" or "), opt(tag("are ")), tag("tied for most ")).parse(rest)?;
+    let (rest, repeated) = parse_player_property_keyword(rest)?;
+    if repeated != property || property == PlayerProperty::Speed {
+        return Err(oracle_err(input));
+    }
+    Ok((rest, property))
 }
 
 /// Build the `QuantityRef` for a player-property of the given player scope.
@@ -1610,7 +1628,8 @@ fn parse_number_of_counters_it_had(input: &str) -> OracleResult<'_, QuantityRef>
     ))
 }
 
-/// Parse the object scope for counter references: "it", "that creature", "that permanent", etc.
+/// Parse the object scope for counter references: the granter placeholder, "it",
+/// "that creature", "that permanent", etc.
 ///
 /// CR 122.1 + CR 608.2k: A creature's ability that counts "+1/+1 counters on
 /// him" / "on her" / "on them" refers to that same source object's counters
@@ -1621,6 +1640,11 @@ fn parse_number_of_counters_it_had(input: &str) -> OracleResult<'_, QuantityRef>
 /// the self-reference token `~`) so it cannot drift from the other sites.
 fn parse_counter_object_scope(input: &str) -> OracleResult<'_, ObjectScope> {
     alt((
+        // CR 201.5a: a granted body's by-name counter read names the granting object.
+        value(
+            ObjectScope::GrantingObject,
+            super::target::parse_granting_object_ref,
+        ),
         value(
             ObjectScope::Source,
             alt((tag("~"), super::primitives::parse_object_recipient_pronoun)),
@@ -2877,7 +2901,7 @@ fn filter_is_population_anchored(filter: &TargetFilter) -> bool {
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::Opponent
         | TargetFilter::SelfRef
-        | TargetFilter::GrantingObject
+        | TargetFilter::GrantingObject { .. }
         | TargetFilter::SourceOrPaired
         | TargetFilter::StackAbility { .. }
         | TargetFilter::StackSpell
@@ -2907,6 +2931,7 @@ fn filter_is_population_anchored(filter: &TargetFilter) -> bool {
         | TargetFilter::EventTargetController
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::DeclaredPlayer { .. }
         | TargetFilter::ParentTargetController
         | TargetFilter::ParentTargetOwner
         | TargetFilter::SourceChosenPlayer
@@ -3013,7 +3038,7 @@ pub(crate) fn objects_filter_zone_is_unambiguous(filter: &TargetFilter) -> bool 
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::Opponent
         | TargetFilter::SelfRef
-        | TargetFilter::GrantingObject
+        | TargetFilter::GrantingObject { .. }
         | TargetFilter::SourceOrPaired
         | TargetFilter::StackAbility { .. }
         | TargetFilter::StackSpell
@@ -3043,6 +3068,7 @@ pub(crate) fn objects_filter_zone_is_unambiguous(filter: &TargetFilter) -> bool 
         | TargetFilter::EventTargetController
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::DeclaredPlayer { .. }
         | TargetFilter::ParentTargetController
         | TargetFilter::ParentTargetOwner
         | TargetFilter::SourceChosenPlayer
@@ -3621,9 +3647,13 @@ fn parse_for_each_one_life_changed_this_turn(input: &str) -> OracleResult<'_, Qu
 /// gained/lost this turn" (`LifeGainedThisTurn`/`LifeLostThisTurn`), whose
 /// "for each 1 life ... this turn" form `parse_for_each_one_life_changed_this_turn`
 /// claims first, and from Blood Tyrant's "1 life lost or gained this way" (no
-/// "you"; handled by the `TrackedSetSize` "this way" block).
+/// "you"; handled by the `TrackedSetSize` "this way" block). The subject is
+/// the triggering player either way: "you" on the controller's own trigger,
+/// the anaphoric "they" on a trigger about another player ("that player loses
+/// 2 life for each 1 life they gained" — False Cure).
 fn parse_for_each_one_life_changed(input: &str) -> OracleResult<'_, QuantityRef> {
-    let (rest, _) = alt((tag("1 life you "), tag("one life you "))).parse(input)?;
+    let (rest, _) = alt((tag("1 life "), tag("one life "))).parse(input)?;
+    let (rest, _) = alt((tag("you "), tag("they "))).parse(rest)?;
     value(
         QuantityRef::EventContextAmount,
         alt((tag("gained"), tag("lost"))),
@@ -6440,15 +6470,15 @@ fn parse_number_of_cards_put_into_graveyard_from_anywhere_this_turn(
 /// are disjoint and their sum is exact; a duplicated origin ("your hand or
 /// your hand") declines so it cannot double count. Origins other than your hand
 /// or library, other possessives, "and" joiners, and any missing/extra
-/// "this turn" decline the whole phrase. The owner is always "your": zone-list
-/// forms for other possessives stay `Unimplemented` (e.g. "target player's
-/// graveyard from their library").
+/// "this turn" decline the whole phrase. The owner is always "your" here: the
+/// "target player's graveyard from their ..." sibling lives in
+/// `parse_cards_put_into_target_player_graveyard_from_zones`.
 pub(crate) fn parse_cards_put_into_your_graveyard_from_zones(
     input: &str,
 ) -> OracleResult<'_, Vec<QuantityRef>> {
     let (rest, filter) = parse_cards_put_into_head(input)?;
     let (rest, _) = tag("your graveyard from ").parse(rest)?;
-    let (rest, zones) = parse_put_into_graveyard_origin_zones(rest)?;
+    let (rest, zones) = parse_put_into_graveyard_origin_zones_for_owner(rest, ControllerRef::You)?;
     let (rest, _) = tag(" this turn").parse(rest)?;
     let filter =
         super::condition::add_owned_with_props(filter, ControllerRef::You, &[FilterProp::NonToken]);
@@ -6465,10 +6495,62 @@ pub(crate) fn parse_cards_put_into_your_graveyard_from_zones(
     ))
 }
 
-/// CR 701.9a + CR 701.17a: origin list for "put into your graveyard from ...":
-/// "your hand", "your library", or either joined by "or" (the second possessive
-/// is optional: "your hand or library"). Distinct zones only.
-fn parse_put_into_graveyard_origin_zones(input: &str) -> OracleResult<'_, Vec<Zone>> {
+/// CR 107.3c (X defined by the spell's text is evaluated at resolution) +
+/// CR 701.17a (mill = library to graveyard) + CR 400.7 (per-turn zone-change
+/// records) + CR 404.1 (the "their" possessive is anaphoric to the announced
+/// target player's cards; a player's graveyard holds their cards) +
+/// CR 115.1a ("target player's" announces the spell's target): "[type] cards
+/// [that were] put into target player's graveyard from their <zone>[ or
+/// <zone>] this turn" (Cruel Calculations) -> one `ZoneChangeCountThisTurn`
+/// per origin zone (hand / library only), owned by the targeted player.
+///
+/// Mirrors `parse_cards_put_into_your_graveyard_from_zones`: the "their"
+/// possessive binds to `ControllerRef::TargetPlayer` (the announced target,
+/// read at resolution from the first `TargetRef::Player`), never to the
+/// `EnchantedPlayer` curse anaphor of the "from anywhere" form. Each
+/// zone-change record has exactly one `from_zone`, so the per-zone counts are
+/// disjoint and their sum is exact; a duplicated origin declines so it cannot
+/// double count. Mixed possessives ("their hand or your library"), "his or
+/// her", "and" joiners, non-hand/library origins, a bare "their graveyard"
+/// without the "target player's" head, and any missing/extra "this turn"
+/// decline the whole phrase.
+pub(crate) fn parse_cards_put_into_target_player_graveyard_from_zones(
+    input: &str,
+) -> OracleResult<'_, Vec<QuantityRef>> {
+    let (rest, filter) = parse_cards_put_into_head(input)?;
+    let (rest, _) = tag("target player's graveyard from ").parse(rest)?;
+    let (rest, zones) =
+        parse_put_into_graveyard_origin_zones_for_owner(rest, ControllerRef::TargetPlayer)?;
+    let (rest, _) = tag(" this turn").parse(rest)?;
+    let filter = super::condition::add_owned_with_props(
+        filter,
+        ControllerRef::TargetPlayer,
+        &[FilterProp::NonToken],
+    );
+    Ok((
+        rest,
+        zones
+            .into_iter()
+            .map(|zone| QuantityRef::ZoneChangeCountThisTurn {
+                from: Some(zone),
+                to: Some(Zone::Graveyard),
+                filter: filter.clone(),
+            })
+            .collect(),
+    ))
+}
+
+/// CR 701.9a (discard = hand to graveyard) + CR 701.17a (mill = library to
+/// graveyard): origin list for "put into [possessive] graveyard from ...",
+/// parameterized by owner so the your-form ("your hand", "your library") and
+/// the target-player form ("their hand", "their library") share one grammar.
+/// The first possessive is required and owner-bound ("your " for You, "their "
+/// for TargetPlayer); the second is optional ("your hand or library" / "their
+/// hand or library"). Distinct zones only.
+fn parse_put_into_graveyard_origin_zones_for_owner(
+    input: &str,
+    owner: ControllerRef,
+) -> OracleResult<'_, Vec<Zone>> {
     fn origin_zone(input: &str) -> OracleResult<'_, Zone> {
         alt((
             value(Zone::Hand, tag("hand")),
@@ -6476,13 +6558,31 @@ fn parse_put_into_graveyard_origin_zones(input: &str) -> OracleResult<'_, Vec<Zo
         ))
         .parse(input)
     }
+    let possessive = match owner {
+        ControllerRef::You => "your ",
+        ControllerRef::TargetPlayer => "their ",
+        ControllerRef::Opponent
+        | ControllerRef::ScopedPlayer
+        | ControllerRef::TargetOpponent
+        | ControllerRef::ParentTargetController
+        | ControllerRef::EventTargetController
+        | ControllerRef::ParentTargetOwner
+        | ControllerRef::DefendingPlayer
+        | ControllerRef::ChosenPlayer { .. }
+        | ControllerRef::SourceChosenPlayer
+        | ControllerRef::TriggeringPlayer
+        | ControllerRef::EnchantedPlayer
+        | ControllerRef::ActivePlayer
+        | ControllerRef::SpecificPlayer { .. }
+        | ControllerRef::DeclaredPlayer { .. } => return Err(oracle_err(input)),
+    };
     verify(
         map(
             pair(
-                preceded(tag("your "), origin_zone),
+                preceded(tag(possessive), origin_zone),
                 many0(preceded(
                     alt((tag(", or "), tag(" or "))),
-                    preceded(opt(tag("your ")), origin_zone),
+                    preceded(opt(tag(possessive)), origin_zone),
                 )),
             ),
             |(first, mut more)| {
@@ -6660,7 +6760,12 @@ pub(crate) fn parse_attachment_type_list(input: &str) -> OracleResult<'_, Vec<Ty
 /// pair.
 pub(crate) fn parse_attachment_referent_prop(input: &str) -> OracleResult<'_, FilterProp> {
     alt((
-        value(FilterProp::AttachedToSource, tag(" attached to ~")),
+        value(
+            FilterProp::AttachedTo {
+                to: AttachmentReferent::Source,
+            },
+            tag(" attached to ~"),
+        ),
         // CR 301.5a + CR 303.4: source-anaphoric gendered pronoun denotes the
         // ability source (same id as `~`) — Winter Soldier, Captain America
         // (MSH templates). Maps to AttachedToSource, identical to the `~` arm.
@@ -6671,11 +6776,15 @@ pub(crate) fn parse_attachment_referent_prop(input: &str) -> OracleResult<'_, Fi
         // the enchanted player, not the Aura source), which would bind the wrong
         // object set.
         value(
-            FilterProp::AttachedToSource,
+            FilterProp::AttachedTo {
+                to: AttachmentReferent::Source,
+            },
             alt((tag(" attached to him"), tag(" attached to her"))),
         ),
         value(
-            FilterProp::AttachedToRecipient,
+            FilterProp::AttachedTo {
+                to: AttachmentReferent::Recipient,
+            },
             alt((tag(" attached to it"), tag(" attached to that creature"))),
         ),
         // CR 303.4 + CR 301.5: player-referent pronoun/noun phrase — the
@@ -6688,8 +6797,10 @@ pub(crate) fn parse_attachment_referent_prop(input: &str) -> OracleResult<'_, Fi
         // the source is the correct referent (Curse of Thirst, Curse of
         // Surveillance).
         value(
-            FilterProp::AttachedToPlayer {
-                player: ControllerRef::EnchantedPlayer,
+            FilterProp::AttachedTo {
+                to: AttachmentReferent::Player {
+                    player: ControllerRef::EnchantedPlayer,
+                },
             },
             alt((tag(" attached to them"), tag(" attached to that player"))),
         ),
@@ -6979,7 +7090,8 @@ fn parse_for_each_controlled_type_with_keyword(input: &str) -> OracleResult<'_, 
 /// shared property predicate after "with". This is intentionally broader than
 /// the card that first needs it: extending the existing property axis keeps P/T
 /// comparisons and future typed properties in the same for-each building block
-/// as keyword and counter predicates.
+/// as keyword and counter predicates. A base-P/T designation ("with base power
+/// and toughness 2/2", CR 208.4b — Duskana) contributes two conjoined props.
 fn parse_for_each_controlled_type_with_property(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, has_other) =
         opt(alt((value((), tag("other ")), value((), tag("another "))))).parse(input)?;
@@ -6990,13 +7102,13 @@ fn parse_for_each_controlled_type_with_property(input: &str) -> OracleResult<'_,
     // its own `with` dispatch token. Returning after the bare controller phrase
     // would otherwise leave the comparison suffix unconsumed.
     let (rest, _) = tag(" control ").parse(rest)?;
-    let (rest, property) = super::filter::parse_with_property(rest)?;
+    let (rest, with_props) = super::filter::parse_with_properties(rest)?;
 
     let mut properties = Vec::new();
     if has_other.is_some() {
         properties.push(FilterProp::Another);
     }
-    properties.push(property);
+    properties.extend(with_props);
 
     Ok((
         rest,
@@ -8537,6 +8649,36 @@ mod tests {
         }
     }
 
+    /// CR 208.4b + CR 109.4 + CR 109.5: a base-P/T designation in the controller-scoped
+    /// for-each population contributes both exact base-scope props (Duskana,
+    /// the Rage Mother: "for each creature you control with base power and
+    /// toughness 2/2").
+    #[test]
+    fn parse_for_each_controlled_type_with_base_pt_designation() {
+        let (rest, q) =
+            parse_for_each_clause_ref("creature you control with base power and toughness 2/2")
+                .unwrap();
+        assert_eq!(rest, "");
+        let base_eq = |stat| FilterProp::PtComparison {
+            stat,
+            scope: crate::types::ability::PtValueScope::Base,
+            comparator: Comparator::EQ,
+            value: QuantityExpr::Fixed { value: 2 },
+        };
+        match q {
+            QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(tf),
+            } => {
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+                assert_eq!(
+                    tf.properties,
+                    vec![base_eq(PtStat::Power), base_eq(PtStat::Toughness)]
+                );
+            }
+            other => panic!("expected ObjectCount(Typed), got {other:?}"),
+        }
+    }
+
     /// CR 208.4b + CR 608.2c: nested negation and unrelated disjunction do not
     /// establish the direct comparison provenance used by "the difference".
     #[test]
@@ -8830,7 +8972,12 @@ mod tests {
                     properties,
                 }) => {
                     assert_eq!(controller, None);
-                    assert_eq!(properties, vec![FilterProp::AttachedToSource]);
+                    assert_eq!(
+                        properties,
+                        vec![FilterProp::AttachedTo {
+                            to: AttachmentReferent::Source
+                        }]
+                    );
                     assert_eq!(
                         type_filters,
                         vec![TypeFilter::AnyOf(vec![
@@ -8859,7 +9006,12 @@ mod tests {
                     properties,
                 }) => {
                     assert_eq!(controller, None);
-                    assert_eq!(properties, vec![FilterProp::AttachedToSource]);
+                    assert_eq!(
+                        properties,
+                        vec![FilterProp::AttachedTo {
+                            to: AttachmentReferent::Source
+                        }]
+                    );
                     assert_eq!(type_filters, vec![TypeFilter::Subtype("Aura".into())]);
                 }
                 other => panic!("expected Typed filter, got {other:?}"),
@@ -8886,7 +9038,12 @@ mod tests {
                     properties,
                 }) => {
                     assert_eq!(controller, None);
-                    assert_eq!(properties, vec![FilterProp::AttachedToRecipient]);
+                    assert_eq!(
+                        properties,
+                        vec![FilterProp::AttachedTo {
+                            to: AttachmentReferent::Recipient
+                        }]
+                    );
                     assert_eq!(
                         type_filters,
                         vec![TypeFilter::AnyOf(vec![
@@ -8917,7 +9074,12 @@ mod tests {
                     properties,
                 }) => {
                     assert_eq!(controller, None);
-                    assert_eq!(properties, vec![FilterProp::AttachedToRecipient]);
+                    assert_eq!(
+                        properties,
+                        vec![FilterProp::AttachedTo {
+                            to: AttachmentReferent::Recipient
+                        }]
+                    );
                     assert_eq!(type_filters, vec![TypeFilter::Subtype("Aura".into())]);
                 }
                 other => panic!("expected Typed filter, got {other:?}"),
@@ -8948,7 +9110,9 @@ mod tests {
                         assert_eq!(controller, None, "controller for {clause:?}");
                         assert_eq!(
                             properties,
-                            vec![FilterProp::AttachedToSource],
+                            vec![FilterProp::AttachedTo {
+                                to: AttachmentReferent::Source
+                            }],
                             "properties for {clause:?}"
                         );
                         assert_eq!(
@@ -8966,6 +9130,21 @@ mod tests {
 
     #[test]
     fn parse_for_each_attached_to_them_not_source_bound() {
+        // Positive control: the same combinator on the same type, with the
+        // source referent, does bind to the source — so the negative below is
+        // a real discrimination, not an unreachable parser.
+        let (rest, source_bound) = parse_for_each_attached_to_source("curse attached to ~")
+            .expect("\"attached to ~\" binds to the source");
+        assert_eq!(rest, "");
+        assert!(
+            matches!(
+                &source_bound,
+                QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(TypedFilter { properties, .. }),
+                } if properties.contains(&FilterProp::AttachedTo { to: AttachmentReferent::Source })
+            ),
+            "got {source_bound:?}"
+        );
         // CR 301.5a + CR 303.4: the singular-they "them" is recipient-anaphoric for
         // player-enchanting Auras (Curse of Thirst: "Curses attached to them" = the
         // enchanted player), so it must NOT bind to the source. The gendered arm
@@ -8982,7 +9161,7 @@ mod tests {
                 } = &q
                 {
                     assert!(
-                        !properties.contains(&FilterProp::AttachedToSource),
+                        !properties.contains(&FilterProp::AttachedTo { to: AttachmentReferent::Source }),
                         "\"attached to them\" must not bind to the source, got {q:?} (rest {rest:?})"
                     );
                 }
@@ -9000,7 +9179,12 @@ mod tests {
             QuantityRef::ObjectCount {
                 filter: TargetFilter::Typed(TypedFilter { properties, .. }),
             } => {
-                assert_eq!(properties, vec![FilterProp::AttachedToRecipient]);
+                assert_eq!(
+                    properties,
+                    vec![FilterProp::AttachedTo {
+                        to: AttachmentReferent::Recipient
+                    }]
+                );
             }
             other => panic!("expected recipient ObjectCount, got {other:?}"),
         }
@@ -9018,7 +9202,12 @@ mod tests {
                     properties,
                 }) => {
                     assert_eq!(controller, None);
-                    assert_eq!(properties, vec![FilterProp::AttachedToRecipient]);
+                    assert_eq!(
+                        properties,
+                        vec![FilterProp::AttachedTo {
+                            to: AttachmentReferent::Recipient
+                        }]
+                    );
                     assert_eq!(type_filters, vec![TypeFilter::Subtype("Aura".into())]);
                 }
                 other => panic!("expected Typed filter, got {other:?}"),

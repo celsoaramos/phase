@@ -39,8 +39,8 @@ use crate::types::ability::{
     AttachCardinality, AttachSelection, CastManaObjectScope, CastManaSpentMetric, CastVariantPaid,
     CoinFlipResult, Comparator, ControllerRef, CountScope, DamageChannel, DigSource, Duration,
     Effect, EffectOutcomeSignal, FilterProp, GuessOutcome, ObjectScope, ParsedCondition,
-    PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, StaticCondition, TargetFilter,
-    TypeFilter, TypedFilter,
+    PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, SpentColor, StaticCondition,
+    TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
@@ -203,8 +203,35 @@ fn comma_inside_if_creature_subtype_list(lower: &str, comma_idx: usize) -> bool 
     // the span ends where `parse_type_phrase_folding` stops consuming type words.
     target_anaphoric_subtype_span(lower, after_prefix)
         .is_some_and(|(start, end)| (start..end).contains(&comma_idx))
+        // CR 205.3m + CR 608.2c: "if you control a Fish, Octopus, Otter, Seal,
+        // Serpent, or Whale, draw a card" (Unagi's Spray) — the same list commas
+        // inside a control-presence condition.
+        || controls_type_span(lower, after_prefix)
+            .is_some_and(|(start, end)| (start..end).contains(&comma_idx))
 }
 
+/// CR 205.3m: the byte span of a CLOSED subtype list ("a Fish, Octopus, …, or
+/// Whale") in a "<player> control(s) [a/an] <list>" presence condition, or
+/// `None` when the text is not this shape. A lexical span like
+/// [`target_anaphoric_subtype_span`]: it can only prevent a wrong comma split.
+/// Only a list of two or more legs closed by "or" counts, so the comma that ends
+/// a one-type condition ("If you control a creature, creatures you control gain
+/// …") is still the condition's boundary.
+fn controls_type_span(lower: &str, after_prefix: &str) -> Option<(usize, usize)> {
+    let (after_subject, _) = alt((
+        tag::<_, _, OracleError<'_>>("you control "),
+        tag("an opponent controls "),
+    ))
+    .parse(after_prefix)
+    .ok()?;
+    let (subtypes, consumed) =
+        crate::parser::oracle_target::parse_relative_subtype_list(after_subject)?;
+    if subtypes.len() < 2 {
+        return None;
+    }
+    let start = lower.len() - after_subject.len();
+    Some((start, start + consumed))
+}
 /// CR 205.3m: Find the byte span of the subtype-disjunction predicate in a
 /// target-anaphoric "<subject> is a <subtype list>" condition. Returns the
 /// `[start, end)` offsets (relative to `lower`) of the parsed type phrase, or
@@ -1985,6 +2012,40 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
     let remainder = remainder_after_optional_comma(after_type);
     let offset = text.len() - remainder.len();
     (Some(condition), text[offset..].to_string())
+}
+
+/// CR 608.2c + CR 205.3: "the revealed [<core type>] card was a[n] <subtype>"
+/// — a past-tense subtype gate on the card a preceding reveal instruction
+/// revealed (Goblin Charbelcher: "If the revealed land card was a Mountain, …").
+/// The optional core-type word is the printed noun restating the reveal's own
+/// until-filter; it is carried as `card_types` so the gate fails closed for a
+/// revealed card of a different type. Lowers to the `RevealedHasCardType`
+/// subtype axis that the "it's a <type> card" family already uses.
+fn parse_revealed_card_was_subtype(input: &str) -> OracleResult<'_, AbilityCondition> {
+    let (input, _) = tag::<_, _, OracleError<'_>>("the revealed ").parse(input)?;
+    let (input, card_type) =
+        opt(terminated(nom_primitives::parse_core_type, tag(" "))).parse(input)?;
+    let (input, _) = tag("card was ").parse(input)?;
+    let (input, _) = alt((tag("an "), tag("a "))).parse(input)?;
+    let (subtype, consumed) = parse_subtype(input).ok_or_else(|| oracle_err(input))?;
+    let (input, _) = eof(&input[consumed..])?;
+    Ok((
+        input,
+        AbilityCondition::RevealedHasCardType {
+            card_types: card_type.into_iter().collect(),
+            additional_filter: None,
+            subtype_filter: Some(Box::new(TargetFilter::Typed(
+                TypedFilter::default().subtype(subtype),
+            ))),
+        },
+    ))
+}
+
+fn parse_revealed_card_was_subtype_condition_text(text: &str) -> Option<AbilityCondition> {
+    nom_parse_lower(
+        text.trim().trim_end_matches('.'),
+        parse_revealed_card_was_subtype,
+    )
 }
 
 fn parse_its_a_type_condition(
@@ -4696,6 +4757,10 @@ pub(super) fn parse_condition_text(text: &str) -> Option<AbilityCondition> {
         return Some(condition);
     }
 
+    if let Some(condition) = parse_revealed_card_was_subtype_condition_text(text) {
+        return Some(condition);
+    }
+
     let lower = text.to_ascii_lowercase();
     if let Some(condition) = parse_cost_paid_object_matches_filter_condition(lower.as_str()) {
         return Some(condition);
@@ -5074,12 +5139,18 @@ fn parse_symbolic_mana_color_spent_condition(
     let (rest, _) = parse_spent_to_cast_tail(rest)?;
     let condition = if counts.len() == 1 {
         let (color, minimum) = counts[0];
-        AbilityCondition::ManaColorSpent { color, minimum }
+        AbilityCondition::ManaColorSpent {
+            color: SpentColor::ManaSymbol { color },
+            minimum,
+        }
     } else {
         AbilityCondition::And {
             conditions: counts
                 .into_iter()
-                .map(|(color, minimum)| AbilityCondition::ManaColorSpent { color, minimum })
+                .map(|(color, minimum)| AbilityCondition::ManaColorSpent {
+                    color: SpentColor::ManaSymbol { color },
+                    minimum,
+                })
                 .collect(),
         }
     };
@@ -5087,7 +5158,8 @@ fn parse_symbolic_mana_color_spent_condition(
 }
 
 /// CR 106.3 + CR 601.2h: legacy leading-word form, "at least N <color> mana was
-/// spent to cast <self>" → `AbilityCondition::ManaColorSpent`.
+/// spent to cast <self>" → `AbilityCondition::ManaColorSpent` with a
+/// `SpentColor::ColorWord` color (CR 612.2).
 ///
 /// SHADOWED, kept as a fallback only. `parse_mana_color_spent_condition_text`
 /// has exactly one caller (`parse_condition_text`), and every non-test caller of
@@ -5101,8 +5173,7 @@ fn parse_symbolic_mana_color_spent_condition(
 /// `ManaColorSpent` cannot express.
 ///
 /// `parse_symbolic_mana_color_spent_condition` above is NOT shadowed — the
-/// `{W}{W}` symbolic form has no `parse_inner_condition` grammar and stays live
-/// for 22 cards.
+/// `{W}{W}` symbolic form has no `parse_inner_condition` grammar and stays live.
 fn parse_word_mana_color_spent_condition(
     input: &str,
 ) -> super::super::oracle_nom::error::OracleResult<'_, AbilityCondition> {
@@ -5112,7 +5183,13 @@ fn parse_word_mana_color_spent_condition(
     let (rest, color) = nom_primitives::parse_color(rest)?;
     let (rest, _) = tag(" mana").parse(rest)?;
     let (rest, _) = parse_spent_to_cast_tail(rest)?;
-    Ok((rest, AbilityCondition::ManaColorSpent { color, minimum }))
+    Ok((
+        rest,
+        AbilityCondition::ManaColorSpent {
+            color: SpentColor::ColorWord { color },
+            minimum,
+        },
+    ))
 }
 
 fn parse_spent_to_cast_tail(input: &str) -> super::super::oracle_nom::error::OracleResult<'_, ()> {
@@ -11197,7 +11274,9 @@ mod tests {
         assert_eq!(
             condition,
             Some(AbilityCondition::ManaColorSpent {
-                color: ManaColor::Black,
+                color: SpentColor::ManaSymbol {
+                    color: ManaColor::Black
+                },
                 minimum: 1,
             })
         );
@@ -11211,13 +11290,54 @@ mod tests {
             panic!("expected And condition");
         };
         assert!(conditions.contains(&AbilityCondition::ManaColorSpent {
-            color: ManaColor::White,
+            color: SpentColor::ManaSymbol {
+                color: ManaColor::White
+            },
             minimum: 1,
         }));
         assert!(conditions.contains(&AbilityCondition::ManaColorSpent {
-            color: ManaColor::Black,
+            color: SpentColor::ManaSymbol {
+                color: ManaColor::Black
+            },
             minimum: 1,
         }));
+    }
+
+    /// CR 612.2 + CR 107.4: each emitter records how its color was written.
+    #[test]
+    fn mana_color_spent_emitters_record_word_versus_symbol() {
+        let symbol = |color| SpentColor::ManaSymbol { color };
+        let spent = |color, minimum| AbilityCondition::ManaColorSpent { color, minimum };
+
+        let (rest, parsed) =
+            parse_symbolic_mana_color_spent_condition("{g}{g} was spent to cast ~")
+                .expect("the symbolic parser accepts {G}{G}");
+        assert_eq!(rest, "");
+        assert_eq!(parsed, spent(symbol(ManaColor::Green), 2));
+
+        let (rest, parsed) =
+            parse_word_mana_color_spent_condition("at least three red mana was spent to cast ~")
+                .expect("the shadowed word parser accepts the Adamant phrasing");
+        assert_eq!(rest, "");
+        assert_eq!(
+            parsed,
+            spent(
+                SpentColor::ColorWord {
+                    color: ManaColor::Red
+                },
+                3
+            )
+        );
+
+        assert_eq!(
+            parse_condition_text("{G}{U} was spent to cast this spell"),
+            Some(AbilityCondition::And {
+                conditions: vec![
+                    spent(symbol(ManaColor::Green), 1),
+                    spent(symbol(ManaColor::Blue), 1),
+                ],
+            })
+        );
     }
 
     #[test]
