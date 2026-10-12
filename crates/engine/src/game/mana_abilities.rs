@@ -49,7 +49,9 @@ use super::zone_pipeline::{self, ZoneMoveRequest, ZoneMoveResult};
 ///   checks mana affordability through the full auto-tap witness (CR 601.2g)
 ///   and honors tag-scoped mana via the correct ability index (CR 106.6).
 /// * `Planning` — used by auto-tap source scanning. Delegates to
-///   [`AbilityCost::is_payable_for_activation`] with the known `ability_index`.
+///   [`AbilityCost::is_payable_in`] with the known `ability_index` and
+///   `ObjectLegPayment::Unguided` object legs (the mana-ability payment path
+///   prompts its legs without look-ahead, as in `Current`).
 ///   That function already returns `true` for `AbilityCost::Mana` sub-costs
 ///   (CR 601.2g defers them to the mana payment step), so filter-land / Signet
 ///   costs are treated as payable during planning without duplicating the
@@ -949,7 +951,12 @@ fn resolve_single_color_override(
         None
     };
 
-    let resolved = super::effects::mana::resolve_mana_types_for_ability(produced, state, ability);
+    // CR 608.2d: an any-one-color amount reads the color chosen for it.
+    let bound = match mana_type_to_color(color) {
+        Some(chosen) => super::effects::mana::bind_any_one_color_choice(produced, chosen),
+        None => std::borrow::Cow::Borrowed(produced),
+    };
+    let resolved = super::effects::mana::resolve_mana_types_for_ability(&bound, state, ability);
 
     if let Some(previous) = previous_choice {
         state.last_named_choice = previous;
@@ -1127,11 +1134,27 @@ pub(crate) fn mana_choice_prompt(
     match produced {
         ManaProduction::AnyOneColor { color_options, .. } if color_options.len() > 1 => {
             // CR 106.5: An ability that would produce mana of an undefined type
-            // produces no mana, so it needs no color choice.
+            // produces no mana, so it needs no color choice. CR 608.2d: an
+            // amount that reads the color chosen for this production (devotion
+            // to that color) is decided by that choice, so the prompt is
+            // needed when any color would add mana.
             let produces_mana = count_ability
                 .map(|ability| {
-                    !super::effects::mana::resolve_mana_types_for_ability(produced, state, ability)
+                    let adds_mana = |produced: &ManaProduction| {
+                        !super::effects::mana::resolve_mana_types_for_ability(
+                            produced, state, ability,
+                        )
                         .is_empty()
+                    };
+                    if super::effects::mana::any_one_color_count_reads_choice(produced) {
+                        color_options.iter().any(|color| {
+                            adds_mana(&super::effects::mana::bind_any_one_color_choice(
+                                produced, *color,
+                            ))
+                        })
+                    } else {
+                        adds_mana(produced)
+                    }
                 })
                 .unwrap_or(true);
             produces_mana.then(|| ManaChoicePrompt::SingleColor {
@@ -1963,7 +1986,7 @@ pub(crate) fn mana_ability_ready_without_simulation_gated(
     // affordability via the auto-tap witness (CR 601.2g) and honors tag-scoped mana
     // via the correct ability index (CR 106.6).
     //
-    // `Planning` — delegates to `is_payable_for_activation(…, Some(ability_index))`. That function
+    // `Planning` — delegates to `is_payable_in(…, Some(ability_index), Unguided)`. That function
     // already returns `true` for `AbilityCost::Mana` sub-costs (CR 601.2g defers
     // them to the mana payment step), so filter-land / Signet costs are treated as
     // payable during planning. All other components (sacrifice, pay life, discard,
@@ -1977,7 +2000,15 @@ pub(crate) fn mana_ability_ready_without_simulation_gated(
                 }
             }
             ManaPayabilityMode::Planning => {
-                if !cost.is_payable_for_activation(state, player, source_id, Some(ability_index)) {
+                // Object-using legs are judged as the mana-ability payment
+                // path pays them (unguided), the same as `Current` readiness.
+                if !cost.is_payable_in(
+                    state,
+                    player,
+                    source_id,
+                    Some(ability_index),
+                    super::cost_payability::ObjectLegPayment::Unguided,
+                ) {
                     return false;
                 }
             }
@@ -3338,6 +3369,7 @@ fn finish_mana_ability_cost_payment(
         pending.player,
         pending.source_id,
         activation_kind,
+        None,
         ability_def.activation_zone.unwrap_or(Zone::Battlefield),
         events,
     );
@@ -5825,6 +5857,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
         let live_prompt = WaitingFor::DiscardChoice {
             player: PlayerId(0),
@@ -11208,6 +11241,7 @@ mod tests {
             kind: crate::types::events::ActivatedAbilityKind::Normal,
             departed_source_lki: None,
             trigger_state: crate::types::events::ActivationTriggerState::Pending,
+            stack_entry: None,
         };
         assert!(!is_triggered_mana_ability(&ability, Some(&ev)));
     }
