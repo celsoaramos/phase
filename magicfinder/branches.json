@@ -177,5 +177,8 @@
   },
   {
     "branch": "card/cavalcade-attacked-player"
+  },
+  {
+    "branch": "card/zurgo-siegebreaker"
   }
 ]
