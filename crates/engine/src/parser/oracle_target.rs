@@ -9,12 +9,12 @@ use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
 use crate::types::ability::{
-    AggregateFunction, AttachmentKind, CardTypeSetSource, ChoiceType, CombatRelation,
-    CombatRelationSubject, Comparator, ControllerRef, CountScope, DamageKindFilter, FilterProp,
-    NameStickerSet, ObjectProperty, ObjectScope, ParitySource, PlayerFilter, PlayerRelation,
-    PropertyAggregate, PtStat, PtValueScope, QuantityExpr, QuantityRef, SeatDirection,
-    SharedQuality, SharedQualityRelation, TargetFilter, TargetSelectionMode, ThisWayCause,
-    TypeFilter, TypedFilter,
+    AggregateFunction, AttachmentKind, AttachmentReferent, CardTypeSetSource, ChoiceType,
+    CombatRelation, CombatRelationSubject, Comparator, ControllerRef, CountScope, DamageKindFilter,
+    FilterProp, NameStickerSet, ObjectProperty, ObjectScope, ParitySource, PlayerFilter,
+    PlayerRelation, PropertyAggregate, PtStat, PtValueScope, QuantityExpr, QuantityRef,
+    SeatDirection, SharedQuality, SharedQualityRelation, TargetFilter, TargetSelectionMode,
+    ThisWayCause, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::{noncreature_subtype_set, SubtypeSet, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
@@ -3376,6 +3376,19 @@ pub fn parse_type_phrase_folding_with_ctx<'a>(
             if can_recurse {
                 let sep_text = &text[pos + rest_offset + separator.len()..];
                 let (other_filter, final_rest) = parse_type_phrase_folding_with_ctx(sep_text, ctx);
+                if *separator == "or "
+                    && card_type.is_none()
+                    && subtype.is_none()
+                    && adjective_type_filters.is_empty()
+                    && extra_core_type_filters.is_empty()
+                    && neg_type_filters.is_empty()
+                {
+                    if let Some(union) =
+                        parse_color_or_type_union(&properties, &other_filter, after_trimmed)
+                    {
+                        return (union, final_rest);
+                    }
+                }
                 // CR 205.2a: The left branch of a type disjunction must retain
                 // every type word that bound to it before the connector — the
                 // primary core type (`card_type`), the trailing core types from
@@ -4997,6 +5010,88 @@ fn finalize_or_disjunction(combined: TargetFilter, shared_props: &[FilterProp]) 
     distribute_properties_to_or(combined)
 }
 
+/// CR 105.2 + CR 205.2a: "<color> or <type> <noun>" ("black or artifact
+/// creature") joins two kinds of the same noun: the noun of that color, or the
+/// noun with that type. `left_props` hold the color-only left leg, `right` is
+/// the parsed right leg and `right_text` its lowercase source. Returns `None`
+/// unless the left leg is a color and the right leg leads with a type word.
+///
+/// Skips `distribute_core_type_to_or`: backfilling the color-only leg with the
+/// right leg's whole type list would include the type adjective and make the
+/// two legs identical.
+fn parse_color_or_type_union(
+    left_props: &[FilterProp],
+    right: &TargetFilter,
+    right_text: &str,
+) -> Option<TargetFilter> {
+    if !left_props
+        .iter()
+        .any(|prop| matches!(prop, FilterProp::HasColor { .. }))
+    {
+        return None;
+    }
+    let TargetFilter::Typed(right_typed) = right else {
+        return None;
+    };
+    let (_, adjective) = nom_target::parse_type_filter_word(right_text).ok()?;
+    let mut noun = right_typed
+        .type_filters
+        .iter()
+        .filter(|type_filter| **type_filter != adjective)
+        .cloned();
+    let left = typed(
+        noun.next().unwrap_or(TypeFilter::Any),
+        None,
+        left_props.to_vec(),
+        noun.collect(),
+    );
+    let shared: Vec<FilterProp> = left_props
+        .iter()
+        .filter(|prop| !is_adjective_prefix_prop(prop))
+        .cloned()
+        .collect();
+    let combined = distribute_controller_to_or(TargetFilter::Or {
+        filters: vec![left, right.clone()],
+    });
+    let combined = distribute_shared_properties(combined, &shared);
+    Some(distribute_properties_to_or(combined))
+}
+
+/// CR 609.7 + CR 702.72a: Read a reader's whole "X or Y" qualifier ("red or
+/// artifact", "Goblin or Shaman") as the union the type phrase builds, each leg
+/// scoped by the reader's own `scope`. Returns `None` when the phrase is not
+/// wholly consumed or joins fewer than two kinds, so a single-kind qualifier
+/// keeps the reader's own arm.
+pub(crate) fn parse_type_phrase_union(text: &str, scope: &TypedFilter) -> Option<TargetFilter> {
+    let (filter, rest) = parse_type_phrase_folding(text);
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    let joins_two_kinds = match &filter {
+        TargetFilter::Or { filters } => filters.len() >= 2,
+        TargetFilter::Typed(typed) => typed
+            .type_filters
+            .iter()
+            .any(|type_filter| matches!(type_filter, TypeFilter::AnyOf(kinds) if kinds.len() >= 2)),
+        _ => false,
+    };
+    if !joins_two_kinds {
+        return None;
+    }
+    let scoped = |leg: TargetFilter| {
+        TargetFilter::And {
+            filters: vec![TargetFilter::Typed(scope.clone()), leg],
+        }
+        .normalized()
+    };
+    Some(match filter {
+        TargetFilter::Or { filters } => TargetFilter::Or {
+            filters: filters.into_iter().map(scoped).collect(),
+        },
+        other => scoped(other),
+    })
+}
+
 /// Push a caller-supplied set of shared props onto every `Typed` leg reachable
 /// from `filter`. This is the left-to-right distribution path (a suffix parsed
 /// on the LEFT leg before the connector).
@@ -5249,9 +5344,10 @@ fn prop_reads_creature_pt(prop: &FilterProp) -> bool {
         | FilterProp::HasAdventure
         | FilterProp::EnchantedBy
         | FilterProp::EquippedBy
-        | FilterProp::AttachedToSource
-        | FilterProp::AttachedToRecipient
-        | FilterProp::AttachedToPlayer { .. }
+        | FilterProp::AttachedTo { to: AttachmentReferent::Source }
+        | FilterProp::AttachedTo { to: AttachmentReferent::Recipient }
+        | FilterProp::AttachedTo { to: AttachmentReferent::Player { .. } }
+        | FilterProp::AttachedTo { to: AttachmentReferent::DeclaredTarget { .. } }
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::Another
@@ -5268,6 +5364,7 @@ fn prop_reads_creature_pt(prop: &FilterProp) -> bool {
         | FilterProp::MatchesLastChosenCardPredicate
         | FilterProp::HasSingleTarget
         | FilterProp::Modal
+        | FilterProp::PrepareSpell
         | FilterProp::NotColor { .. }
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
@@ -6143,18 +6240,21 @@ fn parse_controller_suffix(text: &str, ctx: &ParseContext) -> Option<(Controller
         // companion `TargetFilter::Player` slot via `effect_references_target_player`
         // (game/ability_utils.rs). Without a scope, fall back to the legacy
         // `ControllerRef::You` behaviour relied on by per-player iteration
-        // contexts (`resolve_quantity_scoped`).
+        // contexts (`resolve_quantity_scoped`). A player the chain itself declared is the
+        // nearer antecedent (CR 608.2c + CR 115.1a).
         let ctrl = ctx
-            .relative_player_scope
+            .declared_player_scope
             .clone()
+            .or_else(|| ctx.relative_player_scope.clone())
             .unwrap_or(ControllerRef::You);
         return Some((ctrl, leading_ws + trimmed.len() - rest.len()));
     }
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("controlled by that player").parse(trimmed)
     {
         let ctrl = ctx
-            .relative_player_scope
+            .declared_player_scope
             .clone()
+            .or_else(|| ctx.relative_player_scope.clone())
             .unwrap_or(ControllerRef::You);
         return Some((ctrl, leading_ws + trimmed.len() - rest.len()));
     }
@@ -6162,10 +6262,13 @@ fn parse_controller_suffix(text: &str, ctx: &ParseContext) -> Option<(Controller
         // "They control" is an anaphoric player reference when the surrounding
         // parser supplies a relative player scope; otherwise keep the legacy
         // ControllerRef::You fallback used by "any opponent may" accepting-
-        // player resolution.
+        // player resolution. "They" names a chain-declared player only when the chain
+        // declared exactly one (CR 608.2c).
         let ctrl = ctx
-            .relative_player_scope
+            .declared_player_scope
             .clone()
+            .filter(|_| ctx.prior_player_declaration)
+            .or_else(|| ctx.relative_player_scope.clone())
             .unwrap_or(ControllerRef::You);
         return Some((ctrl, leading_ws + trimmed.len() - rest.len()));
     }
@@ -9755,6 +9858,7 @@ fn narrow_population_for_exclusion(
         | TargetFilter::EventTargetController
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::DeclaredPlayer { .. }
         | TargetFilter::ParentTargetController
         | TargetFilter::ParentTargetOwner
         | TargetFilter::SourceChosenPlayer
@@ -9817,7 +9921,8 @@ fn parse_except_continuity_exemption_suffix(text: &str) -> Option<(FilterProp, u
 }
 
 /// CR 205.3: "that isn't a <Subtype>" / "that's not a <Subtype>"
-/// relative-clause negation suffix. Returns negated type filters to append to
+/// relative-clause negation suffix, including an Oxford-comma subtype list
+/// (see [`parse_relative_subtype_list`]). Returns negated type filters to append to
 /// the enclosing target's `neg_type_filters`. Mirrors the `non-<Subtype>`
 /// prefix pattern but expressed as a trailing relative clause
 /// ("target attacking Vampire that isn't a Demon" → `Non(Subtype("Demon"))`).
@@ -9839,23 +9944,68 @@ fn parse_that_isnt_subtype_suffix(text: &str) -> Option<(Vec<TypeFilter>, usize)
             return None;
         };
 
-    // Optional article: "a " / "an " before the subtype.
-    let (after_article, article_len) =
-        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("a ").parse(after_neg) {
-            (rest, "a ".len())
-        } else if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("an ").parse(after_neg) {
-            (rest, "an ".len())
-        } else {
-            (after_neg, 0)
-        };
-
-    // CR 205.3: Subtype token — delegates to the shared subtype recognizer.
-    let (subtype, sub_len) = parse_subtype(after_article)?;
-    let total = leading_ws + neg_len + article_len + sub_len;
+    // CR 205.3: one subtype or an Oxford-comma subtype list ("isn't a Kraken,
+    // Leviathan, Merfolk, Octopus, or Serpent" — Summon: Leviathan). Not being
+    // any of the listed subtypes is not being each of them, so every leg becomes
+    // its own `Non`, AND-combined by the caller's `neg_type_filters`.
+    let (subtypes, list_len) = parse_relative_subtype_list(after_neg)?;
+    let total = leading_ws + neg_len + list_len;
     Some((
-        vec![TypeFilter::Non(Box::new(TypeFilter::Subtype(subtype)))],
+        subtypes
+            .into_iter()
+            .map(|subtype| TypeFilter::Non(Box::new(TypeFilter::Subtype(subtype))))
+            .collect(),
         total,
     ))
+}
+
+/// One "[a/an] <Subtype>" leg of a relative-clause subtype list. Returns the
+/// canonical subtype and the text after it.
+fn parse_relative_subtype_leg(input: &str) -> Option<(String, &str)> {
+    let (body, _) = opt(alt((
+        tag::<_, _, OracleError<'_>>("an "),
+        tag::<_, _, OracleError<'_>>("a "),
+    )))
+    .parse(input)
+    .ok()?;
+    // CR 205.3: delegates to the shared subtype recognizer.
+    let (subtype, len) = parse_subtype(body)?;
+    Some((subtype, &body[len..]))
+}
+
+/// CR 205.3a + CR 205.3m: the subtype list of a "that is / that isn't" relative
+/// clause — a single leg, a two-leg "X or Y", or an Oxford-comma list
+/// "X, Y, ..., or Z" (each leg may carry its own article). Returns the canonical
+/// subtypes and the bytes consumed.
+///
+/// A list is closed only by an "or" leg, so a comma run that never
+/// closes ("a Demon, Zombies you control ...") is not read as a list: the result
+/// rolls back to the legs up to the last closing conjunction, or to the first leg.
+pub(crate) fn parse_relative_subtype_list(input: &str) -> Option<(Vec<String>, usize)> {
+    let (first, mut rest) = parse_relative_subtype_leg(input)?;
+    let mut subtypes = vec![first];
+    let mut closed = (1usize, rest);
+    while let Ok((after_separator, closes)) = alt((
+        value(
+            true,
+            alt((tag::<_, _, OracleError<'_>>(", or "), tag(" or "))),
+        ),
+        value(false, tag(", ")),
+    ))
+    .parse(rest)
+    {
+        let Some((next, after_leg)) = parse_relative_subtype_leg(after_separator) else {
+            break;
+        };
+        subtypes.push(next);
+        rest = after_leg;
+        if closes {
+            closed = (subtypes.len(), rest);
+        }
+    }
+    let (count, end) = closed;
+    subtypes.truncate(count);
+    Some((subtypes, input.len() - end.len()))
 }
 
 fn is_relative_core_type_filter(type_filter: &TypeFilter) -> bool {
@@ -9948,7 +10098,7 @@ fn parse_that_is_core_type_suffix(text: &str) -> Option<(Vec<TypeFilter>, usize)
 /// Creature core type. Returns the bytes consumed (including leading whitespace).
 /// Returns `None` unless the clause names at least one recognized subtype, so
 /// color/supertype "that's …" relative clauses are left to their own parsers.
-fn parse_that_is_subtype_suffix(text: &str) -> Option<(TypeFilter, usize)> {
+pub(crate) fn parse_that_is_subtype_suffix(text: &str) -> Option<(TypeFilter, usize)> {
     let trimmed = text.trim_start();
     let leading_ws = text.len() - trimmed.len();
 
@@ -9964,38 +10114,11 @@ fn parse_that_is_subtype_suffix(text: &str) -> Option<(TypeFilter, usize)> {
         return None;
     };
 
-    // One "[a/an] <Subtype>" leg → `(Subtype, remaining)`.
-    let parse_leg = |rest: &'_ str| -> Option<(String, usize)> {
-        let after_article = if let Ok((r, _)) = tag::<_, _, OracleError<'_>>("a ").parse(rest) {
-            ("a ".len(), r)
-        } else if let Ok((r, _)) = tag::<_, _, OracleError<'_>>("an ").parse(rest) {
-            ("an ".len(), r)
-        } else {
-            (0usize, rest)
-        };
-        let (article_len, body) = after_article;
-        let (subtype, sub_len) = parse_subtype(body)?;
-        Some((subtype, article_len + sub_len))
-    };
-
-    let mut subtypes: Vec<TypeFilter> = Vec::new();
-    let (first, first_len) = parse_leg(after_intro)?;
-    subtypes.push(TypeFilter::Subtype(first));
-    let mut rest = &after_intro[first_len..];
-
-    // Optional " or [a/an] <Subtype>" continuations.
-    loop {
-        let Ok((after_or, _)) = tag::<_, _, OracleError<'_>>(" or ").parse(rest) else {
-            break;
-        };
-        let Some((next, next_len)) = parse_leg(after_or) else {
-            break;
-        };
-        subtypes.push(TypeFilter::Subtype(next));
-        rest = &after_or[next_len..];
-    }
-
-    let consumed = leading_ws + (trimmed.len() - rest.len());
+    // CR 205.3: one subtype, "X or Y", or an Oxford-comma list ("that's a Demon,
+    // Horror, or Nightmare" — Ancient Cellarspawn); any leg satisfies the clause.
+    let (subtypes, list_len) = parse_relative_subtype_list(after_intro)?;
+    let consumed = leading_ws + (trimmed.len() - after_intro.len()) + list_len;
+    let mut subtypes: Vec<TypeFilter> = subtypes.into_iter().map(TypeFilter::Subtype).collect();
     let filter = if subtypes.len() == 1 {
         subtypes.pop().expect("non-empty")
     } else {
@@ -23043,5 +23166,119 @@ mod exile_graveyard_source_shape {
         ] {
             assert!(parse_exile_graveyard_source(phrase).is_none(), "{phrase}");
         }
+    }
+}
+
+#[cfg(test)]
+mod color_or_type_union {
+    use super::*;
+
+    /// Each `Or` leg as (type filters, colors), in order.
+    fn legs(filter: &TargetFilter) -> Vec<(Vec<TypeFilter>, Vec<ManaColor>)> {
+        let TargetFilter::Or { filters } = filter else {
+            panic!("expected an Or union, got {filter:?}");
+        };
+        filters
+            .iter()
+            .map(|leg| {
+                let TargetFilter::Typed(typed) = leg else {
+                    panic!("expected a Typed leg, got {leg:?}");
+                };
+                let colors = typed
+                    .properties
+                    .iter()
+                    .filter_map(|prop| match prop {
+                        FilterProp::HasColor { color } => Some(*color),
+                        _ => None,
+                    })
+                    .collect();
+                (typed.type_filters.clone(), colors)
+            })
+            .collect()
+    }
+
+    /// CR 105.2 + CR 205.2a: Soldevi Adnate's "black or artifact creature" is a
+    /// black creature or an artifact creature, never two identical legs.
+    #[test]
+    fn color_or_type_noun_reads_both_kinds() {
+        let (filter, rest) = parse_type_phrase_folding("black or artifact creature");
+        assert_eq!(rest, "");
+        assert_eq!(
+            legs(&filter),
+            vec![
+                (vec![TypeFilter::Creature], vec![ManaColor::Black]),
+                (vec![TypeFilter::Artifact, TypeFilter::Creature], vec![]),
+            ]
+        );
+    }
+
+    /// CR 105.2 + CR 205.2a: without a noun ("red or artifact"), the color leg
+    /// is any object of that color; "blue or artifact card" keeps its card noun.
+    #[test]
+    fn color_or_type_without_noun_reads_both_kinds() {
+        let (filter, rest) = parse_type_phrase_folding("red or artifact");
+        assert_eq!(rest, "");
+        assert_eq!(
+            legs(&filter),
+            vec![
+                (vec![TypeFilter::Any], vec![ManaColor::Red]),
+                (vec![TypeFilter::Artifact], vec![]),
+            ]
+        );
+        let (filter, rest) = parse_type_phrase_folding("blue or artifact card");
+        assert_eq!(rest, "");
+        let legs = legs(&filter);
+        assert_eq!(legs[0].1, vec![ManaColor::Blue]);
+        assert!(!legs[0].0.contains(&TypeFilter::Artifact));
+        assert!(legs[1].0.contains(&TypeFilter::Artifact));
+        assert!(legs[1].1.is_empty());
+    }
+
+    /// The union needs a color-only left leg and a type-led right leg; color
+    /// pairs and type pairs keep the ordinary disjunction.
+    #[test]
+    fn color_pairs_and_type_pairs_are_not_color_or_type_unions() {
+        let (filter, _) = parse_type_phrase_folding("red or white creature");
+        assert_eq!(
+            legs(&filter),
+            vec![
+                (vec![TypeFilter::Creature], vec![ManaColor::Red]),
+                (vec![TypeFilter::Creature], vec![ManaColor::White]),
+            ]
+        );
+        let (filter, _) = parse_type_phrase_folding("artifact or creature");
+        assert_eq!(
+            legs(&filter),
+            vec![
+                (vec![TypeFilter::Artifact], vec![]),
+                (vec![TypeFilter::Creature], vec![]),
+            ]
+        );
+    }
+
+    /// CR 609.7 + CR 702.72a: a reader's "X or Y" qualifier is the union, each
+    /// leg carrying the reader's scope; a single kind is left to the reader.
+    #[test]
+    fn type_phrase_union_scopes_each_leg() {
+        let scope = TypedFilter::creature()
+            .controller(ControllerRef::You)
+            .properties(vec![FilterProp::Another]);
+        let union = parse_type_phrase_union("Goblin or Shaman", &scope).expect("two kinds");
+        let TargetFilter::Or { filters } = &union else {
+            panic!("expected Or, got {union:?}");
+        };
+        for (leg, kind) in filters.iter().zip(["Goblin", "Shaman"]) {
+            let TargetFilter::Typed(typed) = leg else {
+                panic!("expected Typed leg, got {leg:?}");
+            };
+            assert!(typed.type_filters.contains(&TypeFilter::Creature));
+            assert!(typed
+                .type_filters
+                .contains(&TypeFilter::Subtype(kind.to_string())));
+            assert_eq!(typed.controller, Some(ControllerRef::You));
+            assert!(typed.properties.contains(&FilterProp::Another));
+        }
+        assert!(parse_type_phrase_union("Giant", &scope).is_none());
+        assert!(parse_type_phrase_union("Goblin or Shaman you know", &scope).is_none());
     }
 }

@@ -41,8 +41,8 @@ use crate::types::ability::{
     GameRestriction, LibraryPosition, MultiTargetSpec, NameStickerSet, ObjectScope,
     PermissionGrantee, PlayerFilter, PreventionAmount, PreventionScope, PtValue, QuantityExpr,
     QuantityRef, RestrictionPlayerScope, RoundingMode, SpellStackToGraveyardReplacement,
-    StaticCondition, StaticDefinition, SubAbilityLink, TargetChoiceTiming, TargetFilter, TypeFilter,
-    TypedFilter,
+    StaticCondition, StaticDefinition, SubAbilityLink, TargetChoiceTiming, TargetFilter,
+    TypeFilter, TypedFilter,
 };
 use crate::types::counter::CounterType;
 use crate::types::game_state::{DistributionUnit, TargetSelectionConstraint};
@@ -56,13 +56,13 @@ use super::subject;
 use super::{
     each_target_filter_mut, has_typed_target, is_broadcast_population_filter, parse_effect_clause,
     parse_event_context_ref_with_ctx, parse_for_each_object_copy_parts,
-    refine_damage_target_remainder, replace_player_anaphor_with_parent_target,
-    scan_contains_phrase, target_filter_controller_ref, ParsedEffectClause,
+    refine_damage_target_remainder, replace_player_anaphor, scan_contains_phrase,
+    target_filter_controller_ref, ParsedEffectClause,
 };
 use crate::game::effects::effect::generic_effect_population_filter;
 
 pub(super) fn rewrite_player_anaphor_targets_in_definition(def: &mut AbilityDefinition) {
-    replace_player_anaphor_with_parent_target(def.effect.as_mut());
+    replace_player_anaphor(def.effect.as_mut(), || TargetFilter::ParentTarget);
     if let Some(sub) = def.sub_ability.as_deref_mut() {
         rewrite_player_anaphor_targets_in_definition(sub);
     }
@@ -3918,6 +3918,7 @@ fn ability_reads_last_created(def: &AbilityDefinition) -> bool {
             | TargetFilter::EventTargetController
             | TargetFilter::ParentTarget
             | TargetFilter::ParentTargetSlot { .. }
+            | TargetFilter::DeclaredPlayer { .. }
             | TargetFilter::ParentTargetController
             | TargetFilter::ParentTargetOwner
             | TargetFilter::SourceChosenPlayer
@@ -4014,6 +4015,7 @@ pub(super) fn filter_tree_has_chosen_card(filter: &TargetFilter) -> bool {
         | TargetFilter::EventTargetController
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::DeclaredPlayer { .. }
         | TargetFilter::ParentTargetController
         | TargetFilter::ParentTargetOwner
         | TargetFilter::SourceChosenPlayer

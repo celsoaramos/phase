@@ -16,15 +16,16 @@ use crate::game::filter::{
 };
 use crate::game::speed::effective_speed;
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, AggregateFunction, BasicLandType,
-    CardTypeSetSource, CastManaObjectScope, CastManaSpentMetric, CastPermissionConstraint,
-    CastingPermission, CombatHistoryScope, ContinuousModification, ControllerRef, CountScope,
-    DamageChannel, Duration, Effect, FilterProp, ModalSelectionCondition, ModalSelectionConstraint,
-    NameStickerSet, ObjectProperty, ObjectScope, ParsedCondition, PlayerFilter, PlayerScope,
-    PossessionAxis, QuantityExpr, QuantityRef, RepeatContinuation, ResolvedAbility, RoundingMode,
-    SpellCastingOption, StaticCondition, StaticDefinition, SubtypeExclusion,
-    TargetDamageSourceBinding, TargetFilter, TargetRef, ThisWayCause, TrackedAnaphorSource,
-    TriggerCondition, TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
+    AbilityCondition, AbilityCost, AbilityDefinition, AggregateFunction, AttachmentReferent,
+    BasicLandType, CardTypeSetSource, CastManaObjectScope, CastManaSpentMetric,
+    CastPermissionConstraint, CastingPermission, CombatHistoryScope, ContinuousModification,
+    ControllerRef, CountScope, DamageChannel, Duration, Effect, FilterProp,
+    ModalSelectionCondition, ModalSelectionConstraint, NameStickerSet, ObjectProperty, ObjectScope,
+    ParsedCondition, PlayerFilter, PlayerScope, PossessionAxis, QuantityExpr, QuantityRef,
+    RepeatContinuation, ResolvedAbility, RoundingMode, SpellCastingOption, StaticCondition,
+    StaticDefinition, SubtypeExclusion, TargetDamageSourceBinding, TargetFilter, TargetRef,
+    ThisWayCause, TrackedAnaphorSource, TriggerCondition, TriggerDefinition, TurnJournalKind,
+    TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::{positive_counter_types, CounterType};
@@ -62,7 +63,7 @@ pub struct QuantityContext {
     /// CR 613.4c: The per-recipient binding for "<subject> gets +N/+M for
     /// each X attached to it" Aura/Equipment statics. Set by the layer
     /// evaluator when the dynamic modification's filter contains
-    /// `FilterProp::AttachedToRecipient`; `None` otherwise.
+    /// `FilterProp::AttachedTo { to: AttachmentReferent::Recipient }`; `None` otherwise.
     pub recipient: Option<ObjectId>,
     /// Current player for an "each player/opponent" resolution pass. Distinct
     /// from `controller`, which remains the printed ability's controller.
@@ -364,13 +365,16 @@ fn visit_characteristic_leaf<'s>(
             ZoneRef::Exile => {
                 for &obj_id in &state.exile {
                     if let Some(obj) = state.objects.get(&obj_id) {
-                        let owner_matches = count_scope_owner_matches(
-                            state,
-                            scope,
-                            ctx.clone(),
-                            controller,
-                            obj.owner,
-                        );
+                        // CR 108.2 + CR 109.1: only cards in exile contribute
+                        // characteristics; the CR 722.3c retained copy is not one.
+                        let owner_matches = obj.is_card_population_member()
+                            && count_scope_owner_matches(
+                                state,
+                                scope,
+                                ctx.clone(),
+                                controller,
+                                obj.owner,
+                            );
                         if owner_matches {
                             if let Some(view) = characteristic_view_for_object(state, obj_id) {
                                 visit(CharacteristicMember::Object(obj_id), view, false);
@@ -3212,7 +3216,10 @@ pub(crate) fn filter_uses_recipient(filter: &TargetFilter) -> bool {
 
 fn filter_prop_uses_recipient(prop: &FilterProp) -> bool {
     match prop {
-        FilterProp::AttachedToRecipient | FilterProp::Another => true,
+        FilterProp::AttachedTo {
+            to: AttachmentReferent::Recipient,
+        }
+        | FilterProp::Another => true,
         FilterProp::AnyOf { props } => props.iter().any(filter_prop_uses_recipient),
         // CR 608.2c: Negation reads the inner prop's references — recurse (mirrors AnyOf).
         FilterProp::Not { prop } => filter_prop_uses_recipient(prop),
@@ -3798,7 +3805,7 @@ pub(crate) fn resolve_quantity_for_ability_condition(
 }
 
 /// Resolve a QuantityExpr with ability targets/chosen-X plus a per-object
-/// recipient binding for `FilterProp::AttachedToRecipient`.
+/// recipient binding for `FilterProp::AttachedTo { to: AttachmentReferent::Recipient }`.
 pub(crate) fn resolve_quantity_with_targets_and_recipient(
     state: &GameState,
     expr: &QuantityExpr,
@@ -4084,6 +4091,37 @@ fn reduce_property_values(values: impl Iterator<Item = i32>, function: Aggregate
     }
 }
 
+/// CR 108.2 + CR 109.1: whether `filter` names CARDS ("cards you own in
+/// exile") rather than the generic objects in a zone. A conjunction is card-only
+/// when any conjunct is, a union only when every branch is, a complement takes
+/// its inner filter's population.
+fn filter_names_cards(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(typed) => typed
+            .type_filters
+            .iter()
+            .any(|type_filter| matches!(type_filter, TypeFilter::Card)),
+        TargetFilter::And { filters } => filters.iter().any(filter_names_cards),
+        TargetFilter::Or { filters } => {
+            !filters.is_empty() && filters.iter().all(filter_names_cards)
+        }
+        TargetFilter::Not { filter } => filter_names_cards(filter),
+        _ => false,
+    }
+}
+
+/// The objects a zone-ranged query over `filter` starts from: the cards in the
+/// zone when the filter names cards (the CR 722.3c retained prepare copy in
+/// exile is a copy of a card, not a card — CR 108.2 + CR 109.1), else every
+/// object there.
+fn zone_population_ids(state: &GameState, zone: Zone, filter: &TargetFilter) -> Vec<ObjectId> {
+    if filter_names_cards(filter) {
+        crate::game::targeting::zone_card_ids(state, zone)
+    } else {
+        crate::game::targeting::zone_object_ids(state, zone)
+    }
+}
+
 fn filter_zone_object_ids(state: &GameState, filter: &TargetFilter) -> Vec<ObjectId> {
     let zones = filter.extract_zones();
     let zones = if zones.is_empty() {
@@ -4093,7 +4131,7 @@ fn filter_zone_object_ids(state: &GameState, filter: &TargetFilter) -> Vec<Objec
     };
     zones
         .into_iter()
-        .flat_map(|zone| crate::game::targeting::zone_object_ids(state, zone))
+        .flat_map(|zone| zone_population_ids(state, zone, filter))
         .collect()
 }
 
@@ -4265,9 +4303,10 @@ fn filter_population_anchor_ids(
             if zones.is_empty() {
                 return None;
             }
+            // Same population as `filter_zone_object_ids`.
             zones
                 .into_iter()
-                .flat_map(|zone| crate::game::targeting::zone_object_ids(state, zone))
+                .flat_map(|zone| zone_population_ids(state, zone, filter))
                 .collect()
         }
     };
@@ -4760,7 +4799,9 @@ fn resolve_ref(
             // distinct on that axis (preserving the legacy invariant).
             let mut signatures: std::collections::HashSet<Vec<Vec<String>>> =
                 std::collections::HashSet::new();
-            for id in crate::game::targeting::zone_object_ids(state, zone) {
+            // CR 108.2 + CR 109.1: distinct qualities among the cards in the
+            // zone when the filter names cards; generic queries see every object.
+            for id in zone_population_ids(state, zone, filter) {
                 // CR 400.3 + CR 109.5 + CR 108.4a: graveyard/hand/library
                 // membership is owner-scoped, not controller-scoped, so a
                 // stale `obj.controller` left by a control-change effect
@@ -5261,12 +5302,16 @@ fn resolve_ref(
                             usize_to_i32_saturating(state.graveyard_of(p.id).len())
                         }
                         ZoneRef::Hand => usize_to_i32_saturating(p.hand.len()),
+                        // CR 108.2 + CR 109.1: cards the player owns in exile;
+                        // the CR 722.3c retained prepare copy is not a card.
                         ZoneRef::Exile => usize_to_i32_saturating(
                             state
                                 .exile
                                 .iter()
                                 .filter(|&&id| {
-                                    state.objects.get(&id).is_some_and(|o| o.owner == pid)
+                                    state.objects.get(&id).is_some_and(|o| {
+                                        o.owner == pid && o.is_card_population_member()
+                                    })
                                 })
                                 .count(),
                         ),
@@ -5438,7 +5483,11 @@ fn resolve_ref(
                                 controller,
                                 obj.owner,
                             );
-                            if owner_matches
+                            // CR 108.2 + CR 109.1: count only cards in exile;
+                            // the CR 722.3c retained prepare copy is a copy of
+                            // a card, not a card.
+                            if obj.is_card_population_member()
+                                && owner_matches
                                 && matches_zone_card_filter(
                                     state,
                                     obj_id,
@@ -5825,9 +5874,7 @@ fn resolve_ref(
                 // of the two shapes it takes at quantity-resolution time:
                 //   - a resolving instant/sorcery is still on the Stack (its
                 //     effect, e.g. Thunder Salvo, runs before the spell leaves —
-                //     CR 608.2n) and carries NO `cast_from_zone` (that provenance
-                //     is stamped only onto placeholder permanent-spell objects at
-                //     cast and permanents at resolution);
+                //     CR 608.2n) and carries its cast `cast_from_zone`;
                 //   - an ETB replacement evaluates against the placeholder
                 //     permanent-spell object, which DOES carry `cast_from_zone`.
                 // A reanimated / put-onto-battlefield permanent is neither on the
@@ -6448,6 +6495,13 @@ fn resolve_ref(
                                 })
                                 .is_some_and(|pid| pid == snap.controller)
                         }
+                        Some(ControllerRef::DeclaredPlayer { group }) => ability
+                            .and_then(|a| {
+                                crate::game::targeting::resolve_live_declared_player(
+                                    state, a, *group,
+                                )
+                            })
+                            .is_some_and(|pid| pid == snap.controller),
                         Some(ControllerRef::ParentTargetController) => ability
                             .and_then(|a| {
                                 crate::game::ability_utils::parent_target_controller(a, state)
@@ -6536,6 +6590,11 @@ fn damage_source_controller_matches(
                     TargetRef::Player(player) => Some(*player),
                     TargetRef::Object(_) => None,
                 })
+            })
+            .is_some_and(|player| actual == player),
+        ControllerRef::DeclaredPlayer { group } => ability
+            .and_then(|ability| {
+                crate::game::targeting::resolve_live_declared_player(state, ability, *group)
             })
             .is_some_and(|player| actual == player),
         ControllerRef::ParentTargetController => ability
@@ -7119,13 +7178,6 @@ fn object_for_scope<'a>(
 }
 
 /// Resolve an [`ObjectScope`] to a concrete object id under `ctx`.
-///
-/// `pub(crate)` for ONE reason: the resource loop firewall's
-/// `counters_on_source_provably_excludes_class` arm must ask THE SAME scope
-/// authority the `QuantityRef::CountersOn` resolver asks, rather than
-/// re-implementing "`ObjectScope::Source` means the ability's own source". Do not
-/// read this widened visibility as an invitation to resolve quantities outside
-/// `game::quantity` — every other caller is in this module.
 pub(crate) fn object_id_for_scope(
     state: &GameState,
     scope: ObjectScope,
@@ -9539,9 +9591,9 @@ pub(crate) fn resolve_player_count(
                                 )
                         }
                         // CR 508.6 + CR 102.2: opponent of the controller
-                        // attacking the enchanted/defending player this combat.
+                        // attacking the enchanted player (live combat membership).
                         // Delegates to the single-authority predicate in
-                        // `matches_player_scope` (the two copies must stay in sync).
+                        // `matches_player_scope`.
                         PlayerFilter::OpponentAttackingEnchantedPlayer => {
                             crate::game::effects::matches_player_scope(
                                 state, p.id, filter, controller, source_id,
@@ -10665,12 +10717,14 @@ mod tests {
         state.attacker_declarations_this_turn = vec![
             AttackDeclarationRecord {
                 object_id: p0_attacker,
+                incarnation: None,
                 lki: creature_lki("Goblin", PlayerId(0)),
                 is_token: false,
                 is_commander: false,
             },
             AttackDeclarationRecord {
                 object_id: p1_attacker,
+                incarnation: None,
                 lki: creature_lki("Soldier", PlayerId(1)),
                 is_token: false,
                 is_commander: false,
@@ -11894,9 +11948,11 @@ mod tests {
         let recipient_relative = QuantityExpr::Ref {
             qty: QuantityRef::SharedCardTypes {
                 source: CardTypeSetSource::Objects {
-                    filter: TargetFilter::Typed(
-                        TypedFilter::card().properties(vec![FilterProp::AttachedToRecipient]),
-                    ),
+                    filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
+                        FilterProp::AttachedTo {
+                            to: crate::types::ability::AttachmentReferent::Recipient,
+                        },
+                    ])),
                 },
             },
         };
@@ -12762,6 +12818,7 @@ mod tests {
             amount: 2,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         });
 
         let expr = QuantityExpr::Ref {
@@ -14067,24 +14124,40 @@ mod tests {
         let p0_owned = ZoneChangeRecord {
             core_types: vec![CoreType::Creature],
             owner: PlayerId(0),
+            arrival: crate::types::game_state::ArrivalIdentity {
+                owner: PlayerId(0),
+                controller: PlayerId(0),
+            },
             controller: PlayerId(0),
             ..ZoneChangeRecord::test_minimal(ObjectId(10), Some(Zone::Hand), Zone::Graveyard)
         };
         let p0_owned_stolen = ZoneChangeRecord {
             core_types: vec![CoreType::Artifact],
             owner: PlayerId(0),
+            arrival: crate::types::game_state::ArrivalIdentity {
+                owner: PlayerId(0),
+                controller: PlayerId(1),
+            },
             controller: PlayerId(1),
             ..ZoneChangeRecord::test_minimal(ObjectId(11), Some(Zone::Battlefield), Zone::Graveyard)
         };
         let p1_owned_stolen_by_p0 = ZoneChangeRecord {
             core_types: vec![CoreType::Creature],
             owner: PlayerId(1),
+            arrival: crate::types::game_state::ArrivalIdentity {
+                owner: PlayerId(1),
+                controller: PlayerId(0),
+            },
             controller: PlayerId(0),
             ..ZoneChangeRecord::test_minimal(ObjectId(12), Some(Zone::Battlefield), Zone::Graveyard)
         };
         let token = ZoneChangeRecord {
             core_types: vec![CoreType::Creature],
             owner: PlayerId(0),
+            arrival: crate::types::game_state::ArrivalIdentity {
+                owner: PlayerId(0),
+                controller: PlayerId(0),
+            },
             controller: PlayerId(0),
             is_token: true,
             ..ZoneChangeRecord::test_minimal(ObjectId(13), Some(Zone::Battlefield), Zone::Graveyard)
@@ -14092,6 +14165,10 @@ mod tests {
         let nonpermanent = ZoneChangeRecord {
             core_types: vec![CoreType::Instant],
             owner: PlayerId(0),
+            arrival: crate::types::game_state::ArrivalIdentity {
+                owner: PlayerId(0),
+                controller: PlayerId(0),
+            },
             controller: PlayerId(0),
             ..ZoneChangeRecord::test_minimal(ObjectId(14), Some(Zone::Hand), Zone::Graveyard)
         };
@@ -16193,21 +16270,25 @@ mod tests {
                 player_id: PlayerId(1),
                 source_amounts: vec![(ObjectId(11), 4)],
                 total_damage: 4,
+                source_incarnations: vec![],
             },
             GameEvent::CombatDamageDealtToPlayer {
                 player_id: PlayerId(2),
                 source_amounts: vec![(ObjectId(12), 9)],
                 total_damage: 9,
+                source_incarnations: vec![],
             },
             GameEvent::CombatDamageDealtToPlayer {
                 player_id: PlayerId(1),
                 source_amounts: vec![(ObjectId(13), 2)],
                 total_damage: 2,
+                source_incarnations: vec![],
             },
             GameEvent::CombatDamageDealtToPlayer {
                 player_id: PlayerId(0),
                 source_amounts: vec![(ObjectId(14), 7)],
                 total_damage: 7,
+                source_incarnations: vec![],
             },
         ];
 
@@ -17808,6 +17889,7 @@ mod tests {
                     cast_variant: crate::types::game_state::CastingVariant::Normal,
                     was_kicked: false,
                     spell_object_id: None,
+                    prepared_copy_source: None,
                 },
                 SpellCastRecord {
                     name: String::new(),
@@ -17823,6 +17905,7 @@ mod tests {
                     cast_variant: crate::types::game_state::CastingVariant::Normal,
                     was_kicked: false,
                     spell_object_id: None,
+                    prepared_copy_source: None,
                 },
             ]),
         );
@@ -17934,6 +18017,7 @@ mod tests {
                 cast_variant: crate::types::game_state::CastingVariant::Normal,
                 was_kicked: false,
                 spell_object_id: None,
+                prepared_copy_source: None,
             }
         }
 
@@ -19460,6 +19544,7 @@ mod tests {
         }
         let record_with_power = |power| AttackDeclarationRecord {
             object_id: attacker,
+            incarnation: None,
             lki: {
                 let mut lki = state.objects[&attacker].snapshot_public_characteristics();
                 lki.power = Some(power);
@@ -19487,6 +19572,7 @@ mod tests {
             attacks: vec![],
             declaration_records: vec![AttackDeclarationRecord {
                 object_id: unrelated_attacker,
+                incarnation: None,
                 lki: {
                     let mut lki =
                         state.objects[&unrelated_attacker].snapshot_public_characteristics();
@@ -20091,6 +20177,7 @@ mod tests {
             amount: 5,
             is_combat: false,
             excess: 0,
+            source_incarnation: None,
         });
         let expr = QuantityExpr::Ref {
             qty: QuantityRef::EventContextAmount,
@@ -20175,6 +20262,7 @@ mod tests {
             amount: 5,
             is_combat: false,
             excess: 0,
+            source_incarnation: None,
         });
         let expr = QuantityExpr::Ref {
             qty: QuantityRef::EventContextAmount,
@@ -20196,6 +20284,7 @@ mod tests {
             amount: 2,
             is_combat: false,
             excess: 0,
+            source_incarnation: None,
         });
         let expr = QuantityExpr::Ref {
             qty: QuantityRef::EventContextAmount,
@@ -20230,6 +20319,7 @@ mod tests {
             amount: 2,
             is_combat: false,
             excess: 0,
+            source_incarnation: None,
         });
         let expr = QuantityExpr::Ref {
             qty: QuantityRef::EventContextAmount,
@@ -20252,6 +20342,7 @@ mod tests {
             amount: 6,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         });
         let expr = QuantityExpr::Ref {
             qty: QuantityRef::EventContextAmount,
@@ -20275,6 +20366,7 @@ mod tests {
             amount: 6,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         });
         let expr = QuantityExpr::Ref {
             qty: QuantityRef::EventContextAmount,
@@ -20395,6 +20487,7 @@ mod tests {
             amount: 4,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         });
         let expr = QuantityExpr::Ref {
             qty: QuantityRef::Power {
@@ -20613,6 +20706,7 @@ mod tests {
             amount: 3,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         });
 
         let mut ability = ResolvedAbility::new(
@@ -20699,6 +20793,7 @@ mod tests {
             amount: 2,
             is_combat: false,
             excess: 0,
+            source_incarnation: None,
         });
 
         let mut ability = ResolvedAbility::new(
@@ -22552,7 +22647,9 @@ mod tests {
         causes.insert(sacrificed, ThisWayCause::Sacrificed);
         causes.insert(milled, ThisWayCause::Milled);
         causes.insert(sacrificed_to_exile, ThisWayCause::Sacrificed);
-        state.tracked_set_member_causes.insert(set_id, causes);
+        state
+            .tracked_set_member_causes
+            .insert(set_id, causes.into_iter().collect());
 
         let creature_filter = Box::new(TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)));
         let count_for = |caused_by| {
@@ -22826,7 +22923,9 @@ mod tests {
         causes.insert(disc_creature_a, ThisWayCause::Discarded);
         causes.insert(disc_creature_b, ThisWayCause::Discarded);
         causes.insert(disc_instant, ThisWayCause::Discarded);
-        state.tracked_set_member_causes.insert(set_id, causes);
+        state
+            .tracked_set_member_causes
+            .insert(set_id, causes.into_iter().collect());
 
         let count_for = |caused_by| {
             let expr = QuantityExpr::Ref {
@@ -22901,7 +23000,9 @@ mod tests {
         let mut causes = HashMap::new();
         causes.insert(cr_a, ThisWayCause::Discarded);
         causes.insert(cr_b, ThisWayCause::Discarded);
-        state.tracked_set_member_causes.insert(set_id, causes);
+        state
+            .tracked_set_member_causes
+            .insert(set_id, causes.into_iter().collect());
 
         let expr = QuantityExpr::Ref {
             qty: QuantityRef::DistinctCardTypes {
@@ -23904,6 +24005,7 @@ mod tests {
             amount: 3,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         });
 
         // No targets: an untargeted damage trigger, which is exactly the shape
@@ -24043,6 +24145,10 @@ mod dandan_scoped_zone_tests {
         let mut state = state.clone();
         state.zone_changes_this_turn.push_back(ZoneChangeRecord {
             owner,
+            arrival: crate::types::game_state::ArrivalIdentity {
+                owner,
+                controller: PlayerId(0),
+            },
             power: Some(3),
             ..ZoneChangeRecord::test_minimal(ObjectId(50), Some(Zone::Graveyard), Zone::Hand)
         });
@@ -24107,5 +24213,232 @@ mod dandan_scoped_zone_tests {
         fill_graveyard(&mut split, P1, 8);
         assert_eq!(graveyards_with_seven(&split, PlayerRelation::All), 2);
         assert_eq!(graveyards_with_seven(&split, PlayerRelation::Opponent), 1);
+    }
+}
+
+/// CR 108.2 + CR 109.1 + CR 722.3c: quantities over the CARDS in exile exclude
+/// non-card objects there. Building-block rows: each quantity arm is read
+/// against one real Sorcery card, one non-card copy of a card (the CR 722.3c
+/// retained prepare copy's shape: `is_copy`, not a token, an Instant owned by
+/// P0) and one Artifact token, all in P0's exile, then paired with a second
+/// real card that must raise the count by exactly one.
+#[cfg(test)]
+mod exile_card_population_tests {
+    use super::*;
+    use crate::game::zones::create_object;
+    use crate::types::ability::{
+        CardTypeSetSource, ControllerRef, CountBinding, CountScope, FilterProp, QuantityExpr,
+        QuantityRef, SharedQuality, TargetFilter, TargetRef, TypeFilter, TypedFilter, ZoneRef,
+    };
+    use crate::types::card_type::CoreType;
+    use crate::types::identifiers::CardId;
+    use crate::types::zones::Zone;
+
+    const P0: PlayerId = PlayerId(0);
+
+    struct Board {
+        state: GameState,
+        source: ObjectId,
+        copy: ObjectId,
+        token: ObjectId,
+    }
+
+    fn exile_object(state: &mut GameState, card: u64, name: &str, core_type: CoreType) -> ObjectId {
+        let id = create_object(state, CardId(card), P0, name.to_string(), Zone::Exile);
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types = vec![core_type];
+        obj.base_card_types = obj.card_types.clone();
+        id
+    }
+
+    fn board() -> Board {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            P0,
+            "Population Reader".to_string(),
+            Zone::Battlefield,
+        );
+        exile_object(&mut state, 2, "Exiled Sorcery", CoreType::Sorcery);
+        let copy = exile_object(&mut state, 3, "Retained Prepare Copy", CoreType::Instant);
+        state.objects.get_mut(&copy).unwrap().is_copy = true;
+        let token = exile_object(&mut state, 4, "Exiled Token", CoreType::Artifact);
+        state.objects.get_mut(&token).unwrap().is_token = true;
+        Board {
+            state,
+            source,
+            copy,
+            token,
+        }
+    }
+
+    /// Reach guard shared by every row: both non-card objects really sit in
+    /// P0's exile with the types that would satisfy each query.
+    fn assert_non_cards_in_exile(board: &Board) {
+        for id in [board.copy, board.token] {
+            let obj = &board.state.objects[&id];
+            assert!(board.state.exile.contains(&id));
+            assert_eq!(obj.owner, P0);
+            assert!(!obj.is_represented_by_a_card());
+        }
+        assert_eq!(board.state.exile.len(), 3);
+    }
+
+    /// Adds a second real card (an Instant) to P0's exile: the paired positive.
+    fn add_second_card(board: &mut Board) {
+        exile_object(
+            &mut board.state,
+            5,
+            "Second Exiled Instant",
+            CoreType::Instant,
+        );
+    }
+
+    fn read(board: &Board, qty: QuantityRef) -> i32 {
+        resolve_quantity_with_targets_slice(
+            &board.state,
+            &QuantityExpr::Ref { qty },
+            P0,
+            board.source,
+            &[TargetRef::Player(P0)],
+        )
+    }
+
+    fn assert_counts(qty: QuantityRef, expected_cards_only: i32) {
+        let mut board = board();
+        assert_non_cards_in_exile(&board);
+        assert_eq!(
+            read(&board, qty.clone()),
+            expected_cards_only,
+            "{qty:?}: only the real card in exile counts"
+        );
+        add_second_card(&mut board);
+        assert_eq!(
+            read(&board, qty.clone()),
+            expected_cards_only + 1,
+            "{qty:?}: a second real card in exile counts"
+        );
+    }
+
+    /// Like `assert_counts`, for a generic query that sees every object in exile.
+    fn assert_counts_objects(qty: QuantityRef, expected: i32) {
+        let mut board = board();
+        assert_non_cards_in_exile(&board);
+        assert_eq!(read(&board, qty.clone()), expected, "{qty:?}");
+        add_second_card(&mut board);
+        assert_eq!(
+            read(&board, qty.clone()),
+            expected + 1,
+            "{qty:?}: second card"
+        );
+    }
+
+    #[test]
+    fn exile_card_population_target_zone_card_count() {
+        assert_counts(
+            QuantityRef::TargetZoneCardCount {
+                zone: ZoneRef::Exile,
+                scope: ControllerRef::TargetPlayer,
+                binding: CountBinding::Anaphoric,
+            },
+            1,
+        );
+    }
+
+    /// The copy's Instant and the token's Artifact types do not contribute;
+    /// the second real card adds Instant.
+    #[test]
+    fn exile_card_population_distinct_card_types_in_zone() {
+        assert_counts(
+            QuantityRef::DistinctCardTypes {
+                source: CardTypeSetSource::Zone {
+                    zone: ZoneRef::Exile,
+                    scope: CountScope::Owner,
+                },
+            },
+            1,
+        );
+    }
+
+    /// The Cosmogoyf shape ("cards you own in exile"): a zoned filter whose
+    /// universe is the anchored zone population.
+    #[test]
+    fn exile_card_population_object_count_zoned_filter() {
+        assert_counts(
+            QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
+                    FilterProp::Owned {
+                        controller: ControllerRef::You,
+                    },
+                    FilterProp::InZone { zone: Zone::Exile },
+                ])),
+            },
+            1,
+        );
+    }
+
+    /// A complemented zoned filter takes its universe from the zone listing
+    /// (`filter_zone_object_ids`) rather than the anchored population.
+    #[test]
+    fn exile_card_population_object_count_complement_universe() {
+        assert_counts(
+            QuantityRef::ObjectCount {
+                filter: TargetFilter::Not {
+                    filter: Box::new(TargetFilter::Typed(TypedFilter::card().properties(vec![
+                        FilterProp::Owned {
+                            controller: ControllerRef::Opponent,
+                        },
+                        FilterProp::InZone { zone: Zone::Exile },
+                    ]))),
+                },
+            },
+            1,
+        );
+    }
+
+    /// A GENERIC (non-card-qualified) object filter ranges over every object in
+    /// the zone: the retained prepare copy (and any other object) counts, so one
+    /// real card plus a copy and a token is three, four with a second card.
+    #[test]
+    fn generic_exile_object_count_includes_non_card_objects() {
+        assert_counts_objects(
+            QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(
+                    TypedFilter::new(TypeFilter::Any)
+                        .properties(vec![FilterProp::InZone { zone: Zone::Exile }]),
+                ),
+            },
+            3,
+        );
+    }
+
+    /// The distinct-name count is generic the same way: the differently named
+    /// retained copy raises it.
+    #[test]
+    fn generic_exile_object_count_distinct_names_includes_non_card_objects() {
+        assert_counts_objects(
+            QuantityRef::ObjectCountDistinct {
+                filter: TargetFilter::Typed(
+                    TypedFilter::new(TypeFilter::Any)
+                        .properties(vec![FilterProp::InZone { zone: Zone::Exile }]),
+                ),
+                qualities: vec![SharedQuality::Name],
+            },
+            3,
+        );
+    }
+
+    #[test]
+    fn exile_card_population_object_count_distinct_names() {
+        assert_counts(
+            QuantityRef::ObjectCountDistinct {
+                filter: TargetFilter::Typed(
+                    TypedFilter::card().properties(vec![FilterProp::InZone { zone: Zone::Exile }]),
+                ),
+                qualities: vec![SharedQuality::Name],
+            },
+            1,
+        );
     }
 }
