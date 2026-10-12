@@ -2,10 +2,8 @@ use std::collections::HashSet;
 
 use crate::game::quantity::resolve_quantity_with_targets;
 use crate::game::replacement::{self, ReplacementResult};
-use crate::types::ability::{
-    Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter, TargetRef,
-};
-use crate::types::events::GameEvent;
+use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter};
+use crate::types::events::{GameEvent, LifeTotalReading};
 use crate::types::game_state::{
     GameState, PendingEffectResolutionEvent, PendingEffectResolved, PendingLifeTotalAssignment,
     WaitingFor,
@@ -58,7 +56,10 @@ pub fn resolve_gain(
     // authority for player resolution from a TargetFilter — context-refs
     // (Controller, ParentTargetController) resolve via state slots; explicit
     // Player targets come from `ability.targets`.
-    let player_id: PlayerId = resolve_life_loss_target(state, ability, Some(player_filter));
+    // CR 608.2b: a declared player whose target was illegal gains nothing.
+    let Some(player_id) = resolve_life_loss_target(state, ability, Some(player_filter)) else {
+        return Ok(());
+    };
 
     // CR 119.7: "If an effect says that a player can't gain life ... a replacement
     // effect that would replace a life gain event affecting that player won't do
@@ -271,6 +272,15 @@ pub fn apply_life_gain_after_replacement(
     events.push(GameEvent::LifeChanged {
         player_id: pid,
         amount: gain_amount as i32,
+        // CR 119.1: read back after the edit, so a run of life changes carries
+        // each intermediate total rather than only the final snapshot's.
+        new_total: LifeTotalReading(
+            state
+                .players
+                .iter()
+                .find(|player| player.id == pid)
+                .map(|player| player.life),
+        ),
     });
     gain_amount
 }
@@ -397,6 +407,15 @@ pub fn apply_life_loss_after_replacement(
     events.push(GameEvent::LifeChanged {
         player_id: pid,
         amount: -(loss_amount as i32),
+        // CR 119.3: read back after the edit, so a run of combat-damage life
+        // losses carries each intermediate total rather than only the final one.
+        new_total: LifeTotalReading(
+            state
+                .players
+                .iter()
+                .find(|player| player.id == pid)
+                .map(|player| player.life),
+        ),
     });
     loss_amount
 }
@@ -562,7 +581,10 @@ pub fn resolve_lose(
         _ => return Err(EffectError::MissingParam("LoseLife amount".to_string())),
     };
 
-    let target_player_id = resolve_life_loss_target(state, ability, target_filter);
+    // CR 608.2b: a declared player whose target was illegal loses nothing.
+    let Some(target_player_id) = resolve_life_loss_target(state, ability, target_filter) else {
+        return Ok(());
+    };
 
     if apply_life_loss(state, target_player_id, amount.max(0) as u32, events).is_err() {
         return Ok(());
@@ -577,11 +599,11 @@ pub fn resolve_lose(
     Ok(())
 }
 
-fn resolve_life_loss_target(
+pub(super) fn resolve_life_loss_target(
     state: &GameState,
     ability: &ResolvedAbility,
     target_filter: Option<&TargetFilter>,
-) -> PlayerId {
+) -> Option<PlayerId> {
     // CR 115.1: When the filter is a context-ref (Controller, etc.) the acting
     // player MUST come from state slots — not `ability.targets`, which inherits
     // the parent's chosen Player target via chain target propagation. Mirrors
@@ -594,16 +616,21 @@ fn resolve_life_loss_target(
 
     // Non-context-ref filters (e.g., explicit Player target on "target opponent
     // loses 2 life"): the chosen player is in `ability.targets`.
-    if let Some(player) = ability.targets.iter().find_map(|target| match target {
-        TargetRef::Player(player) => Some(*player),
-        _ => None,
-    }) {
-        return player;
+    // CR 601.2c: the read skips a separately announced quantity slot, so the
+    // primary target keeps its distinct slot identity.
+    if let Some(player) =
+        crate::game::ability_utils::primary_announced_player(&ability.targets, ability)
+    {
+        return Some(player);
     }
 
     // No filter and no Player target: defensive fallback to controller (matches
-    // historical behavior for `LoseLife { target: None }`).
-    ability.controller
+    // historical behavior for `LoseLife { target: None }`). CR 608.2b: a filter
+    // that declared its own target slot names no one once that slot is empty.
+    match target_filter {
+        Some(filter) if super::declared_player_slot_is_empty(state, ability, filter) => None,
+        _ => Some(ability.controller),
+    }
 }
 
 /// CR 119.5: Set a player's life total to a specific number.
@@ -631,17 +658,10 @@ pub fn resolve_set_life_total(
     let target_player_ids: Vec<PlayerId> = if matches!(target, TargetFilter::AllPlayers) {
         crate::game::players::apnap_order(state)
     } else {
-        vec![ability
-            .targets
-            .iter()
-            .find_map(|t| {
-                if let TargetRef::Player(pid) = t {
-                    Some(*pid)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(ability.controller)]
+        let Some(player) = resolve_life_loss_target(state, ability, Some(target)) else {
+            return Ok(());
+        };
+        vec![player]
     };
 
     // CR 119.5: Set each player's life total one at a time, decomposing into the
@@ -1029,6 +1049,56 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, GameEvent::LifeChanged { amount, .. } if *amount == -2)));
+    }
+
+    /// CR 119.1 + CR 119.3: every `LifeChanged` reports the player's life total
+    /// as it stands once that one change is applied — not the total after the
+    /// whole action. A run of changes is therefore replayable one at a time,
+    /// which is what lets a presentation layer show intermediate totals without
+    /// summing amounts (a sum diverges once a replacement alters one of them).
+    #[test]
+    fn life_changed_reports_the_total_after_each_individual_change() {
+        let mut state = GameState::new_two_player(42);
+        let mut events = Vec::new();
+
+        for amount in [3, 4] {
+            let ability = ResolvedAbility::new(
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: amount },
+                    player: TargetFilter::Controller,
+                },
+                vec![],
+                ObjectId(100),
+                PlayerId(0),
+            );
+            resolve_gain(&mut state, &ability, &mut events).unwrap();
+        }
+
+        let ability = ResolvedAbility::new(
+            Effect::LoseLife {
+                amount: QuantityExpr::Fixed { value: 5 },
+                target: None,
+            },
+            vec![TargetRef::Player(PlayerId(0))],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        resolve_lose(&mut state, &ability, &mut events).unwrap();
+
+        let totals: Vec<(i32, Option<i32>)> = events
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::LifeChanged {
+                    player_id,
+                    amount,
+                    new_total,
+                } if *player_id == PlayerId(0) => Some((*amount, new_total.0)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(totals, vec![(3, Some(23)), (4, Some(27)), (-5, Some(22))]);
+        assert_eq!(state.players[0].life, 22);
     }
 
     /// CR 119.7: "can't gain life" suppresses life gain, life total unchanged.

@@ -96,6 +96,17 @@ pub fn resolve(
     let mut payment_ability = ability.clone();
     payment_ability.controller = payer;
 
+    // CR 601.2h + CR 608.2c: a resolution-time Composite is staged before
+    // any sub-cost can mutate canonical state. The transaction descriptor owns
+    // the untouched base plus a replayable root; the ordinary authority below
+    // runs only on its guarded shadow.
+    if matches!(cost, AbilityCost::Composite { .. })
+        && !state.payment_transaction_replay
+        && state.payment_transaction.is_none()
+    {
+        return crate::game::payment_transaction::begin(state, ability, events);
+    }
+
     // CR 118.1 + CR 118.5: Per-object scaled mana cost (was
     // `PaymentCost::ScaledMana`). `scale` is resolution-only metadata: the mana
     // `cost` base (which may carry colored pips) is multiplied by `times`; when
@@ -299,6 +310,7 @@ fn resolve_ability_cost_payment(
     events: &mut Vec<GameEvent>,
 ) -> Result<PaymentOutcome, EffectError> {
     if matches!(cost, AbilityCost::Composite { .. })
+        && !state.payment_transaction_replay
         && !costs::can_pay(
             state,
             payer,
@@ -378,7 +390,16 @@ fn resolution_mana_x_max(
     loop {
         let mut concrete = cost.clone();
         concrete.concretize_x(max);
-        if casting::can_pay_effect_mana_cost_after_auto_tap(state, payer, source_id, &concrete) {
+        // CR 605.3b + CR 616.1: the chosen amount is paid through
+        // `pay_unless_cost`, which has no resume root, so the offered range must
+        // not count a mana source whose own cost would pause.
+        if casting::can_pay_effect_mana_cost_after_auto_tap(
+            state,
+            payer,
+            source_id,
+            &concrete,
+            casting::PausedManaPayment::Unresumable,
+        ) {
             return Some(max);
         }
         if max == 0 {
@@ -602,7 +623,7 @@ mod tests {
         resolve(&mut state, &ability, &mut events).unwrap();
 
         assert!(state.cost_payment_failed_flag);
-        assert_eq!(state.players[0].mana_pool.mana.len(), 1);
+        assert_eq!(state.players[0].mana_pool.total(), 1);
     }
 
     #[test]
@@ -628,7 +649,7 @@ mod tests {
         resolve(&mut state, &ability, &mut events).unwrap();
 
         assert!(!state.cost_payment_failed_flag);
-        assert_eq!(state.players[0].mana_pool.mana.len(), 0);
+        assert_eq!(state.players[0].mana_pool.total(), 0);
         assert!(!state.objects.get(&restricted).unwrap().tapped);
         assert!(state.objects.get(&unrestricted).unwrap().tapped);
     }
@@ -681,7 +702,7 @@ mod tests {
         assert_eq!(state.players[0].life, 17);
         assert!(events.iter().any(|e| matches!(
             e,
-            GameEvent::LifeChanged { player_id, amount }
+            GameEvent::LifeChanged { player_id, amount, .. }
                 if *player_id == PlayerId(0) && *amount == -3
         )));
     }
@@ -726,7 +747,7 @@ mod tests {
         assert_eq!(state.players[0].life, 16);
         assert!(events.iter().any(|e| matches!(
             e,
-            GameEvent::LifeChanged { player_id, amount }
+            GameEvent::LifeChanged { player_id, amount, .. }
                 if *player_id == PlayerId(0) && *amount == -4
         )));
     }
@@ -787,7 +808,7 @@ mod tests {
         let result = resolve(&mut state, &ability, &mut events);
         assert!(result.is_ok());
         assert!(!state.cost_payment_failed_flag);
-        assert_eq!(state.players[0].mana_pool.mana.len(), 0);
+        assert_eq!(state.players[0].mana_pool.total(), 0);
         assert_eq!(state.players[0].life, 17);
     }
 
@@ -816,7 +837,7 @@ mod tests {
         resolve(&mut state, &ability, &mut events).unwrap();
 
         assert!(state.cost_payment_failed_flag);
-        assert_eq!(state.players[0].mana_pool.mana.len(), 1);
+        assert_eq!(state.players[0].mana_pool.total(), 1);
     }
 
     #[test]
@@ -846,7 +867,7 @@ mod tests {
         resolve(&mut state, &ability, &mut events).unwrap();
 
         assert!(!state.cost_payment_failed_flag);
-        assert_eq!(state.players[0].mana_pool.mana.len(), 0);
+        assert_eq!(state.players[0].mana_pool.total(), 0);
     }
 
     #[test]
@@ -884,7 +905,7 @@ mod tests {
         let result = resolve(&mut state, &ability, &mut events);
         assert!(result.is_ok());
         assert!(state.cost_payment_failed_flag);
-        assert_eq!(state.players[0].mana_pool.mana.len(), 1);
+        assert_eq!(state.players[0].mana_pool.total(), 1);
         assert_eq!(state.players[0].life, 2);
     }
 
@@ -998,7 +1019,14 @@ mod tests {
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &pay, &mut events, 0).unwrap();
 
-        assert_eq!(state.players[0].life, 18);
+        // R5 keeps the authoritative base untouched while the Phyrexian
+        // replacement prompt is open; the projected shadow carries the
+        // provisional life loss.
+        assert_eq!(state.players[0].life, 20);
+        assert_eq!(
+            crate::game::payment_transaction::project(&state).players[0].life,
+            18
+        );
         assert_eq!(
             state.players[0].energy, 2,
             "the later energy cost must remain unpaid during the replacement choice"
@@ -1641,6 +1669,7 @@ mod tests {
         state.current_trigger_event = Some(GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
 
         let draw = ResolvedAbility::new(
@@ -1706,7 +1735,7 @@ mod tests {
                 | ResolutionChoiceOutcome::ActionResult(_)
         ));
         assert_eq!(state.players[0].hand.len(), 2);
-        assert_eq!(state.players[0].mana_pool.mana.len(), 1);
+        assert_eq!(state.players[0].mana_pool.total(), 1);
     }
 
     /// CR 107.3f + CR 118.12: Elenda and Azor's attack trigger resolves
@@ -1854,9 +1883,9 @@ mod tests {
         // All 7 mana units (4 colorless for X + W + U + B) must be spent —
         // the pre-fix code paid only 4 generic and left W/U/B untapped.
         assert!(
-            state.players[0].mana_pool.mana.is_empty(),
+            state.players[0].mana_pool.is_empty(),
             "W/U/B must be paid alongside the X-derived generic, pool: {:?}",
-            state.players[0].mana_pool.mana
+            state.players[0].mana_pool
         );
         assert_eq!(state.players[0].hand.len(), 4, "drew X=4 cards");
     }
@@ -1903,7 +1932,7 @@ mod tests {
             );
         }
         assert!(
-            state.players[0].mana_pool.mana.is_empty(),
+            state.players[0].mana_pool.is_empty(),
             "controller must have no mana at all, so not even {{W}} at X=0 is payable"
         );
 
@@ -1964,7 +1993,7 @@ mod tests {
             0,
             "the IfYouDo Draw rider must not fire when the cost payment failed"
         );
-        assert!(state.players[0].mana_pool.mana.is_empty());
+        assert!(state.players[0].mana_pool.is_empty());
     }
 
     /// Control case for the above: `{X}{W}` where the player has EXACTLY one
@@ -2085,7 +2114,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            state.players[0].mana_pool.mana.is_empty(),
+            state.players[0].mana_pool.is_empty(),
             "the {{W}} pip must be paid even though X=0"
         );
         assert_eq!(
@@ -2156,6 +2185,7 @@ mod tests {
         state.current_trigger_event = Some(GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
 
         // CR 608.2c: Build the IfYouDo SequentialSibling Draw rider — exact
@@ -2266,7 +2296,7 @@ mod tests {
             "IfYouDo Draw{{X=3}} must draw 3 cards after Yes + Submit 3"
         );
         assert_eq!(
-            state.players[0].mana_pool.mana.len(),
+            state.players[0].mana_pool.total(),
             2,
             "3 of 5 mana must be spent on X cost"
         );
@@ -2325,6 +2355,7 @@ mod tests {
         state.current_trigger_event = Some(GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
 
         let mut draw = ResolvedAbility::new(
@@ -2376,7 +2407,7 @@ mod tests {
             "decline must not draw any cards"
         );
         assert_eq!(
-            state.players[0].mana_pool.mana.len(),
+            state.players[0].mana_pool.total(),
             5,
             "decline must not spend any mana"
         );
@@ -2726,6 +2757,7 @@ mod tests {
         let event_b = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         state.current_trigger_event = Some(event_b.clone());
         let context_b = ResolvingTriggerContext::capture(&state)
@@ -2808,6 +2840,7 @@ mod tests {
         state.current_trigger_event = Some(GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
 
         let mut draw = ResolvedAbility::new(
@@ -2861,7 +2894,7 @@ mod tests {
             "X=0 must draw 0 cards (the Draw count IS X)"
         );
         assert_eq!(
-            state.players[0].mana_pool.mana.len(),
+            state.players[0].mana_pool.total(),
             5,
             "X=0 must spend 0 mana"
         );
@@ -2939,6 +2972,7 @@ mod tests {
         state.current_trigger_event = Some(GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 2,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
 
         let mut draw = ResolvedAbility::new(
@@ -3118,8 +3152,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.players[0].hand.len(), 3);
-        assert_eq!(state.players[0].mana_pool.mana.len(), 0);
-        assert_eq!(state.players[1].mana_pool.mana.len(), 2);
+        assert_eq!(state.players[0].mana_pool.total(), 0);
+        assert_eq!(state.players[1].mana_pool.total(), 2);
     }
 
     /// CR 107.1c: "Pay any amount" with zero energy still pauses with
