@@ -2168,11 +2168,10 @@ pub(crate) fn gross_mana_output(
 
 fn gross_mana_output_of(state: &GameState, resolved: &ResolvedAbility) -> u32 {
     let resolved = mana_abilities::apply_condition_instead_mana_swap(state, resolved);
+    // The base output is planned like every other source (a "choose a color"
+    // count follows the chosen color — Nyx Lotus, #8443).
     let mut total = match &resolved.effect {
-        Effect::Mana { produced, .. } => {
-            super::effects::mana::resolve_mana_types_for_ability(produced, state, &resolved).len()
-                as u32
-        }
+        Effect::Mana { produced, .. } => planned_gross_mana(produced, state, &resolved),
         _ => 0,
     };
     let mut node = resolved.sub_ability.as_deref();
