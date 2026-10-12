@@ -96,11 +96,11 @@ describe("openPhaseSocket", () => {
   it("resolves with serverInfo once ServerHello arrives and sends ClientHello", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
-    ws.deliverMessage(helloFrame({ protocol_version: 130 }));
+    ws.deliverMessage(helloFrame());
 
     const socket = await promise;
     expect(socket.serverInfo.mode).toBe("Full");
-    expect(socket.serverInfo.protocolVersion).toBe(130);
+    expect(socket.serverInfo.protocolVersion).toBe(PROTOCOL_VERSION);
     expect(ws.send).toHaveBeenCalledWith(
       expect.stringContaining('"type":"ClientHello"'),
     );
@@ -283,6 +283,39 @@ describe("openPhaseSocket", () => {
     ws.deliverMessage(helloFrame({ protocol_version: PROTOCOL_VERSION + 1 }));
 
     await expect(promise).rejects.toBeInstanceOf(HandshakeError);
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("rejects Full v133 before it can read the activation's stack entry", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 133 }));
+
+    await expect(promise).rejects.toMatchObject({
+      kind: "protocol_mismatch",
+    });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("rejects Full v131 before it can read the stack-exile rider's incarnation", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 131 }));
+
+    await expect(promise).rejects.toMatchObject({
+      kind: "protocol_mismatch",
+    });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("rejects Full v130 before it can read the coordinated player scope", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 130 }));
+
+    await expect(promise).rejects.toMatchObject({
+      kind: "protocol_mismatch",
+    });
     expect(ws.close).toHaveBeenCalled();
   });
 
