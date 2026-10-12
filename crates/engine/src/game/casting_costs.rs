@@ -1096,11 +1096,17 @@ fn spell_alternative_cost_is_payable(
         }
         // CR 118.3 + CR 601.2h: every leg must be payable, and multiple chosen
         // hand-discard legs must be payable together (one card cannot serve two).
+        // Spell costs prompt their object legs without look-ahead.
         AbilityCost::Composite { costs } => {
             costs.iter().all(|sub_cost| {
                 spell_alternative_cost_is_payable(state, player, object_id, sub_cost)
-            }) && super::cost_payability::discard_legs_jointly_payable(
-                state, player, object_id, None, costs,
+            }) && super::cost_payability::object_cost_legs_jointly_payable(
+                state,
+                player,
+                object_id,
+                None,
+                costs,
+                super::cost_payability::ObjectLegPayment::Unguided,
             )
         }
         other => other.is_payable(state, player, object_id),
@@ -5909,7 +5915,37 @@ pub(crate) fn target_first_activation_defers_interactive_costs_to_payment_bounda
 /// interactive activation-cost component from the serialized residual. Every
 /// completed handler removes one matching leg, so repeated components and a
 /// chosen `OneOf` branch naturally re-enter here until no selection remains.
+///
+/// Legs that use up chosen objects are paid with distinct objects: the residual
+/// must still be jointly payable before anything more is surfaced (a selection
+/// that strands a later leg is refused with its whole action), and a surfaced
+/// prompt offers only the objects that keep the rest payable.
 pub(crate) fn surface_next_unpaid_interactive_activation_cost(
+    state: &mut GameState,
+    player: PlayerId,
+    pending: &mut PendingCast,
+    events: &mut Vec<GameEvent>,
+) -> Result<Option<WaitingFor>, EngineError> {
+    if let Some(residual) = pending.activation_cost.as_ref() {
+        if !super::cost_payability::activation_residual_jointly_payable(
+            state,
+            player,
+            pending.object_id,
+            pending.ability.context.granting_object,
+            residual,
+        ) {
+            return Err(EngineError::ActionNotAllowed(
+                "The remaining cost can't be paid with distinct objects".into(),
+            ));
+        }
+    }
+    let surfaced = surface_next_interactive_activation_cost_leg(state, player, pending, events)?;
+    Ok(surfaced.map(|waiting_for| {
+        super::cost_payability::restrict_activation_prompt_to_joint_payment(state, waiting_for)
+    }))
+}
+
+fn surface_next_interactive_activation_cost_leg(
     state: &mut GameState,
     player: PlayerId,
     pending: &mut PendingCast,
@@ -14511,6 +14547,7 @@ fn auto_tap_mana_sources_inner(
                     player,
                     option.object_id,
                     crate::types::events::ActivatedAbilityKind::Mana,
+                    None,
                     crate::types::zones::Zone::Battlefield,
                     events,
                 );
@@ -14832,19 +14869,20 @@ pub(super) fn max_x_value_excluding(
     // max(mana yield, tap-keyword yield), never the sum, or the X cap inflates
     // above what the caster can actually pay.
     //
-    // CR 117.1d + CR 601.2g: Use `feasible_mana_capacity` (not the auto-tap-
-    // only `max_mana_yield`) so sacrifice-/discard-/life-cost mana abilities
-    // the controller could activate manually are counted. Without this, KCI
-    // (and similar non-tap mana sources) understate the X cap for X-spells
-    // — see #562. The per-permanent sum can over-count chain-sacrifice
-    // configurations (tracked in #1235); colored-shard non-tap feasibility
-    // is deferred separately (tracked in #1234).
+    // CR 117.1d + CR 601.2g: Use `x_ceiling_mana_capacity` (the feasible
+    // capacity, not the auto-tap-only `max_mana_yield`) so sacrifice-/discard-/
+    // life-cost mana abilities the controller could activate manually are
+    // counted. Without this, KCI (and similar non-tap mana sources) understate
+    // the X cap for X-spells — see #562. A source whose amount depends on the
+    // color it is activated for is left out (fails closed). The per-permanent
+    // sum can over-count chain-sacrifice configurations (tracked in #1235);
+    // colored-shard non-tap feasibility is deferred separately (tracked in #1234).
     let permanent_capacity: u32 = state
         .battlefield
         .iter()
         .filter(|id| !excluded_sources.contains(id))
         .map(|&id| {
-            let mana = mana_sources::feasible_mana_capacity(state, id, player, spell_ctx.as_ref());
+            let mana = mana_sources::x_ceiling_mana_capacity(state, id, player, spell_ctx.as_ref());
             let tap = pred
                 .filter(|p| state.objects.get(&id).is_some_and(|o| p(o, player)))
                 .map_or(0, |_| 1);
