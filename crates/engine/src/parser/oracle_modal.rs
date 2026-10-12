@@ -23,7 +23,9 @@ use super::oracle_cost::parse_oracle_cost;
 #[cfg(test)]
 use super::oracle_effect::lower_ability_ir;
 use super::oracle_effect::{
-    conditions::{split_leading_conditional, strip_leading_general_conditional},
+    conditions::{
+        split_leading_conditional, strip_routed_leading_general_conditional, LeadingConditionRoute,
+    },
     parse_ability_ir_with_context, try_parse_named_choice,
 };
 use super::oracle_ir::context::ParseContext;
@@ -1032,12 +1034,24 @@ fn reflexive_modal_connector(
     header: &ModalHeaderAst,
     ctx: &mut ParseContext,
 ) -> Result<AbilityCondition, Box<Effect>> {
-    let (guard, _) = strip_leading_general_conditional(&header.raw, ctx);
-    if let Some(guard) = guard {
-        return Ok(AbilityCondition::when_you_do_with_guard(guard));
+    match strip_routed_leading_general_conditional(&header.raw, ctx) {
+        // CR 115.1 + CR 608.2c: a target P/T threshold guard's
+        // `TargetMatchesFilter { subject_slot: None }` reads the gated node's own
+        // first object target, and a mode may announce its own target, so the
+        // guard cannot bind the antecedent "that creature" here; refuse it.
+        (Some((_, LeadingConditionRoute::TargetPtThreshold)), _) => {
+            return Err(Box::new(Effect::unimplemented(
+                "modal_reflexive_condition",
+                &header.raw,
+            )));
+        }
+        (Some((guard, LeadingConditionRoute::General)), _) => {
+            return Ok(AbilityCondition::when_you_do_with_guard(guard));
+        }
+        (None, _) => {}
     }
 
-    // `strip_leading_general_conditional` returns `None` both for a header
+    // `strip_routed_leading_general_conditional` returns `None` both for a header
     // with no guard and for an unmodeled leading conditional. Only the first
     // may become a bare `WhenYouDo`: lowering the second that way would make
     // an unsupported intervening-if condition silently permissive.
@@ -1466,10 +1480,15 @@ fn parse_modal_mode_irs(
             // `base_ctx` holds — a reset base stays reset, and no mode can
             // invent authority its parent lacked.
             mode_ctx.subject = mode_anaphor_subject(mode_ctx.subject.take());
+            // CR 700.2: declared-slot numbering is mode-local at runtime, so a
+            // mode never admits a declared-slot referent.
+            mode_ctx.body_scope = super::oracle_ir::context::BodyScope::ModalMode;
             mode_ctx.diagnostics.clear();
             let mut ability = parse_ability_ir_with_context(&mode.body, kind, &mut mode_ctx);
             guard_unsupported_mode_qualifiers_ir(&mut ability, kind, &mode_ctx);
             base_ctx.diagnostics.extend(mode_ctx.diagnostics);
+            // CR 700.2: the selected modes resolve as one chain, so their declared-player groups must not repeat.
+            base_ctx.next_declared_player_group = mode_ctx.next_declared_player_group;
             ModalModeIr {
                 source_text: mode.source_text.clone(),
                 source_line: mode.source_line,
@@ -1826,6 +1845,7 @@ fn lower_as_enters_anchor_word_modal(
             bypass_beneficiary: None,
             protection_does_not_remove: None,
             room_door: None,
+            granting_object: None,
         };
         result.statics.push(placeholder);
     }

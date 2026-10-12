@@ -4,9 +4,9 @@ use crate::game::game_object::LinkedAbilitySource;
 use crate::types::ability::{AbilityProvenance, Duration, ResolvedAbility};
 use crate::types::game_state::{
     ExileLink, ExileLinkKind, ExiledStopInput, GameState, LibrarySearchDeliveryResume, LookGrant,
-    RepeatUntilStopWitness, StackEntryKind,
+    RepeatUntilStopWitness, StackEntry, StackEntryKind,
 };
-use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
+use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
 
@@ -306,6 +306,21 @@ fn record_link(
     true
 }
 
+/// CR 400.7 + CR 113.7a: The incarnation of `source_id` a linked-exile read or
+/// write is made for. A resolving ability of that source acts as the object that
+/// put it on the stack (its push-time capture); anything else acts as the object
+/// as it now exists. `None` when the object no longer exists.
+pub(crate) fn linked_exile_incarnation(state: &GameState, source_id: ObjectId) -> Option<u64> {
+    state
+        .resolving_stack_entry
+        .as_ref()
+        .filter(|entry| entry.source_id == source_id)
+        .and_then(StackEntry::ability)
+        .and_then(|ability| ability.source_ref(state))
+        .map(|source| source.incarnation)
+        .or_else(|| state.objects.get(&source_id).map(|obj| obj.incarnation))
+}
+
 /// CR 607.1 + CR 607.2a + CR 607.5 + CR 113.7a: the pairing identity of the
 /// ability of `source_id` whose instruction is performing the exile being
 /// linked now — the incarnation that put it on the stack and the copiable
@@ -332,14 +347,8 @@ fn resolving_exile_supplier(state: &GameState, source_id: ObjectId) -> Option<Li
     };
     // CR 400.7 + CR 113.7a: the push-time capture names the object that put
     // the ability on the stack even after it changed zones.
-    let incarnation = ability.source_incarnation.or_else(|| {
-        state
-            .objects
-            .get(&source_id)
-            .map(|object| object.incarnation)
-    })?;
     Some(LinkedAbilitySource {
-        creator: ObjectIncarnationRef::of(source_id, incarnation),
+        creator: ability.source_ref(state)?,
         characteristic_set,
     })
 }
@@ -626,7 +635,7 @@ mod tests {
         AbilityDefinition, AbilityKind, CastingPermission, Effect, ManaProduction, PlayerFilter,
         QuantityExpr, QuantityRef, TargetFilter,
     };
-    use crate::types::identifiers::ObjectId;
+    use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
     use crate::types::player::PlayerId;
     use crate::types::statics::CastFrequency;
     use crate::types::zones::{EtbTapState, Zone};
