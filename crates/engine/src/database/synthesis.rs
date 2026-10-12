@@ -7914,18 +7914,29 @@ pub fn synthesize_backup(face: &mut CardFace) {
 /// permanent. The `type_str` is the capitalized Champion payload (e.g.
 /// "Kithkin", "Dragon"); per CR 702.72a it always names a creature type. A
 /// payload of "Creature" (cards that champion a creature of any type) yields a
-/// bare creature filter with no subtype constraint.
+/// bare creature filter with no subtype constraint. An "X or Y" payload
+/// ("Goblin or Shaman") is the union of both types.
 ///
 /// `FilterProp::Another` enforces the "another" clause (CR 109.1): the
-/// championing permanent itself can never be the exiled creature.
+/// championing permanent itself can never be the exiled permanent.
 fn champion_type_filter(type_str: &str) -> TargetFilter {
-    let mut filter = TypedFilter::creature()
-        .controller(ControllerRef::You)
-        .properties(vec![FilterProp::Another]);
-    if !type_str.eq_ignore_ascii_case("creature") {
-        filter = filter.subtype(type_str.to_string());
+    let any_creature = type_str.eq_ignore_ascii_case("creature");
+    // CR 109.2 + CR 205.3m: a creature type names any permanent with that
+    // type, kindreds included; only "a creature" is scoped to creatures.
+    let scope = if any_creature {
+        TypedFilter::creature()
+    } else {
+        TypedFilter::permanent()
     }
-    TargetFilter::Typed(filter)
+    .controller(ControllerRef::You)
+    .properties(vec![FilterProp::Another]);
+    if any_creature {
+        return TargetFilter::Typed(scope);
+    }
+    if let Some(union) = crate::parser::oracle_target::parse_type_phrase_union(type_str, &scope) {
+        return union;
+    }
+    TargetFilter::Typed(scope.subtype(type_str.to_string()))
 }
 
 fn champion_has_eligible_object_condition(type_str: &str) -> AbilityCondition {
@@ -18640,16 +18651,7 @@ mod idempotency_tests {
 
     /// CR 609.3 + CR 111.7 (#8147): one mobilized token trades in combat before
     /// the end step, so it has ceased to exist by the time the delayed
-    /// "sacrifice them" fires. The delayed trigger snapshots BOTH token ids at
-    /// creation and carries no incarnation pins, so `live_object_targets` still
-    /// hands the resolver the dead id; `sacrifice::resolve` used to `?` out with
-    /// `EffectError::ObjectNotFound` on it and abandon the whole effect, leaving
-    /// the survivor on the battlefield forever.
-    ///
-    /// Discriminating (fail-on-revert): restore the `ok_or(...)?` in
-    /// `effects/sacrifice.rs` and the survivor stays on the battlefield.
-    /// `synthesize_mobilize_runtime_sacrifices_tokens_at_next_end_step` cannot
-    /// see this — nothing dies in it, so every snapshotted id is still live.
+    /// "sacrifice them" fires.
     #[test]
     fn mobilize_end_step_sacrifice_still_takes_the_survivor_of_a_combat_trade() {
         let mut face = CardFace::default();
@@ -18691,6 +18693,62 @@ mod idempotency_tests {
             state.objects[&survivor].zone,
             Zone::Graveyard,
             "surviving mobilized token must still be sacrificed"
+        );
+    }
+
+    /// CR 603.7c + CR 111.7: both mobilized tokens are gone before the end step, and
+    /// a later token producer has overwritten `last_created_token_ids`. The delayed
+    /// "sacrifice them" has no referent left, so it must not sacrifice that later
+    /// token.
+    #[test]
+    fn mobilize_end_step_sacrifice_ignores_a_later_producers_token_when_all_referents_are_gone() {
+        let mut face = CardFace::default();
+        face.keywords
+            .push(Keyword::Mobilize(QuantityExpr::Fixed { value: 2 }));
+        synthesize_mobilize(&mut face);
+
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Mobilizer".to_string(),
+            Zone::Battlefield,
+        );
+        let execute = face
+            .triggers
+            .first()
+            .and_then(|trigger| trigger.execute.as_deref())
+            .expect("mobilize trigger must have an execute body");
+        let ability = build_resolved_from_def(execute, source_id, PlayerId(0));
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        let tokens = state.last_created_token_ids.clone();
+        assert_eq!(tokens.len(), 2);
+        for token in tokens {
+            state.battlefield.retain(|id| *id != token);
+            state.objects.remove(&token);
+        }
+
+        let later_token = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Later Token".to_string(),
+            Zone::Battlefield,
+        );
+        state.last_created_token_ids = vec![later_token];
+
+        let stacked =
+            check_delayed_triggers(&mut state, &[GameEvent::PhaseChanged { phase: Phase::End }]);
+        assert_eq!(stacked.len(), 1, "end-step cleanup must still stack");
+        resolve_top(&mut state, &mut events);
+
+        assert_eq!(
+            state.objects[&later_token].zone,
+            Zone::Battlefield,
+            "the later producer's token was never named by the delayed trigger"
         );
     }
 
@@ -24728,7 +24786,7 @@ mod sunburst_runtime_tests {
             .map(|c| ManaUnit::new(ManaType::from(*c), ObjectId(0), false, Vec::new()))
             .collect();
         if let Some(p) = state.players.iter_mut().find(|p| p.id == P0) {
-            p.mana_pool.mana = mana;
+            p.mana_pool = crate::types::mana::ManaPool::from_units(mana);
         }
 
         (GameRunner::from_state(state), spell)
@@ -25603,7 +25661,12 @@ mod champion_synthesis_tests {
                             .type_filters
                             .iter()
                             .any(|f| matches!(f, TypeFilter::Subtype(s) if s == "Elf")));
+                        // CR 109.2 + CR 205.3m: an Elf permanent, kindreds included.
                         assert!(tf
+                            .type_filters
+                            .iter()
+                            .any(|f| matches!(f, TypeFilter::Permanent)));
+                        assert!(!tf
                             .type_filters
                             .iter()
                             .any(|f| matches!(f, TypeFilter::Creature)));
@@ -25620,6 +25683,28 @@ mod champion_synthesis_tests {
             .find(|b| matches!(&*b.effect, Effect::Sacrifice { .. }))
             .expect("sacrifice branch must exist");
         assert!(is_champion_self_sacrifice_ability(sacrifice));
+    }
+
+    /// CR 702.72a: "Champion a Goblin or Shaman" (Lightning Crafter) exiles
+    /// another Goblin or another Shaman you control, never one subtype named
+    /// "Goblin or Shaman".
+    #[test]
+    fn champion_or_payload_is_a_union_of_both_types() {
+        let filter = champion_type_filter("Goblin or Shaman");
+        let TargetFilter::Or { filters } = &filter else {
+            panic!("expected an Or union, got {filter:?}");
+        };
+        assert_eq!(filters.len(), 2);
+        for (leg, kind) in filters.iter().zip(["Goblin", "Shaman"]) {
+            let TargetFilter::Typed(tf) = leg else {
+                panic!("expected a Typed leg, got {leg:?}");
+            };
+            assert_eq!(tf.controller, Some(ControllerRef::You));
+            assert!(tf.properties.contains(&FilterProp::Another));
+            assert!(tf
+                .type_filters
+                .contains(&TypeFilter::Subtype(kind.to_string())));
+        }
     }
 
     /// CR 702.72a + CR 702.72b: Champion synthesizes an LTB trigger that

@@ -1,7 +1,8 @@
+use crate::types::game_state::RandomDraw;
 use rand::Rng;
 use std::collections::HashSet;
 
-use crate::game::quantity::resolve_quantity;
+use crate::game::quantity::{resolve_quantity, resolve_quantity_with_targets};
 use crate::game::replacement::{self, ReplacementResult};
 use crate::types::ability::{
     DieRollIgnoreRule, DieRollModifier, Effect, EffectError, EffectKind, ResolvedAbility,
@@ -42,7 +43,7 @@ pub(crate) fn roll_natural(state: &mut GameState, sides: u8) -> u8 {
         debug_assert!(false, "CR 706.1: a die roll must have at least one side");
         return 1;
     }
-    state.rng.random_range(1..=sides)
+    state.rng.draw(RandomDraw::Outcome).random_range(1..=sides)
 }
 
 /// CR 706.2: Apply a die roll's (optional) modifier to a natural result.
@@ -191,8 +192,7 @@ pub fn resolve(
     // CR 706.1: Resolve how many dice of this kind to roll, in the ability's
     // context; clamp at zero (a 0-count roll is a no-op). Each die is rolled
     // independently with the same sides/modifier/results table.
-    let count =
-        resolve_quantity(state, count_expr, ability.controller, ability.source_id).max(0) as u32;
+    let count = resolve_quantity_with_targets(state, count_expr, ability).max(0) as u32;
 
     let instruction = PendingDieRollInstruction {
         source_id: ability.source_id,
@@ -1236,6 +1236,7 @@ mod tests {
             amount: 6,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         });
         let draw = ResolvedAbility::new(
             Effect::Draw {
@@ -1302,6 +1303,7 @@ mod tests {
             amount: 20,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         });
         let draw = ResolvedAbility::new(
             Effect::Draw {
