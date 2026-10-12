@@ -4241,11 +4241,7 @@ fn parse_unless_mana_payment(cost_str: &str) -> Option<AbilityCost> {
     {
         return None;
     }
-    if let Some(cost) = super::oracle_effect::parse_unless_for_each_payment(after_cost, &mana_cost)
-    {
-        return Some(cost);
-    }
-    Some(AbilityCost::Mana { cost: mana_cost })
+    super::oracle_effect::parse_unless_mana_cost_tail(after_cost, &mana_cost)
 }
 
 /// CR 608.2f + CR 118.12a: true for a payer whose identity the `player_scope`
@@ -4328,6 +4324,15 @@ fn hoist_unless_pay_modifier(
     .1
     .is_some()
     {
+        return (text.to_string(), None);
+    }
+    // CR 608.2c + CR 118.12a: instructions are followed in the order written, and an
+    // "unless" binds to its own instruction. When the unless-bearing sentence sequences
+    // instructions with ", then ", hoisting the unless to the trigger root would ask for
+    // the payment before the earlier instructions run (Cyclone, Phantasmal Sphere: the
+    // prompt must follow the counter). Decline; the per-clause path
+    // (`extract_resolution_unless_pay_modifier`) attaches it to its own clause.
+    if nom_primitives::split_once_on(enclosing, ", then ").is_ok() {
         return (text.to_string(), None);
     }
 
@@ -6341,11 +6346,6 @@ pub(crate) fn static_condition_to_trigger_condition(
 
         // Not combinator — handle common negation patterns.
         StaticCondition::Not { condition } => match condition.as_ref() {
-            StaticCondition::DuringYourTurn => Some(TriggerCondition::Not {
-                condition: Box::new(TriggerCondition::DuringPlayersTurn {
-                    player: PlayerFilter::Controller,
-                }),
-            }),
             // Negate a quantity comparison by flipping the comparator.
             // Apply the same `Another` → `OtherThanTriggerObject` substitution
             // as the affirmative branch (CR 603.4).
@@ -6369,55 +6369,15 @@ pub(crate) fn static_condition_to_trigger_condition(
                     rhs: QuantityExpr::Fixed { value: 0 },
                 })
             }
-            // CR 110.5b: Not(SourceIsTapped) → source is untapped.
-            StaticCondition::SourceIsTapped => Some(TriggerCondition::Not {
-                condition: Box::new(TriggerCondition::SourceIsTapped),
+            // CR 603.4: every other negation recurses through this bridge and wraps
+            // the affirmative mapping, so subject scopes (monarch player, commander
+            // ownership, starting player) ride through unchanged and an
+            // unbridgeable inner condition stays `None` (fail closed).
+            inner => static_condition_to_trigger_condition(inner).map(|condition| {
+                TriggerCondition::Not {
+                    condition: Box::new(condition),
+                }
             }),
-            // CR 725.1 + CR 109.5: "if you're not the monarch" / "if an opponent
-            // is the monarch". The subject scope must survive the bridge —
-            // collapsing it to `Controller` here would silently rebind
-            // "that player is the monarch" to the ability's controller.
-            StaticCondition::IsMonarch { player } => Some(TriggerCondition::Not {
-                condition: Box::new(TriggerCondition::IsMonarch {
-                    player: player.clone(),
-                }),
-            }),
-            // CR 725.1: "if there is a monarch" (negated no-monarch check).
-            StaticCondition::NoMonarch => Some(TriggerCondition::Not {
-                condition: Box::new(TriggerCondition::NoMonarch),
-            }),
-            // CR 103.1: "you weren't the starting player" → Not(WasStartingPlayer).
-            StaticCondition::WasStartingPlayer { controller } => Some(TriggerCondition::Not {
-                condition: Box::new(TriggerCondition::WasStartingPlayer {
-                    controller: controller.clone(),
-                }),
-            }),
-            // CR 702.185c: "no spell was warped this turn" → Not(SpellCastWithVariantThisTurn).
-            StaticCondition::SpellCastWithVariantThisTurn { variant } => {
-                Some(TriggerCondition::Not {
-                    condition: Box::new(TriggerCondition::SpellCastWithVariantThisTurn {
-                        variant: *variant,
-                    }),
-                })
-            }
-            StaticCondition::CastVariantPaid { variant } => Some(TriggerCondition::Not {
-                condition: Box::new(TriggerCondition::CastVariantPaidPersistent {
-                    variant: *variant,
-                }),
-            }),
-            // CR 903.3d + CR 603.4: "if you don't control your/a commander". The
-            // affirmative arm bridges below; without this one the negated form
-            // round-trips through `ability_condition_to_static_condition` and then
-            // dies here, so `triggers::delayed_intervening_if` would silently keep
-            // only the RESOLUTION-time half of CR 603.4 for a negated commander
-            // gate. `ownership` rides through unchanged — CR 903.3 "your commander"
-            // must not widen to CR 903.3d "a commander" under negation either.
-            StaticCondition::ControlsCommander { ownership } => Some(TriggerCondition::Not {
-                condition: Box::new(TriggerCondition::ControlsCommander {
-                    ownership: *ownership,
-                }),
-            }),
-            _ => None,
         },
 
         // And/Or — recursive. If ANY child is unmappable, the entire compound
@@ -16261,6 +16221,14 @@ fn parse_loses_game_actor(input: &str) -> OracleResult<'_, Option<TargetFilter>>
         value(
             (Some(TargetFilter::AttachedTo), true),
             tag("enchanted player "),
+        ),
+        // CR 607.2d: "the chosen player" is linked to the source's own
+        // "choose a player/opponent" ability, whose answer is persisted on the
+        // source and read here as `SourceChosenPlayer` (Shinryu, Transcendent
+        // Rival). The reader also makes the linked chooser persist its pick.
+        value(
+            (Some(TargetFilter::SourceChosenPlayer), true),
+            tag("the chosen player "),
         ),
     ))
     .parse(input)?;
