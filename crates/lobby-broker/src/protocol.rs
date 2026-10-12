@@ -60,6 +60,37 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
+/// 134 — `GameEvent::AbilityActivated` gains `stack_entry` (`Option<ObjectId>`,
+///      omitted when absent) — the stack object a stack-using activation
+///      created (CR 602.2a), which an activation trigger's "copy that ability"
+///      names (CR 707.10). Events ride in `GameState` (`current_trigger_event`,
+///      each triggered ability's stored event), and an older peer drops the
+///      field silently, resolving those copies differently. Full-game peers and
+///      P2P move in lockstep (wire 116); no lobby carrier names it.
+///
+/// 133 — CR 614.12a pre-entry as-enters choices: `ProposedEvent::ZoneChange`
+///      gains `enter_with_choices` (the answers riding the entry event),
+///      `PendingReplacement` gains `delivery_boundary` (the event the paused
+///      delivery's owner parked on), and `NamedChoiceSourceBinding` gains
+///      `PendingEntry` (`WaitingFor::NamedChoice.source.binding`). All are
+///      serialized inside `GameState`; a v132 peer cannot parse the new binding
+///      tag. Full-game peers and P2P move in lockstep (wire 115); no lobby
+///      carrier names it.
+///
+/// 132 — `GameObject::exile_from_stack_linked_source` carries the stamping
+///      incarnation (`ObjectIncarnationRef`, CR 400.7). A v131 peer cannot
+///      decode a set rider; a legacy bare id decodes as `LEGACY_INCARNATION`
+///      and is attributed to no live object. Full-game peers and P2P move in
+///      lockstep (wire 114); no lobby carrier names it.
+///
+/// 131 — `PlayerFilter` gains `AnyOf { filters }`
+///      (`{"type":"AnyOf","filters":[…]}`, the union of player sets) and
+///      `TargetPlayer` (`{"type":"TargetPlayer"}`, the first declared player
+///      target), serialized inside `GameState` wherever a resolving or pending
+///      ability carries a `player_scope`. A v130 peer cannot parse either tag.
+///      Full-game peers and P2P move in lockstep (wire 113); no lobby carrier
+///      names it.
+///
 /// 130 — `GameState::linked_exile_lki` holds one incarnation-bounded
 ///      `LinkedExileLki` per departure (CR 400.7). A v129 peer cannot decode a
 ///      non-empty map. Full-game peers and P2P move in lockstep (wire 112); no
@@ -1004,7 +1035,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 130;
+pub const PROTOCOL_VERSION: u32 = 134;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2261,12 +2292,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 130);
+        assert_eq!(PROTOCOL_VERSION, 134);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 129);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 133);
     }
 
     #[test]
