@@ -6212,6 +6212,7 @@ pub(crate) fn static_condition_to_trigger_condition(
         StaticCondition::DuringOpponentsTurn => Some(TriggerCondition::DuringPlayersTurn {
             player: PlayerFilter::Opponent,
         }),
+        StaticCondition::DuringYourEndStep => None,
         StaticCondition::DayNightIs { .. } => None,
         StaticCondition::SharesColorWithMostCommonColorAmongPermanents => None,
 

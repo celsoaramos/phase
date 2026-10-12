@@ -33388,3 +33388,26 @@ fn ir_facade_demotes_a_refused_granter_name() {
         Effect::Unimplemented { name, .. } if name == "granter_reference_unreached"
     )));
 }
+
+/// CR 607.2a + CR 508.4: Mardu Siegebreaker — "create a tapped token that's a copy of
+/// the exiled card attacking that opponent" copies the card this creature exiled and
+/// the token enters ATTACKING (the suffix is an entry qualifier, not part of the source).
+#[test]
+fn mardu_siegebreaker_attack_copy_of_exiled_card_enters_attacking() {
+    let parsed = parse_oracle_text(
+        "Deathtouch, haste\nWhen this creature enters, exile up to one other target creature you control until this creature leaves the battlefield.\nWhenever this creature attacks, for each opponent, create a tapped token that's a copy of the exiled card attacking that opponent. At the beginning of your next end step, sacrifice those tokens.",
+        "Mardu Siegebreaker",
+        &[],
+        &["Creature".into()],
+        &["Human".into(), "Warrior".into()],
+    );
+    let json = serde_json::to_string(&parsed.triggers).unwrap();
+    assert!(
+        json.contains("\"enters_attacking\":true") && json.contains("CopyTokenOf"),
+        "copy token must enter attacking: {json}"
+    );
+    assert!(
+        !json.contains("\"type\":\"TrackedSet\",\"id\":0},\"owner\""),
+        "copy source must not be an unbound tracked set: {json}"
+    );
+}

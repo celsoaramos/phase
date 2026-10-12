@@ -274,6 +274,7 @@ fn static_condition_to_restriction_condition(
         // The `Not` recursion arm above yields `Not(IsYourTurn)` for
         // "it's not your turn".
         StaticCondition::DuringYourTurn => Some(ParsedCondition::IsYourTurn),
+        StaticCondition::DuringYourEndStep => None,
         // CR 102.3 + CR 805.4a: keep the opponent relation distinct from
         // `Not(IsYourTurn)`, which would incorrectly include a teammate's turn.
         StaticCondition::DuringOpponentsTurn => Some(ParsedCondition::IsOpponentsTurn),

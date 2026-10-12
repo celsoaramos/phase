@@ -138,10 +138,27 @@ pub fn resolve(
             // copy has no legal source and resolves as a clean no-op through the
             // empty-source path below, which still emits `EffectResolved`.
             match ability.cost_paid_object.as_ref() {
+                // CR 607.2a: "the exiled card" with no cost-paid object bound is the
+                // card this source exiled via a linked "until ~ leaves the battlefield"
+                // effect (Mardu Siegebreaker's attack trigger). Only a source with no
+                // live link is the malformed-ability case.
                 None => {
-                    return Err(EffectError::MissingParam(
-                        "CopyTokenOf requires a cost-paid object".to_string(),
-                    ));
+                    let linked: Vec<ObjectId> =
+                        crate::game::exile_links::live_links_for_source(state, ability.source_id)
+                            .map(|link| link.exiled_id)
+                            .filter(|id| {
+                                state
+                                    .objects
+                                    .get(id)
+                                    .is_some_and(|obj| obj.zone == Zone::Exile)
+                            })
+                            .collect();
+                    if linked.is_empty() && !crate::game::exile_links::source_is_linked_exile_consumer(state, ability.source_id) {
+                        return Err(EffectError::MissingParam(
+                            "CopyTokenOf requires a cost-paid object".to_string(),
+                        ));
+                    }
+                    linked
                 }
                 Some(snapshot) => snapshot
                     .live_object_id(state)

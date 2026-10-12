@@ -2418,6 +2418,7 @@ pub(crate) fn static_condition_uses_unspent_mana(condition: &StaticCondition) ->
         | StaticCondition::Unrecognized { .. }
         | StaticCondition::DuringYourTurn
         | StaticCondition::DuringOpponentsTurn
+        | StaticCondition::DuringYourEndStep
         | StaticCondition::SourceEnteredThisTurn
         | StaticCondition::SourceHasDealtDamage
         | StaticCondition::WasCast { .. }

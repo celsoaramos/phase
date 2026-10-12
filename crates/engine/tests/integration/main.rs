@@ -524,6 +524,7 @@ mod idol_of_false_gods_counter_animation;
 mod if_you_do_declined_gate_later_instruction_p7;
 mod inevitable_betrayal_no_mana_cost;
 mod infantry_shield_mobilize_grant;
+mod zurgo_siegebreaker_tokens;
 mod inherent_rule_trigger_display_name;
 mod inkshield_prevented_this_way_token_rider;
 mod innocent_bystander_whole_event_damage;

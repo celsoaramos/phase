@@ -6242,6 +6242,7 @@ pub(crate) fn static_condition_to_ability_condition(
         // no `AbilityCondition` counterpart yet. Return `None` rather than
         // lowering it to `Not(IsYourTurn)`, which would be wrong in 2HG.
         | StaticCondition::DuringOpponentsTurn
+        | StaticCondition::DuringYourEndStep
         // CR 508.6 + CR 608.2: no `AbilityCondition` equivalent on either scope;
         // `None` for DIFFERENT reasons.
         //

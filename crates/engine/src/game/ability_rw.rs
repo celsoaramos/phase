@@ -2114,6 +2114,7 @@ fn legacy_static_condition(x: &StaticCondition) -> bool {
         | StaticCondition::Unrecognized { .. }
         | StaticCondition::DuringYourTurn
         | StaticCondition::DuringOpponentsTurn
+        | StaticCondition::DuringYourEndStep
         | StaticCondition::WasCast { .. }
         | StaticCondition::IsRingBearer
         | StaticCondition::RingLevelAtLeast { .. }
@@ -7161,6 +7162,7 @@ fn rw_static_condition(x: &StaticCondition) -> RwProfile {
         | StaticCondition::Unrecognized { .. }
         | StaticCondition::DuringYourTurn
         | StaticCondition::DuringOpponentsTurn
+        | StaticCondition::DuringYourEndStep
         | StaticCondition::WasCast { .. }
         | StaticCondition::IsRingBearer
         | StaticCondition::RingLevelAtLeast { .. }

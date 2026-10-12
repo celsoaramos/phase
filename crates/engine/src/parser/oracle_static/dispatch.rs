@@ -2786,6 +2786,26 @@ pub(crate) fn parse_static_line_inner(
         });
     }
 
+    // --- "During your end step, <subject> have \"<this X> can't be sacrificed.\"" ---
+    // CR 701.21 + CR 513.1: Zurgo, Thunder's Decree. The prohibition belongs to the
+    // GRANTED objects (Warrior tokens you control), gated on the controller's end
+    // step — not to the source. Must precede the self-referential fallback below,
+    // which would otherwise claim the quoted phrase for the source itself.
+    if let Some(rest) = nom_tag_tp(&tp, "during your end step, ") {
+        if let Some((subject, quoted)) = rest.split_around(" have \"") {
+            if nom_primitives::scan_contains(quoted.lower, "can't be sacrificed") {
+                if let Some(affected) = parse_continuous_subject_filter(subject.original.trim()) {
+                    let mut def =
+                        StaticDefinition::new(StaticMode::Other("CantBeSacrificed".to_string()))
+                            .affected(affected)
+                            .description(text.to_string());
+                    def.condition = Some(StaticCondition::DuringYourEndStep);
+                    return Some(def);
+                }
+            }
+        }
+    }
+
     // --- "~ can't be sacrificed" (CR 701.21) ---
     // Self-referential prohibition on sacrifice. Runtime enforcement lives in
     // `game::sacrifice` via `object_has_static_other(state, id, "CantBeSacrificed")`.
