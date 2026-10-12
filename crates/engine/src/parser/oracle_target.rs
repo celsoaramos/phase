@@ -1570,6 +1570,29 @@ pub fn parse_target_with_syntax<'a>(
             }
         }
     }
+    // CR 508.5 + CR 608.2c: "the player [or planeswalker] that creature is attacking"
+    // (Cavalcade of Calamity) — the attacked
+    // player of the attacker that fired the trigger. It is NOT a parent target (an
+    // `Attacks` trigger has none, so `ParentTarget` resolved to nobody and the damage
+    // never happened). `DefendingPlayer` resolves through the trigger event's attacker
+    // even when the source is not the attacker. A planeswalker being attacked is
+    // approximated by its controller (the defending player).
+    if let Some((filter, rest)) = nom_on_lower(text, &lower, |input| {
+        value(
+            TargetFilter::DefendingPlayer,
+            (
+                tag::<_, _, OracleError<'_>>("the player"),
+                opt(tag(" or planeswalker")),
+                alt((
+                    tag(" that creature is attacking"),
+                    tag(" that creature's attacking"),
+                )),
+            ),
+        )
+        .parse(input)
+    }) {
+        return (filter, rest, syntax);
+    }
     // CR 608.2c: Definite anaphoric references to previously-mentioned objects/players.
     // Longest-match-first: "the creature's controller" before "the creature".
     if let Some((filter, rest)) = nom_on_lower(text, &lower, |input| {

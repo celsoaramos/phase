@@ -37957,3 +37957,25 @@ fn becomes_target_object_controller_antecedent_fails_closed() {
         );
     }
 }
+
+/// CR 508.5 + CR 608.2c: Cavalcade of Calamity — "deals 1 damage to the player or
+/// planeswalker that creature is attacking". The trigger has no parent target, so a
+/// `ParentTarget` recipient resolved to nobody and the damage never happened.
+#[test]
+fn cavalcade_of_calamity_damages_the_attacked_player() {
+    use crate::types::ability::Effect;
+
+    let def = parse_trigger_line(
+        "Whenever a creature you control with power 1 or less attacks, this enchantment deals 1 damage to the player or planeswalker that creature is attacking.",
+        "Cavalcade of Calamity",
+    );
+    assert_eq!(def.mode, TriggerMode::Attacks);
+    let execute = def.execute.as_deref().expect("execute ability");
+    match execute.effect.as_ref() {
+        Effect::DealDamage { target, .. } => assert!(
+            matches!(target, TargetFilter::DefendingPlayer),
+            "recipient must be the attacked player, got {target:?}"
+        ),
+        other => panic!("expected DealDamage, got {other:?}"),
+    }
+}
