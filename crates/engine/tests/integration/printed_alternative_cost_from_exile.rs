@@ -77,7 +77,7 @@ fn fireblast_exiled_by_impulse_draw_offers_the_mountain_sacrifice() {
         "Fireblast was exiled"
     );
     assert_eq!(state.objects[&filler].zone, Zone::Exile);
-    assert!(state.players[0].mana_pool.mana.is_empty());
+    assert!(state.players[0].mana_pool.is_empty());
 
     assert!(
         can_cast_object_now(runner.state(), P0, fireblast),
