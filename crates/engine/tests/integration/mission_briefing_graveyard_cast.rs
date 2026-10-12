@@ -162,7 +162,7 @@ fn mission_briefing_recast_spell_is_exiled_instead_of_graveyard() {
         "the chosen instant is cast from the graveyard"
     );
     assert!(
-        s.runner.state().players[0].mana_pool.mana.is_empty(),
+        s.runner.state().players[0].mana_pool.is_empty(),
         "the recast pays its {{U}} cost"
     );
     s.runner.advance_until_stack_empty();
