@@ -5142,7 +5142,7 @@ fn filter_prop_contains_quantity_scope(prop: &FilterProp, scope: ObjectScope) ->
         | FilterProp::FaceDown
         | FilterProp::Transformed
         | FilterProp::TargetsOnly { .. }
-        | FilterProp::AttachedTo { .. }
+        | FilterProp::AttachedToMatching { .. }
         | FilterProp::Targets { .. }
         | FilterProp::CouldBeTargetedByTriggeringSpell
         | FilterProp::HasXInManaCost
@@ -5294,7 +5294,7 @@ fn filter_prop_binds_prior_target(prop: &FilterProp) -> bool {
         | FilterProp::FaceDown
         | FilterProp::Transformed
         | FilterProp::TargetsOnly { .. }
-        | FilterProp::AttachedTo { .. }
+        | FilterProp::AttachedToMatching { .. }
         | FilterProp::Targets { .. }
         | FilterProp::CouldBeTargetedByTriggeringSpell
         | FilterProp::HasXInManaCost

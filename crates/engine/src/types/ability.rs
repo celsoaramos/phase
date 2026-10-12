@@ -6816,7 +6816,7 @@ pub enum FilterProp {
     /// OBJECT matching `host`. "an Equipment attached to a creature you
     /// control" (Akiri, Fearless Voyager). A player-attached Aura never
     /// matches (use `AttachedToPlayer`).
-    AttachedTo {
+    AttachedToMatching {
         host: Box<TargetFilter>,
     },
     /// Matches any object that is NOT the trigger source (for "another creature" triggers).

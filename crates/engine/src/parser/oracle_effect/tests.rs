@@ -64775,7 +64775,7 @@ fn prop_has_chosen_color(p: &FilterProp) -> bool {
             reference.as_deref().is_some_and(filter_has_chosen_color)
         }
         FilterProp::TargetsOnly { filter } => filter_has_chosen_color(filter),
-        FilterProp::Targets { filter } | FilterProp::AttachedTo { host: filter } => {
+        FilterProp::Targets { filter } | FilterProp::AttachedToMatching { host: filter } => {
             filter_has_chosen_color(filter)
         }
         // Nested `PlayerFilter`.

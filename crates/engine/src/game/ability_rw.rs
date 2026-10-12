@@ -2480,7 +2480,7 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         FilterProp::CanEnchant { target } => legacy_target_filter(target),
         FilterProp::DifferentNameFrom { filter }
         | FilterProp::TargetsOnly { filter }
-        | FilterProp::Targets { filter } | FilterProp::AttachedTo { host: filter } => legacy_target_filter(filter),
+        | FilterProp::Targets { filter } | FilterProp::AttachedToMatching { host: filter } => legacy_target_filter(filter),
         FilterProp::DistinctFrom { reference } => legacy_target_filter(reference),
         FilterProp::SharesQuality { reference, .. } => {
             reference.as_deref().is_some_and(legacy_target_filter)
@@ -2773,7 +2773,7 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         FilterProp::CanEnchant { target } => member_bound_target_filter(target),
         FilterProp::DifferentNameFrom { filter }
         | FilterProp::TargetsOnly { filter }
-        | FilterProp::Targets { filter } | FilterProp::AttachedTo { host: filter } => member_bound_target_filter(filter),
+        | FilterProp::Targets { filter } | FilterProp::AttachedToMatching { host: filter } => member_bound_target_filter(filter),
         FilterProp::DistinctFrom { reference } => member_bound_target_filter(reference),
         FilterProp::SharesQuality { reference, .. } => {
             reference.as_deref().is_some_and(member_bound_target_filter)

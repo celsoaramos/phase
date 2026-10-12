@@ -5389,7 +5389,7 @@ fn prop_reads_creature_pt(prop: &FilterProp) -> bool {
         | FilterProp::FaceDown
         | FilterProp::Transformed
         | FilterProp::TargetsOnly { .. }
-        | FilterProp::AttachedTo { .. }
+        | FilterProp::AttachedToMatching { .. }
         | FilterProp::Targets { .. }
         | FilterProp::CouldBeTargetedByTriggeringSpell
         | FilterProp::HasXInManaCost

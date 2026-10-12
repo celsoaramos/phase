@@ -9018,7 +9018,7 @@ fn parse_choose_object_selection_filter(
 /// both phrases as the ability resolves (Akiri ruling 2020-09-25), and it is
 /// unattached. Emitted as a 2-effect chain:
 ///   head:        `ChooseObjectsIntoTrackedSet` over attachments whose host
-///                matches (`FilterProp::AttachedTo`), exactly one
+///                matches (`FilterProp::AttachedToMatching`), exactly one
 ///   sub_ability: `UnattachAll { attachment: TrackedSet, target: host }`
 ///
 /// `UnattachAll` publishes the creature each chosen attachment came off of as
@@ -9057,9 +9057,11 @@ fn try_parse_unattach_chosen_attachment(
     if !host_rem.trim().is_empty() || !matches!(host, TargetFilter::Typed(_)) {
         return None;
     }
-    attachment_tf.properties.push(FilterProp::AttachedTo {
-        host: Box::new(host.clone()),
-    });
+    attachment_tf
+        .properties
+        .push(FilterProp::AttachedToMatching {
+            host: Box::new(host.clone()),
+        });
 
     let unattach = AbilityDefinition::new(
         AbilityKind::Spell,

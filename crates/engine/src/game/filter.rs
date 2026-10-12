@@ -277,7 +277,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::TargetsOnly { .. }
-        | FilterProp::AttachedTo { .. }
+        | FilterProp::AttachedToMatching { .. }
         | FilterProp::Targets { .. }
         | FilterProp::ColorCount { .. }
         | FilterProp::ManaSymbolCount { .. }
@@ -801,7 +801,7 @@ fn filter_prop_characteristic_reads_at(prop: &FilterProp, depth: u32) -> Charact
         // CR 608.2c: negation does not change WHICH state the inner prop reads.
         FilterProp::Not { prop } => filter_prop_characteristic_reads_at(prop, depth),
         // CR 115.9b/c: the stack entry's targets are matched by the inner filter.
-        FilterProp::TargetsOnly { filter } | FilterProp::Targets { filter } | FilterProp::AttachedTo { host: filter } => {
+        FilterProp::TargetsOnly { filter } | FilterProp::Targets { filter } | FilterProp::AttachedToMatching { host: filter } => {
             target_filter_characteristic_reads_at(filter, depth)
         }
         // CR 603.4: the shared quality names exactly which characteristic is
@@ -1074,7 +1074,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::TargetsOnly { .. }
-        | FilterProp::AttachedTo { .. }
+        | FilterProp::AttachedToMatching { .. }
         | FilterProp::Targets { .. }
         | FilterProp::ColorCount { .. }
         | FilterProp::ManaSymbolCount { .. }
@@ -2166,7 +2166,7 @@ pub(crate) fn filter_prop_contains(
         FilterProp::SharesQuality { reference, .. } => reference.as_deref().is_some_and(recurse),
         // CR 115.9b/9c: the stack entry's target-side filters.
         FilterProp::Targets { filter }
-        | FilterProp::AttachedTo { host: filter }
+        | FilterProp::AttachedToMatching { host: filter }
         | FilterProp::TargetsOnly { filter } => recurse(filter),
         // CR 608.2c: prop-level combinators.
         FilterProp::Not { prop } => filter_prop_contains(prop, leaf),
@@ -2429,7 +2429,7 @@ fn filter_prop_contains_filter_prop(
                 .as_deref()
                 .is_some_and(|inner| filter_contains_filter_prop(inner, predicate)),
             FilterProp::Targets { filter }
-            | FilterProp::AttachedTo { host: filter }
+            | FilterProp::AttachedToMatching { host: filter }
             | FilterProp::TargetsOnly { filter } => filter_contains_filter_prop(filter, predicate),
             FilterProp::Not { prop } => filter_prop_contains_filter_prop(prop, predicate),
             FilterProp::AnyOf { props } => props
@@ -3010,6 +3010,7 @@ fn declared_group_controller(prop: &mut FilterProp) -> Option<&mut ControllerRef
         | FilterProp::Transformed
         | FilterProp::TargetsOnly { .. }
         | FilterProp::Targets { .. }
+        | FilterProp::AttachedToMatching { .. }
         | FilterProp::CouldBeTargetedByTriggeringSpell
         | FilterProp::HasXInManaCost
         | FilterProp::HasXInActivationCost
@@ -3350,7 +3351,7 @@ fn rewrite_filter_prop(
             .into_iter()
             .for_each(|inner| rewrite_filter_props(inner, rewrite_node, rewrite, complete)),
         FilterProp::Targets { filter }
-        | FilterProp::AttachedTo { host: filter }
+        | FilterProp::AttachedToMatching { host: filter }
         | FilterProp::TargetsOnly { filter } => {
             rewrite_filter_props(filter, rewrite_node, rewrite, complete)
         }
@@ -7414,7 +7415,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::CountersPutOnThisTurn { .. }
         | FilterProp::Transformed
         | FilterProp::TargetsOnly { .. }
-        | FilterProp::AttachedTo { .. }
+        | FilterProp::AttachedToMatching { .. }
         | FilterProp::Targets { .. }
         // CR 201.2: Source-/target-relative name predicates require
         // resolution context the spell-history scan doesn't currently plumb
@@ -8629,7 +8630,7 @@ fn matches_filter_prop(
         // `HasAttachment` to the "enchanted or equipped" compound-subject class.
         // CR 301.5 + CR 303.4: the object is attached to a host matching the
         // nested filter, read with the same context as the outer match.
-        FilterProp::AttachedTo { host } => match obj.attached_to {
+        FilterProp::AttachedToMatching { host } => match obj.attached_to {
             Some(crate::game::game_object::AttachTarget::Object(host_id)) => {
                 // "a creature YOU control": the host's controller reads the
                 // outer match's controller (mirrors `DifferentNameFrom`).
@@ -9644,7 +9645,7 @@ fn zone_change_record_matches_property(
         // object id; a zone-change snapshot does not carry it. Fail closed.
         | FilterProp::CountersPutOnThisTurn { .. }
         | FilterProp::TargetsOnly { .. }
-        | FilterProp::AttachedTo { .. }
+        | FilterProp::AttachedToMatching { .. }
         | FilterProp::Targets { .. }
         // CR 107.3 + CR 202.1: X-in-cost is a spell-cast-time predicate; it has no
         // meaning for a zone-change record (the object has already left the stack
@@ -20518,7 +20519,7 @@ mod characteristic_read_classification_tests {
             | FilterProp::Owned { .. }
             | FilterProp::HasAttachment { .. }
             | FilterProp::HasAnyAttachmentOf { .. }
-            | FilterProp::AttachedTo { .. }
+            | FilterProp::AttachedToMatching { .. }
             | FilterProp::MostPrevalentCreatureTypeIn { .. }
             | FilterProp::AttackedThisTurn { .. }
             | FilterProp::NameMatchesAnyPermanent { .. }

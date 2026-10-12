@@ -1236,7 +1236,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             FilterProp::Targets { filter } => {
                 parts.push(format!("targets {}", fmt_target(filter)));
             }
-            FilterProp::AttachedTo { host } => {
+            FilterProp::AttachedToMatching { host } => {
                 parts.push(format!("attached to {}", fmt_target(host)));
             }
             FilterProp::Named { name } => parts.push(format!("named \"{name}\"")),

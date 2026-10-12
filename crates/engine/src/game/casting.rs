@@ -28980,7 +28980,7 @@ fn filter_prop_reads_chosen_target(prop: &FilterProp, read: TargetRead) -> bool 
             .as_ref()
             .is_some_and(|x| controller_ref_reads_chosen_target(x, read)),
         FilterProp::CanEnchant { target: filter }
-        | FilterProp::AttachedTo { host: filter }
+        | FilterProp::AttachedToMatching { host: filter }
         | FilterProp::DifferentNameFrom { filter }
         | FilterProp::DistinctFrom { reference: filter }
         | FilterProp::TargetsOnly { filter }
