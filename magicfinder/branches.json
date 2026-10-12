@@ -174,5 +174,8 @@
   },
   {
     "branch": "card/if-you-do-repeat-process"
+  },
+  {
+    "branch": "card/cavalcade-attacked-player"
   }
 ]
