@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use crate::game::deck_loading::{load_deck_into_state, DeckEntry, DeckPayload, PlayerDeckPayload};
+use crate::game::deck_loading::{
+    hydrate_loaded_game_from_card_db, load_deck_into_state, DeckEntry, DeckPayload,
+    PlayerDeckPayload,
+};
 use crate::types::events::GameEvent;
 use crate::types::format::SideboardPolicy;
 use crate::types::game_state::{GameState, PlayerDeckPool, WaitingFor};
@@ -313,6 +316,10 @@ pub fn apply_trusted_match_forfeit(
         winner: Some(winner),
     };
 
+    // CR 104.1 + CR 723.1: a match forfeit does not go through
+    // `elimination::end_game`, so it ends player control itself.
+    crate::game::turn_control::end_all_player_control(state);
+
     Ok(vec![GameEvent::GameOver {
         winner: Some(winner),
     }])
@@ -516,10 +523,18 @@ fn restart_between_games_with_starting_player(
     // slots the engine binds match the new game's pause.
     let interaction_session = state.interaction_session_id.clone();
 
+    // The card database is a property of the engine instance, not of a single
+    // game, and `GameState::new` leaves the `#[serde(skip)]` handle as `None`.
+    // Without this carry every later game of the match loses its whole-corpus
+    // draw source — the Momir Basic emblem's `{X}` ability (CR 707.2 + CR 202.3)
+    // resolves to no token — and the database-derived registries below are
+    // never rebuilt.
+    next_state.card_db = state.card_db.clone();
+
     load_deck_into_state(&mut next_state, &payload);
-    // The booster shelf is stocked only at rehydrate, which this rebuild never
-    // reaches: it holds no card database, and `load_deck_into_state` resets the
-    // shelf. Carry it for every source, set products and Cube alike. Whether a
+    // `load_deck_into_state` resets the booster shelf, and the hydration below
+    // stocks one only when it is empty. Carry it for every source, set products
+    // and Cube alike, before hydrating so game one's shelf is kept. Whether a
     // game stocks one depends only on the registered deck pools, sideboards
     // included, which sideboarding cannot extend; what it holds comes from the
     // card database and `booster_pack_pool`, neither of which changes within a
@@ -530,6 +545,16 @@ fn restart_between_games_with_starting_player(
     // from the carried one. The shelf is `#[serde(skip)]` and outside state
     // identity, and either sample is an equally random draw of sets.
     next_state.booster_shelf = state.booster_shelf.clone();
+    // Hydrate game two exactly as the canonical init hydrates game one: printed
+    // faces (`back_face` for DFCs), the Conjure / meld / card-name registries,
+    // and the full-corpus creature subtype vocabulary are all `#[serde(skip)]`
+    // or reset by `GameState::new`. The payload synthesis half of
+    // `load_and_hydrate_decks` is deliberately skipped — the pools already hold
+    // game one's synthesized decks. A game built without a database (tests)
+    // had nothing to hydrate in game one either.
+    if let Some(db) = next_state.card_db.clone() {
+        hydrate_loaded_game_from_card_db(&mut next_state, &db);
+    }
     let start = super::engine::start_game_with_starting_player(&mut next_state, starting_player);
     events.extend(start.events);
 
@@ -572,9 +597,11 @@ mod tests {
     use super::*;
     use crate::game::deck_loading::PlayerDeckPayload;
     use crate::game::engine::{apply_as_current, start_game};
+    use crate::types::ability::ControlWindow;
     use crate::types::actions::GameAction;
     use crate::types::card::CardFace;
     use crate::types::card_type::{CardType, CoreType};
+    use crate::types::game_state::{ActivePlayerControl, ScheduledTurnControl};
     use crate::types::mana::ManaCost;
 
     fn basic_land(name: &str) -> CardFace {
@@ -704,6 +731,108 @@ mod tests {
             vec![GameEvent::GameOver {
                 winner: Some(PlayerId(1))
             }]
+        );
+    }
+
+    /// CR 723.1: a two-seat game in a live match with one player-control effect
+    /// over the active seat. The controller is deliberately *not* the active
+    /// player: a latch whose controller is the active seat routes every seat to
+    /// itself and reads identically to no latch at all.
+    fn state_with_live_player_control(match_type: MatchType) -> GameState {
+        let mut state = GameState::new_two_player(7);
+        state.match_config.match_type = match_type;
+        state.match_phase = MatchPhase::InGame;
+
+        let target_player = state.active_player;
+        let controller = opponent(target_player);
+        state.scheduled_turn_controls.push(ScheduledTurnControl {
+            target_player,
+            controller,
+            timestamp: 1,
+            grant_extra_turn_after: false,
+            window: ControlWindow::NextTurn,
+        });
+        state.active_full_turn_control = Some(ActivePlayerControl {
+            controller,
+            timestamp: 1,
+        });
+        crate::game::turn_control::recompute_active_player_control(&mut state);
+
+        assert_ne!(
+            controller, state.active_player,
+            "reach guard: a latch controlling the active seat is invisible to every routed read"
+        );
+        assert_eq!(
+            state.match_phase,
+            MatchPhase::InGame,
+            "reach guard: the transition's `match_phase` guard is passable"
+        );
+        assert_eq!(
+            state.turn_decision_controller,
+            Some(controller),
+            "reach guard: CR 723.1 control is live before the game ends"
+        );
+        state
+    }
+
+    /// CR 104.1 + CR 723.1: no player-control effect survives the game, in any of
+    /// the places one is recorded. `clause` names what the calling row discriminates.
+    fn assert_no_control_survives(state: &GameState, clause: &str) {
+        assert_eq!(
+            state.turn_decision_controller, None,
+            "a decision controller outlived the game (clause: {clause})"
+        );
+        assert_eq!(
+            state.turn_decision_control_timestamp, None,
+            "a control timestamp outlived the game (clause: {clause})"
+        );
+        assert_eq!(
+            state.active_full_turn_control, None,
+            "a full-turn control window outlived the game (clause: {clause})"
+        );
+        assert_eq!(
+            state.active_combat_phase_control, None,
+            "a combat-phase control window outlived the game (clause: {clause})"
+        );
+        assert!(
+            state.scheduled_turn_controls.is_empty(),
+            "a scheduled control outlived the game (clause: {clause})"
+        );
+    }
+
+    /// CR 104.1 + CR 723.1: a match forfeit does not go through
+    /// `elimination::end_game`, so it ends player control itself.
+    #[test]
+    fn a_trusted_match_forfeit_ends_player_control() {
+        let mut state = state_with_live_player_control(MatchType::Bo3);
+
+        let events =
+            apply_trusted_match_forfeit(&mut state, PlayerId(0), MatchForfeitCause::MatchConcede)
+                .expect("two-seat Bo3 match concede is trusted");
+
+        assert_eq!(
+            events.len(),
+            1,
+            "reach guard: the forfeit ran and emitted its game-over event"
+        );
+        assert!(
+            state.match_forfeit_result.is_some(),
+            "reach guard: the forfeit recorded its result"
+        );
+        assert_eq!(
+            state.waiting_for,
+            WaitingFor::GameOver {
+                winner: Some(PlayerId(1))
+            },
+            "reach guard: the forfeit parked the terminal wait"
+        );
+        assert!(
+            state.game_end.is_none(),
+            "reach guard: a forfeit never routes through `end_game`"
+        );
+        assert_no_control_survives(
+            &state,
+            "the teardown's call in `apply_trusted_match_forfeit`",
         );
     }
 

@@ -1,4 +1,3 @@
-#[cfg(test)]
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -8,13 +7,14 @@ use crate::game::quantity::resolve_quantity_with_targets;
 use crate::game::replacement::{self, ReplacementResult};
 use crate::game::zones;
 use crate::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, CastingPermission,
-    Comparator, ContinuousModification, ControllerRef, CopiableValues, DelayedTriggerCondition,
-    Duration, Effect, EffectError, EffectKind, FilterProp, ManaContribution, ManaProduction,
-    PermissionGrantee, PlayerFilter, PtValue, QuantityExpr, QuantityRef, ResolvedAbility,
-    SacrificeCost, SearchSelectionConstraint, StaticDefinition, TargetFilter, TargetRef,
-    TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter,
+    AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, AttachCardinality,
+    AttachSelection, CastingPermission, Comparator, ContinuousModification, ControllerRef,
+    CopiableValues, DelayedTriggerCondition, Duration, Effect, EffectError, EffectKind, FilterProp,
+    ManaContribution, ManaProduction, PermissionGrantee, PlayerFilter, PtValue, QuantityExpr,
+    QuantityRef, ResolvedAbility, SacrificeCost, SearchSelectionConstraint, StaticDefinition,
+    TargetFilter, TargetRef, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter,
 };
+use crate::types::card::PrintedLoyalty;
 use crate::types::card_type::{CardType, CoreType, Supertype};
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
@@ -535,7 +535,10 @@ pub fn resolve(
             None,
         ),
     };
-    let token_owner = resolve_token_owner(state, ability, owner_filter);
+    // CR 608.2b: a declared player whose target was illegal creates no token.
+    let Some(token_owner) = resolve_token_owner(state, ability, owner_filter) else {
+        return no_token(state, ability, events);
+    };
 
     // CR 303.4 + CR 303.4i: Resolve the specified Aura/Role host once, at propose
     // time. ParentTarget reads the first Object target (the for-each loop's
@@ -613,7 +616,8 @@ pub fn resolve(
             }
         }
         ReplacementResult::Prevented => {
-            // Token creation was prevented entirely
+            // CR 609.3: nothing was created, so the previous result must not read as this one's.
+            state.last_created_token_ids = Vec::new();
         }
         ReplacementResult::NeedsChoice(player) => {
             state.waiting_for =
@@ -650,6 +654,24 @@ pub fn resolve(
     Ok(())
 }
 
+/// CR 609.3 "do as much as possible": resolve without creating a token.
+///
+/// Shared by every branch that finds nothing to copy so they emit an identical
+/// `EffectResolved` and clear `last_created_token_ids` the same way.
+pub(crate) fn no_token(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    state.last_created_token_ids = Vec::new();
+    events.push(GameEvent::EffectResolved {
+        kind: EffectKind::from(&ability.effect),
+        source_id: ability.source_id,
+        subject: None,
+    });
+    Ok(())
+}
+
 /// CR 111.1 + CR 111.4 + CR 111.10: Build the resolved `TokenSpec` for a
 /// token creation event, combining parsed script attributes with typed
 /// `Effect::Token` fallback fields and ability context (source/controller/
@@ -662,13 +684,21 @@ fn build_token_spec(
     fallback_toughness: &PtValue,
     tapped: bool,
     enters_attacking: bool,
-    static_abilities: Vec<crate::types::ability::StaticDefinition>,
+    mut static_abilities: Vec<crate::types::ability::StaticDefinition>,
     enter_with_counters: Vec<(CounterType, u32)>,
     attach_to: TokenHostRequest,
     ability: &ResolvedAbility,
     state: &GameState,
 ) -> TokenSpec {
     use crate::types::proposed_event::TokenCharacteristics;
+
+    // CR 201.5a + CR 400.7: the token's statics name the incarnation that
+    // created it, so a creator that later changes zones is a different object.
+    if let Some(creator) = ability.source_ref(state) {
+        for static_def in static_abilities.iter_mut() {
+            crate::game::layers::stamp_static_granter(static_def, creator);
+        }
+    }
 
     let (display_name, power, toughness, core_types, subtypes, supertypes, colors, keywords) =
         if let Some(attrs) = parsed {
@@ -709,6 +739,7 @@ fn build_token_spec(
             display_name,
             power,
             toughness,
+            loyalty: None,
             core_types,
             subtypes,
             supertypes,
@@ -1287,6 +1318,7 @@ pub(crate) fn materialize_token_spec_body(
     object.token_image_ref = token_image_ref;
     let has_attrs = ch.power.is_some()
         || ch.toughness.is_some()
+        || ch.loyalty.is_some()
         || !ch.core_types.is_empty()
         || !ch.subtypes.is_empty()
         || !ch.supertypes.is_empty()
@@ -1300,6 +1332,14 @@ pub(crate) fn materialize_token_spec_body(
         object.base_toughness = ch.toughness;
         object.layer_base_power = ch.power;
         object.layer_base_toughness = ch.toughness;
+        // CR 306.5b + CR 306.5c: record the token's printed loyalty; live loyalty
+        // stays counter-derived. Placing entry loyalty counters from this value is
+        // not yet done for tokens. Mirrors `printed_cards::apply_face`, so a
+        // planeswalker token and a card-backed planeswalker carry loyalty identically.
+        object.loyalty = ch.loyalty;
+        object.printed_loyalty = ch.loyalty.map(PrintedLoyalty::Fixed);
+        object.base_loyalty = object.loyalty;
+        object.base_printed_loyalty = object.printed_loyalty;
         object.card_types = CardType {
             supertypes: ch.supertypes.clone(),
             core_types: ch.core_types.clone(),
@@ -1889,6 +1929,9 @@ pub(crate) fn commit_liminal_token_entry_with_post_actions(
                     Effect::Attach {
                         attachment: TargetFilter::SelfRef,
                         target: TargetFilter::Any,
+                        selection: AttachSelection::AtResolution {
+                            count: AttachCardinality::One,
+                        },
                     },
                     Vec::new(),
                     entry.source_id,
@@ -2408,93 +2451,31 @@ pub(crate) fn realize_settled_token_battlefield_entry(
     }
 }
 
-// ── Layer B: token-handler batch purity gate (Tier 3) ────────────────────
+// ── Layer B: token-handler bulk admission gate ────────────────────────────
 
-/// CR 603.2 + CR 603.6a: The §2.2a emits-exactly-{ZoneChanged,TokenCreated}
-/// gate. Layer C (`game/stack.rs::observers_are_batch_safe`) probes ONLY the
-/// `ZoneChanged(ETB)` + `TokenCreated` events one produced token emits. That
-/// probe is COMPLETE only if the resolved spec's creation emits exactly those
-/// two events. Every `TokenSpec` field that would emit an additional
-/// `GameEvent` (`enter_with_counters` → `CounterAdded`, counters.rs), introduce
-/// an interactive replacement (`enter_with_counters` → AddCounter replacement),
-/// or mutate extra battlefield state (`enters_attacking` → combat;
-/// `sacrifice_at` → delayed trigger, CR 603.7; `attach_to` → host attachments,
-/// CR 303.4) is rejected. A spec passing this gate provably emits exactly
-/// `{ZoneChanged(ETB), TokenCreated}` per produced token (see the field-by-field
-/// proof in `apply_create_token_after_replacement`).
+/// CR 603.2 + CR 603.6a: The emits-exactly-{ZoneChanged,TokenCreated} gate.
+/// The stack's bulk executor (`game/stack.rs::resolve_bulk_token_run`) elides
+/// the priority checkpoints between members on the proof that every member's
+/// creation does what member 1's did, and that its events reach no delayed
+/// trigger, combat state or host. That holds only if the resolved spec's
+/// creation emits exactly those two events. Every `TokenSpec` field that would
+/// emit an additional `GameEvent` (`enter_with_counters` → `CounterAdded`,
+/// counters.rs), introduce an interactive replacement (`enter_with_counters` →
+/// AddCounter replacement), or mutate extra battlefield state
+/// (`enters_attacking` → combat; `sacrifice_at` → delayed trigger, CR 603.7;
+/// `attach_to` → host attachments, CR 303.4) is rejected. A spec passing this
+/// gate provably emits exactly `{ZoneChanged(ETB), TokenCreated}` per produced
+/// token (see the field-by-field proof in `apply_create_token_after_replacement`).
 ///
 /// `characteristics` / `script_name` / `static_abilities` / `tapped` /
-/// `source_id` / `controller` are INERT: they set object fields directly or
-/// feed the ETB probe and emit no creation-time event beyond the ETB pair.
-#[cfg(test)]
+/// `source_id` / `controller` are INERT: they set object fields directly and
+/// emit no creation-time event beyond the ETB pair.
 pub(crate) fn spec_emits_only_etb_pair(spec: &TokenSpec) -> bool {
     spec.enter_with_counters.is_empty() // no CounterAdded event / AddCounter replacement
         && !spec.enters_attacking // no combat-state mutation (CR 508.4)
         && spec.sacrifice_at.is_none() // no delayed trigger (CR 603.7)
         // no host attachment mutation and no CR 303.4i entry verdict to reach
         && !spec.attach_to.is_requested()
-}
-
-/// CR 603.6a + CR 111.1: The set of event keys a single produced token EMITS as
-/// it enters the battlefield, given its core types. Mirrors the event-side
-/// deriver exactly (`keys_from_event` — the `to == Zone::Battlefield` branch of
-/// its `GameEvent::ZoneChanged` arm for the ETB pair, and its
-/// `GameEvent::TokenCreated` arm for `TokenCreated`): a token entering emits the broad
-/// `EnterBattlefield(None)`, one narrow `EnterBattlefield(Some(ct))` per core
-/// type, and `TokenCreated`. Kept in lockstep with the deriver so the §2.3a gate
-/// reasons about exactly the events siblings would observe.
-#[cfg(test)]
-fn produced_token_emitted_keys(
-    produced_core_types: &[CoreType],
-) -> Vec<crate::types::triggers::TriggerEventKey> {
-    use crate::types::triggers::TriggerEventKey;
-    // CR 603.6a: broad ETB key, emitted for every entering permanent, plus one
-    // narrow key per core type of the entering object.
-    let mut keys = vec![TriggerEventKey::EnterBattlefield(None)];
-    keys.extend(
-        produced_core_types
-            .iter()
-            .map(|ct| TriggerEventKey::EnterBattlefield(Some(*ct))),
-    );
-    // CR 111.1 ("Some effects put tokens onto the battlefield"): a token's
-    // creation also emits `TokenCreated`. NOT CR 111.10, which is the
-    // predefined-token characteristics catalog (Treasure/Food/Clue/Role) and
-    // says nothing about event emission — the ~58 other CR 111.10 citations in
-    // this file are correct for exactly that catalog.
-    keys.push(TriggerEventKey::TokenCreated);
-    keys
-}
-
-/// CR 603.2 + CR 603.6a + CR 603.3: The §2.3a produced-token-non-observer gate,
-/// parameterized by what the produced token actually EMITS on entry. A produced
-/// token whose own triggers OBSERVE its in-batch siblings would fire on them —
-/// which one-by-one resolution (CR 603.3 topmost-on-stack) lets it do, but a
-/// single batched application would not — so such a token cannot batch.
-///
-/// The gate intersects each trigger's REGISTERED keys (`keys_from_trigger_def`,
-/// the EXACT classifier the live index uses, so the observer-key derivation can
-/// never drift from registration) with the set of keys the produced token EMITS
-/// on entry (`produced_token_emitted_keys`, mirroring CR 603.6a's broad+narrow
-/// emission for `produced_core_types`). A landfall trigger registered under
-/// `EnterBattlefield(Some(Land))` carried by a Creature copy (which emits only
-/// `{None, Some(Creature), TokenCreated}`) does NOT intersect → it cannot
-/// observe its creature siblings → batch-safe. A "whenever a creature enters"
-/// trigger (`EnterBattlefield(Some(Creature))`) or a broad permanent-ETB trigger
-/// (`EnterBattlefield(None)`) DOES intersect a creature copy's emission →
-/// refused.
-///
-/// Conservatively rejects any trigger routed to unclassified (catch-all/dynamic
-/// modes fire on everything, so they always observe siblings).
-#[cfg(test)]
-pub(crate) fn produced_token_is_non_observer(
-    triggers: &[TriggerDefinition],
-    produced_core_types: &[CoreType],
-) -> bool {
-    let emitted = produced_token_emitted_keys(produced_core_types);
-    triggers.iter().all(|def| {
-        let (keys, route_unclassified) = crate::game::trigger_index::keys_from_trigger_def(def);
-        !route_unclassified && !keys.iter().any(|k| emitted.contains(k))
-    })
 }
 
 /// CR 614.1a + CR 616.1: The §3.4 MEDIUM-1 interactive-replacement gate. Token
@@ -2506,7 +2487,6 @@ pub(crate) fn produced_token_is_non_observer(
 /// (Doubling Season's mandatory Double) are fine and stay per-token (§5.2) —
 /// they never produce `NeedsChoice`. Reuses the live pipeline's exact decision
 /// functions, side-effect-free (`&GameState`, no `apply_single_replacement`).
-#[cfg(test)]
 fn token_creation_needs_choice(
     state: &GameState,
     spec: &TokenSpec,
@@ -2542,7 +2522,6 @@ fn token_creation_needs_choice(
 /// type predicate the disjointness check can reason about (negation,
 /// subtype-only, broad `Permanent`/`Card`/`Any`) — the caller then conserves by
 /// refusing the batch.
-#[cfg(test)]
 fn type_filter_core_types(filter: &TypeFilter) -> Option<Vec<CoreType>> {
     match filter {
         TypeFilter::Creature => Some(vec![CoreType::Creature]),
@@ -2573,7 +2552,6 @@ fn type_filter_core_types(filter: &TypeFilter) -> Option<Vec<CoreType>> {
 
 /// CR 205: The concrete `CoreType` set a `TargetFilter` counts, when it is a
 /// single-`TypeFilter` `Typed` filter. Any other shape yields `None`.
-#[cfg(test)]
 fn target_filter_counted_core_types(filter: &TargetFilter) -> Option<Vec<CoreType>> {
     match filter {
         TargetFilter::Typed(TypedFilter { type_filters, .. }) => {
@@ -2593,7 +2571,6 @@ fn target_filter_counted_core_types(filter: &TargetFilter) -> Option<Vec<CoreTyp
 /// quantity inside a `QuantityCheck` is provably disjoint from `token_core_types`.
 /// Any other condition shape (or an un-provable filter) returns `false` →
 /// conserve.
-#[cfg(test)]
 fn condition_invariant_for_token(
     condition: &crate::types::ability::AbilityCondition,
     token_core_types: &[CoreType],
@@ -2632,9 +2609,10 @@ fn condition_invariant_for_token(
 /// `TargetFilter::Controller`), its `count` is a literal `Fixed` (no
 /// source-relative quantity), it does not enter attacking (combat reads the
 /// source), and it is not attached to a host (attachment reads the source's
-/// target). The remaining fields are pure characteristics (name / P/T / types /
-/// colors / keywords / supertypes / static abilities / ETB counters) which are
-/// baked into the spec and identical across sources — bound but unconstrained.
+/// target). The remaining fields are characteristics bound but unconstrained
+/// here: a spec can still read its source (a `Source`-scoped P/T quantity, a
+/// static stamped with its creator, CR 201.5a), so a consumer that treats
+/// members as interchangeable compares their resolved specs (`admits_bulk_run`).
 ///
 /// EXHAUSTIVE destructure (no `..`): every field of `Effect::Token` is
 /// consciously dispositioned, mirroring `resolve_token_spec`. A future field
@@ -2666,100 +2644,157 @@ pub(crate) fn token_effect_is_source_independent(ability: &ResolvedAbility) -> b
         && attach_to.is_none()
 }
 
-/// CR 608.2 + CR 608.2c: Layer B — the Token-handler purity gate. Returns a
-/// `BatchPlan` iff resolving this `Effect::Token` `run_len` times one-by-one
-/// would produce the identical per-resolution decision and token spec as one
-/// batched application of the base `Token` effect.
+/// CR 608.2c: The run-invariant shape both bulk arms share: a bare
+/// `Effect::Token` with a literal `Fixed` count whose per-resolution spec
+/// resolves read-only, mirroring `resolve`. `None` for any other shape.
 ///
-/// v1 batches the base `Effect::Token` (untargeted, `Fixed` count, emitting
-/// exactly the ETB pair, with no produced-token observer and no interactive
-/// replacement). A `CopyTokenOf`-instead sub-ability whose condition is
-/// currently met (the copy branch) is batched along a CONTIGUOUS PREFIX of the
-/// run whose copy sources share identical copiable values (CR 707.2) — the
-/// prefix length may be shorter than `run_len`, with the remaining entries
-/// resolved in a later step. A `ConditionInstead` sub-ability that is currently
-/// NOT met is accepted only when its condition is provably invariant across the
-/// run (so all N resolutions take the base branch).
-///
-/// `run_source_ids` are the per-entry source object ids of the contiguous run
-/// (resolution order, top-down), needed only by the met-copy prefix path to
-/// gather each entry's `SelfRef` copy source. The base-token path ignores them.
-#[cfg(test)]
-pub(crate) fn try_resolve_batch(
+/// A root `condition`, `repeat_for` or `player_scope` decides at each member's
+/// resolution whether, how many times, or for which players its token is
+/// created, and each can read the member's own source (a counted filter
+/// excluding it, an enchanted or exiling source). Member 1's checkpoint
+/// then vets a token the other members need not create, so all three refuse.
+fn bulk_token_shape(
     state: &GameState,
     ability: &ResolvedAbility,
-    run_len: u32,
-    run_source_ids: &[ObjectId],
-) -> Option<super::BatchPlan> {
-    // The effect must be a bare `Effect::Token` with a literal `Fixed` count.
+) -> Option<(
+    TokenSpec,
+    PlayerId,
+    crate::types::proposed_event::EtbTapState,
+    u32,
+)> {
     let Effect::Token { count, .. } = &ability.effect else {
         return None;
     };
-    if !matches!(count, QuantityExpr::Fixed { .. }) {
+    if !matches!(count, QuantityExpr::Fixed { .. })
+        || ability.condition.is_some()
+        || ability.repeat_for.is_some()
+        || ability.player_scope.is_some()
+    {
         return None;
     }
+    resolve_token_spec(state, ability)
+}
 
-    // Resolve the per-resolution TokenSpec read-only, mirroring `resolve`.
-    // HIGH-1: resolve ONCE here — `resolve_token_spec` parses token scripts,
-    // resolves quantities, and builds attributes, so the perf-path must not
-    // resolve it twice. The resolved spec's `core_types` feed the disjointness
-    // invariance proof below directly.
-    let (spec, owner, enter_tapped, resolved_count) = resolve_token_spec(state, ability)?;
+/// CR 608.2 + CR 608.2c: Layer B — the Token-handler bulk admission gate.
+/// Returns `true` iff each of a run of identical untargeted resolutions of this
+/// base `Effect::Token` instructs one token from the same spec, whose creation
+/// emits only the ETB pair per token (a mandatory replacement can still change
+/// how many tokens are created, CR 614.1a), cannot pause for a replacement
+/// choice, and has no printed supertype that trips a pairwise state-based
+/// action against an earlier member's token. The stack's bulk executor still
+/// resolves every member individually through `resolve_top`, holds each
+/// member to member 1's token-entry events (`token_entry_events`), and elides
+/// the checkpoints between them only once member 1's checkpoint is shown
+/// inert.
+///
+/// A `ConditionInstead` sub-ability that is currently NOT met is accepted only
+/// when its condition is provably invariant across the run (so every member
+/// takes the base branch). A met copy-instead swap (`CopyTokenOf`) is decided by
+/// the copy arm (`try_resolve_copy_batch`) over the run's members,
+/// `run_members` (top-down resolution order).
+pub(crate) fn admits_bulk_run(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    run_members: &[&ResolvedAbility],
+) -> bool {
+    let Some((spec, owner, enter_tapped, resolved_count)) = bulk_token_shape(state, ability) else {
+        return false;
+    };
 
-    // CR 608.2c: A sub-ability changes the resolved effect. Two acceptable
-    // shapes: a `ConditionInstead`-gated sub currently NOT met (the base
-    // `Token` resolves, provably invariant across the run), or a met
-    // `ConditionInstead` copy-instead swap which is batched along a value-equal
-    // prefix (CR 707.2). Any other sub shape conserves.
+    // CR 608.2c: A sub-ability changes the resolved effect. The acceptable
+    // shapes are a `ConditionInstead`-gated sub that is met (every member
+    // resolves the swapped effect; the copy arm decides) or one currently NOT
+    // met whose condition is provably invariant across the run (the base
+    // `Token` resolves for every member).
     if let Some(sub) = &ability.sub_ability {
-        match &sub.condition {
-            Some(crate::types::ability::AbilityCondition::ConditionInstead { inner }) => {
-                if super::evaluate_condition(inner, state, ability) {
-                    // The swap currently fires: the resolved effect is the
-                    // sub's (e.g. CopyTokenOf). Attempt copy-prefix batching.
-                    return try_resolve_copy_batch(state, ability, sub, inner, run_source_ids);
-                }
-                // NOT met: base `Token` resolves. Token core types feed the
-                // disjointness invariance proof.
-                if !condition_invariant_for_token(inner, &spec.characteristics.core_types) {
-                    return None;
-                }
-            }
-            // Any other sub-ability shape (continuation step, sequential
-            // sibling, other instead conditions) is not proven batch-safe.
-            _ => return None,
+        let Some(crate::types::ability::AbilityCondition::ConditionInstead { inner }) =
+            &sub.condition
+        else {
+            return false;
+        };
+        // CR 608.2c + CR 704.3: the override's own chain (`sub_ability`,
+        // `else_ability`) runs after the token in one branch or both, and on
+        // the met branch its `repeat_for` / `player_scope` decide per member how
+        // many tokens it creates (`ability_utils::apply_instead_swap`). Member
+        // 1's checkpoint speaks for neither, so refuse them.
+        if sub.sub_ability.is_some()
+            || sub.else_ability.is_some()
+            || sub.repeat_for.is_some()
+            || sub.player_scope.is_some()
+        {
+            return false;
+        }
+        // CR 608.2c: each member evaluates the swap against its own source (a
+        // counted filter can exclude or relate to that source), so the run is
+        // admitted only when every member takes member 1's branch.
+        let met = super::evaluate_condition(inner, state, ability);
+        if run_members
+            .iter()
+            .skip(1)
+            .any(|member| super::evaluate_condition(inner, state, member) != met)
+        {
+            return false;
+        }
+        if met {
+            return try_resolve_copy_batch(state, ability, sub, inner, run_members);
+        }
+        if !condition_invariant_for_token(inner, &spec.characteristics.core_types) {
+            return false;
         }
     }
 
-    // v1 batches a single base token per resolution. A non-unit per-resolution
-    // count (e.g. "create two Insects") is correct to batch but the count-fusion
-    // interaction is out of v1 scope (§5.2a) — conserve.
+    // One base token per resolution. A non-unit per-resolution count (e.g.
+    // "create two Insects") is not admitted — conserve.
     if resolved_count != 1 {
-        return None;
+        return false;
     }
 
-    // §2.2a: the resolved spec must emit exactly {ZoneChanged, TokenCreated}.
+    // The resolved spec must emit exactly {ZoneChanged, TokenCreated}.
     if !spec_emits_only_etb_pair(&spec) {
-        return None;
+        return false;
     }
 
-    // §2.3a: the produced token must not itself observe the ETB/TokenCreated
-    // events its in-batch siblings emit. The produced token's emission is
-    // derived from its own core types (the spec's characteristics).
-    if !produced_token_is_non_observer(
-        &base_token_trigger_defs(&spec),
-        &spec.characteristics.core_types,
-    ) {
-        return None;
+    // CR 704.5j + CR 704.5k: a printed legendary or world spec refuses before
+    // the executor clones; a supertype a continuous effect adds (CR 613.1d) is
+    // checked on member 1's layered token in the stack's bulk executor.
+    if has_pairwise_sba_supertype(&spec.characteristics.supertypes) {
+        return false;
     }
 
-    // §3.4: token creation must not be able to pause for an interactive
-    // (optional / order-material) replacement choice.
-    if token_creation_needs_choice(state, &spec, owner, enter_tapped, resolved_count) {
-        return None;
+    // CR 201.5a + CR 704.3: member 1's checkpoint speaks for the elided ones
+    // only if every member creates member 1's token. A distinct-source run's
+    // spec can read its member's source (a `Source`-scoped P/T quantity, a
+    // static stamped with its creator), so each member's spec must match.
+    if !run_members.iter().skip(1).all(|member| {
+        bulk_token_shape(state, member).is_some_and(
+            |(member_spec, member_owner, member_tapped, member_count)| {
+                TokenSpec {
+                    source_id: spec.source_id,
+                    ..member_spec
+                } == spec
+                    && member_owner == owner
+                    && member_tapped == enter_tapped
+                    && member_count == resolved_count
+            },
+        )
+    }) {
+        return false;
     }
 
-    Some(super::BatchPlan::token(spec, run_len))
+    // CR 614.1a + CR 616.1: token creation must not be able to pause for an
+    // interactive (optional / order-material) replacement choice.
+    !token_creation_needs_choice(state, &spec, owner, enter_tapped, resolved_count)
+}
+
+/// CR 704.5j + CR 704.5k: the legend rule and the world rule compare a
+/// permanent with the others. A second identical legendary or world token
+/// trips them where the first did not, so member 1's checkpoint cannot speak
+/// for later members' checkpoints.
+pub(crate) fn has_pairwise_sba_supertype(supertypes: &[Supertype]) -> bool {
+    supertypes.iter().any(|supertype| match supertype {
+        Supertype::Legendary | Supertype::World => true,
+        Supertype::Basic | Supertype::Snow | Supertype::Ongoing | Supertype::Host => false,
+    })
 }
 
 /// Token handler-owned admission for the stack's clone-and-proof runner.
@@ -2770,24 +2805,24 @@ pub(crate) fn supports_sequential_batch_proof(ability: &ResolvedAbility) -> bool
 }
 
 /// CR 608.2c + CR 707.2: A met `ConditionInstead` whose swapped effect is a
-/// bare `CopyTokenOf { target: SelfRef, … }` copies the run's own source object
-/// per entry. When a contiguous prefix of the run's copy sources share
-/// identical copiable values (CR 707.2 fingerprints), those N self-copies are
-/// equivalent to one batched spec, so the prefix collapses into a single
-/// `CopyToken` batch. The prefix may be shorter than `run_len`; the remainder
-/// resolves in a later step (which re-enters this path).
+/// bare `CopyTokenOf { target: SelfRef, … }` copies each member's own source
+/// object (CR 608.2h: its last-known copiable values once it has left the
+/// battlefield). The copy arm admits the run only when every member has a copy
+/// source and all of them share the top member's copiable values (CR 707.2):
+/// each member then creates a token from the copiable values member 1's token
+/// took, so member 1's checkpoint speaks for the elided ones. Any other run is
+/// refused whole; the stack's sequential proof takes it.
 ///
 /// `sub` is the override sub-ability (its effect is the swapped `CopyTokenOf`);
-/// `inner` is the already-fired `ConditionInstead` condition. `run_source_ids`
-/// are the per-entry source ids (top-down resolution order).
-#[cfg(test)]
+/// `inner` is the already-fired `ConditionInstead` condition. `run_members` are
+/// the run's abilities (top-down resolution order).
 fn try_resolve_copy_batch(
     state: &GameState,
     ability: &ResolvedAbility,
     sub: &ResolvedAbility,
     inner: &crate::types::ability::AbilityCondition,
-    run_source_ids: &[ObjectId],
-) -> Option<super::BatchPlan> {
+    run_members: &[&ResolvedAbility],
+) -> bool {
     // 1. SHAPE GATE FIRST (cheapest): the swapped effect must be a bare
     //    self-copy with the default single-token shape and no exceptions.
     let Effect::CopyTokenOf {
@@ -2801,59 +2836,81 @@ fn try_resolve_copy_batch(
         additional_modifications,
     } = &sub.effect
     else {
-        return None;
+        return false;
     };
     if !extra_keywords.is_empty() || !additional_modifications.is_empty() {
-        return None;
+        return false;
     }
 
-    // 2. LAZY-GATHER the run's copy sources (only now, after the shape gate).
-    //    Each entry's `target: SelfRef` copy source is that entry's own source
-    //    object — exactly `run_source_ids` (top-down resolution order).
-    if run_source_ids.len() < 2 {
-        // A prefix of fewer than 2 cannot collapse; fall back to sequential.
-        return None;
+    // 2. CR 608.2h + CR 707.2: each member copies its own source, read on its
+    //    own swapped ability through the copy handler's authority
+    //    (`token_copy::copy_source`): the source's current copiable values
+    //    while it is the incarnation the member captured, or that
+    //    incarnation's last-known ones once it has left the battlefield. A
+    //    member with no copy source is refused.
+    if run_members.len() < 2 {
+        return false;
+    }
+    let Some(copy_sources) = run_members
+        .iter()
+        .map(|member| {
+            let swapped = crate::game::ability_utils::apply_instead_swap(
+                member,
+                member.sub_ability.as_deref()?,
+            );
+            super::token_copy::copy_source(
+                state,
+                &swapped,
+                super::token_copy::CopySourceReferent::OwnSource,
+            )
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+
+    // 3. CR 707.2: every member must copy the top member's copiable values.
+    //    A run with a divergent member is refused whole: the executor resolves
+    //    the whole run, and a divergent member's token would differ from member
+    //    1's, so member 1's checkpoint could not speak for it.
+    let run_values = &copy_sources[0].values;
+    if copy_sources
+        .iter()
+        .any(|source| source.values != *run_values)
+    {
+        return false;
+    }
+    if !copy_token_values_emit_only_etb_pair(run_values) {
+        return false;
+    }
+    // Supertypes are left to the executor's layered pairwise check on member
+    // 1's token (CR 704.5j, CR 704.5k): a copy's legendary supertype may come
+    // from its copiable values (CR 707.9b) or from a layer-4 effect
+    // (CR 613.1d), and only the layered token shows both.
+
+    // 4. H1 INVARIANCE GATE (AFTER the run's values): the condition must be
+    //    invariant over the COPY's core types (what enters), not the
+    //    placeholder spec's. A copy creating Lands gated on a Land count would
+    //    diverge per resolution.
+    if !condition_invariant_for_token(inner, &run_values.card_types.core_types) {
+        return false;
     }
 
-    // 3. Compute the value-equal contiguous prefix (CR 707.2).
-    let (prefix_values, prefix_len) =
-        super::token_copy::compute_copy_batch_prefix(state, run_source_ids)?;
-    if prefix_len < 2 {
-        return None;
-    }
-    if !copy_token_values_emit_only_etb_pair(&prefix_values) {
-        return None;
-    }
-
-    // 4. H1 INVARIANCE GATE (AFTER prefix): the condition must be invariant over
-    //    the COPY's core types (what enters), not the placeholder spec's. A copy
-    //    creating Lands gated on a Land count would diverge per resolution.
-    if !condition_invariant_for_token(inner, &prefix_values.card_types.core_types) {
-        return None;
-    }
-
-    // 5. Build the probe spec from the prefix's shared copiable values so the
-    //    §2.2a emits-only-ETB-pair gate holds and Layer C's
-    //    `zone_change_record_from_spec` reflects the true produced token.
-    let probe_spec = copy_probe_spec(ability, &prefix_values);
+    // 5. Build the probe spec from the run's shared copiable values so the
+    //    emits-only-ETB-pair and replacement-choice gates read the token each
+    //    member actually creates.
+    let probe_spec = copy_probe_spec(ability, run_values);
     if !spec_emits_only_etb_pair(&probe_spec) {
-        return None;
+        return false;
     }
-    // §2.3a: a copy token inherits the copied permanent's full trigger set
-    // (CR 707.2 + CR 707.5 — the copy's ETB triggers fire), so the non-observer
-    // gate reads the prefix's copiable trigger definitions — NOT
-    // `base_token_trigger_defs` (which only surfaces a base token's Role-subtype
-    // triggers). The produced token's emission is derived from the COPY's core
-    // types (what enters), so a Scute-shape landfall trigger keyed
-    // `EnterBattlefield(Some(Land))` on a Creature copy does NOT intersect the
-    // copy's `{None, Some(Creature), TokenCreated}` emission and stays batch-safe.
-    if !produced_token_is_non_observer(
-        &prefix_values.trigger_definitions,
-        &prefix_values.card_types.core_types,
-    ) {
-        return None;
-    }
-    let owner = resolve_token_owner(state, ability, &TargetFilter::Controller);
+    // CR 603.2 + CR 603.3b: observers are not decided here, as on the base
+    // arm. A trigger that sees a member's token, whether the copy carries it
+    // (CR 707.2) or another permanent does, is collected by member 1's
+    // checkpoint or by the executor's per-member collection, which ends the
+    // run at that member.
+    let Some(owner) = resolve_token_owner(state, ability, &TargetFilter::Controller) else {
+        return false;
+    };
     if token_creation_needs_choice(
         state,
         &probe_spec,
@@ -2861,23 +2918,15 @@ fn try_resolve_copy_batch(
         crate::types::proposed_event::EtbTapState::from_seeded_tapped(false),
         1,
     ) {
-        return None;
+        return false;
     }
-
-    // 6. Retain only the read-only probe facts needed by legacy observer tests.
-    Some(super::BatchPlan::copy_token(
-        probe_spec,
-        prefix_values.mana_cost.mana_value(),
-        prefix_len,
-    ))
+    true
 }
 
 /// CR 306.5b + CR 614.1c + CR 707.2: `CopyTokenOf` seeds intrinsic counters
 /// from the copied values while applying the copy. Those counters emit
-/// `CounterAdded` and may pause for replacement choices, so the copy-prefix
-/// batch may only collapse values whose creation still emits exactly the ETB
-/// pair.
-#[cfg(test)]
+/// `CounterAdded` and may pause for replacement choices, so the copy arm
+/// may only admit values whose creation still emits exactly the ETB pair.
 fn copy_token_values_emit_only_etb_pair(values: &crate::types::ability::CopiableValues) -> bool {
     crate::game::printed_cards::intrinsic_face_counters(values.loyalty, None).is_empty()
         && crate::game::printed_cards::self_etb_counter_replacements(
@@ -2886,12 +2935,12 @@ fn copy_token_values_emit_only_etb_pair(values: &crate::types::ability::Copiable
         .is_empty()
 }
 
-/// CR 707.2 + CR 603.6a: Build the Layer C / §2.2a probe `TokenSpec` for a
-/// copy-prefix batch from the prefix's shared copiable values. The probe needs
-/// only the copiable values (CR 707.2): token art comes from the live source at
-/// resolution time (`token_copy::resolve`), so no `PrintedCardRef` is threaded
-/// through the probe.
-#[cfg(test)]
+/// CR 707.2 + CR 603.6a: Build the probe `TokenSpec` the copy arm's
+/// emits-only-ETB-pair and replacement-choice gates read, from the run's shared
+/// copiable values. The probe needs only the copiable values (CR 707.2): a
+/// copy's display identity comes from its copy source at resolution time
+/// (`token_copy::copy_source`), so no `PrintedCardRef` is threaded through the
+/// probe.
 pub(crate) fn copy_probe_spec(
     ability: &ResolvedAbility,
     values: &crate::types::ability::CopiableValues,
@@ -2916,6 +2965,7 @@ pub(crate) fn copy_probe_spec_for(
             display_name: values.name.clone(),
             power: values.power,
             toughness: values.toughness,
+            loyalty: None,
             core_types: values.card_types.core_types.clone(),
             subtypes: values.card_types.subtypes.clone(),
             supertypes: values.card_types.supertypes.clone(),
@@ -2932,27 +2982,6 @@ pub(crate) fn copy_probe_spec_for(
         controller,
         attach_to: TokenHostRequest::NotRequested,
     }
-}
-
-/// CR 111.10: Enumerate the trigger definitions a BASE `Token` spec injects on
-/// the produced token, WITHOUT creating an object — the §2.3a non-observer gate
-/// input. Predefined subtype abilities (`predefined_token_abilities`) are
-/// ACTIVATED abilities and register no trigger; spec `static_abilities` are
-/// continuous (CR 611) and register no trigger. A `Role` subtype would inject
-/// `predefined_role_token_spec(name).triggers`, but Roles are created via
-/// `attach_to`, which `spec_emits_only_etb_pair` already excludes — so a
-/// passing spec injects no triggers. Collected explicitly (defense in depth):
-/// if a future spec ever carries a Role subtype while passing the gate, its
-/// triggers are surfaced here for classification.
-#[cfg(test)]
-fn base_token_trigger_defs(spec: &TokenSpec) -> Vec<TriggerDefinition> {
-    let mut out: Vec<TriggerDefinition> = Vec::new();
-    if spec.characteristics.subtypes.iter().any(|s| s == "Role") {
-        if let Some(role) = predefined_role_token_spec(&spec.characteristics.display_name) {
-            out.extend(role.triggers);
-        }
-    }
-    out
 }
 
 fn normalized_token_static_definition(mut static_def: StaticDefinition) -> StaticDefinition {
@@ -3011,7 +3040,7 @@ pub(crate) fn resolve_token_spec(
     };
 
     let count = resolve_quantity_with_targets(state, count, ability).max(0) as u32;
-    let token_owner = resolve_token_owner(state, ability, owner);
+    let token_owner = resolve_token_owner(state, ability, owner)?;
     let host_request = TokenHostRequest::from_binding(
         attach_to.is_some(),
         attach_to
@@ -3159,6 +3188,12 @@ fn resolve_attach_host(
             crate::game::targeting::resolve_live_parent_slot_from_root(state, ability, index)
                 .map(target_ref_to_attach_target)
         }
+        // CR 608.2b + CR 608.2c: the declared player of the chain; an illegal or
+        // unannounced one names no host.
+        AttachHostAuthority::DeclaredPlayer(group) => {
+            crate::game::targeting::resolve_live_declared_player(state, ability, group)
+                .map(AttachTarget::Player)
+        }
         AttachHostAuthority::Source => Some(AttachTarget::Object(ability.source_id)),
         AttachHostAuthority::SpecificObject(id) => Some(AttachTarget::Object(id)),
         AttachHostAuthority::NoHost => None,
@@ -3190,6 +3225,9 @@ enum AttachHostAuthority {
     Pronoun,
     /// One numbered slot of the resolving chain's accumulated targets.
     ParentSlot(usize),
+    /// CR 608.2c: the player an earlier clause declared, read through the declared-group
+    /// authority.
+    DeclaredPlayer(crate::types::ability::ChosenGroupId),
     /// The ability's own source object.
     Source,
     /// An object the ability definition names outright.
@@ -3264,16 +3302,13 @@ fn classify_attach_host_authority(filter: &TargetFilter) -> AttachHostAuthority 
 
         TargetFilter::ParentTarget => AttachHostAuthority::Pronoun,
         TargetFilter::ParentTargetSlot { index } => AttachHostAuthority::ParentSlot(*index),
+        TargetFilter::DeclaredPlayer { group } => AttachHostAuthority::DeclaredPlayer(*group),
         TargetFilter::SelfRef => AttachHostAuthority::Source,
         TargetFilter::SpecificObject { id } => AttachHostAuthority::SpecificObject(*id),
 
-        // CR 115.1a: the remaining player-valued TARGET SLOTS, which
-        // `denotes_player_target` also claims. Kept as their own arm rather than
-        // folded into a guard so the variant list stays readable, and asserted
-        // to agree with that authority in `attach_host_authority_tests`.
-        TargetFilter::Player | TargetFilter::SpecificPlayer { .. } => {
-            AttachHostAuthority::SelectedPlayerTarget
-        }
+        // CR 115.1a: the remaining player-valued TARGET SLOT, which
+        // `denotes_player_target` also claims.
+        TargetFilter::Player => AttachHostAuthority::SelectedPlayerTarget,
 
         // Player-valued filters that are NOT target slots. CR 303.4 permits a
         // player host, but each of these names its player through a context
@@ -3301,6 +3336,7 @@ fn classify_attach_host_authority(filter: &TargetFilter) -> AttachHostAuthority 
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::DefendingPlayer
         | TargetFilter::Owner
+        | TargetFilter::SpecificPlayer { .. }
         | TargetFilter::AllPlayers => AttachHostAuthority::NoHost,
 
         // Object references this path does not resolve. Each names its object
@@ -3315,7 +3351,7 @@ fn classify_attach_host_authority(filter: &TargetFilter) -> AttachHostAuthority 
         // slot. It fails closed here until a host authority for the pair exists.
         TargetFilter::SourceOrPaired
         | TargetFilter::None
-        | TargetFilter::GrantingObject
+        | TargetFilter::GrantingObject { .. }
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
@@ -3383,7 +3419,7 @@ pub(crate) fn resolve_token_owner(
     state: &GameState,
     ability: &ResolvedAbility,
     owner_filter: &TargetFilter,
-) -> PlayerId {
+) -> Option<PlayerId> {
     // CR 115.1: Context-ref filters route through the central helper so chain
     // target propagation cannot leak the parent's Player target into a sub
     // CreateToken whose `owner: Controller`. The helper handles
@@ -3399,15 +3435,17 @@ pub(crate) fn resolve_token_owner(
     // *source* alongside the player `owner` slot, and resolving the source
     // object's controller as the token owner would be wrong. When no player
     // slot exists, the controller creates the token.
-    ability
-        .targets
-        .iter()
-        .rev()
-        .find_map(|target| match target {
-            TargetRef::Player(pid) => Some(*pid),
-            TargetRef::Object(_) => None,
-        })
-        .unwrap_or(ability.controller)
+    Some(
+        ability
+            .targets
+            .iter()
+            .rev()
+            .find_map(|target| match target {
+                TargetRef::Player(pid) => Some(*pid),
+                TargetRef::Object(_) => None,
+            })
+            .unwrap_or(ability.controller),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3783,6 +3821,7 @@ fn junk_ability() -> AbilityDefinition {
             count: QuantityExpr::Fixed { value: 1 },
             position: crate::types::ability::LibraryPosition::Top,
             face_down: false,
+            actor: crate::types::ability::LibraryInstructionActor::Controller,
         },
     )
     .sub_ability(AbilityDefinition::new(
@@ -3925,6 +3964,31 @@ fn heartwood_ability() -> AbilityDefinition {
     .cost(AbilityCost::Tap)
 }
 
+/// CR 701.71a: the Jace planeswalker token created by `empower Jace N` —
+/// "[−1]: Surveil 1." (CR 701.25a) and "[−3]: Draw a card." (CR 121.1).
+/// Engine-defined from the rule text, not parsed from the catalog row's printed
+/// text, so the printed reminder parenthetical never becomes ability text.
+fn jace_token_abilities() -> Vec<AbilityDefinition> {
+    vec![
+        AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Surveil {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        )
+        .cost(AbilityCost::Loyalty { amount: -1 }),
+        AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        )
+        .cost(AbilityCost::Loyalty { amount: -3 }),
+    ]
+}
+
 /// CR 111.10: Predefined token abilities keyed by subtype.
 /// Returns ability definitions to inject for the given subtype, or empty if none.
 pub fn predefined_token_abilities(subtype: &str) -> Vec<AbilityDefinition> {
@@ -3943,6 +4007,7 @@ pub fn predefined_token_abilities(subtype: &str) -> Vec<AbilityDefinition> {
         "Incubator" => vec![incubator_ability()],
         "Shard" => vec![shard_ability()],
         "Heartwood" => vec![heartwood_ability()],
+        "Jace" => jace_token_abilities(),
         _ => vec![],
     }
 }
@@ -3967,6 +4032,8 @@ fn predefined_token_rules_text(subtype: &str) -> Option<&'static str> {
         ),
         "Incubator" => Some("{2}: Transform this artifact."),
         "Shard" => Some("{2}, Sacrifice this enchantment: Scry 1, then draw a card."),
+        // CR 701.71a
+        "Jace" => Some("[−1]: Surveil 1.\n[−3]: Draw a card."),
         _ => None,
     }
 }
@@ -4249,6 +4316,20 @@ fn predefined_role_token_spec(name: &str) -> Option<RoleSpec> {
     }
 }
 
+/// Recompute `token_art` from the object's current base characteristics.
+/// Called by every token ability injector (which all creation, copy, and
+/// replay flows run once the base is final), so live and replayed tokens
+/// agree without any flow-specific hook.
+fn refresh_token_art_descriptor(
+    state: &mut GameState,
+    obj_id: crate::types::identifiers::ObjectId,
+) {
+    let Some(obj) = state.objects.get_mut(&obj_id) else {
+        return;
+    };
+    obj.restore_token_art_baseline();
+}
+
 /// Inject predefined token abilities based on the token's subtypes and name.
 ///
 /// Two dispatch paths:
@@ -4272,6 +4353,17 @@ pub(super) fn inject_resolved_token_abilities(
     state: &mut GameState,
     obj_id: crate::types::identifiers::ObjectId,
 ) {
+    inject_resolved_token_abilities_inner(state, obj_id);
+    // The base is final after injection (or was already final when there was
+    // nothing to inject): refresh the art descriptor on every path, including
+    // the early no-payload returns, so vanilla tokens carry one too.
+    refresh_token_art_descriptor(state, obj_id);
+}
+
+fn inject_resolved_token_abilities_inner(
+    state: &mut GameState,
+    obj_id: crate::types::identifiers::ObjectId,
+) {
     let Some(materialized) = materialize_token_ability_payload_for_object(state, obj_id) else {
         return;
     };
@@ -4285,19 +4377,25 @@ pub(super) fn inject_resolved_token_abilities(
 
 /// CR 111.3 + CR 111.4: Grant catalog `rules_text` when token creation resolved
 /// a `token_image_ref` preset whose abilities are not already covered by the
-/// predefined path (e.g. SOS Pest attack life gain).
+/// predefined path (e.g. SOS Pest attack life gain). CR 111.10: A predefined
+/// token (Treasure, Food, Clue, …) already received its abilities at creation,
+/// so the single authority `materialize_token_ability_payload` short-circuits
+/// on it and nothing catalog-derived is re-granted.
 pub(crate) fn inject_catalog_token_abilities(
     state: &mut GameState,
     obj_id: crate::types::identifiers::ObjectId,
 ) {
-    let Some(preset) = state.objects.get(&obj_id).and_then(|obj| {
-        obj.token_image_ref.as_ref().and_then(|image_ref| {
-            crate::game::token_presets::known_token_preset_by_id(&image_ref.preset_id)
-        })
-    }) else {
+    inject_catalog_token_abilities_inner(state, obj_id);
+    refresh_token_art_descriptor(state, obj_id);
+}
+
+fn inject_catalog_token_abilities_inner(
+    state: &mut GameState,
+    obj_id: crate::types::identifiers::ObjectId,
+) {
+    let Some(materialized) = materialize_token_ability_payload_for_object(state, obj_id) else {
         return;
     };
-    let materialized = materialize_catalog_token_payload(preset);
     if materialized.source == TokenAbilitySource::CatalogRulesText
         && materialized.has_functional_payload()
     {
@@ -4409,23 +4507,38 @@ fn catalog_rules_text_abilities(
     // independently of `parse_oracle_ir`'s single entry point, so it needs its
     // own `normalize_card_name_refs` pass here, mirroring `parse_oracle_ir`'s
     // call in `oracle.rs`.
-    let rules_text = crate::parser::oracle_util::normalize_card_name_refs(rules_text, card_name);
+    let (rules_text, refusals) =
+        crate::parser::oracle_util::normalize_card_name_refs_reporting(rules_text, card_name);
     let mut static_definitions = Vec::new();
     let mut modifications = Vec::new();
     let mut unparsed_lines = Vec::new();
-    for line in rules_text
+    for (index, line) in rules_text
         .split('\n')
         .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .enumerate()
+        .filter(|(_, line)| !line.is_empty())
     {
         let parsed_statics = crate::parser::oracle_static::parse_static_line_multi(line);
+        // CR 201.5a: a granter reference the walk cannot bind, or a granter name the masker
+        // left as the host, would read the wrong object, so its line is refused as unparsed.
+        let unreached = |def: &StaticDefinition| {
+            let node = crate::types::ability_visit::DefinitionNode::Static(def);
+            refusals.contains(&index) || crate::parser::oracle::granter_reference_unreached(node)
+        };
+        let refused =
+            || crate::parser::oracle_util::render_granting_self_reference(line, card_name);
         if parsed_statics.is_empty() {
-            let parsed_modifications = crate::parser::oracle_static::classify_quoted_inner(line);
-            if parsed_modifications.is_empty() {
+            let carrier = StaticDefinition::continuous()
+                .modifications(crate::parser::oracle_static::classify_quoted_inner(line));
+            if carrier.modifications.is_empty() {
                 unparsed_lines.push(line.to_string());
+            } else if unreached(&carrier) {
+                unparsed_lines.push(refused());
             } else {
-                modifications.extend(parsed_modifications);
+                modifications.extend(carrier.modifications);
             }
+        } else if parsed_statics.iter().any(unreached) {
+            unparsed_lines.push(refused());
         } else {
             static_definitions.extend(
                 parsed_statics
@@ -4450,6 +4563,15 @@ fn catalog_rules_text_abilities(
 }
 
 pub(super) fn inject_predefined_token_abilities(
+    state: &mut GameState,
+    obj_id: crate::types::identifiers::ObjectId,
+) -> bool {
+    let applied = inject_predefined_token_abilities_inner(state, obj_id);
+    refresh_token_art_descriptor(state, obj_id);
+    applied
+}
+
+fn inject_predefined_token_abilities_inner(
     state: &mut GameState,
     obj_id: crate::types::identifiers::ObjectId,
 ) -> bool {
@@ -6030,6 +6152,142 @@ mod tests {
         );
     }
 
+    /// CR 111.10a: A Treasure token has exactly one ability. Linking a catalog
+    /// preset after creation (the debug preset-spawn path, which defers
+    /// `token_image_ref` until after `inject_resolved_token_abilities` ran) must
+    /// not re-grant that ability from the preset's catalog `rules_text`.
+    #[test]
+    fn catalog_injection_keeps_single_predefined_treasure_ability() {
+        // M20 Treasure preset: `PredefinedArtifact { kind: Treasure }` whose
+        // catalog rules_text is the CR 111.10a ability.
+        let preset = crate::game::token_presets::known_token_preset_by_id(
+            "0060ce13-67e2-5607-a29b-721c743e6770",
+        )
+        .expect("M20 Treasure preset");
+        // Reach-guard: the catalog text on its own yields a functional payload,
+        // so a single ability below is the predefined short-circuit, not a parse gap.
+        assert!(
+            materialize_catalog_token_payload(preset).has_functional_payload(),
+            "Treasure catalog rules_text must parse to a functional payload"
+        );
+
+        let mut state = GameState::new(crate::types::format::FormatConfig::standard(), 2, 42);
+        let obj_id = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Treasure".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            obj.is_token = true;
+            obj.card_types.core_types.push(CoreType::Artifact);
+            obj.card_types.subtypes.push("Treasure".to_string());
+        }
+        // Every functional object channel `apply_token_ability_payload` can write
+        // (`modifications` land in the static pair; the catalog path never writes
+        // `back_face`).
+        let channels = |obj: &GameObject| {
+            (
+                obj.abilities.len(),
+                obj.base_abilities.len(),
+                obj.static_definitions.len(),
+                obj.base_static_definitions.len(),
+                obj.trigger_definitions.len(),
+                obj.base_trigger_definitions.len(),
+                obj.keywords.len(),
+                obj.base_keywords.len(),
+            )
+        };
+
+        // Creation-time injection, before the preset image ref is linked.
+        inject_resolved_token_abilities(&mut state, obj_id);
+        assert_eq!(
+            state.objects[&obj_id].abilities.len(),
+            1,
+            "creation must install the predefined Treasure ability"
+        );
+        let before = channels(&state.objects[&obj_id]);
+        let rules_text_before = state.objects[&obj_id].token_rules_text.clone();
+
+        state.objects.get_mut(&obj_id).unwrap().token_image_ref = preset.token_image_ref.clone();
+        inject_catalog_token_abilities(&mut state, obj_id);
+
+        let obj = &state.objects[&obj_id];
+        assert_eq!(
+            channels(obj),
+            before,
+            "catalog injection must not grow any functional channel"
+        );
+        assert_eq!(
+            obj.abilities.len(),
+            1,
+            "catalog injection must not duplicate the predefined Treasure ability"
+        );
+        assert_eq!(obj.base_abilities.len(), 1);
+        // Parity with the normal creation path: a predefined token keeps the
+        // predefined display text (none for Treasure), not the catalog text.
+        assert_eq!(obj.token_rules_text, rules_text_before);
+    }
+
+    /// FRA Jace planeswalker token (MTGJSON uuid).
+    const JACE_TOKEN_PRESET_ID: &str = "635f825d-d6fb-59ac-a807-af08713a3794";
+
+    /// CR 701.71a: through `materialize_token_ability_payload`,
+    /// the Jace token's abilities come from the subtype-keyed registry, so its catalog
+    /// rules-text fallback is not taken. (What the debug-preset creation path leaves on
+    /// the created object is asserted by the planeswalker-token integration test.)
+    #[test]
+    fn jace_token_abilities_come_from_the_predefined_registry() {
+        let preset = crate::game::token_presets::known_token_preset_by_id(JACE_TOKEN_PRESET_ID)
+            .expect("FRA Jace token preset");
+        let materialized = materialize_token_ability_payload(
+            &preset.body.display_name,
+            &preset.body.subtypes,
+            Some(preset),
+        );
+        // Red as `CatalogRulesText` if the registry route was not taken; red as
+        // `None` if the registry wiring silently missed. The two are distinguished.
+        assert_eq!(materialized.source, TokenAbilitySource::Predefined);
+        assert_eq!(materialized.abilities.len(), 2);
+        assert!(materialized.unparsed_rules_text_lines.is_empty());
+        // Each effect is paired with its loyalty cost, so swapping the effects
+        // between the two costs goes red.
+        let effect_for_loyalty_cost = |amount: i32| {
+            let matching: Vec<_> = materialized
+                .abilities
+                .iter()
+                .filter(|ability| {
+                    matches!(ability.cost, Some(AbilityCost::Loyalty { amount: a }) if a == amount)
+                })
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "exactly one ability costs loyalty {amount}"
+            );
+            &*matching[0].effect
+        };
+        assert!(matches!(
+            effect_for_loyalty_cost(-1),
+            Effect::Surveil {
+                count: QuantityExpr::Fixed { value: 1 },
+                ..
+            }
+        ));
+        assert!(matches!(
+            effect_for_loyalty_cost(-3),
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                ..
+            }
+        ));
+        // The registry arm is keyed to the Jace subtype, not to planeswalker
+        // subtypes in general.
+        assert!(predefined_token_abilities("Chandra").is_empty());
+    }
+
     #[test]
     fn catalog_pest_dies_trigger_uses_battlefield_lki_zone() {
         let preset = crate::game::token_presets::known_token_preset_by_id(
@@ -6321,6 +6579,7 @@ mod tests {
                 display_name: "Pest".to_string(),
                 power: Some(1),
                 toughness: Some(1),
+                loyalty: None,
                 core_types: vec![CoreType::Creature],
                 subtypes: vec!["Pest".to_string()],
                 supertypes: vec![],
@@ -6400,6 +6659,7 @@ mod tests {
                 display_name: "Treasure".to_string(),
                 power: None,
                 toughness: None,
+                loyalty: None,
                 core_types: vec![CoreType::Artifact],
                 subtypes: vec!["Treasure".to_string()],
                 supertypes: vec![],
@@ -6469,6 +6729,7 @@ mod tests {
                 display_name: "Royal".to_string(),
                 power: None,
                 toughness: None,
+                loyalty: None,
                 core_types: vec![CoreType::Enchantment],
                 subtypes: vec!["Aura".to_string(), "Role".to_string()],
                 supertypes: vec![],
@@ -6547,6 +6808,7 @@ mod tests {
                 display_name: "Monster Role".to_string(),
                 power: None,
                 toughness: None,
+                loyalty: None,
                 core_types: vec![CoreType::Enchantment],
                 subtypes: vec!["Aura".to_string(), "Role".to_string()],
                 supertypes: vec![],
@@ -6737,6 +6999,7 @@ mod tests {
                 display_name: "Monster Role".to_string(),
                 power: None,
                 toughness: None,
+                loyalty: None,
                 core_types: vec![CoreType::Enchantment],
                 subtypes: vec!["Aura".to_string(), "Role".to_string()],
                 supertypes: vec![],
@@ -7298,6 +7561,7 @@ mod tests {
                 display_name: "Construct".to_string(),
                 power: Some(0),
                 toughness: Some(0),
+                loyalty: None,
                 core_types: vec![CoreType::Artifact, CoreType::Creature],
                 subtypes: vec!["Construct".to_string()],
                 supertypes: vec![],
@@ -7363,6 +7627,7 @@ mod tests {
                 display_name: "Stoneforged Blade".to_string(),
                 power: Some(0),
                 toughness: Some(0),
+                loyalty: None,
                 core_types: vec![CoreType::Artifact],
                 subtypes: vec!["Equipment".to_string()],
                 supertypes: vec![],
@@ -7431,6 +7696,7 @@ mod tests {
                 display_name: "Conditional Blade".to_string(),
                 power: Some(0),
                 toughness: Some(0),
+                loyalty: None,
                 core_types: vec![CoreType::Artifact],
                 subtypes: vec!["Equipment".to_string()],
                 supertypes: vec![],
@@ -7506,6 +7772,7 @@ mod tests {
                 display_name: "Meteorite".to_string(),
                 power: Some(0),
                 toughness: Some(0),
+                loyalty: None,
                 core_types: vec![CoreType::Artifact],
                 subtypes: vec![],
                 supertypes: vec![],
@@ -7560,6 +7827,7 @@ mod tests {
                 display_name: "Hero".to_string(),
                 power: Some(1),
                 toughness: Some(1),
+                loyalty: None,
                 core_types: vec![CoreType::Creature],
                 subtypes: vec!["Hero".to_string()],
                 supertypes: vec![],
@@ -8033,6 +8301,7 @@ mod tests {
                     display_source: DisplaySource::Token,
                     printed_ref: None,
                     token_image_ref: None,
+                    token_art: None,
                     extra_keywords: Vec::new(),
                     additional_modifications: Vec::new(),
                     tapped: false,
@@ -8975,13 +9244,20 @@ mod tests {
             .position(|a| a.cost.as_ref().and_then(sacrifice_target).is_some())
             .expect("host must carry Rock's granted sacrifice-cost ability after evaluate_layers");
 
+        let granted = &runner.state().objects[&host].abilities[idx];
         assert_eq!(
-            runner.state().objects[&host].abilities[idx]
-                .cost
-                .as_ref()
-                .and_then(sacrifice_target),
-            Some(&TargetFilter::SpecificObject { id: rock_id }),
-            "CR 201.5a: the sacrifice cost must target Rock (the granting object), not the host"
+            granted.cost.as_ref().and_then(sacrifice_target),
+            Some(&TargetFilter::GrantingObject {
+                bound: Some(ObjectIncarnationRef::from_object(
+                    &runner.state().objects[&rock_id]
+                ))
+            })
+        );
+        assert_eq!(
+            granted.granting_object,
+            Some(ObjectIncarnationRef::from_object(
+                &runner.state().objects[&rock_id]
+            ))
         );
         assert!(
             !runner.state().objects[&host].abilities[idx]
@@ -9089,7 +9365,7 @@ mod tests {
             matches!(
                 *def.effect,
                 Effect::Sacrifice {
-                    target: TargetFilter::GrantingObject,
+                    target: TargetFilter::GrantingObject { .. },
                     ..
                 }
             )
@@ -9102,7 +9378,7 @@ mod tests {
 
         // NOTE: check the actual `description` fields directly, NOT a
         // `{:?}`-formatted dump of the tree — `Debug` escapes the raw private-use
-        // char to the literal text `\u{e0002}`, so searching a Debug string for
+        // char to the literal text `\u{e0004}`, so searching a Debug string for
         // the real character is always false regardless of whether scrubbing ran.
         let placeholder = crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER;
         let leaked = static_definitions.iter().any(|def| {
@@ -9146,7 +9422,7 @@ mod tests {
     /// this arm of the corpus property has to live here.
     ///
     /// `serde_json` rather than `format!("{:?}")` is deliberate: `Debug` escapes
-    /// the raw private-use char to the literal text `\u{e0002}`, so a `Debug`
+    /// the raw private-use char to the literal text `\u{e0004}`, so a `Debug`
     /// search for the real character is always false and the guard would be
     /// vacuous. `serde_json` emits it raw, at every depth.
     ///
@@ -9179,6 +9455,87 @@ mod tests {
             json.contains("Sacrifice Rock"),
             "CR 201.5a: the granted body must name the granting token: {json}"
         );
+    }
+
+    /// CR 201.5a: a catalog body naming the token where the masker refuses the name would
+    /// read the equipped creature, so that line is unparsed while the rest still parses.
+    #[test]
+    fn catalog_rules_text_refuses_a_granter_name_left_as_the_host() {
+        let (static_definitions, modifications, unparsed_lines) = catalog_rules_text_abilities(
+            "Equipped creature has \"{T}, Unattach Rock: This creature deals 2 damage to any target.\"\nEquip {1}",
+            "Rock",
+        );
+        assert!(
+            !static_definitions.is_empty() || !modifications.is_empty(),
+            "reach-guard: the Equip line still parses"
+        );
+        assert_eq!(
+            unparsed_lines,
+            vec!["Equipped creature has \"{T}, Unattach ~: ~ deals 2 damage to any target.\""]
+        );
+    }
+
+    /// CR 201.5a: a self-grant whose body names the token where the masker refuses the name
+    /// is unparsed too, since an object that later acquires the ability would read itself.
+    #[test]
+    fn catalog_rules_text_refuses_a_self_granted_granter_name() {
+        let (static_definitions, modifications, unparsed_lines) = catalog_rules_text_abilities(
+            "Rock has \"{T}: Rock deals 1 damage to any target.\"\nEquip {1}",
+            "Rock",
+        );
+        assert!(
+            !static_definitions.is_empty() || !modifications.is_empty(),
+            "reach-guard: the Equip line still parses"
+        );
+        assert_eq!(
+            unparsed_lines,
+            vec!["~ has \"{T}: ~ deals 1 damage to any target.\""]
+        );
+    }
+
+    /// CR 601.2i: a catalog static is cast by nobody, so "the player who cast" it is unparsed.
+    #[test]
+    fn catalog_rules_text_refuses_a_caster_reference() {
+        let (static_definitions, modifications, unparsed_lines) = catalog_rules_text_abilities(
+            "Creatures you control have \"When this creature deals damage to the player who cast Rock, draw a card.\"",
+            "Rock",
+        );
+        assert!(static_definitions.is_empty() && modifications.is_empty());
+        assert_eq!(unparsed_lines.len(), 1, "{unparsed_lines:?}");
+
+        let (static_definitions, _modifications, unparsed_lines) = catalog_rules_text_abilities(
+            "Creatures you control have \"When this creature deals damage to a player, draw a card.\"",
+            "Rock",
+        );
+        assert_eq!(static_definitions.len(), 1);
+        assert!(unparsed_lines.is_empty(), "{unparsed_lines:?}");
+    }
+
+    /// CR 201.5a + CR 115.10a: a catalog static whose granter is read from empty targets is
+    /// unparsed.
+    #[test]
+    fn catalog_rules_text_refuses_a_granter_read_from_empty_targets() {
+        for body in [
+            "{1}: Tap Rock.",
+            "{1}: Put a flying counter and a vigilance counter on Rock.",
+        ] {
+            let (static_definitions, modifications, unparsed_lines) = catalog_rules_text_abilities(
+                &format!("Creatures you control have \"{body}\""),
+                "Rock",
+            );
+            assert!(
+                static_definitions.is_empty() && modifications.is_empty(),
+                "{body}"
+            );
+            assert_eq!(unparsed_lines.len(), 1, "{body}: {unparsed_lines:?}");
+        }
+
+        let (static_definitions, _modifications, unparsed_lines) = catalog_rules_text_abilities(
+            "Creatures you control have \"{1}: Put a flying counter on Rock.\"",
+            "Rock",
+        );
+        assert_eq!(static_definitions.len(), 1);
+        assert!(unparsed_lines.is_empty(), "{unparsed_lines:?}");
     }
 
     /// CR 201.5a — the MEASURED BOUNDARY for this entry point's one un-rendered
@@ -9246,6 +9603,43 @@ mod tests {
              un-rendered `unparsed_lines` axis measurably safe. If this changed, \
              re-measure that axis rather than editing this expectation."
         );
+    }
+
+    /// CR 201.5a: a catalog body naming the token where the walk cannot bind it is refused.
+    #[test]
+    fn catalog_unreached_granter_reference_is_refused_as_unparsed() {
+        let rock = crate::game::token_presets::known_token_presets()
+            .iter()
+            .find(|preset| preset.body.display_name == "Rock")
+            .expect("the Rock preset");
+        let carries_symbol = |payload: &TokenAbilityMaterialization| {
+            serde_json::to_string(&(
+                &payload.static_definitions,
+                &payload.abilities,
+                &payload.trigger_definitions,
+                &payload.modifications,
+            ))
+            .unwrap()
+            .contains("\"type\":\"GrantingObject\"")
+        };
+        let printed = materialize_catalog_token_payload(rock);
+        assert!(printed.unparsed_rules_text_lines.is_empty());
+        assert!(
+            carries_symbol(&printed),
+            "reach-guard: Rock's sacrifice cost keeps its symbol"
+        );
+
+        // A static line, then a line only `classify_quoted_inner` parses.
+        for line in [
+            "Equipped creature has \"{T}: Draw cards equal to the number of +1/+1 counters on Rock.\"",
+            "{T}: Target creature gains \"{T}: Draw cards equal to the number of +1/+1 counters on Rock.\" until end of turn.",
+        ] {
+            let mut drawing = rock.clone();
+            drawing.rules_text = Some(format!("{line}\nEquip {{1}}"));
+            let refused = materialize_catalog_token_payload(&drawing);
+            assert_eq!(refused.unparsed_rules_text_lines, vec![line.to_string()]);
+            assert!(!carries_symbol(&refused), "{line}");
+        }
     }
 
     #[test]
@@ -9347,7 +9741,9 @@ mod tests {
         record.core_types = vec![CoreType::Land];
         record.subtypes = vec!["Forest".to_string()];
         record.controller = land_controller;
+        record.arrival.controller = land_controller;
         record.owner = land_controller;
+        record.arrival.owner = land_controller;
         let event = GameEvent::ZoneChanged {
             object_id: land,
             from: Some(Zone::Hand),
@@ -9520,6 +9916,7 @@ mod attach_host_authority_tests {
             TargetFilter::Neighbor {
                 direction: SeatDirection::Left,
             },
+            TargetFilter::SpecificPlayer { id: PlayerId(1) },
         ] {
             assert!(
                 filter.is_context_ref(),
@@ -9528,7 +9925,7 @@ mod attach_host_authority_tests {
             assert!(
                 !matches!(
                     classify_attach_host_authority(&filter),
-                    AttachHostAuthority::SelectedTarget
+                    AttachHostAuthority::SelectedTarget | AttachHostAuthority::SelectedPlayerTarget
                 ),
                 "{filter:?} is a context reference and must not inherit the ability's \
                  chosen targets as its attachment host"
@@ -9562,5 +9959,125 @@ mod attach_host_authority_tests {
             ),
             "a composite naming an exile-linked object has no host authority here"
         );
+    }
+
+    // ─── TokenArtDescriptor derivation ────────────────────────────────────
+
+    use crate::types::ability::{ReplacementDefinition, StaticDefinition};
+    use crate::types::replacements::ReplacementEvent;
+    use crate::types::statics::StaticMode;
+
+    fn art_fixture() -> GameObject {
+        let mut obj = GameObject::new(
+            ObjectId(1),
+            CardId(1),
+            PlayerId(0),
+            "Goblin".to_string(),
+            Zone::Battlefield,
+        );
+        obj.is_token = true;
+        obj.base_power = Some(1);
+        obj.base_toughness = Some(1);
+        obj.base_color = vec![crate::types::mana::ManaColor::Red];
+        obj.base_card_types.subtypes = vec!["Goblin".to_string()];
+        obj
+    }
+
+    #[test]
+    fn art_descriptor_reports_the_printed_body() {
+        let descriptor = art_fixture().intrinsic_token_art();
+        assert_eq!(descriptor.power, Some(1));
+        assert_eq!(descriptor.toughness, Some(1));
+        assert_eq!(descriptor.colors, vec![crate::types::mana::ManaColor::Red]);
+        assert_eq!(descriptor.subtypes, vec!["Goblin".to_string()]);
+        assert!(descriptor.keywords.is_empty());
+        assert!(!descriptor.has_abilities);
+    }
+
+    #[test]
+    fn art_descriptor_ignores_live_grants_and_modifications() {
+        let mut obj = art_fixture();
+        // Pumped P/T, a color setter, an anthem keyword grant, and a granted
+        // activated ability: all live-layer, none of it printed.
+        obj.power = Some(4);
+        obj.toughness = Some(4);
+        obj.color = vec![crate::types::mana::ManaColor::Blue];
+        obj.keywords = vec![Keyword::Flying];
+        obj.abilities = Arc::new(vec![treasure_ability()]);
+        let descriptor = obj.intrinsic_token_art();
+        assert_eq!(descriptor.power, Some(1));
+        assert_eq!(descriptor.toughness, Some(1));
+        assert_eq!(descriptor.colors, vec![crate::types::mana::ManaColor::Red]);
+        assert!(descriptor.keywords.is_empty());
+        assert!(
+            !descriptor.has_abilities,
+            "live grants must not flip the printed ability summary"
+        );
+    }
+
+    #[test]
+    fn art_descriptor_names_keyword_families_and_passes_unknown_payloads_through() {
+        let mut obj = art_fixture();
+        obj.base_keywords = vec![
+            Keyword::Flying,
+            Keyword::FirstStrike,
+            Keyword::Ward(WardCost::Mana(crate::types::mana::ManaCost::generic(2))),
+            Keyword::Flying,
+            // `kind()` collapses Toxic to the catch-all `Unknown`; the art
+            // mapping must still name its own family.
+            Keyword::Toxic(1),
+            Keyword::Unknown("some-future-keyword".to_string()),
+        ];
+        let descriptor = obj.intrinsic_token_art();
+        assert_eq!(
+            descriptor.keywords,
+            vec![
+                "Flying".to_string(),
+                "FirstStrike".to_string(),
+                "Ward".to_string(),
+                "Toxic".to_string(),
+                "some-future-keyword".to_string(),
+            ]
+        );
+        assert!(descriptor.has_abilities);
+    }
+
+    #[test]
+    fn art_descriptor_has_abilities_covers_every_base_ability_store() {
+        // Each arm independently flips the summary; vanilla stays false.
+        assert!(!art_fixture().intrinsic_token_art().has_abilities);
+
+        let mut keyworded = art_fixture();
+        keyworded.base_keywords = vec![Keyword::Trample];
+        assert!(keyworded.intrinsic_token_art().has_abilities);
+
+        let mut activated = art_fixture();
+        activated.base_abilities = Arc::new(vec![treasure_ability()]);
+        assert!(activated.intrinsic_token_art().has_abilities);
+
+        let mut triggered = art_fixture();
+        triggered.base_trigger_definitions =
+            Arc::new(vec![TriggerDefinition::new(TriggerMode::ChangesZone)]);
+        assert!(triggered.intrinsic_token_art().has_abilities);
+
+        let mut staticed = art_fixture();
+        staticed.base_static_definitions =
+            Arc::new(vec![StaticDefinition::new(StaticMode::Continuous)]);
+        assert!(staticed.intrinsic_token_art().has_abilities);
+
+        let mut replaced = art_fixture();
+        replaced.base_replacement_definitions =
+            Arc::new(vec![ReplacementDefinition::new(ReplacementEvent::Untap)]);
+        assert!(replaced.intrinsic_token_art().has_abilities);
+    }
+
+    #[test]
+    fn art_descriptor_ignores_display_mirror_rules_text() {
+        // `token_rules_text` can mirror catalog text for abilities that were
+        // suppressed from functional injection; it must not flip the summary
+        // on a functionally vanilla token.
+        let mut obj = art_fixture();
+        obj.token_rules_text = Some("Flying".to_string());
+        assert!(!obj.intrinsic_token_art().has_abilities);
     }
 }

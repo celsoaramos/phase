@@ -28,11 +28,12 @@ import {
   loadActiveDeck,
   loadSavedDeckBracket,
 } from "../constants/storage";
-import type { CommanderBracket } from "../types/bracket";
+import { isCommanderFamilyFormat, type CommanderBracket } from "../types/bracket";
 import type { CommanderBracketTier } from "../types/bracketEstimate";
 import type { AiDeckCandidate } from "../services/aiDeckCatalog";
 import { buildLegalAiDeckCatalog } from "../services/aiDeckCatalog";
 import { pickRandomDeckCandidate } from "../services/randomDeckSelection";
+import { restrictAiPoolByBracket } from "../services/aiRandomPool";
 import { AI_DECK_RANDOM, usePreferencesStore } from "../stores/preferencesStore";
 import { effectiveAiDifficulty } from "../services/cedhLock";
 import { createGameLoopController } from "../game/controllers/gameLoopController";
@@ -45,10 +46,13 @@ import { hostRoom, joinRoom } from "../network/connection";
 import type { BrokerClient } from "../services/brokerClient";
 import { loadP2PSession } from "../services/p2pSession";
 import { loadP2PTerminalResult } from "../services/p2pTerminalResult";
-import { expandParsedDeck, type ExpandedDeck, type ParsedDeck } from "../services/deckParser";
+import { expandParsedDeck, type ParsedDeck } from "../services/deckParser";
 import { formatSuppliesDeck } from "../data/formatRegistry";
+import { emptySeatDeck, pileSeatDeck, pileSourceFromParam, type PileSource } from "../services/pileSource";
 import { consumeRecentAutoUpdateMarker } from "../pwa/updateMarker";
-import { loadDraftRun } from "../services/quickDraftPersistence";
+import { inspectActiveQuickDraftLifecycle, loadDraftRun } from "../services/quickDraftPersistence";
+import { loadGameStrict } from "../services/gamePersistence";
+import type { DraftRunState } from "../services/quickDraftPersistence";
 import { SPECTATOR_PLAYER_ID } from "../constants/game";
 import { clearWsSession, loadWsSession, saveWsSession } from "../services/multiplayerSession";
 import {
@@ -78,6 +82,7 @@ import {
 import type { AISeatBinding } from "../game/controllers/aiController";
 import { useMultiplayerStore } from "../stores/multiplayerStore";
 import { useMultiplayerDraftStore } from "../stores/multiplayerDraftStore";
+import { isCoherentUnresolvedDraftStage } from "../stores/draftStore";
 import {
   assignRandomAvatars,
   avatarCardNameForName,
@@ -221,9 +226,10 @@ function setupDraftMatchAvatars(seed: string) {
  * wire-assigned mode re-establishes the seat when its effect re-runs:
  * draft-match re-runs `setupDraftMatchAvatars`, and a fresh WS/P2P-guest
  * adapter re-emits `playerIdentity` from `GameStarted` / `reconnect_ack`. The
- * P2P HOST is the one path with no re-emit (it emits only from its game-start
- * flow) — it is unaffected because the host is always seat 0, which is exactly
- * what `resolveLocalSeat` falls back to.
+ * P2P HOST is the one path with no remount re-emit (it emits only from its
+ * game-start flow and from a resumed `initialize`) — it is unaffected because
+ * the host is always seat 0, which is exactly what `resolveLocalSeat` falls
+ * back to.
  */
 function clearWireAssignedSeat(): void {
   useMultiplayerStore.getState().setActivePlayerId(null);
@@ -294,6 +300,33 @@ type DeckListPayload = {
   ai_difficulties: string[];
 };
 
+function hasExactKeys(value: unknown, required: readonly string[], optional: readonly string[] = []): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return required.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+    && keys.every((key) => required.includes(key) || optional.includes(key));
+}
+
+function sameStringArray(value: unknown, expected: readonly string[]): boolean {
+  return Array.isArray(value) && value.length === expected.length
+    && value.every((entry, index) => typeof entry === "string" && entry === expected[index]);
+}
+
+/** The raw object is forwarded unchanged to the engine, so every key and value must match publication. */
+function matchesPublishedDraftPayload(value: unknown, run: DraftRunState): boolean {
+  if (!hasExactKeys(value, ["player", "opponent", "ai_decks"], ["booster_pack_pool"])) return false;
+  const matchesDeck = (deck: unknown, mainDeck: string[]) => hasExactKeys(deck, ["main_deck", "sideboard", "commander"])
+    && sameStringArray(deck.main_deck, mainDeck)
+    && sameStringArray(deck.sideboard, [])
+    && sameStringArray(deck.commander, []);
+  if (!matchesDeck(value.player, run.playerDeck) || !matchesDeck(value.opponent, run.opponentDeck)
+    || !Array.isArray(value.ai_decks) || value.ai_decks.length !== 0) return false;
+  const pool = run.booster_pack_pool;
+  if (pool === undefined) return !Object.prototype.hasOwnProperty.call(value, "booster_pack_pool");
+  if (pool === null) return value.booster_pack_pool === null;
+  return Array.isArray(pool) && sameStringArray(value.booster_pack_pool, pool);
+}
+
 function nativeAiSeatsFromDeckList(deckList: DeckListPayload): NativeAiSeat[] {
   return [deckList.opponent, ...deckList.ai_decks].map((deck, index) => ({
     seatIndex: index + 1,
@@ -344,6 +377,7 @@ function candidatePassesFilters(
 
 function pickOpponentDeck(
   catalog: AiDeckCandidate[],
+  pool: AiDeckCandidate[],
   requestedDeckId: string,
   excludeIds: Set<string>,
   archetypeFilter: ReturnType<typeof usePreferencesStore.getState>["aiArchetypeFilter"],
@@ -355,78 +389,59 @@ function pickOpponentDeck(
     if (pinned) return pinned;
   }
 
-  const filtered = catalog.filter((candidate) =>
+  // Random seats draw from `pool`: the bracket-restricted pool when it is
+  // non-empty, else the full legal catalog (an empty restriction warns at
+  // setup, so reaching here means the fallback was accepted). Archetype +
+  // coverage are soft preferences applied within that pool.
+  const filtered = pool.filter((candidate) =>
     candidatePassesFilters(candidate, archetypeFilter, coverageFloor)
   );
-  return pickRandomDeckCandidate(filtered.length > 0 ? filtered : catalog, {
+  return pickRandomDeckCandidate(filtered.length > 0 ? filtered : pool, {
     selectedFormat,
     excludeIds,
   }) ?? catalog[0];
 }
 
-// Placeholder decklist for fixed-deck formats (Momir's Madness): the player
-// builds nothing, and the engine synthesizes the real deck for every seat. The
-// builders below ignore its contents for such formats.
+// The empty decklist a seat submits when it has no deck to send.
 const EMPTY_PARSED_DECK: ParsedDeck = { main: [], sideboard: [] };
 
-function buildPlayerOnlyDeckList(deck: ParsedDeck, playerBracket?: CommanderBracket | null): DeckListPayload {
-  const expanded = expandParsedDeck(deck);
-  const player: ExpandedDeckWithTier = { ...expanded, bracket_tier: bracketToEngineTier(playerBracket) };
-  return {
-    player,
-    opponent: {
-      main_deck: [],
-      sideboard: [],
-      commander: [],
-      planar_deck: [],
-      scheme_deck: [],
-      signature_spell: [],
-      companion: [],
-      sticker_sheets: [],
-      bracket_tier: "core",
-    },
-    ai_decks: [],
-    ai_difficulties: [],
-  };
+function emptySeat(): ExpandedDeckWithTier {
+  return { ...emptySeatDeck(), bracket_tier: "core" };
+}
+
+function buildPlayerOnlyDeckList(player: ExpandedDeckWithTier): DeckListPayload {
+  return { player, opponent: emptySeat(), ai_decks: [], ai_difficulties: [] };
 }
 
 async function buildLocalAiDeckList(
   t: TFunction,
   deck: ParsedDeck | null,
   playerCount: number,
-  formatConfig?: FormatConfig,
-  selectedMatchType?: MatchType,
-  playerBracket?: CommanderBracket | null,
+  formatConfig: FormatConfig | undefined,
+  selectedMatchType: MatchType | undefined,
+  playerBracket: CommanderBracket | null,
+  pileSource: PileSource,
 ): Promise<DeckListPayload> {
-  // Fixed-deck formats (Momir's Madness) supply the deck for every seat from the
-  // engine, so there is no AI deck catalog to draw from — submit empty seats and
-  // let `load_and_hydrate_decks` synthesize the identical fixed deck per player.
+  // Supplied-deck formats have no AI deck catalog: the pile seat submits the
+  // host's pile (empty for the default or an engine-fixed deck) and every other
+  // seat submits nothing, leaving the engine to load the shared or fixed deck.
   if (formatConfig && formatSuppliesDeck(formatConfig.format)) {
     const { aiSeats, cedhMode } = usePreferencesStore.getState();
     const opponentCount = Math.max(1, playerCount - 1);
-    const emptySeat = (): ExpandedDeckWithTier => ({
-      main_deck: [],
-      sideboard: [],
-      commander: [],
-      planar_deck: [],
-      scheme_deck: [],
-      signature_spell: [],
-      companion: [],
-      sticker_sheets: [],
-      bracket_tier: "core",
-    });
+    const pile = await pileSeatDeck(formatConfig.format, pileSource);
+    if (!pile) throw new Error(t("multiplayer:page.couldNotLoadDeck"));
     const aiDifficulties = Array.from({ length: opponentCount }, (_, i) =>
       effectiveAiDifficulty(aiSeats[i]?.difficulty ?? "Medium", cedhMode),
     );
     return {
-      player: emptySeat(),
+      player: { ...pile, bracket_tier: "core" },
       opponent: emptySeat(),
       ai_decks: Array.from({ length: opponentCount - 1 }, emptySeat),
       ai_difficulties: aiDifficulties,
     };
   }
 
-  const { aiSeats, cedhMode, aiArchetypeFilter, aiCoverageFloor } = usePreferencesStore.getState();
+  const { aiSeats, cedhMode, aiArchetypeFilter, aiCoverageFloor, aiBracketFilter } = usePreferencesStore.getState();
   const catalog = await buildLegalAiDeckCatalog({
     selectedFormat: formatConfig?.format,
     selectedMatchType,
@@ -438,6 +453,42 @@ async function buildLocalAiDeckList(
         : t("gameProvider.noLegalAiDecks.generic"),
     );
   }
+
+  // The bracket/cEDH restriction is the same pool the setup page previews
+  // (`restrictAiPoolByBracket`): Random seats draw from it, so a 1–3 filter
+  // can never field a bracket-4+ deck. Pinned seats bypass the pool —
+  // `pickOpponentDeck` resolves explicit ids against the full catalog.
+  const bracketPool = restrictAiPoolByBracket(catalog.candidates, {
+    bracketFilter: aiBracketFilter,
+    cedhMode,
+    selectedFormat: formatConfig?.format ?? null,
+  });
+  // An empty pool means the table's bracket constraint excluded every legal
+  // deck (the catalog itself is non-empty here). In cEDH mode the engine
+  // rejects any non-bracket-5 deck at init (`validate_cedh_bracket`, gated
+  // on CEDH AI difficulties), so there is no legal fallback: fail fast
+  // unless every seat is pinned to an explicit deck. Otherwise (manual
+  // filter) any legal deck plays fine — the setup page warns about the
+  // empty pool (soft gate, Start stays enabled), so fall back to the full
+  // legal catalog.
+  const effectiveCedhMode = cedhMode && isCommanderFamilyFormat(formatConfig?.format ?? undefined);
+  if (bracketPool.length === 0 && effectiveCedhMode) {
+    const opponentCount = Math.max(1, playerCount - 1);
+    const needsRandomSeat = Array.from(
+      { length: opponentCount },
+      (_, i) => aiSeats[i]?.deckId ?? AI_DECK_RANDOM,
+    ).some((requestedDeckId) =>
+      requestedDeckId === AI_DECK_RANDOM || !catalog.candidates.some((c) => c.id === requestedDeckId),
+    );
+    if (needsRandomSeat) {
+      throw new Error(
+        formatConfig?.format
+          ? t("gameProvider.noLegalAiDecks.withFormat", { format: formatConfig.format })
+          : t("gameProvider.noLegalAiDecks.generic"),
+      );
+    }
+  }
+  const randomPool = bracketPool.length > 0 ? bracketPool : catalog.candidates;
 
   const excludeIds = new Set<string>();
   let playerDeck = deck;
@@ -468,6 +519,7 @@ async function buildLocalAiDeckList(
     const requestedDeckId = aiSeats[i]?.deckId ?? AI_DECK_RANDOM;
     const result = pickOpponentDeck(
       catalog.candidates,
+      randomPool,
       requestedDeckId,
       excludeIds,
       aiArchetypeFilter,
@@ -580,6 +632,8 @@ export interface GameProviderProps {
    * origin, which fall back to the hosting server via `detectServerUrl()`.
    */
   serverUrl?: string;
+  /** The saved-deck name the host picked as a `HostPile` format's pile; absent = the default pile. */
+  pile?: string;
   onWsEvent?: (event: WsAdapterEvent) => void;
   onP2PEvent?: (event: P2PAdapterEvent) => void;
   onReady?: () => void;
@@ -608,6 +662,7 @@ export function GameProvider({
   source,
   draftId,
   serverUrl: originUrl,
+  pile,
   onWsEvent,
   onP2PEvent,
   onReady,
@@ -807,11 +862,11 @@ export function GameProvider({
     }
 
     if (isP2P) {
-      const parsedDeck = loadActiveDeck();
-      // Fixed-deck formats (Momir's Madness) supply the deck from the engine for
-      // host and guests alike, so no active deck is required to host/join.
-      const suppliesDeck = formatConfig ? formatSuppliesDeck(formatConfig.format) : false;
-      if (!parsedDeck && !suppliesDeck) {
+      // A supplied-deck format reads no active deck; the host's guest gate, not
+      // the guest, decides whether a guest's submission fits the room.
+      const suppliedFormat = formatConfig && formatSuppliesDeck(formatConfig.format) ? formatConfig.format : null;
+      const parsedDeck = suppliedFormat ? null : loadActiveDeck();
+      if (mode === "p2p-host" && !parsedDeck && !suppliedFormat) {
         onNoDeckRef.current?.();
         return;
       }
@@ -854,12 +909,6 @@ export function GameProvider({
 
       const setupP2P = async () => {
         const effectivePlayerCount = playerCount ?? 2;
-        const deckList = buildPlayerOnlyDeckList(
-          parsedDeck ?? EMPTY_PARSED_DECK,
-          loadActiveDeckBracket(),
-        );
-        signal.throwIfAborted();
-
         // Resources that may need undoing on abort/error. `broker` is
         // closed unconditionally when set; `serverGameCode` gates the
         // compensating `unregister` call — we only un-do a registration
@@ -869,6 +918,25 @@ export function GameProvider({
         let hostPeerHandle: { destroy: () => void } | null = null;
 
         try {
+          let player: ExpandedDeckWithTier;
+          if (!suppliedFormat) {
+            player = {
+              ...expandParsedDeck(parsedDeck ?? EMPTY_PARSED_DECK),
+              bracket_tier: bracketToEngineTier(loadActiveDeckBracket()),
+            };
+          } else if (mode === "p2p-host") {
+            const pileDeck = await pileSeatDeck(suppliedFormat, pileSourceFromParam(pile));
+            if (!pileDeck) {
+              if (!signal.aborted) onNoDeckRef.current?.(tRef.current("multiplayer:page.couldNotLoadDeck"));
+              return;
+            }
+            player = { ...pileDeck, bracket_tier: "core" };
+          } else {
+            player = emptySeat();
+          }
+          const deckList = buildPlayerOnlyDeckList(player);
+          signal.throwIfAborted();
+
           if (mode === "p2p-host") {
             // Browser P2P hosts always own seat zero. Do this before claiming
             // a pre-game adapter: its one-shot identity event may already have
@@ -962,7 +1030,6 @@ export function GameProvider({
               const store = useMultiplayerStore.getState();
               const result = await store.openBroker({
                 hostPeerId: host.peer.id,
-                deck: deckList.player,
                 displayName: store.displayName || "Host",
                 public: true,
                 password: null,
@@ -970,15 +1037,15 @@ export function GameProvider({
                 playerCount: effectivePlayerCount,
                 matchConfig: matchConfig ?? { match_type: "Bo1" },
                 formatConfig: formatConfig ?? null,
-                aiSeats: [],
                 roomName: roomName ?? null,
                 draftMetadata: null,
-              });
-              signal.throwIfAborted();
+              }, signal);
+              // Owned before the abort check, so the catch releases a broker that resolved late.
               if (result) {
                 broker = result.broker;
                 serverGameCode = result.gameCode;
               }
+              signal.throwIfAborted();
             }
 
             // Only show the lobby tile for fresh hosts waiting for guests.
@@ -1111,6 +1178,7 @@ export function GameProvider({
               /* best-effort */
             });
           }
+          if (broker) useMultiplayerStore.getState().closeBroker(broker);
           hostPeerHandle?.destroy();
           if (signal.aborted) return;
           const message = err instanceof Error ? err.message : String(err);
@@ -1156,11 +1224,9 @@ export function GameProvider({
 
     if (isOnline || isReconnect) {
       const parsedDeck = isSpectate ? null : loadActiveDeck();
-      const deck = isSpectate
-        ? { main_deck: [], sideboard: [] }
-        : parsedDeck
-          ? parsedDeckToDeckData(parsedDeck)
-          : { main_deck: [], sideboard: [] };
+      // A guest of a supplied-deck room submits nothing; the room's format rides the join URL.
+      const suppliedJoin = Boolean(joinCode) && formatConfig !== undefined && formatSuppliesDeck(formatConfig.format);
+      const deck = parsedDeck && !suppliedJoin ? parsedDeckToDeckData(parsedDeck) : emptySeatDeck();
 
       const mpStore = useMultiplayerStore.getState();
       mpStore.setConnectionStatus("connecting");
@@ -1203,6 +1269,13 @@ export function GameProvider({
       const setupWs = async () => {
         if (cancelled) return;
         const reconnectSession = isReconnect ? loadWsSession() : null;
+        if (wsMode === "host" && !reconnectSession) {
+          // Online play is entered by a join code or a saved session; with neither there is no game to attach to.
+          useMultiplayerStore.getState().setConnectionStatus("disconnected");
+          useMultiplayerStore.getState().showToast(tRef.current("gameProvider.toasts.connectionFailed"));
+          onWsEventRef.current?.({ type: "reconnectFailed" });
+          return;
+        }
         if (reconnectSession) {
           const terminalDelivery = await loadFullTerminalDelivery(reconnectSession.fullKey);
           if (cancelled) return;
@@ -1461,9 +1534,154 @@ export function GameProvider({
     // On cleanup, we clear the WASM game state but keep the worker alive.
     const setupLocal = async () => {
       if (cancelled) return;
-
-      const savedState = await loadGame(gameId);
       const adapter = getSharedAdapter();
+      const soloDraft = source === "draft" && !!draftId;
+      const draftDeckKey = `phase:draft-deck:${gameId}`;
+      const reportDraftError = (error: unknown) => {
+        if (!cancelled) onNoDeckRef.current?.(error instanceof Error ? error.message : String(error));
+      };
+      const unavailableDraftStage = () => new Error(tRef.current("draft:run.resumeUnavailable"));
+      const loadExactDraftRun = async (): Promise<DraftRunState> => {
+        const meta = await inspectActiveQuickDraftLifecycle("inspect");
+        if (!meta || meta.id !== draftId) throw unavailableDraftStage();
+        const run = await loadDraftRun(draftId!);
+        if (!run) throw unavailableDraftStage();
+        if (!isCoherentUnresolvedDraftStage(run, draftId!, gameId)
+          || (meta.setCode === "custom-cube" && !Array.isArray(run.booster_pack_pool))) {
+          throw unavailableDraftStage();
+        }
+        return run;
+      };
+      const startDraftDeck = async (raw: string) => {
+        try {
+          const deckList = JSON.parse(raw) as DeckListPayload;
+          if (soloDraft) {
+            const run = await loadExactDraftRun();
+            if (cancelled) return;
+            if (!matchesPublishedDraftPayload(deckList, run)) throw unavailableDraftStage();
+          }
+          await initGame(
+            gameId,
+            adapter,
+            deckList,
+            formatConfig,
+            playerCount,
+            matchConfig,
+            firstPlayer,
+            soloDraft ? "strict" : "best-effort",
+          );
+          if (cancelled) return;
+          controller = createGameLoopController({
+            mode: mode === "local" ? "local" : "ai", difficulty,
+            aiSeats: resolveAiSeatBindings(gameId, playerCount, difficulty), playerCount,
+          });
+          controller.start();
+          if (cancelled) return;
+          audioManager.setContext("battlefield");
+        } catch (error) {
+          console.error("Draft deck validation failed:", error);
+          reportDraftError(error);
+          return;
+        }
+        try {
+          if (sessionStorage.getItem(draftDeckKey) === raw) sessionStorage.removeItem(draftDeckKey);
+        } catch (error) {
+          // A playable game has started. Keep the handoff for a later cleanup
+          // attempt when storage is unavailable instead of reporting a failed start.
+          console.warn("Could not consume draft deck handoff:", error);
+        }
+      };
+      const startExactDraftStage = async () => {
+        try {
+          const run = await loadExactDraftRun();
+          if (cancelled) return;
+          const deckList = {
+            booster_pack_pool: run.booster_pack_pool,
+            player: { main_deck: run.playerDeck, sideboard: [], commander: [] },
+            opponent: { main_deck: run.opponentDeck, sideboard: [], commander: [] },
+            ai_decks: [],
+          };
+          await initGame(gameId, adapter, deckList, formatConfig, playerCount, matchConfig, firstPlayer, "strict");
+          if (cancelled) return;
+          controller = createGameLoopController({
+            mode: mode === "local" ? "local" : "ai", difficulty,
+            aiSeats: resolveAiSeatBindings(gameId, playerCount, difficulty), playerCount,
+          });
+          controller.start();
+          if (!cancelled) audioManager.setContext("battlefield");
+        } catch (error) {
+          console.error("Draft IDB deck fallback failed:", error);
+          reportDraftError(error);
+        }
+      };
+      let draftDeckRaw: string | null = null;
+      let savedState;
+      try {
+        savedState = await (soloDraft ? loadGameStrict(gameId) : loadGame(gameId));
+      } catch (error) {
+        if (cancelled) return;
+        reportDraftError(error);
+        return;
+      }
+      if (cancelled) return;
+
+      if (soloDraft) {
+        try {
+          draftDeckRaw = sessionStorage.getItem(draftDeckKey);
+        } catch (error) {
+          if (!savedState) {
+            reportDraftError(error);
+            return;
+          }
+          console.warn("Could not read draft deck handoff during saved-game restore:", error);
+        }
+      }
+
+      if (soloDraft) {
+        if (!savedState) {
+          if (draftDeckRaw !== null) await startDraftDeck(draftDeckRaw);
+          else await startExactDraftStage();
+          return;
+        }
+        try {
+          await loadExactDraftRun();
+          if (cancelled) return;
+        } catch (error) {
+          reportDraftError(error);
+          return;
+        }
+        try {
+          await resumeGame(gameId, adapter, savedState);
+        } catch (error) {
+          if (cancelled) return;
+          console.warn("Failed to resume saved draft game:", error);
+          reportDraftError(error);
+          return;
+        }
+        if (cancelled) return;
+        try {
+          const resumedPlayerCount = persistedGameStateView(savedState).players.length;
+          controller = createGameLoopController({
+            mode: mode === "local" ? "local" : "ai", difficulty,
+            aiSeats: resolveAiSeatBindings(gameId, resumedPlayerCount, difficulty),
+            playerCount: resumedPlayerCount,
+          });
+          controller.start();
+          if (cancelled) return;
+          audioManager.setContext("battlefield");
+        } catch (error) {
+          reportDraftError(error);
+          return;
+        }
+        if (draftDeckRaw !== null) {
+          try {
+            if (sessionStorage.getItem(draftDeckKey) === draftDeckRaw) sessionStorage.removeItem(draftDeckKey);
+          } catch (error) {
+            console.warn("Could not consume draft deck handoff:", error);
+          }
+        }
+        return;
+      }
 
       if (savedState) {
         try {
@@ -1514,6 +1732,7 @@ export function GameProvider({
               formatConfig,
               matchConfig?.match_type,
               loadActiveDeckBracket(),
+              pileSourceFromParam(pile),
             );
           } catch (deckErr) {
             onNoDeckRef.current?.(deckErr instanceof Error ? deckErr.message : String(deckErr));
@@ -1552,80 +1771,17 @@ export function GameProvider({
       // No saved state — start a new game.
       // Quick drafts and local Commander pods publish their full engine payload
       // in sessionStorage, including opaque original cube metadata.
-      const draftDeckKey = `phase:draft-deck:${gameId}`;
-      const draftDeckRaw = sessionStorage.getItem(draftDeckKey);
-      if (draftDeckRaw) {
-        sessionStorage.removeItem(draftDeckKey);
-        const deckList = JSON.parse(draftDeckRaw) as {
-          player: ExpandedDeck;
-          opponent: ExpandedDeck;
-          ai_decks: ExpandedDeck[];
-          // Every set the draft contained, passed opaquely to the engine.
-          draft_set_codes?: string[] | null;
-          booster_pack_pool?: string[] | null;
-        };
+      if (!soloDraft) {
         try {
-          await initGame(gameId, adapter, deckList, formatConfig, playerCount, matchConfig, firstPlayer);
-          if (cancelled) return;
-          controller = createGameLoopController({
-            mode: mode === "local" ? "local" : "ai",
-            difficulty,
-            aiSeats: resolveAiSeatBindings(gameId, playerCount, difficulty),
-            playerCount,
-          });
-          controller.start();
-          audioManager.setContext("battlefield");
-        } catch (err) {
-          console.error("Draft deck validation failed:", err);
-          if (!cancelled) onNoDeckRef.current?.();
-        }
-        return;
-      }
-
-      if (source === "draft" && draftId) {
-        const run = await loadDraftRun(draftId);
-        if (run) {
-          const deckList = {
-            booster_pack_pool: run.booster_pack_pool,
-            player: {
-              main_deck: run.playerDeck,
-              sideboard: [] as string[],
-              commander: [] as string[],
-              planar_deck: [] as string[],
-              scheme_deck: [] as string[],
-              sticker_sheets: [] as string[],
-              signature_spell: [] as string[],
-              companion: [] as string[],
-            },
-            opponent: {
-              main_deck: run.opponentDeck,
-              sideboard: [] as string[],
-              commander: [] as string[],
-              planar_deck: [] as string[],
-              scheme_deck: [] as string[],
-              sticker_sheets: [] as string[],
-              signature_spell: [] as string[],
-              companion: [] as string[],
-            },
-            ai_decks: [],
-          };
-          try {
-            await initGame(gameId, adapter, deckList, formatConfig, playerCount, matchConfig, firstPlayer);
-            if (cancelled) return;
-            controller = createGameLoopController({
-              mode: mode === "local" ? "local" : "ai",
-              difficulty,
-              aiSeats: resolveAiSeatBindings(gameId, playerCount, difficulty),
-              playerCount,
-            });
-            controller.start();
-            audioManager.setContext("battlefield");
-          } catch (err) {
-            console.error("Draft IDB deck fallback failed:", err);
-            if (!cancelled) onNoDeckRef.current?.();
-          }
+          draftDeckRaw = sessionStorage.getItem(draftDeckKey);
+        } catch (error) {
+          reportDraftError(error);
           return;
         }
+      }
+      if (draftDeckRaw !== null) {
+        await startDraftDeck(draftDeckRaw);
+        return;
       }
 
       const activeDeckName = localStorage.getItem(ACTIVE_DECK_KEY);
@@ -1646,6 +1802,7 @@ export function GameProvider({
           formatConfig,
           matchConfig?.match_type,
           loadActiveDeckBracket(),
+          pileSourceFromParam(pile),
         );
       } catch (deckErr) {
         onNoDeckRef.current?.(deckErr instanceof Error ? deckErr.message : String(deckErr));
@@ -1724,14 +1881,22 @@ export function GameProvider({
               return;
             }
 
-            deckList = await buildLocalAiDeckList(
-              tRef.current,
-              randomPlayerDeck ? null : (parsedDeck ?? EMPTY_PARSED_DECK),
-              playerCount ?? 2,
-              formatConfig,
-              matchConfig?.match_type,
-              loadActiveDeckBracket(),
-            );
+            try {
+              deckList = await buildLocalAiDeckList(
+                tRef.current,
+                randomPlayerDeck ? null : (parsedDeck ?? EMPTY_PARSED_DECK),
+                playerCount ?? 2,
+                formatConfig,
+                matchConfig?.match_type,
+                loadActiveDeckBracket(),
+                pileSourceFromParam(pile),
+              );
+            } catch (deckErr) {
+              if (!cancelled) {
+                onNoDeckRef.current?.(deckErr instanceof Error ? deckErr.message : String(deckErr));
+              }
+              return;
+            }
             if (cancelled) return;
           }
 
@@ -1743,7 +1908,7 @@ export function GameProvider({
           nativeAdapter = new WebSocketAdapter(
             "native-engine",
             "host",
-            deckList?.player ?? { main_deck: [], sideboard: [] },
+            deckList?.player ?? emptySeatDeck(),
             undefined,
             undefined,
             undefined,
@@ -1977,7 +2142,7 @@ export function GameProvider({
         scheduleStoreReset(reset);
       }
     };
-  }, [gameId, mode, difficulty, joinCode, formatConfig, playerCount, matchConfig, firstPlayer, useBroker, roomName, source, draftId, originUrl]);
+  }, [gameId, mode, difficulty, joinCode, formatConfig, playerCount, matchConfig, firstPlayer, useBroker, roomName, source, draftId, originUrl, pile]);
 
   return (
     <GameDispatchContext.Provider value={dispatchAction}>

@@ -60,8 +60,8 @@ pub(crate) fn parse_typed_you_control(
                 parse_property_descriptor(&desc_lower, desc_remaining, &extra_props, is_other)
             {
                 let (prop_filter, after_prefix) =
-                    if let Some((prop, rest)) = strip_counter_condition_prefix(after_prefix) {
-                        (add_property(prop_filter, prop), rest)
+                    if let Some((props, rest)) = strip_with_qualifier_prefix(after_prefix) {
+                        (add_properties(prop_filter, props), rest)
                     } else {
                         (prop_filter, after_prefix)
                     };
@@ -72,10 +72,10 @@ pub(crate) fn parse_typed_you_control(
             if let Some(compound_filter) =
                 try_parse_compound_subtypes(desc_remaining, &extra_props, is_other)
             {
-                // CR 613.7: Check for counter condition before returning
+                // CR 122.1 + CR 208.4b: "with" qualifier (counter or base-P/T designation)
                 let (compound_filter, after_prefix) =
-                    if let Some((prop, rest)) = strip_counter_condition_prefix(after_prefix) {
-                        (add_property(compound_filter, prop), rest)
+                    if let Some((props, rest)) = strip_with_qualifier_prefix(after_prefix) {
+                        (add_properties(compound_filter, props), rest)
                     } else {
                         (compound_filter, after_prefix)
                     };
@@ -201,12 +201,12 @@ pub(crate) fn parse_typed_you_control(
             } else {
                 return None;
             };
-            // CR 613.7: Check for "with [counter] on it/them" condition between
-            // "you control" and the predicate (e.g., "Elf creatures you control
+            // CR 122.1 + CR 208.4b: "with" qualifier (counter or base-P/T designation)
+            // between "you control" and the predicate (e.g., "Elf creatures you control
             // with a +1/+1 counter on it has trample").
             let (typed_filter, after_prefix) =
-                if let Some((prop, rest)) = strip_counter_condition_prefix(after_prefix) {
-                    (add_property(typed_filter, prop), rest)
+                if let Some((props, rest)) = strip_with_qualifier_prefix(after_prefix) {
+                    (add_properties(typed_filter, props), rest)
                 } else {
                     (typed_filter, after_prefix)
                 };
@@ -249,10 +249,10 @@ pub(crate) fn parse_typed_you_control(
             if let Some(compound_filter) =
                 try_parse_compound_subtypes(desc_remaining, &extra_props, is_other)
             {
-                // CR 613.7: Check for counter condition before returning
+                // CR 122.1 + CR 208.4b: "with" qualifier (counter or base-P/T designation)
                 let (compound_filter, after_prefix) =
-                    if let Some((prop, rest)) = strip_counter_condition_prefix(after_prefix) {
-                        (add_property(compound_filter, prop), rest)
+                    if let Some((props, rest)) = strip_with_qualifier_prefix(after_prefix) {
+                        (add_properties(compound_filter, props), rest)
                     } else {
                         (compound_filter, after_prefix)
                     };
@@ -331,10 +331,10 @@ pub(crate) fn parse_typed_you_control(
             } else {
                 return None;
             };
-            // CR 613.7: Check for "with [counter] on it/them" condition
+            // CR 122.1 + CR 208.4b: "with" qualifier (counter or base-P/T designation)
             let (typed_filter, after_prefix) =
-                if let Some((prop, rest)) = strip_counter_condition_prefix(after_prefix) {
-                    (add_property(typed_filter, prop), rest)
+                if let Some((props, rest)) = strip_with_qualifier_prefix(after_prefix) {
+                    (add_properties(typed_filter, props), rest)
                 } else {
                     (typed_filter, after_prefix)
                 };
@@ -481,10 +481,9 @@ pub(crate) fn parse_subject_additive_type_static(text: &str) -> Option<StaticDef
     if let Some((before_cond, after_cond)) = predicate_tp.split_around(" as long as ") {
         let modifications = parse_additive_type_clause_modifications(before_cond.original)?;
         let condition_text = after_cond.original.trim().trim_end_matches('.');
-        let condition =
-            parse_static_condition(condition_text).unwrap_or(StaticCondition::Unrecognized {
-                text: condition_text.to_string(),
-            });
+        let condition = parse_static_condition(condition_text).unwrap_or_else(|| {
+            unparsed_gate_condition(condition_text, ConditionGatePolarity::Positive)
+        });
         return Some(
             StaticDefinition::continuous()
                 .affected(affected)
@@ -668,10 +667,9 @@ pub(crate) fn parse_conditional_static(text: &str) -> Option<StaticDefinition> {
     let conditional = text.strip_prefix("As long as ")?; // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
     let (condition_text, remainder) = conditional.split_once(", ")?; // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
 
-    let condition =
-        parse_static_condition(condition_text).unwrap_or(StaticCondition::Unrecognized {
-            text: condition_text.to_string(),
-        });
+    let condition = parse_static_condition(condition_text).unwrap_or_else(|| {
+        unparsed_gate_condition(condition_text, ConditionGatePolarity::Positive)
+    });
 
     let mut def = parse_static_line(remainder.trim())?;
     // CR 611.3a + CR 118.12a: When the inner static already carries a typed
@@ -1031,8 +1029,8 @@ pub(crate) fn parse_continuous_gets_has(
             // decision has ONE authority — `parse_affected_scoped_static_condition`
             // (shared.rs) — shared with the "as long as"/"unless"/"if" gate parsers.
             let typed = parse_affected_scoped_static_condition(condition_text, Some(&affected));
-            let condition = typed.unwrap_or(StaticCondition::Unrecognized {
-                text: condition_text.to_string(),
+            let condition = typed.unwrap_or_else(|| {
+                unparsed_gate_condition(condition_text, ConditionGatePolarity::Positive)
             });
             def.condition = Some(condition);
             return Some(def);

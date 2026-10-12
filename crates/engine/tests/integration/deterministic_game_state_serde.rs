@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use engine::game::combat::{
-    AttackTarget, BlockRequirement, CombatRequirement, CombatState, DamageAssignment, DamageTarget,
+    AttackTarget, BlockHistoryPair, BlockRequirement, CombatRequirement, CombatState,
+    DamageAssignment, DamageTarget,
 };
 use engine::game::dungeon::DungeonProgress;
 use engine::game::game_object::{BackFaceData, GameObject, ProtectionStartSnapshot};
@@ -15,13 +16,14 @@ use engine::types::card_type::CardType;
 use engine::types::definitions::Definitions;
 use engine::types::events::{GameEvent, PlayerActionKind};
 use engine::types::game_state::{
-    AutoPassMode, LandPlayRecord, LiminalEntrant, LiminalEntry, LinkedExileSnapshot,
+    AbilityActivationRecord, ActivationTargetFact, AutoPassMode, DepartedStackSpell,
+    LandPlayRecord, LiminalEntrant, LiminalEntry, LinkedExileLki, LinkedExileSnapshot,
     PendingConniveReentry, PersistedGameState, PriorityPassingMode, SpellCastRecord, StackEntry,
     StackEntryKind, StackPaidSnapshot, StackResolutionAutoPassOverlay, StackResolutionBudget,
     StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession, TokenProjection,
     WaitingFor,
 };
-use engine::types::identifiers::{CardId, ObjectId, TrackedSetId};
+use engine::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef, TrackedSetId};
 use engine::types::keywords::ProtectionTarget;
 use engine::types::mana::{ManaColor, ManaCost};
 use engine::types::phase::{PhaseStop, PhaseStopScope};
@@ -40,8 +42,6 @@ const OPTION_HASH_MAP: &str =
 const VEC_HASH_MAP: &str = "serialize_with=\"crate::types::deterministic_serde::vec_hash_map\"";
 const HASH_MAP_OF_HASH_SET: &str =
     "serialize_with=\"crate::types::deterministic_serde::hash_map_of_hash_set\"";
-const HASH_MAP_OF_HASH_MAP: &str =
-    "serialize_with=\"crate::types::deterministic_serde::hash_map_of_hash_map\"";
 const IM_HASH_SET: &str = "serialize_with=\"crate::types::deterministic_serde::im_hash_set\"";
 const IM_HASH_MAP: &str = "serialize_with=\"crate::types::deterministic_serde::im_hash_map\"";
 const IM_HASH_MAP_OF_IM_HASH_MAP: &str =
@@ -114,6 +114,7 @@ const NUMERIC_MAP_ROUND_TRIP_OWNERS: &[NumericRoundTripOwner] = &[
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::spells_cast_this_game", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::spells_cast_this_game_by_player", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::spells_cast_this_turn_by_player", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
+    NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::abilities_activated_this_turn_by_player", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::lands_played_this_turn_by_player", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::attacking_creatures_this_turn", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::attacked_defenders_this_turn", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
@@ -127,6 +128,8 @@ const NUMERIC_MAP_ROUND_TRIP_OWNERS: &[NumericRoundTripOwner] = &[
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::lki_cache", map_key_types: &["ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::lki_copiable_values", map_key_types: &["ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::lki_by_incarnation", map_key_types: &["ObjectId", "u64"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
+    NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::lki_copiable_values_by_incarnation", map_key_types: &["ObjectId", "u64"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
+    NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::departed_stack_spells", map_key_types: &["ObjectId", "u64"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::linked_exile_lki", map_key_types: &["ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::ring_level", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::ring_bearer", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
@@ -142,6 +145,8 @@ const NUMERIC_MAP_ROUND_TRIP_OWNERS: &[NumericRoundTripOwner] = &[
     NumericRoundTripOwner { id: "src/types/game_state.rs::WaitingFor::DeclareBlockers::valid_block_targets", map_key_types: &["ObjectId"], group: RoundTripGroup::DeclareBlockers, numeric_deserializer: Some(NUMERIC_HASH_MAP_DESERIALIZER) },
     NumericRoundTripOwner { id: "src/types/game_state.rs::WaitingFor::DeclareBlockers::block_requirements", map_key_types: &["ObjectId"], group: RoundTripGroup::DeclareBlockers, numeric_deserializer: Some(NUMERIC_HASH_MAP_DESERIALIZER) },
     NumericRoundTripOwner { id: "src/types/game_state.rs::WaitingFor::DeclareBlockers::blocker_constraints", map_key_types: &["ObjectId"], group: RoundTripGroup::DeclareBlockers, numeric_deserializer: Some(NUMERIC_HASH_MAP_DESERIALIZER) },
+    NumericRoundTripOwner { id: "src/types/game_state.rs::WaitingFor::DeclareBlockers::must_be_blocked_targets", map_key_types: &["ObjectId"], group: RoundTripGroup::DeclareBlockers, numeric_deserializer: Some(NUMERIC_HASH_MAP_DESERIALIZER) },
+    NumericRoundTripOwner { id: "src/types/game_state.rs::WaitingFor::DeclareBlockers::block_capacities", map_key_types: &["ObjectId"], group: RoundTripGroup::DeclareBlockers, numeric_deserializer: Some(NUMERIC_HASH_MAP_DESERIALIZER) },
 ];
 
 fn owner_id(file: &str, owner: &str, variant: Option<&str>, field: &str) -> String {
@@ -187,6 +192,7 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         "triggers_fired_this_turn",
         "triggers_fired_this_turn_per_opponent",
         "triggers_fired_this_game",
+        "triggered_abilities_added_mana_this_turn",
         "crew_activated_this_turn",
         "crew_resolved_this_turn",
         "exerted_this_turn",
@@ -203,10 +209,10 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         "players_attacked_this_turn",
         "creatures_attacked_this_turn",
         "creatures_blocked_this_turn",
+        "creature_blocked_attackers_this_turn",
         "players_who_created_token_this_turn",
         "players_who_discarded_card_this_turn",
         "players_who_sacrificed_artifact_this_turn",
-        "batched_zone_change_trigger_fired",
         "assassin_or_commander_dealt_combat_damage_this_turn",
         "modal_modes_chosen_this_turn",
         "modal_modes_chosen_this_game",
@@ -260,11 +266,19 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         "im::HashSet",
         Classification::Canonical(IM_HASH_SET),
     );
+    add_spec(
+        &mut specs,
+        game_state,
+        "GameState",
+        None,
+        "batched_zone_change_trigger_fired",
+        "im::HashSet",
+        Classification::Canonical(IM_HASH_SET),
+    );
 
     for field in [
         "stack_paid_facts",
         "liminal_entries",
-        "tracked_object_sets",
         "tracked_set_participants",
         "commander_cast_count",
         "commander_cast_owners",
@@ -312,9 +326,18 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         game_state,
         "GameState",
         None,
+        "abilities_activated_this_turn_by_player",
+        "Box<HashMap>",
+        Classification::Canonical(HASH_MAP),
+    );
+    add_spec(
+        &mut specs,
+        game_state,
+        "GameState",
+        None,
         "tracked_set_member_causes",
-        "HashMap<HashMap>",
-        Classification::Canonical(HASH_MAP_OF_HASH_MAP),
+        "im::HashMap<im::HashMap>",
+        Classification::Canonical(IM_HASH_MAP_OF_IM_HASH_MAP),
     );
     add_spec(
         &mut specs,
@@ -348,7 +371,7 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         "Box<HashMap<HashSet>>",
         Classification::Canonical(HASH_MAP_OF_HASH_SET),
     );
-    for field in ["objects", "attribution", "lki_cache"] {
+    for field in ["objects", "attribution", "lki_cache", "tracked_object_sets"] {
         add_spec(
             &mut specs,
             game_state,
@@ -373,14 +396,44 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         game_state,
         "GameState",
         None,
+        "lki_copiable_values_by_incarnation",
+        "im::HashMap<im::HashMap>",
+        Classification::Canonical(IM_HASH_MAP_OF_IM_HASH_MAP),
+    );
+    add_spec(
+        &mut specs,
+        game_state,
+        "GameState",
+        None,
+        "departed_stack_spells",
+        "im::HashMap<im::HashMap>",
+        Classification::Canonical(IM_HASH_MAP_OF_IM_HASH_MAP),
+    );
+    add_spec(
+        &mut specs,
+        game_state,
+        "GameState",
+        None,
         "trigger_fire_counts_this_turn",
         "HashMap",
         Classification::Canonical(HASH_MAP_ENTRIES),
     );
-    for (field, adapter) in [
-        ("activated_abilities_this_turn", "with=\"tuple_key_map\""),
-        ("activated_abilities_this_game", "with=\"tuple_key_map\""),
-        ("ability_resolutions_this_turn", "with=\"tuple_key_map\""),
+    for (field, shape, adapter) in [
+        (
+            "activated_abilities_this_turn",
+            "im::HashMap",
+            "with=\"tuple_key_map\"",
+        ),
+        (
+            "activated_abilities_this_game",
+            "HashMap",
+            "with=\"tuple_key_map\"",
+        ),
+        (
+            "ability_resolutions_this_turn",
+            "im::HashMap",
+            "with=\"tuple_key_map\"",
+        ),
     ] {
         add_spec(
             &mut specs,
@@ -388,7 +441,7 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
             "GameState",
             None,
             field,
-            "HashMap",
+            shape,
             Classification::Canonical(adapter),
         );
     }
@@ -485,6 +538,20 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         ),
         (
             "WaitingFor",
+            Some("DeclareBlockers"),
+            "must_be_blocked_targets",
+            "HashMap",
+            HASH_MAP,
+        ),
+        (
+            "WaitingFor",
+            Some("DeclareBlockers"),
+            "block_capacities",
+            "HashMap",
+            HASH_MAP,
+        ),
+        (
+            "WaitingFor",
             Some("ChooseOneOfBranch"),
             "replacement_applied",
             "HashSet",
@@ -535,6 +602,7 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         ("PostReplacementDrain", None, "applied", "HashSet", HASH_SET),
         ("PendingDrawDelivery", None, "applied", "HashSet", HASH_SET),
         ("DrawSequenceFrame", None, "applied", "HashSet", HASH_SET),
+        ("DrawDealerSeat", None, "applied", "HashSet", HASH_SET),
     ] {
         add_spec(
             &mut specs,
@@ -681,6 +749,14 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
             "CombatState",
             None,
             "attacking_incarnations_this_combat",
+            "HashSet",
+            Classification::Canonical(HASH_SET),
+        ),
+        (
+            "src/game/combat.rs",
+            "CombatState",
+            None,
+            "creature_blocked_attackers_this_combat",
             "HashSet",
             Classification::Canonical(HASH_SET),
         ),
@@ -1160,7 +1236,7 @@ fn serde_hash_owner_census_is_exhaustive_and_every_canonical_owner_names_its_ada
 
     assert_eq!(
         NUMERIC_MAP_ROUND_TRIP_OWNERS.len(),
-        52,
+        57,
         "the reviewed numeric-map owner matrix must remain exact"
     );
     for group in [
@@ -1472,21 +1548,21 @@ fn build_all_direct_numeric_maps_state() -> GameState {
         (ObjectId(1), ObjectAttribution::default()),
         (ObjectId(2), ObjectAttribution::default()),
     ]);
-    state.tracked_object_sets = HashMap::from([
+    state.tracked_object_sets = im::HashMap::from_iter([
         (TrackedSetId(1), vec![ObjectId(11)]),
         (TrackedSetId(2), vec![ObjectId(22), ObjectId(23)]),
     ]);
-    state.tracked_set_member_causes = HashMap::from([
+    state.tracked_set_member_causes = im::HashMap::from_iter([
         (
             TrackedSetId(1),
-            HashMap::from([
+            im::HashMap::from_iter([
                 (ObjectId(11), ThisWayCause::Exiled),
                 (ObjectId(12), ThisWayCause::Sacrificed),
             ]),
         ),
         (
             TrackedSetId(2),
-            HashMap::from([
+            im::HashMap::from_iter([
                 (ObjectId(21), ThisWayCause::Destroyed),
                 (ObjectId(22), ThisWayCause::Milled),
             ]),
@@ -1660,6 +1736,35 @@ fn build_all_direct_numeric_maps_state() -> GameState {
         (ObjectId(1), first_lki.clone()),
         (ObjectId(2), second_lki.clone()),
     ]);
+    state.abilities_activated_this_turn_by_player = Box::new(HashMap::from([
+        (
+            PlayerId(0),
+            im::Vector::from(vec![AbilityActivationRecord {
+                activator: PlayerId(0),
+                source: ObjectId(1),
+                source_lki: first_lki.clone(),
+                source_zone: engine::types::zones::Zone::Battlefield,
+                ability_tag: None,
+                is_loyalty_ability: false,
+                targets: vec![ActivationTargetFact::Object {
+                    id: ObjectId(2),
+                    lki: Box::new(second_lki.clone()),
+                }],
+            }]),
+        ),
+        (
+            PlayerId(1),
+            im::Vector::from(vec![AbilityActivationRecord {
+                activator: PlayerId(1),
+                source: ObjectId(2),
+                source_lki: second_lki.clone(),
+                source_zone: engine::types::zones::Zone::Battlefield,
+                ability_tag: None,
+                is_loyalty_ability: true,
+                targets: vec![ActivationTargetFact::Player(PlayerId(0))],
+            }]),
+        ),
+    ]));
     state.lki_copiable_values = HashMap::from([
         (ObjectId(1), intrinsic_copiable_values(&first)),
         (ObjectId(2), intrinsic_copiable_values(&second)),
@@ -1674,22 +1779,91 @@ fn build_all_direct_numeric_maps_state() -> GameState {
             im::HashMap::from_iter([(1, second_lki.clone()), (2, first_lki.clone())]),
         ),
     ]);
+    state.lki_copiable_values_by_incarnation = im::HashMap::from_iter([
+        (
+            ObjectId(1),
+            im::HashMap::from_iter([
+                (1, intrinsic_copiable_values(&first)),
+                (2, intrinsic_copiable_values(&second)),
+            ]),
+        ),
+        (
+            ObjectId(2),
+            im::HashMap::from_iter([
+                (1, intrinsic_copiable_values(&second)),
+                (2, intrinsic_copiable_values(&first)),
+            ]),
+        ),
+    ]);
+    let departed_spell =
+        |entry_id: ObjectId, controller: PlayerId, object: &GameObject| DepartedStackSpell {
+            entry: StackEntry {
+                id: entry_id,
+                source_id: entry_id,
+                controller,
+                kind: StackEntryKind::ActivatedAbility {
+                    source_id: entry_id,
+                    ability: Box::new(ResolvedAbility::new(
+                        Effect::NoOp,
+                        Vec::new(),
+                        entry_id,
+                        controller,
+                    )),
+                },
+            },
+            object: Box::new(object.clone()),
+        };
+    state.departed_stack_spells = im::HashMap::from_iter([
+        (
+            ObjectId(1),
+            im::HashMap::from_iter([
+                (1, departed_spell(ObjectId(1), PlayerId(0), &first)),
+                (2, departed_spell(ObjectId(1), PlayerId(0), &second)),
+            ]),
+        ),
+        (
+            ObjectId(2),
+            im::HashMap::from_iter([
+                (1, departed_spell(ObjectId(2), PlayerId(1), &second)),
+                (2, departed_spell(ObjectId(2), PlayerId(1), &first)),
+            ]),
+        ),
+    ]);
     state.linked_exile_lki = HashMap::from([
         (
             ObjectId(1),
-            vec![LinkedExileSnapshot {
-                exiled_id: ObjectId(11),
-                owner: PlayerId(0),
-                mana_value: 1,
+            vec![LinkedExileLki {
+                departed: 3,
+                successor: 4,
+                snapshot: vec![LinkedExileSnapshot {
+                    exiled_id: ObjectId(11),
+                    owner: PlayerId(0),
+                    mana_value: 1,
+                }],
             }],
         ),
         (
             ObjectId(2),
-            vec![LinkedExileSnapshot {
-                exiled_id: ObjectId(22),
-                owner: PlayerId(1),
-                mana_value: 2,
-            }],
+            vec![
+                LinkedExileLki {
+                    departed: 5,
+                    successor: 6,
+                    snapshot: vec![LinkedExileSnapshot {
+                        exiled_id: ObjectId(22),
+                        owner: PlayerId(1),
+                        mana_value: 2,
+                    }],
+                },
+                LinkedExileLki {
+                    departed: 7,
+                    successor: 8,
+                    snapshot: vec![LinkedExileSnapshot {
+                        exiled_id: ObjectId(23),
+                        owner: PlayerId(0),
+                        mana_value: 3,
+                    }],
+                },
+            ],
         ),
     ]);
     state.ring_level = HashMap::from([(PlayerId(0), 1), (PlayerId(1), 2)]);
@@ -1753,6 +1927,7 @@ fn every_direct_numeric_key_game_state_map_round_trips_populated() {
         "spells_cast_this_game",
         "spells_cast_this_game_by_player",
         "spells_cast_this_turn_by_player",
+        "abilities_activated_this_turn_by_player",
         "lands_played_this_turn_by_player",
         "attacking_creatures_this_turn",
         "attacked_defenders_this_turn",
@@ -1765,6 +1940,8 @@ fn every_direct_numeric_key_game_state_map_round_trips_populated() {
         "lki_cache",
         "lki_copiable_values",
         "lki_by_incarnation",
+        "lki_copiable_values_by_incarnation",
+        "departed_stack_spells",
         "linked_exile_lki",
         "ring_level",
         "ring_bearer",
@@ -1773,7 +1950,7 @@ fn every_direct_numeric_key_game_state_map_round_trips_populated() {
     ];
     assert_eq!(
         direct_fields.len(),
-        41,
+        44,
         "private stack_trigger_firings is covered by its unit test"
     );
     for field in direct_fields {
@@ -1788,7 +1965,12 @@ fn every_direct_numeric_key_game_state_map_round_trips_populated() {
             "{field}: exact key/value membership changed"
         );
     }
-    for field in ["tracked_set_member_causes", "lki_by_incarnation"] {
+    for field in [
+        "tracked_set_member_causes",
+        "lki_by_incarnation",
+        "lki_copiable_values_by_incarnation",
+        "departed_stack_spells",
+    ] {
         for (outer_key, inner) in before[field].as_object().unwrap() {
             assert_eq!(
                 inner.as_object().map(serde_json::Map::len),
@@ -2053,12 +2235,19 @@ fn declare_blockers_numeric_maps_round_trip_through_value_bare_raw_and_trusted()
                 },
             ),
         ]),
+        must_be_blocked_targets: HashMap::from([
+            (ObjectId(3), vec![ObjectId(1)]),
+            (ObjectId(4), vec![ObjectId(1)]),
+        ]),
+        block_capacities: HashMap::from([(ObjectId(3), Some(1)), (ObjectId(4), None)]),
     };
     let value = waiting_value(&waiting);
     for field in [
         "valid_block_targets",
         "block_requirements",
         "blocker_constraints",
+        "must_be_blocked_targets",
+        "block_capacities",
     ] {
         assert_eq!(
             value["data"][field].as_object().map(serde_json::Map::len),
@@ -2079,6 +2268,8 @@ fn declare_blockers_numeric_maps_round_trip_through_value_bare_raw_and_trusted()
         valid_block_targets: HashMap::new(),
         block_requirements: HashMap::new(),
         blocker_constraints: HashMap::new(),
+        must_be_blocked_targets: HashMap::new(),
+        block_capacities: HashMap::new(),
     };
     let empty_value = waiting_value(&empty);
     assert_eq!(
@@ -2535,6 +2726,110 @@ fn protection_tuple_map_round_trips_deterministically_through_all_persistence_fo
                 .expect("source fixture object exists")
                 .protection_start_exempt_attachments,
             "{persistence_name} persistence restores every protection snapshot"
+        );
+    }
+}
+
+/// S1: the block-history pair sets (`CombatState::creature_blocked_attackers_this_combat`,
+/// `GameState::creature_blocked_attackers_this_turn`) round-trip through every
+/// persistence form with insertion-order-independent, `Ord`-sorted bytes —
+/// the model is `protection_tuple_map_round_trips_deterministically_through_all_persistence_forms`.
+#[test]
+fn block_history_pair_sets_round_trip_through_all_persistence_forms() {
+    let low = BlockHistoryPair {
+        blocker: ObjectIncarnationRef::of(ObjectId(1), 0),
+        attacker: ObjectIncarnationRef::of(ObjectId(10), 0),
+    };
+    let high = BlockHistoryPair {
+        blocker: ObjectIncarnationRef::of(ObjectId(2), 0),
+        attacker: ObjectIncarnationRef::of(ObjectId(20), 0),
+    };
+
+    let mut forward = GameState::new(FormatConfig::standard(), 2, 42);
+    forward.combat = Some(CombatState {
+        creature_blocked_attackers_this_combat: [low, high].into_iter().collect(),
+        ..Default::default()
+    });
+    forward.creature_blocked_attackers_this_turn = [low, high].into_iter().collect();
+
+    let mut reverse = GameState::new(FormatConfig::standard(), 2, 42);
+    reverse.combat = Some(CombatState {
+        creature_blocked_attackers_this_combat: [high, low].into_iter().collect(),
+        ..Default::default()
+    });
+    reverse.creature_blocked_attackers_this_turn = [high, low].into_iter().collect();
+
+    let forward_bytes = serde_json::to_string(&forward).expect("forward state serializes");
+    let reverse_bytes = serde_json::to_string(&reverse).expect("reverse state serializes");
+    assert_eq!(
+        forward_bytes, reverse_bytes,
+        "hash insertion order must not affect canonical state bytes"
+    );
+
+    let value: serde_json::Value =
+        serde_json::from_str(&forward_bytes).expect("forward bytes are JSON");
+    let expected_pairs = serde_json::json!([
+        {
+            "blocker": {"object_id": 1, "incarnation": 0},
+            "attacker": {"object_id": 10, "incarnation": 0}
+        },
+        {
+            "blocker": {"object_id": 2, "incarnation": 0},
+            "attacker": {"object_id": 20, "incarnation": 0}
+        }
+    ]);
+    assert_eq!(
+        value["creature_blocked_attackers_this_turn"], expected_pairs,
+        "the turn-scoped field is an Ord-sorted sequence of exact pairs"
+    );
+    assert_eq!(
+        value["combat"]["creature_blocked_attackers_this_combat"], expected_pairs,
+        "the combat-scoped field is an Ord-sorted sequence of exact pairs"
+    );
+
+    let bare: GameState = serde_json::from_str(&forward_bytes).expect("bare state restores");
+    assert_eq!(
+        bare.creature_blocked_attackers_this_turn,
+        forward.creature_blocked_attackers_this_turn
+    );
+    assert_eq!(
+        bare.combat
+            .as_ref()
+            .expect("combat restores")
+            .creature_blocked_attackers_this_combat,
+        forward
+            .combat
+            .as_ref()
+            .expect("combat exists")
+            .creature_blocked_attackers_this_combat
+    );
+    assert_eq!(
+        serde_json::to_string(&bare).expect("bare state reserializes"),
+        forward_bytes,
+        "bare-state bytes remain stable after restore"
+    );
+
+    for (persistence_name, persisted) in [
+        ("raw", PersistedGameState::Raw(Box::new(forward.clone()))),
+        ("trusted", PersistedGameState::capture(forward.clone())),
+    ] {
+        let bytes = serde_json::to_string(&persisted)
+            .unwrap_or_else(|error| panic!("{persistence_name} state serializes: {error}"));
+        let restored: PersistedGameState = serde_json::from_str(&bytes)
+            .unwrap_or_else(|error| panic!("{persistence_name} state deserializes: {error}"));
+        assert_eq!(
+            serde_json::to_string(&restored)
+                .unwrap_or_else(|error| panic!("{persistence_name} state reserializes: {error}")),
+            bytes,
+            "{persistence_name} persistence bytes remain stable after restore"
+        );
+        let restored = restored
+            .into_game_state()
+            .unwrap_or_else(|error| panic!("{persistence_name} state finalizes: {error}"));
+        assert_eq!(
+            restored.creature_blocked_attackers_this_turn,
+            forward.creature_blocked_attackers_this_turn,
+            "{persistence_name} persistence restores the turn-scoped ledger"
         );
     }
 }
