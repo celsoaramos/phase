@@ -1320,6 +1320,7 @@ mod sentinel_sliver_vigilance_grant;
 mod sephiroth_super_nova_transform_emblem_4359;
 mod serpent_society_ward_poison_cost;
 mod serras_emissary_chosen_card_type_protection;
+mod shoot_the_sheriff_non_outlaw;
 mod shorten_efficacy;
 mod shuffle_them_into_libraries;
 mod shuri_wakandan_inventor_copy_recipient;
