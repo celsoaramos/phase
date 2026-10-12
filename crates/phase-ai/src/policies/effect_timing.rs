@@ -444,6 +444,21 @@ fn burn_score(ctx: &PolicyContext<'_>) -> f64 {
 fn counterspell_score(ctx: &PolicyContext<'_>) -> f64 {
     let is_own_turn = turn_control::turn_decision_maker(ctx.state) == ctx.ai_player;
     let patience = ctx.config.profile.interaction_patience;
+
+    // Before blockers, with nothing on the stack to answer, the pump only
+    // gives information away: on our turn the opponent blocks around it, on
+    // theirs they may simply not attack (and with no attack there is no
+    // blocking step, CR 508.8). The trick belongs after blocks.
+    if ctx.state.stack.is_empty()
+        && matches!(
+            ctx.state.phase,
+            Phase::BeginCombat | Phase::DeclareAttackers
+        )
+    {
+        let own_turn = engine::game::turn_control::turn_decision_maker(ctx.state) == ctx.ai_player;
+        return if own_turn { -0.5 * patience } else { -2.0 };
+    }
+
     let intent_bonus = match ctx.strategic_intent() {
         StrategicIntent::PreserveAdvantage => 0.15,
         StrategicIntent::Stabilize => 0.2,
@@ -575,6 +590,21 @@ fn combat_trick_score(ctx: &PolicyContext<'_>) -> f64 {
     }
 
     let patience = ctx.config.profile.interaction_patience;
+
+    // Before blockers, with nothing on the stack to answer, the pump only
+    // gives information away: on our turn the opponent blocks around it, on
+    // theirs they may simply not attack (and with no attack there is no
+    // blocking step, CR 508.8). The trick belongs after blocks.
+    if ctx.state.stack.is_empty()
+        && matches!(
+            ctx.state.phase,
+            Phase::BeginCombat | Phase::DeclareAttackers
+        )
+    {
+        let own_turn = engine::game::turn_control::turn_decision_maker(ctx.state) == ctx.ai_player;
+        return if own_turn { -0.5 * patience } else { -2.0 };
+    }
+
     let intent_bonus = match ctx.strategic_intent() {
         StrategicIntent::PushLethal => 0.2,
         StrategicIntent::PreserveAdvantage => 0.1,
@@ -2380,6 +2410,64 @@ mod tests {
             score < -1.5,
             "Combat trick should be strongly penalized during End step, got {score}"
         );
+    }
+
+    /// `combat_trick_score` for the AI (seat 0) at `phase` of `active`'s turn,
+    /// with an empty stack.
+    fn combat_trick_score_at(phase: Phase, active: PlayerId) -> f64 {
+        let mut state = GameState::new_two_player(42);
+        state.phase = phase;
+        state.active_player = active;
+        let config = AiConfig::default();
+        let decision = AiDecisionContext {
+            waiting_for: WaitingFor::Priority {
+                player: PlayerId(0),
+            },
+            candidates: Vec::new(),
+        };
+        let candidate = CandidateAction {
+            action: GameAction::CastSpell {
+                object_id: ObjectId(0),
+                card_id: CardId(1),
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
+        };
+        let ctx = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &crate::context::AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        combat_trick_score(&ctx)
+    }
+
+    /// Field report 2026-10-12 (MagicFinder): Giant Growth at the beginning of
+    /// the OPPONENT'S combat, with no attacker coming.
+    #[test]
+    fn combat_trick_strongly_penalized_before_attacks_on_opponents_turn() {
+        for phase in [Phase::BeginCombat, Phase::DeclareAttackers] {
+            let score = combat_trick_score_at(phase, PlayerId(1));
+            assert!(
+                score < -1.5,
+                "{phase:?} on the opponent's turn, got {score}"
+            );
+        }
+    }
+
+    #[test]
+    fn combat_trick_waits_for_blocks_on_own_turn() {
+        let before = combat_trick_score_at(Phase::DeclareAttackers, PlayerId(0));
+        let after = combat_trick_score_at(Phase::DeclareBlockers, PlayerId(0));
+        assert!(before < 0.0, "before blocks, got {before}");
+        assert!(after > 0.0, "after blocks, got {after}");
+        // On the opponent's turn the blocking step is where our trick lives.
+        assert!(combat_trick_score_at(Phase::DeclareBlockers, PlayerId(1)) > 0.0);
     }
 
     #[test]

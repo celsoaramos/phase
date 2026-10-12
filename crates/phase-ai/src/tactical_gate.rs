@@ -119,12 +119,17 @@ impl TacticalFacts {
                 _ => TacticalWindow::Other,
             }
         };
-        let pass_preserves_stronger_window = own_turn
-            && state.stack.is_empty()
-            && matches!(
-                state.phase,
-                Phase::PreCombatMain | Phase::BeginCombat | Phase::DeclareAttackers
-            );
+        // Before blockers are declared a temporary pump still has a better
+        // window ahead (CR 509: blockers, then priority again). That holds on
+        // the OPPONENT'S turn too: our creatures there only matter as blockers,
+        // and if no attack comes the declare-blockers step never happens
+        // (CR 508.8), so the pump was useless anyway. Field report 2026-10-12
+        // (MagicFinder): the AI cast Giant Growth on its untapped Grizzly Bears
+        // at the beginning of the opponent's combat, when the opponent had no
+        // creature able to attack.
+        let pass_preserves_stronger_window = state.stack.is_empty()
+            && (matches!(state.phase, Phase::BeginCombat | Phase::DeclareAttackers)
+                || (own_turn && matches!(state.phase, Phase::PreCombatMain)));
 
         Self {
             window,
@@ -7080,6 +7085,59 @@ mod tests {
             "Target creature gets +4/+4 until end of turn. If it's a Spirit, it gains trample until end of turn.",
             true
         ));
+    }
+
+    /// Field report 2026-10-12 (MagicFinder): Giant Growth on the AI's
+    /// UNTAPPED Grizzly Bears at the beginning of the opponent's combat. The
+    /// creature could still block, so the no-beneficiary rule lets it through;
+    /// the window rule must not: blocks (if any) come later.
+    #[test]
+    fn rejects_pump_before_attacks_on_opponents_turn() {
+        for phase in [Phase::BeginCombat, Phase::DeclareAttackers] {
+            let mut scenario = GameScenario::new();
+            scenario.add_creature(P0, "Grizzly Bears", 2, 2);
+            scenario.add_creature(P1, "Scute Swarm", 1, 1);
+            let growth = scenario
+                .add_spell_to_hand_from_oracle(
+                    P0,
+                    "Giant Growth",
+                    true,
+                    "Target creature gets +3/+3 until end of turn.",
+                )
+                .id();
+            let mut runner = scenario.build();
+            let state = runner.state_mut();
+            state.phase = phase;
+            state.active_player = P1;
+            state.priority_player = P0;
+            state.waiting_for = WaitingFor::Priority { player: P0 };
+
+            let config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+            let decision = AiDecisionContext {
+                waiting_for: state.waiting_for.clone(),
+                candidates: Vec::new(),
+            };
+            let candidate = CandidateAction {
+                action: GameAction::CastSpell {
+                    object_id: growth,
+                    card_id: state.objects.get(&growth).unwrap().card_id,
+                    targets: Vec::new(),
+                    payment_mode: CastPaymentMode::Auto,
+                },
+                metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Spell),
+            };
+            let ctx = PolicyContext {
+                state,
+                decision: &decision,
+                candidate: &candidate,
+                ai_player: P0,
+                config: &config,
+                context: &AiContext::empty(&config.weights),
+                cast_facts: None,
+                search_depth: crate::policies::context::SearchDepth::Root,
+            };
+            assert_eq!(assess_candidate(&ctx), GateDecision::Reject, "{phase:?}");
+        }
     }
 
     #[test]
