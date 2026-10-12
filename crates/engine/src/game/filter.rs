@@ -22127,7 +22127,7 @@ mod entry_projection_tests {
             choose(true, TargetSelectionMode::Chosen).sub_ability(AbilityDefinition::new(
                 AbilityKind::Spell,
                 Effect::Choose {
-                    choice_type: ChoiceType::CardName,
+                    choice_type: ChoiceType::card_name(),
                     persist: true,
                     selection: TargetSelectionMode::Chosen,
                 },
