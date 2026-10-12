@@ -487,6 +487,39 @@ describe("getBoardChoiceView", () => {
     });
   });
 
+  it("offers cancel on the SaddleMount board choice", () => {
+    const choice = getBoardChoiceView({
+      type: "SaddleMount",
+      data: {
+        player: 0,
+        mount_id: 40,
+        saddle_power: 2,
+        eligible_creatures: [10, 11],
+        contributions: [2, 3],
+      },
+    });
+
+    expect(choice).not.toBeNull();
+    if (!choice) return;
+    expect(choice.cancelAction).toEqual({ type: "CancelCast" });
+  });
+
+  it("offers cancel on the StationTarget board choice", () => {
+    const choice = getBoardChoiceView({
+      type: "StationTarget",
+      data: {
+        player: 0,
+        spacecraft_id: 30,
+        eligible_creatures: [10],
+      },
+    });
+
+    expect(choice).not.toBeNull();
+    if (!choice) return;
+    expect(choice.intent).toBe("station");
+    expect(choice.cancelAction).toEqual({ type: "CancelCast" });
+  });
+
   it("sums raw power for Slaughter keep sets so negative-power creatures lower the total", () => {
     const choice = getBoardChoiceView({
       type: "KeepWithinTotalPowerChoice",
@@ -1056,6 +1089,7 @@ const PARTITION_FIXTURES: Record<
   PayCost: NO_TARGET_REF_LEGAL_SET,
   BlightChoice: NO_TARGET_REF_LEGAL_SET,
   PayManaAbilityMana: NO_TARGET_REF_LEGAL_SET,
+  ManaAbilityManaPayment: NO_TARGET_REF_LEGAL_SET,
   ChooseManaColor: NO_TARGET_REF_LEGAL_SET,
   CollectEvidenceChoice: NO_TARGET_REF_LEGAL_SET,
   HarmonizeTapChoice: NO_TARGET_REF_LEGAL_SET,

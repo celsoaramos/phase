@@ -19,10 +19,10 @@ use crate::parser::oracle_ir::diagnostic::{ClauseGap, ClauseGapKind, OracleDiagn
 use crate::parser::oracle_util::normalize_card_name_refs;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityUseTally,
-    ActivationRestriction, AdditionalCost, AggregateFunction, AttackSubject, AttackedYouScope,
-    AttackerBlockStatus, CardTypeSetSource, ChoiceType, CoinFlipResult, CombatHistoryScope,
-    CommanderOwnership, Comparator, ContinuousModification, ControllerRef, CountScope,
-    CounterKindChooser, CounterKindDomain, CounterSourceRider, DelayedTriggerCondition,
+    ActivationRestriction, AdditionalCost, AggregateFunction, AttachmentReferent, AttackSubject,
+    AttackedYouScope, AttackerBlockStatus, CardTypeSetSource, ChoiceType, CoinFlipResult,
+    CombatHistoryScope, CommanderOwnership, Comparator, ContinuousModification, ControllerRef,
+    CountScope, CounterKindChooser, CounterKindDomain, CounterSourceRider, DelayedTriggerCondition,
     DieRollModifier, DoublePTMode, Duration, EachDamageRecipient, Effect, EffectOutcomeSignal,
     EffectScope, FilterProp, ForEachCategoryAction, GameRestriction, LetterQuery, LibraryPosition,
     ManaProduction, MassLibraryShuffleMode, NameStickerSet, ObjectProperty, ObjectScope,
@@ -770,6 +770,7 @@ fn fmt_target(filter: &TargetFilter) -> String {
         TargetFilter::DefendingPlayer => "defending player".into(),
         TargetFilter::ParentTarget => "parent target".into(),
         TargetFilter::ParentTargetSlot { index } => format!("parent target slot {index}"),
+        TargetFilter::DeclaredPlayer { .. } => "declared player".to_string(),
         TargetFilter::ParentTargetController => "parent target's controller".into(),
         TargetFilter::ParentTargetOwner => "parent target's owner".into(),
         TargetFilter::SourceChosenPlayer => "source's chosen player".into(),
@@ -956,11 +957,18 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             FilterProp::Foretold => parts.push("foretold".into()),
             FilterProp::EnchantedBy => parts.push("enchanted by self".into()),
             FilterProp::EquippedBy => parts.push("equipped by self".into()),
-            FilterProp::AttachedToSource => parts.push("attached to self".into()),
-            FilterProp::AttachedToRecipient => parts.push("attached to it".into()),
-            FilterProp::AttachedToPlayer { player } => {
-                parts.push(format!("attached to {}", fmt_controller(player)))
-            }
+            FilterProp::AttachedTo {
+                to: AttachmentReferent::Source,
+            } => parts.push("attached to self".into()),
+            FilterProp::AttachedTo {
+                to: AttachmentReferent::Recipient,
+            } => parts.push("attached to it".into()),
+            FilterProp::AttachedTo {
+                to: AttachmentReferent::Player { player },
+            } => parts.push(format!("attached to {}", fmt_controller(player))),
+            FilterProp::AttachedTo {
+                to: AttachmentReferent::DeclaredTarget { slot },
+            } => parts.push(format!("attached to target #{slot}")),
             FilterProp::Unpaired => parts.push("unpaired".into()),
             FilterProp::HasAttachment {
                 kind,
@@ -1069,6 +1077,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                     ControllerRef::ScopedPlayer => "that player's",
                     ControllerRef::TargetPlayer => "target player's",
                     ControllerRef::TargetOpponent => "target opponent's",
+                    ControllerRef::DeclaredPlayer { .. } => "that player's",
                     ControllerRef::ParentTargetController => "parent target's",
                     ControllerRef::EventTargetController => "the damaged object's controller's",
                     ControllerRef::ParentTargetOwner => "parent target owner's",
@@ -1218,6 +1227,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             }
             FilterProp::HasSingleTarget => parts.push("single target".into()),
             FilterProp::Modal => parts.push("modal spell".into()),
+            FilterProp::PrepareSpell => parts.push("prepared spell".into()),
             FilterProp::FaceDown => parts.push("face-down".into()),
             FilterProp::Transformed => parts.push("transformed".into()),
             FilterProp::TargetsOnly { filter } => {
@@ -1260,6 +1270,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                 ControllerRef::ScopedPlayer => "scoped player",
                 ControllerRef::TargetPlayer => "target player",
                 ControllerRef::TargetOpponent => "target opponent",
+                ControllerRef::DeclaredPlayer { .. } => "that player",
                 ControllerRef::ParentTargetController => "parent target's controller",
                 ControllerRef::EventTargetController => {
                     "controller of the object the triggering event targeted"
@@ -1340,6 +1351,7 @@ fn fmt_controller(ctrl: &ControllerRef) -> String {
         ControllerRef::ScopedPlayer => "scoped player controls",
         ControllerRef::TargetPlayer => "target player controls",
         ControllerRef::TargetOpponent => "target opponent controls",
+        ControllerRef::DeclaredPlayer { .. } => "that player controls",
         ControllerRef::ParentTargetController => "parent target's controller controls",
         ControllerRef::EventTargetController => {
             "the controller of the object the triggering event targeted controls"
@@ -4299,9 +4311,16 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         Effect::Tribute { count } => {
             d.push(("count".into(), count.to_string()));
         }
-        Effect::BecomePrepared { target }
-        | Effect::BecomeUnprepared { target }
-        | Effect::BecomeSaddled { target }
+        // CR 722.3a/b + CR 115.10a: key the subject by scope exactly as `ForceAttack`
+        // does — a declared/anaphoric `target` vs an untargeted population `filter`.
+        Effect::BecomePrepared { target, scope } | Effect::BecomeUnprepared { target, scope } => {
+            let subject_key = match scope {
+                EffectScope::Single => "target",
+                EffectScope::All => "filter",
+            };
+            d.push((subject_key.into(), fmt_target(target)));
+        }
+        Effect::BecomeSaddled { target }
         | Effect::BecomeBlocked { target }
         | Effect::PairWith { target } => {
             d.push(("target".into(), fmt_target(target)));
@@ -4889,6 +4908,7 @@ fn fmt_trigger_condition(
         } => format!("attackers declared {} {count}", fmt_comparator(comparator)),
         TC::ExceptFirstDrawInDrawStep => "except first draw in draw step".into(),
         TC::PlacedByAbilitySource => "placed by this ability".into(),
+        TC::AddedManaWithThisAbilityThisTurn => "added mana with this ability this turn".into(),
         TC::TriggeringSpellTargetsFilter { filter } => {
             format!("triggering spell targets {}", fmt_target(filter))
         }
@@ -5586,9 +5606,7 @@ fn build_trigger_item(
 ) -> ParsedItem {
     // CR 603.8: StateCondition triggers use the priority pipeline, not the
     // event-based trigger registry — they are supported.
-    let mode_supported = !matches!(&trig.mode, TriggerMode::Unknown(_))
-        && (trigger_registry.contains_key(&trig.mode)
-            || matches!(&trig.mode, TriggerMode::StateCondition));
+    let mode_supported = trigger_mode_is_supported(&trig.mode, trigger_registry);
     let mut children = Vec::new();
     if let Some(execute) = &trig.execute {
         children.push(build_ability_item(
@@ -5764,6 +5782,20 @@ fn build_ability_item(
             payload_traversal,
         ));
     });
+
+    // CR 603.7: the event a delayed trigger waits for is a trigger condition in
+    // its own right; project it with the trigger-item builder, so a mode that
+    // can't fire shows as an unsupported child, matching the aggregate gap.
+    for trigger in delayed_trigger_definitions(&def.effect) {
+        let mut child = build_trigger_item(
+            trigger,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        );
+        child.supported &= delayed_trigger_mode_is_supported(&trigger.mode, trigger_registry);
+        children.push(child);
+    }
 
     visit_direct_effect_ability_payloads(&def.effect, |_, payload| {
         children.push(build_ability_item(
@@ -7564,15 +7596,74 @@ fn check_trigger(
     }
     // CR 603.8: StateCondition triggers are handled by the priority pipeline
     // (check_state_triggers), not the event-based trigger registry. They are supported.
-    if matches!(&trigger.mode, TriggerMode::Unknown(_))
-        || (!trigger_registry.contains_key(&trigger.mode)
-            && !matches!(&trigger.mode, TriggerMode::StateCondition))
-    {
+    if !trigger_mode_is_supported(&trigger.mode, trigger_registry) {
         let label = format!("Trigger:{}", trigger.mode);
         if !missing.contains(&label) {
             missing.push(label);
         }
     }
+}
+
+/// Whether a printed (battlefield) trigger mode can fire: recognised, and either
+/// in the event-trigger registry or a CR 603.8 state trigger (handled by the
+/// priority pipeline's `check_state_triggers`). Delayed triggers use the
+/// stricter `delayed_trigger_mode_is_supported`.
+fn trigger_mode_is_supported(
+    mode: &TriggerMode,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+) -> bool {
+    !matches!(mode, TriggerMode::Unknown(_))
+        && (trigger_registry.contains_key(mode) || matches!(mode, TriggerMode::StateCondition))
+}
+
+/// CR 603.7 + CR 603.8: a delayed trigger fires only through an event matcher
+/// (`trigger_matchers::trigger_matcher`); the state-trigger check walks
+/// battlefield definitions, never `state.delayed_triggers`. So a delayed
+/// definition (and its projected child) is supported only when its mode has a
+/// registered matcher — `StateCondition` is not.
+fn delayed_trigger_mode_is_supported(
+    mode: &TriggerMode,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+) -> bool {
+    !matches!(mode, TriggerMode::Unknown(_)) && trigger_registry.contains_key(mode)
+}
+
+/// CR 603.7: the trigger definitions a delayed trigger this effect creates is
+/// waiting for: a "whenever ? this turn" event, or a "when next" event and its
+/// alternative. Phase- and zone-change-bound conditions carry none.
+fn delayed_trigger_definitions(effect: &Effect) -> Vec<&TriggerDefinition> {
+    let Effect::CreateDelayedTrigger { condition, .. } = effect else {
+        return Vec::new();
+    };
+    match condition {
+        DelayedTriggerCondition::WheneverEvent { trigger, .. } => vec![trigger.as_ref()],
+        DelayedTriggerCondition::WhenNextEvent {
+            trigger,
+            or_trigger,
+            ..
+        } => std::iter::once(trigger.as_ref())
+            .chain(or_trigger.as_deref())
+            .collect(),
+        DelayedTriggerCondition::AtNextPhase { .. }
+        | DelayedTriggerCondition::AtNextPhaseForPlayer { .. }
+        | DelayedTriggerCondition::AtBeginningOfAddedPhase { .. }
+        | DelayedTriggerCondition::WhenLeavesPlay { .. }
+        | DelayedTriggerCondition::WhenLeavesPlayFiltered { .. }
+        | DelayedTriggerCondition::WhenDies { .. }
+        | DelayedTriggerCondition::WhenEntersBattlefield { .. }
+        | DelayedTriggerCondition::WhenDiesOrExiled { .. } => Vec::new(),
+    }
+}
+
+/// CR 603.7: the trigger modes a delayed trigger this effect creates is
+/// waiting for. A delayed "whenever"/"when next" trigger whose mode can't fire
+/// (Priority Boarding's and Touch of Moonglove's unrecognised events) never
+/// does anything, so the ability that creates it isn't supported.
+fn delayed_trigger_modes(effect: &Effect) -> Vec<&TriggerMode> {
+    delayed_trigger_definitions(effect)
+        .into_iter()
+        .map(|trigger| &trigger.mode)
+        .collect()
 }
 
 fn truncate_label(text: &str, max: usize) -> &str {
@@ -8122,6 +8213,14 @@ fn collect_ability_missing_parts(
         let label = format!("Effect:{name}");
         if !missing.contains(&label) {
             missing.push(label);
+        }
+    }
+    for mode in delayed_trigger_modes(&def.effect) {
+        if !delayed_trigger_mode_is_supported(mode, trigger_registry) {
+            let label = format!("Trigger:{mode}");
+            if !missing.contains(&label) {
+                missing.push(label);
+            }
         }
     }
 
@@ -8939,10 +9038,7 @@ fn is_trigger_supported(
     static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
     token_static_traversal: TokenStaticTraversal,
 ) -> bool {
-    if matches!(&trigger.mode, TriggerMode::Unknown(_))
-        || (!trigger_registry.contains_key(&trigger.mode)
-            && !matches!(&trigger.mode, TriggerMode::StateCondition))
-    {
+    if !trigger_mode_is_supported(&trigger.mode, trigger_registry) {
         return false;
     }
     trigger.execute.as_deref().is_none_or(|execute| {
@@ -8963,6 +9059,12 @@ fn is_ability_supported(
     token_static_traversal: TokenStaticTraversal,
 ) -> bool {
     if matches!(&*def.effect, Effect::Unimplemented { .. }) {
+        return false;
+    }
+    if delayed_trigger_modes(&def.effect)
+        .into_iter()
+        .any(|mode| !delayed_trigger_mode_is_supported(mode, trigger_registry))
+    {
         return false;
     }
     if let Some(sub) = &def.sub_ability {
@@ -13592,6 +13694,137 @@ mod tests {
         );
     }
 
+    /// CR 603.7: a delayed trigger whose mode can't fire (Priority Boarding's and
+    /// Touch of Moonglove's unrecognised events parse to `TriggerMode::Unknown`)
+    /// never does anything, so the ability creating it is not supported and the
+    /// gap names the mode. Control: the same generator waiting for a registered
+    /// mode stays supported.
+    #[test]
+    fn delayed_trigger_with_an_unregistered_mode_is_not_supported() {
+        fn generator(mode: TriggerMode) -> CardFace {
+            CardFace {
+                abilities: vec![AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::CreateDelayedTrigger {
+                        condition: DelayedTriggerCondition::WheneverEvent {
+                            trigger: Box::new(TriggerDefinition::new(mode)),
+                            expiry: crate::types::ability::WheneverEventExpiry::EndOfTurn,
+                        },
+                        effect: Box::new(AbilityDefinition::new(
+                            AbilityKind::Spell,
+                            Effect::Draw {
+                                count: QuantityExpr::Fixed { value: 1 },
+                                target: TargetFilter::Controller,
+                            },
+                        )),
+                        uses_tracked_set: false,
+                    },
+                )],
+                ..Default::default()
+            }
+        }
+
+        let unknown = generator(TriggerMode::Unknown(
+            "Whenever you reveal a card this way".to_string(),
+        ));
+        let gaps = super::card_face_gaps(&unknown);
+        assert!(
+            gaps.iter().any(|gap| gap.starts_with("Trigger:")),
+            "the unregistered delayed mode is a gap: {gaps:?}"
+        );
+        let trigger_registry = super::build_trigger_registry();
+        let static_registry = super::build_static_registry();
+        assert!(!super::is_ability_supported(
+            &unknown.abilities[0],
+            &trigger_registry,
+            &static_registry,
+            super::TokenStaticTraversal::Include,
+        ));
+
+        let registered = generator(TriggerMode::SpellCast);
+        assert!(super::card_face_gaps(&registered).is_empty());
+        assert!(super::is_ability_supported(
+            &registered.abilities[0],
+            &trigger_registry,
+            &static_registry,
+            super::TokenStaticTraversal::Include,
+        ));
+
+        // Maintainer round 3, finding 6: the parse tree projects the delayed
+        // event as a trigger child carrying the same support verdict, so the
+        // display never shows only supported nodes beside an aggregate gap.
+        let trigger_children = |face: &CardFace| -> Vec<bool> {
+            super::build_ability_item(
+                &face.abilities[0],
+                &trigger_registry,
+                &static_registry,
+                super::TokenStaticTraversal::Include,
+            )
+            .children
+            .iter()
+            .filter(|child| matches!(child.category, super::ParseCategory::Trigger))
+            .map(|child| child.supported)
+            .collect()
+        };
+        assert_eq!(trigger_children(&unknown), [false], "unsupported child");
+        assert_eq!(trigger_children(&registered), [true], "supported child");
+
+        // Both `WhenNextEvent` alternatives are projected.
+        let mut when_next = registered.clone();
+        if let Effect::CreateDelayedTrigger { condition, .. } =
+            when_next.abilities[0].effect.as_mut()
+        {
+            *condition = DelayedTriggerCondition::WhenNextEvent {
+                trigger: Box::new(TriggerDefinition::new(TriggerMode::SpellCast)),
+                or_trigger: Some(Box::new(TriggerDefinition::new(TriggerMode::Unknown(
+                    "Whenever you reveal a card this way".to_string(),
+                )))),
+                lifetime: Default::default(),
+            };
+        }
+        assert_eq!(
+            trigger_children(&when_next),
+            [true, false],
+            "the main and alternative events"
+        );
+        assert!(!super::card_face_gaps(&when_next).is_empty());
+
+        // Maintainer round 4, finding 3 (CR 603.7 + CR 603.8): a delayed
+        // StateCondition has no event matcher and the state-trigger check never
+        // reads delayed triggers, so it can't fire: unsupported, with an
+        // unsupported child. The ordinary battlefield state trigger stays
+        // supported, and so does the registered delayed event above.
+        let delayed_state = generator(TriggerMode::StateCondition);
+        assert!(
+            super::card_face_gaps(&delayed_state)
+                .iter()
+                .any(|gap| gap.starts_with("Trigger:")),
+            "a delayed state trigger is a gap"
+        );
+        assert!(!super::is_ability_supported(
+            &delayed_state.abilities[0],
+            &trigger_registry,
+            &static_registry,
+            super::TokenStaticTraversal::Include,
+        ));
+        assert_eq!(
+            trigger_children(&delayed_state),
+            [false],
+            "unsupported child"
+        );
+        let ordinary_state = TriggerDefinition::new(TriggerMode::StateCondition);
+        assert!(
+            super::build_trigger_item(
+                &ordinary_state,
+                &trigger_registry,
+                &static_registry,
+                super::TokenStaticTraversal::Include,
+            )
+            .supported,
+            "an ordinary battlefield state trigger stays supported"
+        );
+    }
+
     /// An explicit Exile origin can retrieve the intended set when it is still
     /// the latest, but does not preserve that identity across a later publisher.
     #[test]
@@ -14374,10 +14607,11 @@ mod tests {
     use crate::database::synthesis::build_oracle_face;
     use crate::parser::oracle_ir::diagnostic::{CascadeSlot, OracleDiagnostic};
     use crate::types::ability::{
-        AbilityCondition, AbilityKind, Comparator, ContinuousModification, ControllerRef,
-        CounterTransferMode, DieResultBranch, Effect, PileSource, PlayerFilter, PlayerScope,
-        PreventionAmount, PreventionScope, ReplacementCondition, StaticDefinition, TargetFilter,
-        TriggerConstraint, VoteSubject, VoteTally, VoteVisibility, VoterScope,
+        AbilityCondition, AbilityDefinition, AbilityKind, Comparator, ContinuousModification,
+        ControllerRef, CounterTransferMode, DelayedTriggerCondition, DieResultBranch, Effect,
+        PileSource, PlayerFilter, PlayerScope, PreventionAmount, PreventionScope, QuantityExpr,
+        ReplacementCondition, StaticDefinition, TargetFilter, TriggerConstraint, TriggerDefinition,
+        VoteSubject, VoteTally, VoteVisibility, VoterScope,
     };
     use crate::types::card_type::CardType;
     use crate::types::identifiers::{CardId, ObjectId};
@@ -14652,6 +14886,40 @@ mod tests {
         let all = keys(EffectScope::All);
         assert!(all.iter().any(|k| k == "filter"));
         assert!(!all.iter().any(|k| k == "target"));
+    }
+
+    /// CR 722.3a/b + CR 115.10a: a mass "each creature you control becomes
+    /// (un)prepared" keys its subject as `filter`, a declared/anaphoric subject as
+    /// `target`, so `coverage-parse-diff` sees a Single → All reclassification.
+    #[test]
+    fn become_prepared_signature_keys_subject_by_scope() {
+        let subject = || TargetFilter::Typed(TypedFilter::creature());
+        let keys = |effect: Effect| -> Vec<String> {
+            effect_details(&effect)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+        };
+        for scope in [EffectScope::Single, EffectScope::All] {
+            for effect in [
+                Effect::BecomePrepared {
+                    target: subject(),
+                    scope,
+                },
+                Effect::BecomeUnprepared {
+                    target: subject(),
+                    scope,
+                },
+            ] {
+                let got = keys(effect);
+                let (want, absent) = match scope {
+                    EffectScope::Single => ("target", "filter"),
+                    EffectScope::All => ("filter", "target"),
+                };
+                assert!(got.iter().any(|k| k == want), "{scope:?}: {got:?}");
+                assert!(!got.iter().any(|k| k == absent), "{scope:?}: {got:?}");
+            }
+        }
     }
 
     #[test]
