@@ -1,3 +1,4 @@
+use crate::types::game_state::RandomDraw;
 use rand::Rng;
 
 use crate::game::players;
@@ -159,7 +160,10 @@ pub(crate) fn resolve_random_in_chain(
     }
 
     // CR 608.2d (override): the game selects uniformly at random.
-    let index = state.rng.random_range(0..options.len());
+    let index = state
+        .rng
+        .draw(RandomDraw::Outcome)
+        .random_range(0..options.len());
     let chosen = options[index].clone();
 
     let (mut source, persist_player) =
@@ -244,6 +248,12 @@ pub(crate) fn bind_named_choice(
                 ChoiceValue::Counter(kind) => Some(kind),
                 _ => None,
             });
+    }
+    // CR 105.4 + CR 608.2c: "that color" later in this resolution names this
+    // answer, whether or not the chooser persists it and whatever other kind
+    // of choice comes between (`named_color_this_resolution`).
+    if let Some(ChoiceValue::Color(color)) = ChoiceValue::from_choice(choice_type, choice) {
+        state.named_color_this_resolution = Some(color);
     }
     let updated_context = source.as_deref_mut().and_then(|source| {
         let context = source.context.as_mut()?;
