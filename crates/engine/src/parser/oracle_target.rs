@@ -1571,11 +1571,13 @@ pub fn parse_target_with_syntax<'a>(
         }
     }
     // CR 508.5 + CR 608.2c: "the player [or planeswalker] that creature is attacking"
-    // (Cavalcade of Calamity) — the attacked
-    // player of the attacker that fired the trigger. It is NOT a parent target (an
-    // `Attacks` trigger has none, so `ParentTarget` resolved to nobody and the damage
-    // never happened). `DefendingPlayer` resolves through the trigger event's attacker
-    // even when the source is not the attacker. A planeswalker being attacked is
+    // (Cavalcade of Calamity, Raid Bombardment) and "... it's attacking" (Scorch
+    // Spitter, Hellrider, Fathom Fleet Swordjack, Rakdos Roustabout, Mage Slayer,
+    // Myr Battlesphere) — the attacked player of the attacker the ability is about.
+    // It is NOT a parent target (an `Attacks`/`BecomesBlocked` trigger has none, so
+    // `ParentTarget` resolved to nobody and the damage never happened).
+    // `DefendingPlayer` resolves through the source when it is the attacker, else
+    // through the trigger event's attacker. A planeswalker being attacked is
     // approximated by its controller (the defending player).
     if let Some((filter, rest)) = nom_on_lower(text, &lower, |input| {
         value(
@@ -1586,6 +1588,8 @@ pub fn parse_target_with_syntax<'a>(
                 alt((
                     tag(" that creature is attacking"),
                     tag(" that creature's attacking"),
+                    tag(" it is attacking"),
+                    tag(" it's attacking"),
                 )),
             ),
         )
