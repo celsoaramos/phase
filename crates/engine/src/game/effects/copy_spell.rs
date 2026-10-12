@@ -7,9 +7,7 @@ use crate::types::ability::{
     Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter, TargetRef,
 };
 use crate::types::events::GameEvent;
-use crate::types::game_state::{
-    CastingVariant, CopyTargetSlot, GameState, StackEntry, StackEntryKind, WaitingFor,
-};
+use crate::types::game_state::{CastingVariant, GameState, StackEntry, StackEntryKind};
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef, TrackedSetId};
 use crate::types::player::PlayerId;
 use crate::types::statics::StaticMode;
@@ -126,6 +124,9 @@ pub fn resolve(
     // activated/triggered ability entries; clone a GameObject only when the
     // copied stack entry already has one.
     if let Some(source_obj) = source_object {
+        // CR 722.3d: the clone intentionally keeps `prepared_copy_source`, so a
+        // copy of a spell cast as a prepare spell is itself a prepare spell;
+        // `FilterProp::PrepareSpell` relies on this inheritance.
         let mut copy_obj = source_obj.clone();
         copy_obj.id = copy_id;
         copy_obj.controller = copy_controller;
@@ -142,6 +143,7 @@ pub fn resolve(
         // cast from a graveyard" riders (Sevinne's Reclamation, issue #3283)
         // re-fire when a flashback copy resolves.
         copy_obj.cast_from_zone = None;
+        copy_obj.cast_controller = None;
         // CR 707.10: no mana was spent to cast a spell copy — reset the
         // cast-payment stamps so spend-color riders ("if {W}{W} was spent to
         // cast it", issue #5943) do not re-fire off the original's payment.
@@ -189,6 +191,10 @@ pub fn resolve(
             StackEntryKind::Spell { ability: None, .. } => {}
             StackEntryKind::ActivatedAbility { ability, .. } => {
                 preserve_ability_copy_source_recursive(ability);
+                // CR 610.3a + CR 707.10: the copy is put onto the stack now, so
+                // only "until" events after this point can stop its move; it
+                // does not inherit the events latched onto the original.
+                ability.clear_duration_events_recursive();
             }
             StackEntryKind::TriggeredAbility { ability, .. } => {
                 preserve_ability_copy_source_recursive(ability);
@@ -284,49 +290,26 @@ pub fn resolve(
         crate::game::triggers::collect_triggers_into_deferred(state, &[spell_copied]);
     }
 
-    // CR 707.10c: If the copy has targets, allow the controller to choose new ones.
-    let copy_targets = top_entry
-        .entry
-        .ability()
-        .map(|a| a.targets.clone())
-        .unwrap_or_default();
-
     // CR 707.10c / CR 115.1: arm retarget selection only when the copy effect
     // explicitly granted "you may choose new targets". Otherwise the copy keeps
     // the original spell's declared targets (already present on the cloned
-    // stack entry) and resolution proceeds without a player choice.
-    if !copy_targets.is_empty()
-        && matches!(
-            ability.effect,
-            Effect::CopySpell {
-                retarget: CopyRetargetPermission::MayChooseNewTargets,
-                ..
-            }
-        )
-    {
-        let Some(copy_ability) = state
-            .stack
-            .back()
-            .and_then(|entry| entry.ability())
-            .cloned()
-        else {
-            events.push(GameEvent::EffectResolved {
-                kind: EffectKind::from(&ability.effect),
-                source_id: ability.source_id,
-                subject: None,
-            });
-            drain_spell_copied_observer_triggers(state, events, copied_spell_card_id.is_some())?;
-            return Ok(());
-        };
-        open_copy_retarget_choice(
-            state,
-            copy_controller,
-            copy_id,
-            &copy_targets,
-            &copy_ability,
-            EffectKind::CopySpell,
-            copy_id,
-        );
+    // stack entry) and resolution proceeds without a player choice. Whether
+    // there is anything to choose is the chain census (`chain_retarget_slots`,
+    // every addressed declared target — e.g. Fiery Annihilation's Equipment
+    // sub-target), not the root node's own `targets`.
+    if matches!(
+        ability.effect,
+        Effect::CopySpell {
+            retarget: CopyRetargetPermission::MayChooseNewTargets,
+            ..
+        }
+    ) && super::copy_choice::open_copy_retarget_walk(
+        state,
+        copy_controller,
+        copy_id,
+        EffectKind::CopySpell,
+        copy_id,
+    ) {
         // EffectResolved deferred until after retarget choice completes.
         return Ok(());
     }
@@ -417,51 +400,6 @@ fn drain_spell_copied_observer_triggers(
     Ok(())
 }
 
-/// CR 707.10c: Open the shared "may choose new targets" choice for a copied
-/// spell. The copy is already on the stack; `copy_ability` is the copy's
-/// re-sourced ability, so legal alternatives reflect the copy's identity.
-pub(crate) fn open_copy_retarget_choice(
-    state: &mut GameState,
-    copy_controller: PlayerId,
-    copy_id: ObjectId,
-    copy_targets: &[TargetRef],
-    copy_ability: &ResolvedAbility,
-    effect_kind: EffectKind,
-    effect_source_id: ObjectId,
-) {
-    // Compute legal alternatives for each slot so the UI can present valid
-    // choices. If build_target_slots fails (no legal targets exist for the
-    // copy), fall back to empty alternatives — the copy still goes on the
-    // stack and will fizzle at resolution per CR 608.2b if all targets remain
-    // illegal.
-    let selection_slots =
-        super::super::ability_utils::build_target_slots(state, copy_ability).unwrap_or_default();
-
-    let target_slots: Vec<CopyTargetSlot> = copy_targets
-        .iter()
-        .enumerate()
-        .map(|(i, t)| CopyTargetSlot {
-            current: Some(t.clone()),
-            legal_alternatives: selection_slots
-                .get(i)
-                .map(|s| s.legal_targets.clone())
-                .unwrap_or_default(),
-        })
-        .collect();
-
-    // CR 707.10c: "its controller may choose new targets for the copy" — the
-    // copy's controller makes the retarget choice.
-    state.waiting_for = WaitingFor::CopyRetarget {
-        player: copy_controller,
-        copy_id,
-        target_slots,
-        effect_kind,
-        effect_source_id: Some(effect_source_id),
-        current_slot: 0,
-        paradigm_remaining_offers: None,
-    };
-}
-
 /// CR 707.10: "A copy of a spell is controlled by the player under whose
 /// control it was put on the stack." For most copy effects (Twincast, Gogo)
 /// that is the effect's controller — the player resolving the copy spell. But
@@ -494,7 +432,7 @@ fn copy_controller(ability: &ResolvedAbility) -> PlayerId {
 /// 702.144a (Demonstrate) sets `copier: Opponent` so a chosen opponent copies.
 /// With no target and no copier, the effect's controller copies
 /// (Twincast/Casualty/Replicate).
-fn resolve_copy_controller(state: &GameState, ability: &ResolvedAbility) -> PlayerId {
+pub(crate) fn resolve_copy_controller(state: &GameState, ability: &ResolvedAbility) -> PlayerId {
     if let Effect::CopySpell {
         copier: Some(cref), ..
     } = &ability.effect
@@ -535,6 +473,7 @@ fn resolve_copier_player(
         ControllerRef::ScopedPlayer
         | ControllerRef::TargetPlayer
         | ControllerRef::TargetOpponent
+        | ControllerRef::DeclaredPlayer { .. }
         | ControllerRef::ParentTargetController
         | ControllerRef::EventTargetController
         | ControllerRef::ParentTargetOwner
@@ -705,6 +644,22 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> CopySource
             return copy_source_from_tracked_set(state, ability, target)
                 .map(|entry| Box::new(CopySource::on_stack(entry)))
                 .map_or(CopySourceLookup::Absent, CopySourceLookup::Source);
+        }
+        // CR 605.3b: "copy that ability" anaphoric to a mana ability's
+        // activation names nothing on the stack — a mana ability never uses
+        // it. Every lookup below (the anaphoric target's same-source entry,
+        // the triggering-entry fallback, the top of the stack) would otherwise
+        // bind an unrelated stack object. A declared target is still honoured.
+        if target.is_context_ref()
+            && matches!(
+                state.current_trigger_event,
+                Some(GameEvent::AbilityActivated {
+                    kind: crate::types::events::ActivatedAbilityKind::Mana,
+                    ..
+                })
+            )
+        {
+            return CopySourceLookup::Absent;
         }
     }
     // CR 400.7 + CR 603.7c: covers the partial-stale case, and is defence in
@@ -926,6 +881,18 @@ fn spell_ability_definition(abilities: &[AbilityDefinition]) -> Option<AbilityDe
 /// points at the wrong entry — bind from the triggering event's spell instead.
 fn triggering_spell_stack_entry(state: &GameState) -> Option<StackEntry> {
     let event = state.current_trigger_event.as_ref()?;
+    // CR 605.3b: a mana ability never uses the stack, so there is no stack
+    // entry for "that ability" to copy; the same-source fallback below would
+    // otherwise bind an unrelated activation of the same permanent.
+    if matches!(
+        event,
+        GameEvent::AbilityActivated {
+            kind: crate::types::events::ActivatedAbilityKind::Mana,
+            ..
+        }
+    ) {
+        return None;
+    }
     let object_id = crate::game::targeting::extract_source_from_event(event)?;
     if matches!(event, GameEvent::AbilityActivated { .. }) {
         if let Some(entry) = state.stack.iter().rev().find(|entry| {
@@ -1050,26 +1017,22 @@ fn preserve_ability_copy_source_recursive(ability: &mut ResolvedAbility) {
 }
 
 /// CR 707.10d: Replace every object target on a copied spell with `new_target`
-/// and capture the target's current incarnation for ordinary resolution pins.
+/// and pin each rewritten occurrence to the target's current incarnation.
 fn rewrite_copy_spell_object_targets(
     ability: &mut ResolvedAbility,
     new_target: ObjectId,
     new_target_pin: Option<ObjectIncarnationRef>,
 ) {
-    let replaced_object_target = ability
-        .targets
-        .iter_mut()
-        .filter(|target| matches!(target, TargetRef::Object(_)))
-        .map(|target| {
-            *target = TargetRef::Object(new_target);
+    // Every rewritten position is refreshed; players keep their position.
+    let occurrences = ability
+        .target_occurrences()
+        .into_iter()
+        .map(|(target, pin)| match target {
+            TargetRef::Object(_) => (TargetRef::Object(new_target), new_target_pin),
+            TargetRef::Player(_) => (target, pin),
         })
-        .count()
-        > 0;
-    if replaced_object_target {
-        if let Some(pin) = new_target_pin {
-            ability.update_selected_target_incarnation(pin);
-        }
-    }
+        .collect();
+    ability.replace_target_occurrences(occurrences);
     if let Some(sub) = ability.sub_ability.as_mut() {
         rewrite_copy_spell_object_targets(sub, new_target, new_target_pin);
     }
@@ -1110,6 +1073,7 @@ mod tests {
     };
     use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;
+    use crate::types::game_state::WaitingFor;
     use crate::types::game_state::{
         CastingVariant, DepartedStackSpell, StackEntry, StackEntryKind,
     };
@@ -3010,6 +2974,8 @@ mod tests {
             player_id: PlayerId(0),
             source_id: source_creature,
             kind: crate::types::events::ActivatedAbilityKind::Normal,
+            departed_source_lki: None,
+            trigger_state: crate::types::events::ActivationTriggerState::Pending,
         });
 
         let copy_effect = ResolvedAbility::new(
@@ -3162,6 +3128,8 @@ mod tests {
             player_id: PlayerId(0),
             source_id: basalt,
             kind: crate::types::events::ActivatedAbilityKind::Normal,
+            departed_source_lki: None,
+            trigger_state: crate::types::events::ActivationTriggerState::Pending,
         });
 
         let copy_effect = ResolvedAbility::new(
@@ -3235,6 +3203,8 @@ mod tests {
             player_id: PlayerId(0),
             source_id: source_creature,
             kind: crate::types::events::ActivatedAbilityKind::Normal,
+            departed_source_lki: None,
+            trigger_state: crate::types::events::ActivationTriggerState::Pending,
         });
 
         let copy_effect = ResolvedAbility::new(
@@ -4064,7 +4034,7 @@ mod tests {
             vec![TargetRef::Object(iteration_member)]
         );
         assert!(
-            copied_ability.selected_target_pin_is_current(iteration_member, &state),
+            copied_ability.target_occurrence_is_current(0, &state),
             "automatic retarget must capture the iteration member incarnation"
         );
 
@@ -4094,7 +4064,7 @@ mod tests {
             .cloned()
             .expect("automatic copy ability must remain on the stack");
         assert!(
-            !copied_ability.selected_target_pin_is_current(iteration_member, &state),
+            !copied_ability.target_occurrence_is_current(0, &state),
             "returned iteration member must no longer match the captured copy target pin"
         );
         crate::game::stack::resolve_top(&mut state, &mut events);

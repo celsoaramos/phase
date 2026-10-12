@@ -1,6 +1,7 @@
 import type { BracketDeckRequest, BracketEstimate } from "../types/bracketEstimate";
 import type {
   InteractionActionId,
+  InteractionId,
   InteractionPreview,
   InteractionPreviewRequest,
   InteractionSubmission,
@@ -168,7 +169,8 @@ export type BuiltInGameFormat =
   | "Momir"
   | "CommanderDraft"
   | "Freeform"
-  | "FreeformCommander";
+  | "FreeformCommander"
+  | "Dandan";
 
 /**
  * Wire form of `GameFormat::Custom(CustomFormatId)`.
@@ -405,14 +407,6 @@ export interface FormatConfig {
    * of a session.
    */
   allow_debug_actions: boolean;
-  /**
-   * Experimental-dungeons capability flag: when true the engine offers
-   * Baldur's Gate Wilderness alongside the AFR trio on a normal venture,
-   * and as an alternative to Undercity when taking the initiative. Off by
-   * default. Orthogonal to format — applies on top of any `GameFormat`.
-   * Immutable for the life of a session.
-   */
-  allow_experimental_dungeons: boolean;
   /**
    * Present exactly when `format` is a `Custom:<id>` string, and then
    * `custom_rules.id` must equal that id — the engine's
@@ -1300,6 +1294,22 @@ export interface TokenImageRef {
   preset_id: string;
 }
 
+/** Engine-owned intrinsic token body for shape-based art lookup (mirrors
+ *  Rust `TokenArtDescriptor`). Derived from printed (`base_*`) stores only —
+ *  pumps, color setters, and grants never contribute. Absent for cards,
+ *  non-token objects, and tokens from older snapshots (which fall back to
+ *  the legacy live-field lookup). */
+export interface TokenArtDescriptor {
+  power: number | null;
+  toughness: number | null;
+  colors: ManaColor[];
+  subtypes: string[];
+  /** Keyword family names (`KeywordKind` discriminants, e.g. "FirstStrike";
+   *  `Unknown` keywords carry their raw payload instead). */
+  keywords: string[];
+  has_abilities: boolean;
+}
+
 export type TokenPtProvenance =
   | "FixedOrAbsent"
   | {
@@ -1634,6 +1644,7 @@ export interface GameObject {
    *  image is unavailable. Absent for non-predefined objects. */
   token_rules_text?: string;
   token_image_ref?: TokenImageRef | null;
+  token_art?: TokenArtDescriptor | null;
   source_related_token_ids?: string[];
   unimplemented_mechanics?: string[];
   has_summoning_sickness?: boolean;
@@ -1786,7 +1797,10 @@ export type ManaSourcePenalty =
 
 export type ManaSourceOutput =
   | { type: "Concrete"; data: ManaType }
-  | { type: "DeferredColorChoice" };
+  | {
+      type: "DeferredColorChoice";
+      data: { quantity: { type: "Fixed"; data: number } | { type: "Variable" } };
+    };
 
 export type ProductionOverride =
   | { type: "SingleColor"; data: ManaType }
@@ -1994,7 +2008,36 @@ export type TargetRef =
   | { Object: ObjectId }
   | { Player: PlayerId };
 
-export type CopyTargetSlot = { current?: TargetRef | null; legal_alternatives: TargetRef[] };
+/**
+ * One position of a copy target walk (CR 707.10c / CR 601.2c). Both
+ * permissions are engine-derived and both are answered with `ChooseTarget`
+ * `null`: `can_keep` (a retarget walk: keeping this position's target still
+ * completes) and `can_decline` (an announcement: this optional slot may be
+ * declined, CR 115.6). `address` names the chain position (absent on an
+ * announcement).
+ */
+export type CopyTargetSlot = {
+  current?: TargetRef | null;
+  legal_alternatives: TargetRef[];
+  address?: RetargetSlotAddress | null;
+  can_keep?: boolean;
+  can_decline?: boolean;
+};
+
+/**
+ * CR 601.2c + CR 115.1: a copy announcement's announcing-opponent election
+ * (answered with `ChooseAnnouncingOpponent`). While present, no target slot is
+ * being answered.
+ */
+export type AnnouncerElection = {
+  candidates: PlayerId[];
+  choice_index: number;
+  choice_count: number;
+  target_type?: CoreType;
+};
+
+/** Whether a copy target walk retargets an existing copy or announces a fresh one. */
+export type CopyChoiceMode = "Retarget" | "Announce";
 
 // ── Combat ───────────────────────────────────────────────────────────────
 
@@ -2369,6 +2412,24 @@ export type ReplacementChoiceKind =
   | { type: "OptionalBranch" }
   | { type: "SearchFoundDestination" };
 
+export type ReplacementAutoChoice =
+  | { type: "Order"; data: { order: number[] } }
+  | { type: "Optional"; data: { index: number } };
+
+export interface ReplacementAutoChoiceKey {
+  player: PlayerId;
+  event: string;
+  kind: ReplacementChoiceKind;
+  candidates: unknown[];
+}
+
+export interface ReplacementAutoChoiceRecord {
+  id: string;
+  key: ReplacementAutoChoiceKey;
+  choice: ReplacementAutoChoice;
+  descriptions: string[];
+}
+
 export type EmergeSacrificeQuality =
   | { type: "Artifact" }
   | { type: "Battle" }
@@ -2466,8 +2527,9 @@ export type WaitingFor =
   | {
       type: "MulliganDecision";
       data: {
-        pending: { player: PlayerId; mulligan_count: number; phase: MulliganDecisionPhase }[];
+        pending: { player: PlayerId; mulligan_count: number; free_reveals_taken?: number; phase: MulliganDecisionPhase }[];
         free_first_mulligan: boolean;
+        declared?: { player: PlayerId; mulligan_count: number; free_reveals_taken?: number; kind: MulliganDeclarationKind }[];
       };
     }
   | {
@@ -2494,7 +2556,7 @@ export type WaitingFor =
   | { type: "DeclareAttackers"; data: { player: PlayerId; valid_attacker_ids: ObjectId[]; valid_attack_targets?: AttackTarget[]; valid_attack_targets_by_attacker?: Record<string, AttackTarget[]>; attacker_constraints?: Record<string, CombatRequirement> } }
   | { type: "DeclareBlockers"; data: { player: PlayerId; valid_blocker_ids: ObjectId[]; valid_block_targets: Record<string, ObjectId[]>; block_requirements?: Record<string, BlockRequirementInfo>; blocker_constraints?: Record<string, CombatRequirement>; must_be_blocked_targets?: Record<string, ObjectId[]>; block_capacities?: Record<string, number | null> } }
   | { type: "GameOver"; data: { winner: PlayerId | null } }
-  | { type: "ReplacementChoice"; data: { player: PlayerId; candidate_count: number; candidates?: ReplacementCandidateSummary[]; kind?: ReplacementChoiceKind; last_applied_decides?: boolean } }
+  | { type: "ReplacementChoice"; data: { player: PlayerId; candidate_count: number; candidates?: ReplacementCandidateSummary[]; kind?: ReplacementChoiceKind; last_applied_decides?: boolean; remember_identity?: ReplacementAutoChoiceRecord["key"] } }
   | { type: "EntryControllerChoice"; data: { player: PlayerId; candidates: PlayerId[] } }
   | { type: "OrderTriggers"; data: { player: PlayerId; triggers: PendingTriggerSummary[] } }
   | { type: "CopyTargetChoice"; data: { player: PlayerId; source_id: ObjectId; valid_targets: ObjectId[]; max_mana_value?: number | null; purpose?: { type: "BecomeCopy" | "PersistChosenAttribute" | "CopyTokenSource" } } }
@@ -2533,7 +2595,7 @@ export type WaitingFor =
   | { type: "SearchChoice"; data: { player: PlayerId; cards: ObjectId[]; count: number; reveal?: boolean; up_to?: boolean; allows_partial_find?: boolean; constraint?: SearchSelectionConstraint; ordering_hint?: SearchOrderingHint; split?: SearchDestinationSplit | null } }
   | { type: "SearchPartitionChoice"; data: { player: PlayerId; cards: ObjectId[]; primary_destination: Zone; primary_count: number; primary_enter_tapped: boolean; rest_destination: Zone; source_id: ObjectId } }
   | { type: "OutsideGameChoice"; data: { player: PlayerId; source_id: ObjectId; choices: OutsideGameChoiceEntry[]; count: number; reveal?: boolean; up_to?: boolean; destination: Zone } }
-  | { type: "ChooseOneOfBranch"; data: { player: PlayerId; controller: PlayerId; source_id: ObjectId; branches: unknown[]; branch_descriptions?: string[]; parent_targets?: TargetRef[]; context?: unknown; remaining_players?: PlayerId[] } }
+  | { type: "ChooseOneOfBranch"; data: { player: PlayerId; controller: PlayerId; source_id: ObjectId; branches: unknown[]; branch_descriptions?: string[]; parent_targets?: TargetRef[]; parent_target_pins?: (ObjectIncarnationRef | null)[]; context?: unknown; remaining_players?: PlayerId[] } }
   | { type: "TriggerTargetSelection"; data: { player: PlayerId; trigger_controller?: PlayerId; trigger_event?: GameEvent; trigger_events?: GameEvent[]; target_slots: TargetSelectionSlot[]; mode_labels?: (string | null)[]; target_constraints?: TargetSelectionConstraint[]; selection: TargetSelectionProgress; source_id?: ObjectId; description?: string } }
   | { type: "BetweenGamesSideboard"; data: { player: PlayerId; game_number: number; score: MatchScore; min_main_deck_size: number; max_sideboard_size: number | null } }
   | { type: "BetweenGamesChoosePlayDraw"; data: { player: PlayerId; game_number: number; score: MatchScore } }
@@ -2587,6 +2649,7 @@ export type WaitingFor =
     }
   | { type: "BlightChoice"; data: { player: PlayerId; counters: number; creatures: ObjectId[]; pending_cast: PendingCast } }
   | { type: "PayManaAbilityMana"; data: { player: PlayerId; options: ManaType[][]; pending_mana_ability: unknown } }
+  | { type: "ManaAbilityManaPayment"; data: { player: PlayerId; pending_mana_ability: unknown } }
   | {
       type: "ChooseManaColor";
       data: {
@@ -2606,7 +2669,7 @@ export type WaitingFor =
   | { type: "ResolutionOptionalPaymentChoice"; data: { player: PlayerId; source_id: ObjectId; costs: Array<{ index: number; cost: SerializedAbilityCost }> } }
   | { type: "PairChoice"; data: { player: PlayerId; source_id: ObjectId; choices: ObjectId[] } }
   | { type: "OpponentMayChoice"; data: { player: PlayerId; decision_subject_id?: ObjectId; source_id: ObjectId; description?: string; remaining: PlayerId[] } }
-  | { type: "LoopShortcut"; data: { proposer: PlayerId; predicted_winner: PlayerId | null; certificate: LoopCertificate; schema: ShortcutDecisionSchema } }
+  | { type: "LoopShortcut"; data: { proposer: PlayerId; predicted_winner: PlayerId | null; certificate: LoopCertificate; schema: ShortcutDecisionSchema; road: OfferRoad } }
   | { type: "RespondToShortcut"; data: { player: PlayerId; remaining_players?: PlayerId[]; proposal: ShortcutProposal } }
   | { type: "PrecastCopyShortcutOffer"; data: { proposer: PlayerId; epoch: number; route_count: number } }
   | { type: "RespondToPrecastCopyShortcut"; data: { player: PlayerId; epoch: number; breakpoint_ids?: number[]; remaining_players?: PlayerId[] } }
@@ -2645,6 +2708,7 @@ export type WaitingFor =
   | { type: "ChooseFromZoneChoice"; data: { player: PlayerId; cards: ObjectId[]; count: number; up_to?: boolean; constraint?: ChooseFromZoneConstraint | null; source_id: ObjectId; reciprocal_role?: "Produce" | "Consume" | null } }
   | { type: "BeholdChoice"; data: { player: PlayerId; choices: ObjectId[] } }
   | { type: "EmpowerJaceChoice"; data: { player: PlayerId; source_id: ObjectId; choices: ObjectId[]; count: number } }
+  | { type: "SpellCopyOrderChoice"; data: { player: PlayerId; source_id: ObjectId; choices: ObjectId[] } }
   | { type: "EffectZoneChoice"; data: {
       player: PlayerId;
       cards: ObjectId[];
@@ -2666,7 +2730,7 @@ export type WaitingFor =
       track_exiled_by_source?: boolean;
     } }
   | { type: "DrawnThisTurnTopdeckChoice"; data: { player: PlayerId; cards: ObjectId[]; count: number; min_count: number; life_payment: number; source_id: ObjectId } }
-  | { type: "RetargetChoice"; data: { player: PlayerId; stack_entry_index: number; scope: RetargetScope; current_targets: TargetRef[]; slots: RetargetSlotAddress[]; slot_pools: TargetRef[][]; legal_new_targets: TargetRef[] } }
+  | { type: "RetargetChoice"; data: { player: PlayerId; stack_entry_index: number; scope: RetargetScope; current_targets: TargetRef[]; slots: RetargetSlotAddress[]; slot_pools: TargetRef[][]; legal_new_targets: TargetRef[]; keep_is_distinct?: boolean[] } }
   | { type: "ProliferateChoice"; data: { player: PlayerId; eligible: TargetRef[] } }
   | { type: "TimeTravelChoice"; data: { player: PlayerId; eligible: TargetRef[]; phase: "Remove" | "Add" } }
   | { type: "AssistChoosePlayer"; data: { player: PlayerId; candidates: PlayerId[]; max_generic: number; convoke_mode?: ConvokeMode } }
@@ -2679,7 +2743,7 @@ export type WaitingFor =
   | { type: "ClashChooseOpponent"; data: { player: PlayerId; candidates: PlayerId[]; ability: unknown } }
   // CR 608.2d: "an opponent chooses" from a zone (multiplayer) — the controller
   // picks WHICH opponent makes the choice before the zone choice is presented.
-  | { type: "ChooseFromZoneOpponentChooser"; data: { player: PlayerId; candidates: PlayerId[]; ability: unknown; purpose?: "Ordinary" | "BindReciprocalConsume" } }
+  | { type: "ChooseFromZoneOpponentChooser"; data: { player: PlayerId; candidates: PlayerId[]; ability: unknown; purpose?: "Ordinary" | "BindReciprocalConsume" | "PerPlayerChoiceOrder" | "SubstituteChooser" } }
   | { type: "ChooseAnnouncingOpponent"; data: { player: PlayerId; candidates: PlayerId[]; choice_index: number; choice_count: number; target_type?: CoreType; pending_cast: unknown } }
   | { type: "ChooseGiftRecipient"; data: { player: PlayerId; candidates: PlayerId[]; gift_kind?: { type: string }; pending_cast: unknown } }
   | { type: "ClashCardPlacement"; data: { player: PlayerId; card: ObjectId; remaining: [PlayerId, ObjectId][] } }
@@ -2788,7 +2852,7 @@ export type WaitingFor =
       all_kept: ObjectId[];
       scoped_players: PlayerId[];
     } }
-  | { type: "CopyRetarget"; data: { player: PlayerId; copy_id: ObjectId; target_slots: CopyTargetSlot[]; current_slot?: number } }
+  | { type: "CopyRetarget"; data: { player: PlayerId; controller?: PlayerId | null; copy_id: ObjectId; target_slots: CopyTargetSlot[]; current_slot?: number; mode?: CopyChoiceMode | null; picks?: (TargetRef | null)[] | null; can_keep_rest?: boolean; announcer_election?: AnnouncerElection | null } }
   // CR 700.3 + CR 700.3a: Subject is partitioning their own eligible objects
   // into two piles for an `Effect::SeparateIntoPiles`. `player` is the
   // CR 608.2d + CR 700.3: Controller chooses which opponent separates piles (multiplayer).
@@ -2838,6 +2902,9 @@ export type LearnOption =
 
 // ── Mulligan ─────────────────────────────────────────────────────────────
 
+// CR 103.5: what a held mulligan does when the declare round closes.
+export type MulliganDeclarationKind = { type: "Regular" } | { type: "FreeReveal" };
+
 // CR 103.5 + 103.5b: Player decision at a MulliganDecision prompt.
 //   Keep            — lock in the opening hand (CR 103.5).
 //   Mulligan        — shuffle hand back, redraw the starting hand size (CR 103.5).
@@ -2845,10 +2912,13 @@ export type LearnOption =
 //                     the same number; mulligan counter unchanged (CR 103.5b
 //                     + Serum Powder Oracle text). `object_id` must reference
 //                     a card named "Serum Powder" in the actor's hand.
+//   FreeReveal      — Dandan: reveal a qualifying hand, return it and redraw
+//                     without taking a regular mulligan (CR 103.5 as modified).
 export type MulliganChoice =
   | { type: "Keep" }
   | { type: "Mulligan" }
-  | { type: "UseSerumPowder"; data: { object_id: ObjectId } };
+  | { type: "UseSerumPowder"; data: { object_id: ObjectId } }
+  | { type: "FreeReveal" };
 
 // ── Distribution ─────────────────────────────────────────────────────────
 
@@ -3091,6 +3161,8 @@ export type GameAction =
   | { type: "ChooseTarget"; data: { target: TargetRef | null } }
   | { type: "ChoosePair"; data: { partner: ObjectId | null } }
   | { type: "ChooseReplacement"; data: { index: number } }
+  | { type: "ChooseReplacementAndRemember"; data: { choice: ReplacementAutoChoice } }
+  | { type: "SetReplacementAutoChoice"; data: { selector: string | null } }
   | { type: "ChooseEntryController"; data: { opponent: PlayerId } }
   | { type: "OrderTriggers"; data: { order: number[] } }
   // CR 601.2f: the caster's elected cost-reduction order — a permutation of
@@ -3200,7 +3272,7 @@ export type GameAction =
   | { type: "ChooseRemoveCounterCostDistribution"; data: { distribution: CounterCostChoice[] } }
   | { type: "ChooseCounterMoveDistribution"; data: { selections: CounterMoveChoice[] } }
   | { type: "ChooseCountersToRemove"; data: { selections: CounterRemoveChoice[] } }
-  | { type: "RetargetSpell"; data: { new_targets: TargetRef[] } }
+  | { type: "RetargetSpell"; data: { new_targets: (TargetRef | null)[] } }
   | { type: "LearnDecision"; data: { choice: LearnOption } }
   | { type: "ChooseDungeon"; data: { dungeon: DungeonId } }
   | { type: "ChooseDungeonRoom"; data: { room_index: number } }
@@ -3291,6 +3363,9 @@ export type PlayerActionKind =
   | "Draw"
   | "Forage";
 
+/** CR 602.2 + CR 605.1a + CR 606.1: which kind of activated ability was activated. */
+export type ActivatedAbilityKind = "Normal" | "Loyalty" | "Mana";
+
 export type GameEvent =
   | { type: "GameStarted" }
   | {
@@ -3303,9 +3378,13 @@ export type GameEvent =
   | { type: "PriorityPassed"; data: { player_id: PlayerId } }
   | { type: "SpellCast"; data: { card_id: CardId; controller: PlayerId; object_id: ObjectId; cast_mana_value?: number } }
   | { type: "XValueChosen"; data: { player: PlayerId; object_id: ObjectId; value: number } }
-  | { type: "AbilityActivated"; data: { player_id: PlayerId; source_id: ObjectId } }
+  // `kind` is the engine's activated-ability kind (CR 605.1a / 606.1); it is
+  // omitted by legacy payloads, which mean "Normal". `departed_source_lki` and
+  // `trigger_state` are engine-internal trigger authority the UI never renders.
+  | { type: "AbilityActivated"; data: { player_id: PlayerId; source_id: ObjectId; kind?: ActivatedAbilityKind } }
   | { type: "ExhaustAbilityActivated"; data: { player_id: PlayerId; source_id: ObjectId; is_mana_ability: boolean } }
-  | { type: "ZoneChanged"; data: { object_id: ObjectId; from: Zone; to: Zone } }
+  // `from` is null for an object that enters from no zone (a created token).
+  | { type: "ZoneChanged"; data: { object_id: ObjectId; from: Zone | null; to: Zone } }
   // `new_total` is the player's life total once this change is applied, supplied
   // by the engine (`LifeTotalReading`, serialized transparently) so a mid-animation
   // display can show intermediate totals. Absent on an event from a peer older than
@@ -3344,7 +3423,7 @@ export type GameEvent =
   | { type: "ObjectIntensified"; data: { object_id: ObjectId; amount: number } }
   | { type: "CounterRemoved"; data: { object_id: ObjectId; counter_type: string; count: number } }
   | { type: "TokenCreated"; data: { object_id: ObjectId; name: string; source_id: ObjectId } }
-  | { type: "CreatureDestroyed"; data: { object_id: ObjectId } }
+  | { type: "CreatureDestroyed"; data: { object_id: ObjectId; source_id: ObjectId | null } }
   | { type: "PermanentSacrificed"; data: { object_id: ObjectId; player_id: PlayerId } }
   | { type: "ArmyAmassed"; data: { object_id: ObjectId; source_id: ObjectId; controller: PlayerId } }
   | { type: "EffectResolved"; data: { kind: string; source_id: ObjectId } }
@@ -3389,7 +3468,7 @@ export type GameEvent =
   | { type: "EnergyChanged"; data: { player: PlayerId; delta: number } }
   | { type: "PlayerCounterChanged"; data: { player: PlayerId; counter_kind: PlayerCounterKind; delta: number } }
   | { type: "SpeedChanged"; data: { player: PlayerId; old_speed: number | null; new_speed: number | null } }
-  | { type: "CreatureExploited"; data: { exploiter: ObjectId; sacrificed: ObjectId } }
+  | { type: "CreatureExploited"; data: { exploiter: ObjectId; exploiter_incarnation?: number | null; sacrificed: ObjectId } }
   | { type: "PowerToughnessChanged"; data: { object_id: ObjectId; power: number; toughness: number; power_delta: number; toughness_delta: number } }
   | { type: "RoomEntered"; data: { player_id: PlayerId; dungeon: DungeonId; room_index: number; room_name: string } }
   | { type: "BecomesPlotted"; data: { object_id: ObjectId; player_id: PlayerId } }
@@ -3589,11 +3668,6 @@ export type UnboundedFamily =
   | "turns"
   | "triggers";
 
-/** Whether the boundary can still fail to apply a scheduled collapse. Mirrors
- *  `engine::game::derived_views::CollapseCertainty`. `Conditional` means the collapse may be
- *  declined or may park, and the axis then stays unbounded. */
-export type CollapseCertainty = "Committed" | "Conditional";
-
 /**
  * One display family's collapse coverage. Mirrors
  * `engine::game::derived_views::FamilyCollapseState` (serde `tag`/`content`).
@@ -3606,7 +3680,6 @@ export type FamilyCollapseState =
   | {
       type: "Scheduled";
       data: {
-        certainty: CollapseCertainty;
         /**
          * The seat the engine will ask to name the collapse count (CR 732.2a's "specified number
          * of times") — the loop's CONTROLLER. It is emitted because it is NOT recoverable from
@@ -3633,9 +3706,9 @@ export type FamilyCollapseState =
  * only the engine can answer.
  *
  * `state` is NOT a guarantee that the growth lands, and that is typed rather than disclosed:
- * `Scheduled(Conditional)` is exactly the case where a `Counters`/`Life` axis can be declined (a
+ * `Scheduled` is exactly the case where a `Counters`/`Life` axis can be declined (a
  * counter/life observer appeared between accept and boundary) or a `Tokens` mint can park, leaving
- * the axis unbounded with nothing applied. Only `Scheduled(Committed)` promises a bound.
+ * the axis unbounded with nothing applied.
  */
 export interface UnboundedFamilyView {
   player: PlayerId;
@@ -3749,9 +3822,30 @@ export type DecisionPointKind =
   | "MayChoice"
   | "UnlessBreak";
 
-/** Mirrors `engine::analysis::decision_template::DecisionSlot` (`index` is Rust `u8`). */
+/**
+ * Mirrors `engine::analysis::decision_template::ChoicePoint` (serde unit variants ⇒ bare
+ * strings on the wire). WHICH CHOICE a slot names, as distinct from which instance of it.
+ */
+export type ChoicePoint =
+  | "AnnouncedTarget"
+  | "MayGate"
+  | "TriggerOrder"
+  | "TapCost"
+  | "ProliferateSet"
+  | "ResolutionSet"
+  | "ManaColor"
+  | "ConvokeTaps"
+  | "Mode"
+  | "UnlessBreak";
+
+/**
+ * Mirrors `engine::analysis::decision_template::DecisionSlot` (`index` is Rust `u8`).
+ * Three axes: who asked (`source`), which choice (`point`), which instance of that choice
+ * on that source (`index`).
+ */
 export interface DecisionSlot {
   source: DecisionSource;
+  point: ChoicePoint;
   index: number;
 }
 
@@ -3771,11 +3865,16 @@ export type DecisionSource =
  */
 export type DecisionTemplate = Record<string, unknown>;
 
+/** Mirrors `engine::analysis::loop_check::OfferRoad`: which producer minted a loop-shortcut offer. */
+export type OfferRoad = "Ring" | "RecordedPeriod";
+
 /**
- * Mirrors `engine::analysis::loop_check::ShortcutProposal`. `shortened_by` is the responder
- * whose named place is the proposal's current ending point (CR 732.2b); it is `skip_serializing_if
- * none` on the wire, so an unshortened proposal serializes exactly as before and no protocol
- * version moves — the same posture the two optional fields this interface does not mirror ship.
+ * Mirrors `engine::analysis::loop_check::ShortcutProposal`, less the optional fields the frontend
+ * never reads. `shortened_by` is the responder whose named place is the proposal's current ending
+ * point (CR 732.2b); it is `skip_serializing_if none` on the wire, so an unshortened proposal
+ * serializes exactly as before. No protocol version moved for it because the count a shortening
+ * names rides in `count` itself. The serde posture alone never decides that: an omitted field
+ * whose absence changes what a peer drives still owes a bump.
  */
 export interface ShortcutProposal {
   proposer: PlayerId;
@@ -3784,6 +3883,7 @@ export interface ShortcutProposal {
   unbounded: ResourceAxis[];
   win_kind: WinKind;
   shortened_by?: PlayerId;
+  road: OfferRoad;
 }
 
 /**
@@ -3841,6 +3941,13 @@ export type TargetChoiceKind =
   | { type: "Objects"; data: { category: TargetObjectCategory } }
   | { type: "ObjectsAndPlayers"; data: { category: TargetObjectCategory } };
 
+export interface SharedPilesView {
+  /** The seat whose `Player.library` stores the shared library. */
+  library?: PlayerId;
+  /** The seat whose `Player.graveyard` stores the shared graveyard. */
+  graveyard?: PlayerId;
+}
+
 /**
  * Engine-authored projections computed at each state snapshot. Rides
  * alongside GameState through every adapter path. Frontend components
@@ -3850,6 +3957,8 @@ export type TargetChoiceKind =
  */
 export interface DerivedViews {
   unique_authorized_submitter?: PlayerId;
+  /** Engine-owned Scry prompt identity for this viewer, independent of opportunities. */
+  scry_prompt_id?: InteractionId;
   /** Viewer-visible object ids in each player's exile pile, keyed by PlayerId. */
   visible_exile_object_ids?: Record<string, ObjectId[]>;
   /**
@@ -3858,6 +3967,12 @@ export interface DerivedViews {
    * browser consumes this separately authorized projection.
    */
   debug_library_cards?: DebugLibraryCardView[];
+  /**
+   * Mirrors `engine::game::derived_views::SharedPilesView`. Present only for a
+   * format that shares a library or graveyard; a missing key means that zone is
+   * per-player.
+   */
+  shared_piles?: SharedPilesView;
   /**
    * Engine-classified live keyword badges for battlefield permanents. The
    * strip renders this map directly rather than deciding which keyword timing
@@ -4144,6 +4259,9 @@ export interface GameState {
   next_object_id: number;
   battlefield: ObjectId[];
   stack: StackEntry[];
+  /** The stack entry whose resolution is under way, while it waits on a
+   *  choice mid-resolution; absent between resolutions. */
+  resolving_stack_entry?: StackEntry;
   exile: ObjectId[];
   rng_seed: number;
   combat: CombatState | null;
@@ -4270,6 +4388,7 @@ export interface GameState {
   priority_yields?: PriorityYield[];
   /** CR 603.5: the viewer's stored "don't ask again" auto-choices for optional ("may") triggers. */
   may_trigger_auto_choices?: MayTriggerAutoChoiceRecord[];
+  replacement_auto_choices?: ReplacementAutoChoiceRecord[];
   lands_tapped_for_mana?: Record<number, number[]>;
   scheduled_turn_controls?: Array<{
     target_player: PlayerId;
@@ -4933,6 +5052,15 @@ export interface AiLlmProposalResult {
   /** The model's own one-line justification, for local diagnostics only. */
   reasoning?: string | null;
   error?: string;
+  /**
+   * Provider-reported token usage (`phase_llm::wire::TokenUsage`), present on
+   * success and refusal alike. Diagnostic only.
+   */
+  usage?: {
+    inputTokens?: number | null;
+    outputTokens?: number | null;
+    cachedInputTokens?: number | null;
+  } | null;
 }
 
 /** Engine-built HTTP call for one LLM request. Executed verbatim. */
@@ -4947,8 +5075,12 @@ export interface LlmHttpRequestSpec {
 export interface LlmDecisionRequestResult {
   fingerprint?: string;
   optionCount?: number;
+  /** Characters of prompt the request carries (system + user). */
+  promptChars?: number;
   request?: LlmHttpRequestSpec;
   error?: string;
+  /** The engine's typed refusal (`phase_llm::LlmError`), when it carries one. */
+  errorKind?: { kind: string };
 }
 
 /** Result of submitting an opaque AI proposal to its issuing authority. */

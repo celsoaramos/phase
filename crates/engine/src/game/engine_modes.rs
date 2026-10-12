@@ -4,10 +4,10 @@ use crate::types::identifiers::ObjectId;
 use crate::types::mana::ManaCost;
 
 use super::ability_utils::{
-    assign_targets_in_chain, auto_select_targets_for_ability, begin_target_selection_for_ability,
-    build_chained_resolved, build_target_slots_labelled, cap_distribution_target_slots,
-    random_select_targets_for_ability, record_modal_mode_choices, selected_mode_labels,
-    target_constraints_from_modal, validate_modal_indices,
+    assign_selected_slots_in_chain, auto_select_targets_for_ability,
+    begin_target_selection_for_ability, build_chained_resolved, build_target_slots_labelled,
+    cap_distribution_target_slots, random_select_targets_for_ability, record_modal_mode_choices,
+    selected_mode_labels, target_constraints_from_modal, validate_modal_indices,
 };
 use super::engine::EngineError;
 use super::engine_stack;
@@ -245,7 +245,7 @@ fn handle_activated_mode_choice(
 
         if let Some(targets) = resolved_targets {
             let mut resolved = resolved;
-            assign_targets_in_chain(state, &mut resolved, &targets)?;
+            assign_selected_slots_in_chain(state, &mut resolved, &targets)?;
             // CR 602.2b + CR 601.2c: automatic target assignment is still a
             // declaration before activation costs are paid.
             casting::emit_targeting_events(
@@ -253,6 +253,9 @@ fn handle_activated_mode_choice(
                 &super::ability_utils::declared_targets_in_chain(&resolved),
                 source_id,
                 player,
+                Some(crate::types::events::Targeter::Ability(
+                    crate::types::ability::StackAbilityKind::Activated,
+                )),
                 events,
             );
             let mut pending = PendingCast::for_activation(
@@ -335,8 +338,8 @@ struct TriggeredModeChoice {
 /// `dispatch_pending_trigger_context`): `state.pending_trigger` is set and its
 /// stack entry is already pushed and tracked by `state.pending_trigger_entry`.
 ///
-/// Returns `Ok(None)` when no mode can be chosen (CR 603.3c) so the caller drops
-/// the trigger exactly as the all-modes-unavailable branch does.
+/// Returns `Ok(None)` when no mode can be chosen (CR 603.3c); the caller drops
+/// the pushed entry through `drop_mid_construction_pending_trigger`.
 pub(super) fn resolve_random_modal_trigger(
     state: &mut GameState,
     player: crate::types::player::PlayerId,
@@ -349,15 +352,8 @@ pub(super) fn resolve_random_modal_trigger(
     let Some(indices) =
         super::ability_utils::random_select_modal_indices(state, &modal, unavailable_modes)
     else {
-        // CR 603.3c: No legal mode — drop the trigger. The interactive branches
-        // already removed the in-flight stack entry before this point, so just
-        // clear the cursor here.
-        super::stack::pop_uncommitted_pending_trigger_entry(
-            state,
-            super::lifecycle::DelayedTerminalDisposition::NoLegalChoice,
-        );
-        state.pending_trigger = None;
-        state.pending_trigger_firing = None;
+        // CR 603.3c: No mode can be chosen. The caller drops the pushed entry
+        // through `drop_mid_construction_pending_trigger`.
         return Ok(None);
     };
 
@@ -383,6 +379,77 @@ pub(super) fn resolve_random_modal_trigger(
     Ok(Some(waiting_for))
 }
 
+/// CR 603.3c: choosing a modal trigger's modes is part of putting that one
+/// ability on the stack, so the chosen modes keep every stamp the trigger
+/// received when it triggered and was pushed.
+fn carry_trigger_provenance(
+    pending: &crate::types::ability::ResolvedAbility,
+    chosen: &mut crate::types::ability::ResolvedAbility,
+) {
+    if let Some(source) = &pending.trigger_source {
+        chosen.set_trigger_source_recursive(source.clone());
+    }
+    if pending.source_incarnation.is_some() {
+        chosen.set_source_incarnation_recursive(pending.source_incarnation);
+    }
+    if let Some(player) = pending.original_controller {
+        chosen.set_original_controller_recursive(player);
+    }
+    if let Some(definition_ref) = &pending.trigger_definition_ref {
+        chosen.set_trigger_definition_ref_recursive(definition_ref.clone());
+    }
+    if let Some(origin) = &pending.may_trigger_origin {
+        chosen.set_may_trigger_origin_recursive(origin.clone());
+    }
+    if let Some(player) = pending.scoped_player {
+        chosen.set_scoped_player_recursive(player);
+    }
+    if let Some(x) = pending.chosen_x {
+        chosen.set_chosen_x_recursive(x);
+    }
+    if let Some(snapshot) = &pending.cost_paid_object {
+        chosen.set_cost_paid_object_recursive(snapshot.clone());
+    }
+    if chosen.unless_pay.is_none() {
+        chosen.unless_pay.clone_from(&pending.unless_pay);
+    }
+    let context = &pending.context;
+    if context.source_transformation_count.is_some() {
+        chosen.set_source_transformation_count_recursive(context.source_transformation_count);
+    }
+    if context.source_ability_provenance.is_some() {
+        chosen.set_source_ability_provenance_recursive(context.source_ability_provenance);
+    }
+    if let Some(event) = &context.creation_lookback_event {
+        chosen.set_creation_lookback_event_recursive(event);
+    }
+    for &event in &context.duration_events {
+        chosen.record_duration_event_recursive(event);
+    }
+    // The trigger build stamps the source's cast facts on the root only.
+    chosen.context.cast_from_zone = chosen.context.cast_from_zone.or(context.cast_from_zone);
+    if !context.kickers_paid.is_empty() {
+        chosen
+            .context
+            .kickers_paid
+            .clone_from(&context.kickers_paid);
+    }
+    if !context.additional_cost_payments.is_empty() {
+        chosen
+            .context
+            .additional_cost_payments
+            .clone_from(&context.additional_cost_payments);
+    }
+    chosen.context.additional_cost_payment_count = context.additional_cost_payment_count;
+    chosen.context.additional_cost_paid |= context.additional_cost_paid;
+    chosen.bind_force_block_source_recursive(pending.source_incarnation.map(|incarnation| {
+        crate::types::identifiers::ObjectIncarnationRef {
+            object_id: pending.source_id,
+            incarnation,
+        }
+    }));
+}
+
 fn handle_triggered_mode_choice(
     state: &mut GameState,
     choice: TriggeredModeChoice,
@@ -391,7 +458,7 @@ fn handle_triggered_mode_choice(
     let TriggeredModeChoice {
         player,
         source_id,
-        resolved,
+        mut resolved,
         modal,
         mode_abilities,
         indices,
@@ -401,6 +468,13 @@ fn handle_triggered_mode_choice(
         .pending_trigger
         .take()
         .ok_or_else(|| EngineError::InvalidAction("No pending trigger".to_string()))?;
+    // The stack entry holds the push-time stamps the pending carrier lacks.
+    let pending = state
+        .pending_trigger_entry
+        .and_then(|id| state.stack.iter().rev().find(|entry| entry.id == id))
+        .and_then(|entry| entry.ability())
+        .unwrap_or(trigger.ability.as_ref());
+    carry_trigger_provenance(pending, &mut resolved);
     // CR 603.2 + CR 109.4: Re-establish the trigger event context for
     // the duration of mode-target computation. The modal was paused for mode
     // choice (`trigger_dispatch`) AFTER restoring the context to its pre-dispatch
@@ -494,7 +568,7 @@ fn handle_triggered_mode_choice(
             // optimized, which is why the mechanical `(*b).clone()` rewrite was
             // reverted at this call site.
             let mut resolved = trigger.ability.clone();
-            assign_targets_in_chain(state, &mut resolved, &targets)?;
+            assign_selected_slots_in_chain(state, &mut resolved, &targets)?;
             // CR 113.2c + CR 603.2 + CR 603.3b: `finalize_trigger_target_selection`
             // already drains the deferred-trigger queue and surfaces the next
             // WaitingFor if a sibling trigger needs input; use that result
