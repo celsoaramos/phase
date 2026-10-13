@@ -192,5 +192,8 @@
   },
   {
     "branch": "card/command-bridge-unless-tap"
+  },
+  {
+    "branch": "card/counter-hexproof-spell"
   }
 ]
