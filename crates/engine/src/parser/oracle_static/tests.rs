@@ -26958,7 +26958,7 @@ fn static_life_total_cant_change_opponent_scope() {
     }
 }
 
-/// CR 121.3 + CR 119.7: "[Subject] can't draw cards or gain life." emits both
+/// CR 101.2 + CR 121.3 + CR 119.7: "[Subject] can't draw cards or gain life." emits both
 /// prohibitions, and the life clause binds the same subject as the draw clause
 /// (Mornsong Aria: "Players"; an opponent subject scopes both to opponents).
 #[test]

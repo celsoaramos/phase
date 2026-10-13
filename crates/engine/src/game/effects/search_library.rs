@@ -35,8 +35,11 @@ fn resolve_library_owner(
     // CR 608.2c: "that player ... searches their library" under a player-scoped
     // trigger (Mornsong Aria, Maralen of the Mornsong: "each player's draw step")
     // names the scoped player's library, not the source controller's.
+    // Resolved by the shared context resolver, the same authority the chained
+    // `Shuffle { ScopedPlayer }` uses, so the search and the shuffle name the
+    // same player.
     if matches!(target_player, TargetFilter::ScopedPlayer) {
-        if let Some(player) = ability.scoped_player {
+        if let Some(player) = super::resolve_player_for_context_ref(state, ability, target_player) {
             return player;
         }
     }
