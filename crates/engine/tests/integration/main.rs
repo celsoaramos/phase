@@ -1084,6 +1084,7 @@ mod l02_bb7_cast_context_gates;
 mod l02_bbfu2_batched_counter_triggers;
 mod l02_bbfu4_copy_cast_origin;
 mod lady_loki_agent_of_chaos;
+mod lady_octopus_first_or_second_draw_counter;
 mod laezel_acrobatics_tracked_set_double_exile;
 mod land_equilibrium_forced_sacrifice;
 mod landing_zone_this_way_quantity;
