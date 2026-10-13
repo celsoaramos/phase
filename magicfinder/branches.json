@@ -183,5 +183,8 @@
   },
   {
     "branch": "card/scoped-player-search"
+  },
+  {
+    "branch": "card/top-library-multi-permission"
   }
 ]
