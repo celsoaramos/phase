@@ -494,14 +494,7 @@ fn find_legal_targets_with_context(
     } else {
         // No explicit zone: default behavior (battlefield + stack for Card type)
         if filter_targets_stack_spells(filter) {
-            add_stack_spells(
-                state,
-                filter,
-                source_controller,
-                source_id,
-                target_ctx,
-                &mut targets,
-            );
+            add_stack_spells(state, filter, source_id, target_ctx, &mut targets);
         }
 
         for &obj_id in &state.battlefield {
@@ -3245,15 +3238,10 @@ fn add_zone_targets(
 fn add_stack_spells(
     state: &GameState,
     filter: &TargetFilter,
-    source_controller: PlayerId,
     source_id: ObjectId,
     target_ctx: &super::filter::FilterContext,
     targets: &mut Vec<TargetRef>,
 ) {
-    // Target-invariant player-scoped hexproof bypass (CR 702.11b) hoisted ONCE per
-    // enumeration and threaded into every `can_target` below.
-    let source_ignores_hexproof =
-        crate::game::static_abilities::player_ignores_hexproof(state, source_controller);
     for entry in targetable_stack_spell_entries(state) {
         // CR 601.2c: A spell choosing stack targets during its own cast cannot
         // select itself — targeting the counterspell removes only the counter
@@ -3270,16 +3258,26 @@ fn add_stack_spells(
             Some(o) => o,
             None => continue,
         };
-        if can_target(
-            obj,
-            source_controller,
-            source_id,
-            source_ignores_hexproof,
-            state,
-        ) {
+        if can_target_stack_spell(obj, state) {
             targets.push(TargetRef::Object(entry.id));
         }
     }
+}
+
+/// CR 115.1: targeting restrictions for a SPELL on the stack.
+///
+/// Shroud (CR 702.18a), hexproof (CR 702.11b) and protection (CR 702.16b) are
+/// worded for a *permanent* (or player): a creature card with hexproof is a
+/// spell, not a permanent, while it is on the stack, so those keywords don't
+/// stop a counterspell from targeting it — Counterspell targets Narset,
+/// Enlightened Master or Emrakul, the Aeons Torn on the stack. Routing stack
+/// spells through the battlefield [`can_target`] made every hexproof creature
+/// spell uncounterable by targeted counters. Only a functioning
+/// `StaticMode::CantBeTargeted` (CR 702.18a's descriptive form, which reads the
+/// object's zone-aware active statics) still applies.
+fn can_target_stack_spell(obj: &crate::game::game_object::GameObject, state: &GameState) -> bool {
+    !super::functioning_abilities::active_static_definitions(state, obj)
+        .any(|def| matches!(def.mode, crate::types::statics::StaticMode::CantBeTargeted))
 }
 
 /// CR 608.2g: expose a parked resolving spell only while its object is still
@@ -5921,6 +5919,68 @@ mod tests {
         let targets = find_legal_targets(&state, &TargetFilter::StackSpell, PlayerId(0), counter);
         assert!(targets.contains(&TargetRef::Object(opponent_spell)));
         assert!(!targets.contains(&TargetRef::Object(counter)));
+    }
+
+    #[test]
+    fn stack_spell_with_hexproof_shroud_or_protection_is_still_targetable() {
+        // CR 702.11b / CR 702.18a / CR 702.16b: hexproof, shroud and protection
+        // restrict PERMANENTS. A creature spell carrying them (Narset, Enlightened
+        // Master; Emrakul, the Aeons Torn) is a legal Counterspell target on the
+        // stack. Field report 2026-10-13: an opponent's Narset cast from the
+        // command zone could not be countered.
+        for keyword in [
+            Keyword::Hexproof,
+            Keyword::Shroud,
+            Keyword::HexproofFrom(HexproofFilter::Color(ManaColor::Blue)),
+            Keyword::Protection(crate::types::keywords::ProtectionTarget::Color(
+                ManaColor::Blue,
+            )),
+        ] {
+            let mut state = GameState::new_two_player(42);
+            let counter = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(0),
+                "Counterspell".to_string(),
+                Zone::Stack,
+            );
+            state
+                .objects
+                .get_mut(&counter)
+                .unwrap()
+                .color
+                .push(ManaColor::Blue);
+            let creature_spell = create_object(
+                &mut state,
+                CardId(2),
+                PlayerId(1),
+                "Narset, Enlightened Master".to_string(),
+                Zone::Stack,
+            );
+            state
+                .objects
+                .get_mut(&creature_spell)
+                .unwrap()
+                .keywords
+                .push(keyword.clone());
+            state.stack.push_back(crate::types::game_state::StackEntry {
+                id: creature_spell,
+                source_id: creature_spell,
+                controller: PlayerId(1),
+                kind: crate::types::game_state::StackEntryKind::Spell {
+                    card_id: CardId(2),
+                    ability: None,
+                    casting_variant: CastingVariant::Normal,
+                    actual_mana_spent: 0,
+                },
+            });
+            let targets =
+                find_legal_targets(&state, &TargetFilter::StackSpell, PlayerId(0), counter);
+            assert!(
+                targets.contains(&TargetRef::Object(creature_spell)),
+                "{keyword:?} on a spell must not stop a counterspell from targeting it"
+            );
+        }
     }
 
     #[test]
