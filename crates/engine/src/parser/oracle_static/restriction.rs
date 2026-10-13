@@ -1833,10 +1833,24 @@ pub(crate) fn parse_cant_draw_cards_or_gain_life(
         return None;
     }
 
+    // Both prohibitions bind the one parsed subject, so the life clause's
+    // player scope is derived from `who` rather than re-scanned from the text.
+    let life_scope = match &who {
+        ProhibitionScope::AllPlayers => TargetFilter::Typed(TypedFilter::default()),
+        ProhibitionScope::Opponents => {
+            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
+        }
+        ProhibitionScope::Controller => {
+            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::You))
+        }
+        // CR 303.4e: "Enchanted player" — the player the Aura is attached to.
+        ProhibitionScope::EnchantedCreatureController => TargetFilter::AttachedTo,
+    };
+
     Some(vec![
         StaticDefinition::new(StaticMode::CantDraw { who }).description(text.to_string()),
         StaticDefinition::new(StaticMode::CantGainLife)
-            .affected(parse_player_scope_filter(tp))
+            .affected(life_scope)
             .description(text.to_string()),
     ])
 }
