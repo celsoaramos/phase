@@ -2394,7 +2394,7 @@ pub fn fallback_action(
             ..
         } => issued_selection(contract),
         WaitingFor::PayCost {
-            resume: CostResume::Resolution,
+            resume: CostResume::Resolution | CostResume::UnlessPayment { .. },
             ..
         } => issued(|action| matches!(action, GameAction::SelectCards { .. })),
 

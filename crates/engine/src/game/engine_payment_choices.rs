@@ -1738,6 +1738,45 @@ pub(super) fn handle_unless_payment(
                     payment_failed = true;
                 }
             }
+            // CR 118.12 + CR 701.26a: "[effect] unless [player] taps N untapped
+            // [permanents] they control" (Command Bridge). The selection and the
+            // bounds come from the single resolution payment authority, which
+            // surfaces the same `PayCost { TapCreatures }` object choice that
+            // optional "you may tap" costs use. The prompt resumes through
+            // `CostResume::UnlessPayment`, so completing the selection settles
+            // THIS unless payment (the guarded effect does not happen) instead
+            // of draining the generic resolution continuation. Paying is
+            // checked against the payer's own permanents: the authority reads
+            // the filter's "you" from the ability's controller, so the payer is
+            // swapped in (CR 118.12: the player who pays is the one who taps).
+            AbilityCost::TapCreatures { .. } => {
+                let mut payer_ability = pending_effect.as_ref().clone();
+                payer_ability.controller = player;
+                match costs::pay_ability_cost_for_resolution(
+                    state,
+                    player,
+                    &cost,
+                    &payer_ability,
+                    events,
+                )? {
+                    PaymentOutcome::Paid => {}
+                    PaymentOutcome::Failed { .. } => payment_failed = true,
+                    PaymentOutcome::Paused { .. } => {
+                        let WaitingFor::PayCost { resume, .. } = &mut state.waiting_for else {
+                            return Err(EngineError::InvalidAction(
+                                "unless tap payment paused without a PayCost prompt".to_string(),
+                            ));
+                        };
+                        *resume = crate::types::game_state::CostResume::UnlessPayment {
+                            unless: Box::new(crate::types::game_state::UnlessCostResume {
+                                pending_effect: pending_effect.as_ref().clone(),
+                                trigger_event: trigger_event.clone(),
+                            }),
+                        };
+                        return Ok(action_result(events, state.waiting_for.clone()));
+                    }
+                }
+            }
             AbilityCost::Tap
             | AbilityCost::Untap
             | AbilityCost::Unattach
@@ -1750,7 +1789,6 @@ pub(super) fn handle_unless_payment(
             // CR 118.12: `ExileWithAggregate` has no unless-payment dialog; an
             // unpayable unless cost falls through to the effect (rules-correct).
             | AbilityCost::ExileWithAggregate { .. }
-            | AbilityCost::TapCreatures { .. }
             // CR 122.6 + CR 118.12: `RemoveCounter { target: Some(_) }`
             // (e.g., Chisei "a permanent you control") requires an
             // interactive object-choice dialog not yet wired for
@@ -1868,6 +1906,42 @@ pub(super) fn handle_unless_payment(
         post_action_event_start,
         events,
     )
+}
+
+/// The payer's object selection for an interactive unless-tap cost.
+pub(super) struct UnlessTapSelection<'a> {
+    pub min_count: usize,
+    pub count: usize,
+    pub mode: crate::types::ability::TapCreaturesSelectionMode,
+    pub legal: &'a [ObjectId],
+    pub chosen: &'a [ObjectId],
+}
+
+/// CR 118.12 + CR 701.26a: Complete an "[effect] unless [player] taps …"
+/// payment once the payer picked the permanents (Command Bridge). Tapping is
+/// validated and performed by the same authority as every other tap-N cost;
+/// on success the guarded effect is suppressed exactly like any other paid
+/// unless cost.
+pub(super) fn finish_unless_tap_payment(
+    state: &mut GameState,
+    selection: UnlessTapSelection<'_>,
+    unless: &crate::types::game_state::UnlessCostResume,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    crate::game::casting_costs::pay_tap_creatures_selection(
+        state,
+        selection.min_count,
+        selection.count,
+        selection.mode,
+        selection.legal,
+        selection.chosen,
+        events,
+    )?;
+    state.last_effect_count = Some(selection.chosen.len() as i32);
+    if matches!(state.waiting_for, WaitingFor::PayCost { .. }) {
+        set_active_priority(state);
+    }
+    finish_successful_unless_payment(state, &unless.pending_effect, &unless.trigger_event, events)
 }
 
 /// CR 118.12 + CR 118.12a: The DECLINED-or-FAILED epilogue for every

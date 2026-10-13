@@ -12241,7 +12241,7 @@ fn apply_non_priority_pass_action(
                     "Counter-cost distribution is not valid for mana abilities".to_string(),
                 ));
             }
-            CostResume::Resolution => {
+            CostResume::Resolution | CostResume::UnlessPayment { .. } => {
                 return Err(EngineError::InvalidAction(
                     "Counter-cost distribution is not valid for resolution costs".to_string(),
                 ));
@@ -12569,6 +12569,29 @@ fn apply_non_priority_pass_action(
                 | PayCostKind::ExileFromManaZone { .. } => {
                     return Err(EngineError::InvalidAction(
                         "Cost kind cannot resume a resolution PayCost".into(),
+                    ));
+                }
+            },
+            // CR 118.12: the payer chose which permanents pay an
+            // "unless [player] taps …" cost; tapping them IS the payment.
+            CostResume::UnlessPayment { unless } => match kind {
+                PayCostKind::TapCreatures { mode } => {
+                    engine_payment_choices::finish_unless_tap_payment(
+                        state,
+                        engine_payment_choices::UnlessTapSelection {
+                            min_count: *min_count,
+                            count: *count,
+                            mode: *mode,
+                            legal: choices,
+                            chosen: &chosen,
+                        },
+                        unless,
+                        &mut events,
+                    )?
+                }
+                _ => {
+                    return Err(EngineError::InvalidAction(
+                        "Cost kind cannot resume an unless payment".into(),
                     ));
                 }
             },

@@ -10836,6 +10836,27 @@ pub enum CostResume {
     /// CR 118.12: Resume a resolution-time `Effect::PayCost` after the payer
     /// selects objects for an interactive cost such as tapping creatures.
     Resolution,
+    /// CR 118.12: Resume an "[effect] unless [player] taps …" cost after the
+    /// payer selects which permanents to tap (Command Bridge, "sacrifice it
+    /// unless you tap an untapped permanent you control"). The payer already
+    /// answered `PayUnlessCost { pay: true }`; completing the selection is the
+    /// payment, so the guarded effect is suppressed via
+    /// `finish_successful_unless_payment` instead of draining the generic
+    /// resolution continuation (which would let the guarded effect happen).
+    UnlessPayment {
+        #[serde(rename = "UnlessPayment")]
+        unless: Box<UnlessCostResume>,
+    },
+}
+
+/// CR 118.12: The unless-payment continuation carried by
+/// [`CostResume::UnlessPayment`] while the payer picks the objects that pay
+/// an interactive unless-cost. Boxed so `WaitingFor::PayCost` stays small.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnlessCostResume {
+    pub pending_effect: ResolvedAbility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_event: Option<GameEvent>,
 }
 
 /// CR 601.2h + CR 702.48c: Identifies which spell-cost component a
@@ -18101,7 +18122,9 @@ impl WaitingFor {
                     spell: pending_cast,
                     ..
                 } => Some(pending_cast),
-                CostResume::ManaAbility { .. } | CostResume::Resolution => None,
+                CostResume::ManaAbility { .. }
+                | CostResume::Resolution
+                | CostResume::UnlessPayment { .. } => None,
             },
             WaitingFor::CollectEvidenceChoice { resume, .. } => match resume.as_ref() {
                 CollectEvidenceResume::Casting { pending_cast, .. } => Some(pending_cast),
@@ -18137,7 +18160,9 @@ impl WaitingFor {
                     spell: pending_cast,
                     ..
                 } => Some(pending_cast),
-                CostResume::ManaAbility { .. } | CostResume::Resolution => None,
+                CostResume::ManaAbility { .. }
+                | CostResume::Resolution
+                | CostResume::UnlessPayment { .. } => None,
             },
             WaitingFor::CollectEvidenceChoice { resume, .. } => match resume.as_mut() {
                 CollectEvidenceResume::Casting { pending_cast, .. } => Some(pending_cast),
@@ -18384,7 +18409,8 @@ impl WaitingFor {
                 CostResume::ManaAbility { mana_ability } => Some(mana_ability),
                 CostResume::Spell { .. }
                 | CostResume::SpellCost { .. }
-                | CostResume::Resolution => None,
+                | CostResume::Resolution
+                | CostResume::UnlessPayment { .. } => None,
             },
             WaitingFor::CollectEvidenceChoice { resume, .. } => match resume.as_ref() {
                 CollectEvidenceResume::ManaAbility {

@@ -442,6 +442,9 @@ function payCostSourceId(data: Extract<WaitingFor, { type: "PayCost" }>["data"])
   if (data.resume.type === "Resolution") {
     return undefined;
   }
+  if (data.resume.type === "UnlessPayment") {
+    return data.resume.UnlessPayment.pending_effect.source_id;
+  }
   return (data.resume.Spell as { object_id?: ObjectId } | undefined)?.object_id;
 }
 

@@ -837,6 +837,7 @@ export type PayCostKind =
 export type CostResume =
   | { type: "Spell"; Spell: PendingCast }
   | { type: "Resolution" }
+  | { type: "UnlessPayment"; UnlessPayment: { pending_effect: { source_id?: ObjectId } } }
   | { type: "ManaAbility"; ManaAbility: unknown };
 
 export type ManaColor = "White" | "Blue" | "Black" | "Red" | "Green";
