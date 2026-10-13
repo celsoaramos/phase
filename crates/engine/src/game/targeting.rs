@@ -425,7 +425,6 @@ fn find_legal_targets_with_context(
                     zone_card_ids(state, Zone::Exile),
                     filter,
                     target_ctx,
-                    false,
                     &mut targets,
                 ),
                 Zone::Graveyard => {
@@ -436,7 +435,6 @@ fn find_legal_targets_with_context(
                             player.graveyard.iter().copied(),
                             filter,
                             target_ctx,
-                            false,
                             &mut targets,
                         );
                     }
@@ -449,7 +447,6 @@ fn find_legal_targets_with_context(
                             player.hand.iter().copied(),
                             filter,
                             target_ctx,
-                            false,
                             &mut targets,
                         );
                     }
@@ -462,7 +459,6 @@ fn find_legal_targets_with_context(
                             player.library.iter().copied(),
                             filter,
                             target_ctx,
-                            false,
                             &mut targets,
                         );
                     }
@@ -482,7 +478,7 @@ fn find_legal_targets_with_context(
                                 Some(o) => o,
                                 None => continue,
                             };
-                            if !is_protected_from(obj, source_id, state) {
+                            if can_target_off_battlefield(obj, state) {
                                 targets.push(TargetRef::Object(obj_id));
                             }
                         }
@@ -3199,36 +3195,15 @@ fn add_zone_targets(
     object_ids: impl IntoIterator<Item = ObjectId>,
     filter: &TargetFilter,
     target_ctx: &super::filter::FilterContext,
-    require_full_targeting: bool,
     targets: &mut Vec<TargetRef>,
 ) {
-    let source_id = target_ctx.source_id;
-    let source_controller = target_ctx
-        .source_controller
-        .expect("target enumeration context must include a source controller");
-    // Target-invariant player-scoped hexproof bypass (CR 702.11b) hoisted ONCE per
-    // enumeration. Only the `require_full_targeting` arm consults `can_target`, so the scan
-    // is skipped entirely when full targeting isn't required (the else-arm uses only the
-    // per-object `is_protected_from`).
-    let source_ignores_hexproof = require_full_targeting
-        && crate::game::static_abilities::player_ignores_hexproof(state, source_controller);
     for obj_id in object_ids {
         if super::filter::matches_target_filter_for_zone(state, obj_id, zone, filter, target_ctx) {
             let obj = match state.objects.get(&obj_id) {
                 Some(o) => o,
                 None => continue,
             };
-            if require_full_targeting {
-                if can_target(
-                    obj,
-                    source_controller,
-                    source_id,
-                    source_ignores_hexproof,
-                    state,
-                ) {
-                    targets.push(TargetRef::Object(obj_id));
-                }
-            } else if !is_protected_from(obj, source_id, state) {
+            if can_target_off_battlefield(obj, state) {
                 targets.push(TargetRef::Object(obj_id));
             }
         }
@@ -3258,24 +3233,29 @@ fn add_stack_spells(
             Some(o) => o,
             None => continue,
         };
-        if can_target_stack_spell(obj, state) {
+        if can_target_off_battlefield(obj, state) {
             targets.push(TargetRef::Object(entry.id));
         }
     }
 }
 
-/// CR 115.1: targeting restrictions for a SPELL on the stack.
+/// CR 113.6: targeting restrictions for an object that is not a permanent — a
+/// spell on the stack, or a card in a graveyard, exile, a hand or a library.
 ///
-/// Shroud (CR 702.18a), hexproof (CR 702.11b) and protection (CR 702.16b) are
-/// worded for a *permanent* (or player): a creature card with hexproof is a
-/// spell, not a permanent, while it is on the stack, so those keywords don't
-/// stop a counterspell from targeting it — Counterspell targets Narset,
-/// Enlightened Master or Emrakul, the Aeons Torn on the stack. Routing stack
-/// spells through the battlefield [`can_target`] made every hexproof creature
-/// spell uncounterable by targeted counters. Only a functioning
-/// `StaticMode::CantBeTargeted` (CR 702.18a's descriptive form, which reads the
-/// object's zone-aware active statics) still applies.
-fn can_target_stack_spell(obj: &crate::game::game_object::GameObject, state: &GameState) -> bool {
+/// Shroud (CR 702.18a), hexproof (CR 702.11b, CR 702.11d) and protection
+/// (CR 702.16b) are worded for "this permanent" (or "permanent or player"), and
+/// CR 113.6 has a creature card's abilities function only on the battlefield, so
+/// none of them restricts targeting anywhere else: Counterspell targets Narset,
+/// Enlightened Master (hexproof) on the stack, Disallow targets a
+/// protection-from-blue creature spell, and Unearth targets a
+/// protection-from-black creature card in the graveyard. Only a
+/// functioning `StaticMode::CantBeTargeted` (the descriptive form of CR 702.18a)
+/// still applies; `active_static_definitions` decides whether that static
+/// functions in the object's current zone.
+fn can_target_off_battlefield(
+    obj: &crate::game::game_object::GameObject,
+    state: &GameState,
+) -> bool {
     !super::functioning_abilities::active_static_definitions(state, obj)
         .any(|def| matches!(def.mode, crate::types::statics::StaticMode::CantBeTargeted))
 }
@@ -5924,10 +5904,10 @@ mod tests {
     #[test]
     fn stack_spell_with_hexproof_shroud_or_protection_is_still_targetable() {
         // CR 702.11b / CR 702.18a / CR 702.16b: hexproof, shroud and protection
-        // restrict PERMANENTS. A creature spell carrying them (Narset, Enlightened
-        // Master; Emrakul, the Aeons Torn) is a legal Counterspell target on the
-        // stack. Field report 2026-10-13: an opponent's Narset cast from the
-        // command zone could not be countered.
+        // restrict PERMANENTS (CR 113.6). A creature spell carrying them (Narset,
+        // Enlightened Master) is a legal Counterspell target on the stack. Field
+        // report 2026-10-13: an opponent's Narset cast from the command zone could
+        // not be countered.
         for keyword in [
             Keyword::Hexproof,
             Keyword::Shroud,
