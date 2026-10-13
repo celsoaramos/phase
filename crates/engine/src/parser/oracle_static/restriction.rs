@@ -1810,6 +1810,37 @@ pub(crate) fn parse_cant_draw_cards(tp: &str, text: &str) -> Option<StaticDefini
     Some(StaticDefinition::new(StaticMode::CantDraw { who }).description(text.to_string()))
 }
 
+/// CR 121.3 + CR 119.7: "[Subject] can't draw cards or gain life." — two
+/// prohibitions sharing one subject (Mornsong Aria). The single-static
+/// `parse_cant_draw_cards` stops after "cards" and silently drops the life clause.
+pub(crate) fn parse_cant_draw_cards_or_gain_life(
+    tp: &TextPair<'_>,
+    text: &str,
+) -> Option<Vec<StaticDefinition>> {
+    type VE<'a> = OracleError<'a>;
+
+    let (who, predicate) = strip_casting_prohibition_subject(tp.lower)?;
+    let rest = nom_tag_lower(predicate, predicate, "can't draw ")
+        .or_else(|| nom_tag_lower(predicate, predicate, "can\u{2019}t draw "))?;
+    let (rest, _) = alt((
+        value((), tag::<_, _, VE<'_>>("cards")),
+        value((), tag::<_, _, VE<'_>>("a card")),
+    ))
+    .parse(rest)
+    .ok()?;
+    let rest = nom_tag_lower(rest, rest, " or gain life")?;
+    if !rest.trim_end_matches('.').trim().is_empty() {
+        return None;
+    }
+
+    Some(vec![
+        StaticDefinition::new(StaticMode::CantDraw { who }).description(text.to_string()),
+        StaticDefinition::new(StaticMode::CantGainLife)
+            .affected(parse_player_scope_filter(tp))
+            .description(text.to_string()),
+    ])
+}
+
 /// CR 121.1 + CR 613.11: Parse a draw-source redirection static from Oracle
 /// text: "[Subject] draw(s) cards from the bottom of [your|their] library
 /// rather than/instead of the top." → `DrawFromBottom { who }`.
