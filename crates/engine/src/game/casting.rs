@@ -6585,8 +6585,14 @@ pub(crate) fn top_of_library_permission_source(
         if obj.controller != player {
             continue;
         }
+        // CR 601.2a: One permanent can carry SEVERAL top-of-library
+        // permissions (Augur of Autumn: "play lands from the top" AND, with
+        // coven, "cast creature spells from the top"). Each is checked against
+        // the top card on its own — taking the first permission by mode and
+        // only then testing its filter let the land permission veto the
+        // creature one, so a creature on top was never castable.
         let Some((frequency, alt_cost)) = active_static_definitions(state, obj)
-            .find_map(|s| match &s.mode {
+            .filter_map(|s| match &s.mode {
                 StaticMode::TopOfLibraryCastPermission {
                     play_mode,
                     frequency,
@@ -6614,20 +6620,24 @@ pub(crate) fn top_of_library_permission_source(
                     {
                         return None;
                     }
-                    s.affected
-                        .as_ref()
-                        .map(|f| (f, *frequency, alt_cost.clone()))
+                    let filter = s.affected.as_ref()?;
+                    super::filter::matches_target_filter(
+                        state,
+                        top_id,
+                        filter,
+                        &super::filter::FilterContext::from_source_with_controller(src_id, player),
+                    )
+                    .then(|| (*frequency, alt_cost.clone()))
                 }
                 _ => None,
             })
-            .and_then(|(filter, frequency, alt_cost)| {
-                super::filter::matches_target_filter(
-                    state,
-                    top_id,
-                    filter,
-                    &super::filter::FilterContext::from_source_with_controller(src_id, player),
-                )
-                .then_some((frequency, alt_cost))
+            // CR 601.2a: within one source too, an `Unlimited` permission wins.
+            .reduce(|kept, next| {
+                if !kept.0.is_unlimited() && next.0.is_unlimited() {
+                    next
+                } else {
+                    kept
+                }
             })
         else {
             continue;

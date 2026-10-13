@@ -42858,6 +42858,102 @@ mod top_of_library_cast_permission_runtime {
         );
     }
 
+    /// CR 601.2a + CR 305.1 + CR 401.5: Augur of Autumn carries TWO
+    /// top-of-library permissions on one permanent — "play lands" (Play,
+    /// lands) and, with coven, "cast creature spells" (Cast, creatures). The
+    /// land permission comes first; it must not veto the creature one when
+    /// the top card is a creature. Field report 2026-10-13: a creature on top
+    /// was never castable with coven on.
+    #[test]
+    fn augur_of_autumn_land_permission_does_not_veto_coven_creature_cast() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let augur = {
+            let mut b = scenario.add_creature(P0, "Augur of Autumn", 2, 3);
+            b.from_oracle_text(
+                "You may look at the top card of your library any time.\n\
+                 You may play lands from the top of your library.\n\
+                 Coven — As long as you control three or more creatures with different powers, you may cast creature spells from the top of your library.",
+            );
+            b.id()
+        };
+        // Two more creatures with powers different from Augur's 2 → coven on.
+        scenario.add_creature(P0, "Power One", 1, 1);
+        scenario.add_creature(P0, "Power Five", 5, 5);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+
+        let creature = put_card_on_top_of_library(
+            state,
+            P0,
+            CardId(920),
+            "Top Creature",
+            vec![CoreType::Creature],
+        );
+        assert_eq!(
+            top_of_library_selected_permission(state, P0, creature).map(|(src, _)| src),
+            Some(augur),
+            "the coven permission must authorize the creature on top"
+        );
+        assert!(
+            spell_objects_available_to_cast(state, P0).contains(&creature),
+            "with coven, the creature on top must be castable"
+        );
+
+        let land =
+            put_card_on_top_of_library(state, P0, CardId(921), "Top Land", vec![CoreType::Land]);
+        assert_eq!(
+            top_of_library_land_playable_by_permission(state, P0),
+            Some((land, augur)),
+            "the land permission still plays the land on top"
+        );
+        assert!(!spell_objects_available_to_cast(state, P0).contains(&land));
+
+        let artifact = put_card_on_top_of_library(
+            state,
+            P0,
+            CardId(922),
+            "Top Artifact",
+            vec![CoreType::Artifact],
+        );
+        assert!(
+            !spell_objects_available_to_cast(state, P0).contains(&artifact),
+            "neither permission covers a noncreature spell"
+        );
+    }
+
+    /// Without coven (only one distinct power) the creature permission is off
+    /// and the land permission alone must not authorize a creature on top.
+    #[test]
+    fn augur_of_autumn_without_coven_keeps_creature_on_top_uncastable() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        {
+            let mut b = scenario.add_creature(P0, "Augur of Autumn", 2, 3);
+            b.from_oracle_text(
+                "You may look at the top card of your library any time.\n\
+                 You may play lands from the top of your library.\n\
+                 Coven — As long as you control three or more creatures with different powers, you may cast creature spells from the top of your library.",
+            );
+        }
+        scenario.add_creature(P0, "Same Power A", 2, 2);
+        scenario.add_creature(P0, "Same Power B", 2, 1);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+
+        let creature = put_card_on_top_of_library(
+            state,
+            P0,
+            CardId(923),
+            "Top Creature",
+            vec![CoreType::Creature],
+        );
+        assert!(
+            !spell_objects_available_to_cast(state, P0).contains(&creature),
+            "coven off: the creature on top stays in the library"
+        );
+    }
+
     /// Install a `OncePerTurn` top-of-library permission (Assemble the
     /// Players / Johann shape) whose `affected` filter admits any creature.
     fn install_once_per_turn_creature_static(
