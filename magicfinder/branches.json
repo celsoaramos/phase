@@ -180,5 +180,8 @@
   },
   {
     "branch": "card/non-outlaw-negation"
+  },
+  {
+    "branch": "card/scoped-player-search"
   }
 ]
