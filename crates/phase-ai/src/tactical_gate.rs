@@ -361,6 +361,10 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject;
     }
 
+    if is_proven_damage_whiff(ctx, &effects) {
+        return GateDecision::Reject;
+    }
+
     if let Some((power_bonus, toughness_bonus)) = pure_fixed_pump_bonus(&effects) {
         let source_is_spell = ctx.source_object().is_some_and(|source| {
             source.card_types.core_types.contains(&CoreType::Instant)
@@ -1303,6 +1307,73 @@ fn is_redundant_creature_only_removal(ctx: &PolicyContext<'_>, effects: &[&Effec
     }
 
     saw_creature_only_harm
+}
+
+/// A spell whose ONLY effects are damage to target creatures, none of which the
+/// damage can kill (CR 704.5f/g/h) — 3 damage to a 6/6 attacker, with no
+/// blocker of ours to add combat damage. Casting it changes nothing that lasts
+/// past cleanup (CR 514.2 removes the marked damage) and burns the card.
+///
+/// `AntiSelfHarm` already charges a whiff penalty for this, but on the search
+/// path a root's policy score is weighted at 0.1 against the board evaluation,
+/// so the penalty is erased by a horizon artifact: with the spell on the stack
+/// the continuation can end before combat damage, and the burn line "saves" the
+/// life the pass line loses. Rejecting the proven whiff here, alongside
+/// `is_redundant_creature_only_removal`, is what keeps it off the table.
+///
+/// Fail-open by construction: any non-damage effect (a cantrip, scry, a
+/// destroy line), an unknowable amount (X) or source, or a cast payoff of the
+/// caster's that could care about this spell (prowess, "whenever you cast")
+/// keeps the cast available to policy scoring.
+fn is_proven_damage_whiff(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> bool {
+    let GameAction::CastSpell { object_id, .. } = &ctx.candidate.action else {
+        return false;
+    };
+    let damage_only = !effects.is_empty()
+        && effects.iter().all(|effect| {
+            matches!(effect, Effect::DealDamage { .. })
+                && matches!(effect_polarity(effect), EffectPolarity::Harmful)
+                && targets_creatures_only(effect)
+        });
+    damage_only
+        && !ctx.can_kill_any_legal_target()
+        && !caster_has_cast_payoff(ctx.state, *object_id)
+}
+
+/// Does a permanent the spell's caster controls trigger on casting it?
+///
+/// CR 702.108a: prowess triggers on a noncreature spell its controller casts;
+/// CR 603.2: a "whenever you cast" trigger (`SpellCast`, `SpellCastOrCopy`,
+/// `SpellAbilityCast`, `PlayCard`) fires on the cast itself, independent of
+/// what the spell's effect accomplishes — such a cast is never wasted outright.
+/// Only a type requirement the spell provably fails rules a hook out
+/// (`trigger_is_proven_irrelevant`); anything else counts.
+///
+/// Narrower than `has_relevant_functioning_trigger` on purpose: that test also
+/// counts every unrelated battlefield trigger (an opponent's landfall, an
+/// attack trigger), which would keep almost every real board from proving a
+/// whiff. An opponent's cast hook is a reason NOT to cast, never a payoff.
+fn caster_has_cast_payoff(state: &GameState, spell_id: ObjectId) -> bool {
+    let Some(spell) = state.objects.get(&spell_id) else {
+        return true;
+    };
+    let caster = spell.controller;
+    if state.battlefield.iter().copied().any(|source_id| {
+        synthetic_keyword_spell_cast_trigger_applies(state, source_id, caster, spell_id)
+    }) {
+        return true;
+    }
+    battlefield_active_triggers(state).any(|(source, active)| {
+        source.controller == caster
+            && matches!(
+                active.definition.mode,
+                TriggerMode::SpellCast
+                    | TriggerMode::SpellCastOrCopy
+                    | TriggerMode::SpellAbilityCast
+                    | TriggerMode::PlayCard
+            )
+            && !trigger_is_proven_irrelevant(spell, active.definition)
+    })
 }
 
 fn pure_fixed_pump_bonus(effects: &[&Effect]) -> Option<(i32, i32)> {

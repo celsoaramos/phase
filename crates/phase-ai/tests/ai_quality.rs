@@ -269,40 +269,31 @@ fn does_not_cast_slash_of_light_for_nonlethal_damage() {
         state.waiting_for = WaitingFor::Priority { player: P0 };
     }
 
-    // Easy, Hard, and Very Hard: the whiff guard deterministically ranks the
-    // wasteful cast BELOW passing its priority. Assert via `score_candidates`
-    // (the deterministic policy-registry ranking) rather than `choose_action`
-    // (which applies softmax temperature + search pre-emptions and is therefore
-    // difficulty-stochastic at the argmax boundary). The discriminating signal
-    // for the cast-commit gate is that the whiff burn is deprioritized below
-    // passing.
-    //
-    // Medium is deliberately NOT asserted here: at difficulty Medium the cast
-    // decision goes through the search path which projects casting Slash of Light
-    // as a ~WIN_SCORE (10000) line whether or not the whiff penalty is applied —
-    // a search/terminal-eval artifact orthogonal to the cast-commit whiff guard.
+    // Every difficulty: the proven whiff is rejected by the tactical gate
+    // (`is_proven_damage_whiff`), so the burn never reaches scoring at all.
+    // Medium used to be exempt here — its search projected the cast as a
+    // ~WIN_SCORE line and the 0.1-weighted policy penalty could not outvote
+    // the board evaluation; the gate is what makes the guard hold on the
+    // search path too.
     for diff in [
         AiDifficulty::Easy,
+        AiDifficulty::Medium,
         AiDifficulty::Hard,
         AiDifficulty::VeryHard,
     ] {
         let config = create_config(diff, Platform::Native);
         let scored = phase_ai::score_candidates(runner.state(), P0, &config);
-        let cast = scored
-            .iter()
-            .find(|(a, _)| matches!(a, GameAction::CastSpell { .. }))
-            .map(|(_, s)| *s);
-        let pass = scored
-            .iter()
-            .find(|(a, _)| matches!(a, GameAction::PassPriority))
-            .map(|(_, s)| *s);
-        let (Some(cast), Some(pass)) = (cast, pass) else {
-            panic!("{diff:?}: expected both CastSpell and PassPriority candidates, got {scored:?}");
-        };
         assert!(
-            cast < pass,
-            "{diff:?}: the wasteful Slash of Light cast ({cast:.3}) must rank below \
-             passing ({pass:.3}) — the whiff guard did not deprioritize the burn"
+            scored
+                .iter()
+                .any(|(a, _)| matches!(a, GameAction::PassPriority)),
+            "{diff:?}: passing must stay available, got {scored:?}"
+        );
+        assert!(
+            !scored
+                .iter()
+                .any(|(a, _)| matches!(a, GameAction::CastSpell { .. })),
+            "{diff:?}: the wasteful Slash of Light cast must be gated out, got {scored:?}"
         );
     }
 }
@@ -360,18 +351,30 @@ fn very_hard_slash_of_light_does_not_commit_or_ping_the_3_3() {
         state.waiting_for = WaitingFor::Priority { player: P0 };
     }
 
-    // Reach-guard (tier 1): the exact Slash of Light cast must be offered as a
-    // candidate to the Very Hard scorer. A vacuous "no candidates" pass would
-    // satisfy the outcome asserts below for the wrong reason. Read-only — no
-    // borrow survives past this block.
+    // Reach-guard (tier 1): the engine offers the cast (it is legal and
+    // affordable), and the Very Hard scorer gates exactly that candidate out
+    // while keeping the pass — the decision path did reach the whiff gate.
+    // Read-only — no borrow survives past this block.
+    assert!(
+        engine::ai_support::build_decision_context(runner.state())
+            .candidates
+            .iter()
+            .any(|c| matches!(
+                c.action,
+                GameAction::CastSpell { object_id, .. } if object_id == slash
+            )),
+        "Slash of Light must be a legal CastSpell candidate"
+    );
     let config = create_config(AiDifficulty::VeryHard, Platform::Native);
     let scored = phase_ai::score_candidates(runner.state(), P0, &config);
     assert!(
-        scored.iter().any(|(a, _)| matches!(
+        !scored.iter().any(|(a, _)| matches!(
             a,
             GameAction::CastSpell { object_id, .. } if *object_id == slash
-        )),
-        "Slash of Light must be offered as a CastSpell candidate, got {scored:?}"
+        )) && scored
+            .iter()
+            .any(|(a, _)| matches!(a, GameAction::PassPriority)),
+        "the non-lethal Slash of Light cast must be gated out (pass kept), got {scored:?}"
     );
 
     let ai_players = HashSet::from([P0]);
@@ -515,7 +518,14 @@ fn mixed_damage_and_destroy_is_not_penalized_as_a_damage_whiff() {
     // AI's single creature makes the dynamic ObjectCount amount resolve to 1
     // (Slash-of-Light-shaped); the opponent's 3/3 survives 1 damage but Destroy
     // kills it (CR 701.8a).
-    scenario.add_creature(P0, "My Bear", 2, 1);
+    // Prowess on the AI's creature keeps the pure-burn comparator OUT of the
+    // tactical gate's proven-whiff rejection (a cast payoff makes the cast
+    // not a provable waste), so it still reaches scoring and carries the
+    // -8 `wasted_cast_penalty` this differential measures. Both spells get
+    // the same prowess credit, so the inequality is unchanged.
+    scenario
+        .add_creature(P0, "My Bear", 2, 1)
+        .with_keyword(Keyword::Prowess);
     scenario.add_creature(P1, "Opponent Bear", 3, 3);
 
     let mut my_filter = TypedFilter::creature();
@@ -616,7 +626,14 @@ fn mixed_damage_and_gain_control_is_not_penalized_as_a_damage_whiff() {
     // AI's single creature makes the dynamic ObjectCount amount resolve to 1
     // (Slash-of-Light-shaped); the opponent's 3/3 survives 1 damage but the
     // Island is a legal, useful GainControl permanent target (CR 613.1b).
-    scenario.add_creature(P0, "My Bear", 2, 1);
+    // Prowess on the AI's creature keeps the pure-burn comparator OUT of the
+    // tactical gate's proven-whiff rejection (a cast payoff makes the cast
+    // not a provable waste), so it still reaches scoring and carries the
+    // -8 `wasted_cast_penalty` this differential measures. Both spells get
+    // the same prowess credit, so the inequality is unchanged.
+    scenario
+        .add_creature(P0, "My Bear", 2, 1)
+        .with_keyword(Keyword::Prowess);
     scenario.add_creature(P1, "Opponent Bear", 3, 3);
     scenario.add_basic_land(P1, engine::types::mana::ManaColor::Blue);
 
@@ -720,7 +737,14 @@ fn mixed_damage_and_destroy_all_is_not_penalized_as_a_damage_whiff() {
     // (Slash-of-Light-shaped); the opponent's 3/3 survives 1 damage but is in
     // the wipe's default all-creatures population (CR 701.8, destroy.rs
     // `resolve_all`).
-    scenario.add_creature(P0, "My Bear", 2, 1);
+    // Prowess on the AI's creature keeps the pure-burn comparator OUT of the
+    // tactical gate's proven-whiff rejection (a cast payoff makes the cast
+    // not a provable waste), so it still reaches scoring and carries the
+    // -8 `wasted_cast_penalty` this differential measures. Both spells get
+    // the same prowess credit, so the inequality is unchanged.
+    scenario
+        .add_creature(P0, "My Bear", 2, 1)
+        .with_keyword(Keyword::Prowess);
     scenario.add_creature(P1, "Opponent Bear", 3, 3);
 
     let mut my_filter = TypedFilter::creature();
@@ -2675,5 +2699,132 @@ fn mana_dork_outvalues_a_bigger_body_when_trading() {
         "the reverted margin must be the disclosed +1.493 less the coefficient, \
          i.e. about −6.007; got {}",
         keep_dork_reverted - keep_body_reverted
+    );
+}
+
+// ── Non-lethal burn into combat (Focus Fire, field report 2026-10-15) ──────
+
+const FOCUS_FIRE_ORACLE: &str = "Focus Fire deals X damage to target attacking or blocking creature, where X is 2 plus the number of creatures you control.";
+
+/// The opponent (P1) attacks the AI (P0) with a 6/6; no blockers are declared.
+/// The AI controls `ai_creatures` (power, toughness) bodies and holds Focus
+/// Fire with {W} floating. Returns the runner, the attacker and Focus Fire.
+fn focus_fire_into_attacker(
+    ai_creatures: &[(i32, i32)],
+    blocked_by_first: bool,
+    prowess_on_first: bool,
+) -> (engine::game::scenario::GameRunner, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::DeclareBlockers);
+    let mut mine = Vec::new();
+    for (i, (power, toughness)) in ai_creatures.iter().enumerate() {
+        let mut builder =
+            scenario.add_creature(P0, &format!("AI Creature {i}"), *power, *toughness);
+        if i == 0 && prowess_on_first {
+            builder.with_keyword(Keyword::Prowess);
+        }
+        mine.push(builder.id());
+    }
+    let attacker = scenario.add_creature(P1, "Big Attacker", 6, 6).id();
+    let focus_fire = scenario
+        .add_spell_to_hand_from_oracle(P0, "Focus Fire", true, FOCUS_FIRE_ORACLE)
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![ManaUnit::new(
+            ManaType::White,
+            ObjectId(9_999),
+            false,
+            vec![],
+        )],
+    );
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P0;
+        let mut info = AttackerInfo::attacking_player(attacker, P0);
+        let mut combat = CombatState::default();
+        if blocked_by_first {
+            let blocker = mine[0];
+            info.blocked = true;
+            combat.blocker_assignments.insert(attacker, vec![blocker]);
+            combat.blocker_to_attacker.insert(blocker, vec![attacker]);
+        }
+        combat.attackers = vec![info];
+        state.combat = Some(combat);
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+    }
+    (runner, attacker, focus_fire)
+}
+
+fn offers_cast(
+    state: &engine::types::game_state::GameState,
+    diff: AiDifficulty,
+    spell: ObjectId,
+) -> bool {
+    let config = create_config(diff, Platform::Native);
+    phase_ai::score_candidates(state, P0, &config)
+        .iter()
+        .any(|(a, _)| matches!(a, GameAction::CastSpell { object_id, .. } if *object_id == spell))
+}
+
+/// Field report: the bot had one creature, so Focus Fire dealt 2 + 1 = 3 to an
+/// unblocked 6/6 attacker — the damage went away at cleanup (CR 514.2) and the
+/// 6 combat damage still landed. CR 704.5g: 3 marked damage never reaches 6
+/// toughness, and with no blocker nothing adds to it. Before the gate, Medium
+/// and up scored the cast ABOVE the pass (-10.8 vs -11.8): the 0.1-weighted
+/// whiff penalty lost to a search horizon where the burn line ends before
+/// combat damage.
+#[test]
+fn does_not_cast_focus_fire_for_nonlethal_damage_to_an_unblocked_attacker() {
+    let (runner, _attacker, focus_fire) = focus_fire_into_attacker(&[(2, 2)], false, false);
+    assert!(
+        engine::ai_support::build_decision_context(runner.state())
+            .candidates
+            .iter()
+            .any(|c| matches!(c.action, GameAction::CastSpell { object_id, .. } if object_id == focus_fire)),
+        "Focus Fire must be a legal, affordable cast — otherwise the test is vacuous"
+    );
+    for diff in [
+        AiDifficulty::Easy,
+        AiDifficulty::Medium,
+        AiDifficulty::Hard,
+        AiDifficulty::VeryHard,
+    ] {
+        assert!(
+            !offers_cast(runner.state(), diff, focus_fire),
+            "{diff:?}: a 3-damage Focus Fire on an unblocked 6/6 must be gated out"
+        );
+        let action = ai_choose(runner.state(), diff);
+        assert!(
+            matches!(action, GameAction::PassPriority),
+            "{diff:?}: the AI must pass instead of whiffing Focus Fire, chose {action:?}"
+        );
+    }
+}
+
+/// Sibling: the same 3 damage is lethal once the attacker is BLOCKED by the
+/// AI's 4/4 — CR 510.1 + CR 120.6, 3 marked + 4 combat damage = 7 ≥ 6. The
+/// gate must not take away the card's real job.
+#[test]
+fn focus_fire_stays_available_when_the_blocker_finishes_the_attacker() {
+    let (runner, _attacker, focus_fire) = focus_fire_into_attacker(&[(4, 4)], true, false);
+    for diff in [AiDifficulty::Easy, AiDifficulty::VeryHard] {
+        assert!(
+            offers_cast(runner.state(), diff, focus_fire),
+            "{diff:?}: Focus Fire plus the blocker's combat damage kills the 6/6"
+        );
+    }
+}
+
+/// Sibling: a prowess creature on the AI's side gets value from the cast
+/// itself (CR 702.108a), so the whiff is not provable and stays to scoring.
+#[test]
+fn focus_fire_whiff_stays_available_with_a_prowess_payoff() {
+    let (runner, _attacker, focus_fire) = focus_fire_into_attacker(&[(2, 2)], false, true);
+    assert!(
+        offers_cast(runner.state(), AiDifficulty::Easy, focus_fire),
+        "a prowess payoff makes the cast not a provable whiff"
     );
 }

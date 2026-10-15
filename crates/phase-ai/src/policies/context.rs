@@ -290,6 +290,14 @@ impl<'a> PolicyContext<'a> {
     pub(crate) fn has_opposing_mass_population(&self) -> bool {
         super::removal_lethality::has_opposing_mass_population(self)
     }
+
+    /// Can the pending spell's modelled damage kill at least one legal
+    /// opposing creature target (CR 704.5f/g/h)? `false` only for a PROVEN
+    /// total whiff — every unknown fails open. The cast-commit anti-whiff
+    /// scoring and the tactical gate's whiff rejection share this one answer.
+    pub(crate) fn can_kill_any_legal_target(&self) -> bool {
+        super::removal_lethality::can_kill_any_legal_target(self)
+    }
 }
 
 /// Walk a `ResolvedAbility`'s chain, collecting every effect it can produce.

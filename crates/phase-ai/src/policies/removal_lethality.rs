@@ -60,6 +60,7 @@ use engine::types::card_type::CoreType;
 use engine::types::game_state::{DistributionUnit, GameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::{Keyword, KeywordKind};
+use engine::types::phase::Phase;
 
 use super::context::{collect_resolved_abilities, PolicyContext};
 use super::effect_classify::{
@@ -849,7 +850,10 @@ pub(crate) fn divided_damage_verdict(
 ///   knowable at cast-commit, CR 120.3) or [`PendingDamage::None`] (non-damage
 ///   removal like Destroy/Exile — never a damage whiff);
 /// * there are zero legal object targets (empty set — never conclude a veto
-///   from a vacuous "all survived").
+///   from a vacuous "all survived");
+/// * a surviving target is paired in combat with one of the AI's creatures
+///   before combat damage (CR 510.1 + CR 120.6 — the combat damage adds to the
+///   spell's, see [`awaits_combat_damage_from_ai`]).
 ///
 /// It returns `false` (veto) **only** when at least one legal object target was
 /// fully modelled as [`PendingDamage::Dealt`] and **every** modelled target is
@@ -935,6 +939,12 @@ pub(crate) fn can_kill_any_legal_target(ctx: &PolicyContext<'_>) -> bool {
                     if outcome_is_lethal(object, &outcome) {
                         return true;
                     }
+                    // CR 510.1 + CR 120.6: the AI's creature in combat with it
+                    // adds its combat damage to the same running total, so the
+                    // spell may still finish it — not a provable whiff.
+                    if awaits_combat_damage_from_ai(ctx, object_id) {
+                        return true;
+                    }
                 }
             }
         }
@@ -944,6 +954,44 @@ pub(crate) fn can_kill_any_legal_target(ctx: &PolicyContext<'_>) -> bool {
     // modelled target survived — i.e. `model_any_target && !any_escape`. The
     // empty-set case (`!modelled_any_target`) fails open by contract.
     !modelled_any_target
+}
+
+/// Is `target_id` paired in the current combat with a creature the AI controls
+/// — blocked by one, or blocking one — while combat damage can still be dealt?
+///
+/// CR 510.1a-c: in the combat damage step each attacking and blocking creature
+/// deals its combat damage to the creatures it is paired with, and CR 120.6
+/// keeps all damage marked until cleanup, so a removal spell's damage below the
+/// target's toughness can combine with that combat damage into a kill (the
+/// archetype of "deals X damage to target attacking or blocking creature").
+/// Damage assignment order, first strike and prevention are not modelled, so
+/// this only ever fails the whiff veto OPEN; the combat damage step itself is
+/// included because a first-strike step leaves the regular one still to come
+/// (CR 510.4).
+fn awaits_combat_damage_from_ai(ctx: &PolicyContext<'_>, target_id: ObjectId) -> bool {
+    if !matches!(
+        ctx.state.phase,
+        Phase::DeclareAttackers | Phase::DeclareBlockers | Phase::CombatDamage
+    ) {
+        return false;
+    }
+    let Some(combat) = &ctx.state.combat else {
+        return false;
+    };
+    let controlled_by_ai = |id: &ObjectId| {
+        ctx.state
+            .objects
+            .get(id)
+            .is_some_and(|object| object.controller == ctx.ai_player)
+    };
+    combat
+        .blocker_assignments
+        .get(&target_id)
+        .is_some_and(|blockers| blockers.iter().any(controlled_by_ai))
+        || combat
+            .blocker_to_attacker
+            .get(&target_id)
+            .is_some_and(|attackers| attackers.iter().any(controlled_by_ai))
 }
 
 /// Cast-commit seam query: does ANY inherently-mass non-`DealDamage` effect
