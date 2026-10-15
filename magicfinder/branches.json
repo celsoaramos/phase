@@ -198,5 +198,8 @@
   },
   {
     "branch": "ai/nonlethal-burn-gate"
+  },
+  {
+    "branch": "card/composite-alt-cost-base"
   }
 ]
