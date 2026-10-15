@@ -8,6 +8,7 @@ use super::{
     anthem::*, cda::*, cost_mod::*, evasion::*, keyword_grant::*, loyalty::*, mana_transform::*,
     restriction::*, same_is_true::*, type_change::*,
 };
+use crate::parser::oracle_nom::target::{controller_phrase_among, ControllerPhrase};
 use crate::types::statics::ProhibitionScope;
 
 /// CR 201.5: Consume a self-reference subject — `~` (produced by
@@ -755,15 +756,25 @@ fn filter_prop_has_power_comparison(prop: &FilterProp) -> bool {
 fn parse_attacking_defender_scope<'a>(tp: &TextPair<'a>) -> Option<(&'a str, ControllerRef)> {
     let rest = nom_tag_tp(tp, "all creatures attacking ")
         .or_else(|| nom_tag_tp(tp, "creatures attacking "))?;
-    // Longest-first so the "your opponents and/or …" long form wins before the
-    // bare "your opponents ", and "the last chosen player " before the shorter
+    // The "your opponents and/or …" long form is tried before the bare
+    // "your opponents " row; "you " cannot match "your".
+    if let Some((_, original_rest)) = nom_tag_tp(&rest, "your opponents and/or planeswalkers ")
+        .and_then(|after| {
+            nom_on_lower(after.original, after.lower, |i| {
+                terminated(
+                    controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]),
+                    tag(" "),
+                )
+                .parse(i)
+            })
+        })
+    {
+        return Some((original_rest, ControllerRef::Opponent));
+    }
+    // Longest-first so "the last chosen player " wins before the shorter
     // "the chosen player ".
     for (phrase, defender) in [
         ("you ", ControllerRef::You),
-        (
-            "your opponents and/or planeswalkers they control ",
-            ControllerRef::Opponent,
-        ),
         ("your opponents ", ControllerRef::Opponent),
         ("enchanted player ", ControllerRef::EnchantedPlayer),
         ("the last chosen player ", ControllerRef::SourceChosenPlayer),
@@ -937,6 +948,15 @@ pub(crate) fn parse_static_line_inner(
     // as though they didn't have shadow" / "... as though it had shadow" — per-source
     // permission to block shadow attackers (Heartwood Dryad, Wall of Diffusion).
     if let Some(def) = parse_block_shadow_as_though(&tp, &text) {
+        return Some(def);
+    }
+
+    // CR 510.1c + CR 609.4 + CR 611.3a: "[As long as <cond>, ]for each <creature class>
+    // you control, you may have that creature assign its combat damage as though it
+    // weren't blocked" (Siege Behemoth, Zilortha, Ruxa). Must run before the inverted
+    // "As long as" split below, which would otherwise cut the line at the first
+    // effect-subject comma and leave an `Unrecognized` gate.
+    if let Some(def) = parse_for_each_assign_damage_as_though_unblocked(&tp, &text) {
         return Some(def);
     }
 
@@ -1734,12 +1754,12 @@ pub(crate) fn parse_static_line_inner(
                 ),
                 rest,
             )
-        } else if let Some((prop, rest)) = strip_counter_condition_prefix(after_prefix) {
+        } else if let Some((props, rest)) = strip_with_qualifier_prefix(after_prefix) {
             (
                 TargetFilter::Typed(
                     TypedFilter::creature()
                         .controller(ControllerRef::You)
-                        .properties(vec![prop]),
+                        .properties(props),
                 ),
                 rest,
             )
@@ -1802,14 +1822,15 @@ pub(crate) fn parse_static_line_inner(
     // CR 613.7: "Other" excludes the source permanent itself via FilterProp::Another.
     if let Some(rest_tp) = nom_tag_tp(&tp, "other creatures you control ") {
         let after_prefix = rest_tp.original;
-        let (filter, predicate_text) = if let Some((prop, rest)) =
-            strip_counter_condition_prefix(after_prefix)
+        let (filter, predicate_text) = if let Some((mut props, rest)) =
+            strip_with_qualifier_prefix(after_prefix)
         {
+            props.push(FilterProp::Another);
             (
                 TargetFilter::Typed(
                     TypedFilter::creature()
                         .controller(ControllerRef::You)
-                        .properties(vec![prop, FilterProp::Another]),
+                        .properties(props),
                 ),
                 rest,
             )
@@ -4215,4 +4236,44 @@ fn parse_counters_cant_be_removed_static(
             .affected(filter)
             .description(text.to_string()),
     )
+}
+
+/// Structural-marker site: "your opponents and/or planeswalkers they control"
+/// reads "they control" as a marker; the defender is the opponents either way.
+#[cfg(test)]
+mod structural_marker_tests {
+    use super::*;
+
+    #[test]
+    fn attacking_defender_scope_marker() {
+        let parse = |controller: &str| {
+            let text = format!(
+                "Creatures attacking your opponents and/or planeswalkers {controller} get +1/+0."
+            );
+            let lower = text.to_lowercase();
+            parse_attacking_defender_scope(&TextPair::new(&text, &lower))
+                .map(|(rest, defender)| (rest.to_string(), defender))
+        };
+        assert_eq!(
+            parse("they control"),
+            Some(("get +1/+0.".to_string(), ControllerRef::Opponent))
+        );
+        // A declined controller phrase falls through to the bare "your opponents "
+        // row, which leaves "and/or planeswalkers …" unconsumed.
+        for declined in [
+            "you control",
+            "that player controls",
+            "controlled by that player",
+            "the chosen player controls",
+        ] {
+            assert_eq!(
+                parse(declined),
+                Some((
+                    format!("and/or planeswalkers {declined} get +1/+0."),
+                    ControllerRef::Opponent
+                )),
+                "{declined:?}"
+            );
+        }
+    }
 }

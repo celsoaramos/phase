@@ -19,7 +19,7 @@ use crate::types::ability::{
     AbilityDefinition, AbilityKind, ChosenSubtypeKind, ColorChangeMode, ContinuousModification,
     ControllerRef, CopyRecipient, Duration, EachDamageRecipient, Effect, EffectScope, FilterProp,
     MultiTargetSpec, ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PtValue, QuantityExpr,
-    QuantityRef, StaticCondition, StaticDefinition, TargetFilter, TypedFilter,
+    StaticCondition, StaticDefinition, TargetFilter, TypedFilter,
 };
 use crate::types::game_state::DayNight;
 use crate::types::keywords::Keyword;
@@ -46,7 +46,7 @@ use super::super::oracle_static::{
 };
 use super::super::oracle_target::{
     parse_target, parse_target_with_ctx, parse_target_with_syntax, parse_type_phrase_folding,
-    TargetSyntax,
+    parse_type_phrase_folding_with_ctx, TargetSyntax,
 };
 use super::super::oracle_util::{
     merge_or_filters, parse_number, TextPair, SELF_REF_PARSE_ONLY_PHRASES, SELF_REF_TYPE_PHRASES,
@@ -115,7 +115,7 @@ pub(super) fn try_parse_subject_predicate_ast(
     text: &str,
     ctx: &mut ParseContext,
 ) -> Option<ClauseAst> {
-    if try_parse_targeted_controller_gain_life(text).is_some() {
+    if try_parse_targeted_controller_gain_life(text, ctx).is_some() {
         return None;
     }
 
@@ -724,7 +724,8 @@ fn additive_type_subject_application(
     subject: &str,
     ctx: &mut ParseContext,
 ) -> Option<SubjectApplication> {
-    let (parsed_subject, rest) = parse_target(subject);
+    let (parsed_subject, rest) =
+        parse_target_with_ctx(subject, &mut ctx.clone_player_antecedents());
     if rest.trim().is_empty()
         && matches!(
             parsed_subject,
@@ -1448,15 +1449,15 @@ fn try_parse_subject_base_pt_set_clause_ast(
             .map(|keyword| ContinuousModification::AddKeyword { keyword }),
     );
 
+    // CR 611.2a: no stated duration means this base-P/T set lasts indefinitely.
+    // Permanent remains the unset sentinel for an enclosing clause duration.
+    let duration = leading_duration.or(Some(Duration::Permanent));
     let effect = Effect::GenericEffect {
         static_abilities: vec![StaticDefinition::continuous()
             .affected(affected)
             .modifications(modifications)
             .description(body.trim_end_matches('.').to_string())],
-        // CR 611.2a: a leading duration stripped above is threaded onto the
-        // GenericEffect; otherwise the sequence layer's wrapping duration (for
-        // the trigger-body path, where it is already stripped upstream) applies.
-        duration: leading_duration.clone(),
+        duration: duration.clone(),
         target: application.target.clone(),
         end_cost: None,
     };
@@ -1471,7 +1472,7 @@ fn try_parse_subject_base_pt_set_clause_ast(
         }),
         predicate: Box::new(PredicateAst::Continuous {
             effect,
-            duration: leading_duration,
+            duration,
             sub_ability: None,
         }),
     })
@@ -1750,7 +1751,10 @@ fn try_parse_target_and_same_name_pump_clause(
     // `SameNameAsParentTarget` gate is the load-bearing discriminator: a plain
     // "target creature and each creature you control get +1/+1" secondary lacks
     // it and returns `None`, leaving the generic path untouched.
-    let (secondary_filter, rest) = parse_target(secondary_tp.original.trim());
+    let (secondary_filter, rest) = parse_target_with_ctx(
+        secondary_tp.original.trim(),
+        &mut ctx.clone_player_antecedents(),
+    );
     if !rest.trim().is_empty() || !filter_carries_same_name_as_parent_target(&secondary_filter) {
         return None;
     }
@@ -2915,7 +2919,8 @@ fn parse_subject_application_for(
         }
         // Fallback: strip "of " and re-route through parse_target as "each <remainder>"
         let normalized = format!("each {remainder}");
-        let (filter, _) = parse_target(&normalized);
+        let (filter, _) =
+            ctx.with_player_antecedents(|scoped| parse_target_with_ctx(&normalized, scoped));
         return subject_filter_application(filter, false);
     }
     // CR 119.5: "each player's life total" / "all players' life
@@ -2940,7 +2945,8 @@ fn parse_subject_application_for(
     {
         let consumed = lower.len() - rest_lower.len();
         let phrase = &subject[consumed..];
-        let (filter, rest) = parse_type_phrase_folding(phrase);
+        let (filter, rest) = ctx
+            .with_player_antecedents(|scoped| parse_type_phrase_folding_with_ctx(phrase, scoped));
         let filter = merge_partial_type_phrase_filter(filter, rest.trim());
         return subject_filter_application(filter, false);
     }
@@ -2952,7 +2958,8 @@ fn parse_subject_application_for(
     .parse(lower.as_str())
     .is_ok()
     {
-        let (filter, _) = parse_target(subject);
+        let (filter, _) =
+            ctx.with_player_antecedents(|scoped| parse_target_with_ctx(subject, scoped));
         return Some(SubjectApplication {
             affected: filter,
             target: None,
@@ -3071,7 +3078,8 @@ fn parse_subject_application_for(
     // GainControl→GiveControl rewrite receives `recipient: Neighbor` rather than
     // a generic `Any`/`TriggeringPlayer`.
     {
-        let (neighbor_filter, rest) = parse_target(subject);
+        let (neighbor_filter, rest) =
+            parse_target_with_ctx(subject, &mut ctx.clone_player_antecedents());
         if rest.trim().is_empty() && matches!(neighbor_filter, TargetFilter::Neighbor { .. }) {
             return subject_filter_application(neighbor_filter, false);
         }
@@ -3681,7 +3689,8 @@ fn parse_subject_application_for(
     {
         let consumed = lower.len() - rest_subject.len();
         let original_rest = &subject[consumed..];
-        let (filter, rem) = parse_type_phrase_folding(original_rest);
+        let (filter, rem) =
+            parse_type_phrase_folding_with_ctx(original_rest, &mut ctx.clone_player_antecedents());
         if rem.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
             return Some(SubjectApplication {
                 affected: TargetFilter::ParentTarget,
@@ -3702,7 +3711,8 @@ fn parse_subject_application_for(
         // the remainder as a type phrase. Covers all "that [type]" patterns generically.
         let consumed = lower.len() - rest_subject.len();
         let original_rest = &subject[consumed..];
-        let (filter, rem) = parse_type_phrase_folding(original_rest);
+        let (filter, rem) =
+            parse_type_phrase_folding_with_ctx(original_rest, &mut ctx.clone_player_antecedents());
         if rem.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
             // CR 608.2k + CR 608.2c: Inside a trigger effect, "that [type]" is an
             // anaphoric back-reference to the triggering event's subject object (the
@@ -3748,7 +3758,8 @@ fn parse_subject_application_for(
         }
     }
 
-    let (filter, rest) = parse_type_phrase_folding(subject);
+    let (filter, rest) =
+        parse_type_phrase_folding_with_ctx(subject, &mut ctx.clone_player_antecedents());
     if rest.trim().is_empty() {
         return subject_filter_application(filter, false);
     }
@@ -4205,6 +4216,9 @@ fn resolve_they_pronoun(ctx: &mut ParseContext) -> TargetFilter {
             .chain_prior_mass_population
             .clone()
             .unwrap_or(TargetFilter::TriggeringSource),
+        // CR 608.2c: the nearest earlier clause announced a player; "they" is that
+        // player, spelled as "that player" is.
+        _ if ctx.prior_player_declaration => TargetFilter::ParentTargetController,
         // No trigger context — anaphoric reference to previously mentioned objects
         _ => TargetFilter::ParentTarget,
     }
@@ -4322,6 +4336,59 @@ pub(super) fn static_affected_for_application(application: &SubjectApplication) 
     } else {
         application.affected.clone()
     }
+}
+
+/// CR 115.10a + CR 722.3a + CR 722.3b: the `(target, scope)` of "<subject>
+/// becomes (un)prepared", read from the shape of the already-parsed subject.
+///
+/// Like `BecomeSaddled`, the effect's `target` IS the selection slot, and a
+/// designation of one object is [`EffectScope::Single`]:
+/// - CR 115.1c/115.1d + CR 601.2c/602.2b: a DECLARED target ("target creature
+///   becomes prepared" — Skycoach Waypoint, Biblioplex Tomekeeper; "target
+///   creature that attacked this turn" — Hexhaven Dueling Arena) keeps its
+///   typed filter, so `build_target_slots` surfaces a slot chosen at
+///   announcement and the filter's restrictions are enforced.
+/// - A context-ref `target` keeps its own referent, because it already names
+///   an antecedent: `TriggeringSource` for "that creature" in a triggered
+///   ability (CR 608.2k: the object the trigger condition referred to, read
+///   from the trigger event at resolution), `ParentTarget` for "the other
+///   creature". Being context refs, neither builds a target slot (CR 115.10a).
+/// - `ParentTarget` is used only for an `inherits_parent` subject with no
+///   target of its own ("it becomes unprepared" after a prior instruction's
+///   object, CR 608.2c).
+/// - An untargeted subject that is a context reference (`SelfRef` for "this
+///   creature" — Stensian Sanguinist, `TriggeringSource`, `LastCreated`, ...)
+///   uses the subject's own `affected` filter and names one object.
+/// - An untargeted noun phrase that names an enumerable population ("each
+///   creature you control") is not a target (CR 115.10a), so the filter is
+///   kept and read at resolution under `All`.
+///
+/// The `All` reading is positive and fail-closed: it requires
+/// [`TargetFilter::names_enumerable_population`], because `Any` and a
+/// contentless `Typed` match every object and an `All` sweep over them would
+/// (un)prepare both players' battlefields. A subject that is neither a context
+/// reference nor an enumerable population keeps its filter under `Single`.
+pub(super) fn prepared_designation_subject(
+    application: &SubjectApplication,
+) -> (TargetFilter, EffectScope) {
+    match application.target.as_ref() {
+        // The subject carries its own referent: a declared selection slot (typed
+        // filter), or a context ref that already names an antecedent
+        // (`TriggeringSource` for "that creature" in a trigger, `ParentTarget`
+        // for "the other creature"). Keep it verbatim.
+        Some(target) => return (target.clone(), EffectScope::Single),
+        None if application.inherits_parent => {
+            return (TargetFilter::ParentTarget, EffectScope::Single);
+        }
+        None => {}
+    }
+    let affected = &application.affected;
+    let scope = if !affected.is_context_ref() && affected.names_enumerable_population() {
+        EffectScope::All
+    } else {
+        EffectScope::Single
+    };
+    (affected.clone(), scope)
 }
 
 /// CR 707.2 + CR 115.1 + CR 611.2c: map a parsed "<subject> become[s] a copy /
@@ -5513,21 +5580,44 @@ fn build_become_clause(
         });
     }
 
-    // CR 205.3e + CR 607.2d: "becomes that type" applies the creature type chosen
-    // by the preceding "Choose a creature type" instruction in the same ability
-    // (Imagecrafter, Unnatural Selection, Mistform Mutant, Standardize). Unlike
-    // the "of your choice" arm above, the choice is already made upstream, so this
-    // emits only the apply half — a continuous `AddChosenSubtype` that reads the
-    // source's chosen creature type at resolution. Must intercept before
-    // parse_animation_spec, which would mis-tokenize "that"/"type" as subtypes.
-    if become_text.eq_ignore_ascii_case("that type") {
+    // CR 608.2c + CR 608.2d: "becomes that type" consumes a choice made by an
+    // earlier instruction in this effect chain. CR 205.3e: the producer's
+    // domain, not the recipient's card type, determines which subtype is chosen.
+    // Emit only the application; the existing transient-effect snapshot binds
+    // this resolution's choice even when the source was sacrificed as a cost.
+    // Intercept before animation parsing can mistake "that type" for subtypes.
+    let become_lower = become_text.trim().to_lowercase();
+    if all_consuming(tag::<_, _, OracleError<'_>>("that type"))
+        .parse(become_lower.as_str())
+        .is_ok()
+    {
+        let modifications = match ctx.pending_choice_type.as_ref() {
+            // CR 305.7 + CR 305.6: setting a basic land type replaces land
+            // subtypes and rules-text abilities, then supplies intrinsic mana.
+            Some(crate::types::ability::ChoiceType::BasicLandType) => {
+                vec![ContinuousModification::SetChosenBasicLandType]
+            }
+            // CR 205.1a: a bare subtype change replaces its own subtype set.
+            Some(crate::types::ability::ChoiceType::CreatureType { .. }) => vec![
+                ContinuousModification::RemoveAllSubtypes {
+                    set: crate::types::card_type::SubtypeSet::Creature,
+                },
+                ContinuousModification::AddChosenSubtype {
+                    kind: ChosenSubtypeKind::CreatureType,
+                },
+            ],
+            _ => {
+                return Some(super::parsed_clause(Effect::unimplemented(
+                    "chosen_subtype_context",
+                    predicate.trim(),
+                )));
+            }
+        };
         let affected = static_affected_for_application(&application);
         let effect = Effect::GenericEffect {
             static_abilities: vec![StaticDefinition::continuous()
                 .affected(affected)
-                .modifications(vec![ContinuousModification::AddChosenSubtype {
-                    kind: ChosenSubtypeKind::CreatureType,
-                }])
+                .modifications(modifications)
                 .description(become_text.to_string())],
             duration: duration.clone(),
             target: application.target.clone(),
@@ -5546,19 +5636,18 @@ fn build_become_clause(
         });
     }
 
-    // CR 702.xxx: Prepare (Strixhaven) — "becomes prepared" / "becomes
-    // unprepared" toggles the PreparedState on the target creature. Must
+    // CR 722.3a + CR 722.3b: Prepare — "becomes prepared" / "becomes
+    // unprepared" gives or removes the prepared designation. Must
     // intercept before parse_animation_spec which would try to classify
     // "prepared" / "unprepared" as a subtype. `all_consuming` enforces that
     // the matched tag covers the full `become_text` trailer; longer-match
     // alternative is listed first so "unprepared" doesn't get shadowed by
-    // "prepared". Assign when WotC publishes SOS CR update.
+    // "prepared".
     #[derive(Clone, Copy)]
     enum PreparedKind {
         Prepared,
         Unprepared,
     }
-    let become_lower = become_text.trim().to_lowercase();
     if let Ok((_, kind)) = all_consuming(alt((
         value(
             PreparedKind::Unprepared,
@@ -5568,22 +5657,17 @@ fn build_become_clause(
     )))
     .parse(become_lower.as_str())
     {
-        // CR 722.3a: Resolve the prepare/unprepare target from the subject.
-        // A targeted subject ("target creature becomes prepared", Biblioplex)
-        // binds to the chosen object via `ParentTarget` at resolution; a
-        // self-referential or anaphoric subject ("this creature becomes
-        // prepared" — Stensian Sanguinist, normalized to `~` → `SelfRef`) uses
-        // the subject's own `affected` filter. Mirrors
-        // `static_affected_for_application`'s targeted-vs-subject split so the
-        // self-reference is preserved instead of collapsing to `ParentTarget`.
-        let target = if application.target.is_some() || application.inherits_parent {
-            crate::types::ability::TargetFilter::ParentTarget
-        } else {
-            application.affected.clone()
-        };
+        // CR 722.3a + CR 722.3b: Resolve the prepare/unprepare target and its
+        // scope from the subject (`prepared_designation_subject`). Like
+        // `BecomeSaddled` below, a declared target keeps its typed filter as
+        // the selection slot; an anaphor, self reference, or untargeted
+        // population keeps its own filter, and only an untargeted enumerable
+        // population ("each creature you control" — Codie, Ravenous Codex) is
+        // `All`.
+        let (target, scope) = prepared_designation_subject(&application);
         let effect = match kind {
-            PreparedKind::Prepared => Effect::BecomePrepared { target },
-            PreparedKind::Unprepared => Effect::BecomeUnprepared { target },
+            PreparedKind::Prepared => Effect::BecomePrepared { target, scope },
+            PreparedKind::Unprepared => Effect::BecomeUnprepared { target, scope },
         };
         return Some(super::parsed_clause(effect));
     }
@@ -5659,7 +5743,8 @@ fn build_become_clause(
         // `parse_target` lower-cases internally; pass it the lowercase tail so
         // its returned remainder is also lowercase (we'll feed that to
         // `parse_except_clause` whose tags are lowercase).
-        let (target, remainder) = parse_target(&after_copy_owned);
+        let (target, remainder) =
+            ctx.with_player_antecedents(|scoped| parse_target_with_ctx(&after_copy_owned, scoped));
         // CR 707.9: optional `, except <body> [and <body>]*`. The card name
         // for any SetName override comes from the parse context (set by
         // `parse_oracle_text`). When `ctx.card_name` is `None` or empty
@@ -5704,7 +5789,8 @@ fn build_become_clause(
     {
         let (after_copies_owned, mid_sentence_duration) = strip_pre_except_duration(after_copies);
         let duration = mid_sentence_duration.map(Some).unwrap_or(duration);
-        let (target, remainder) = parse_target(&after_copies_owned);
+        let (target, remainder) = ctx
+            .with_player_antecedents(|scoped| parse_target_with_ctx(&after_copies_owned, scoped));
         let card_name = ctx.card_name.as_deref().unwrap_or("");
         let additional_modifications =
             super::become_copy_except::parse_except_clause(remainder, card_name, ctx)
@@ -6583,7 +6669,7 @@ fn build_restriction_clause(
             | TargetFilter::SourceController
             | TargetFilter::ControllerAndControlledPermanents { .. }
             | TargetFilter::Opponent
-            | TargetFilter::GrantingObject
+            | TargetFilter::GrantingObject { .. }
             | TargetFilter::SourceOrPaired
             | TargetFilter::Not { .. }
             | TargetFilter::Or { .. }
@@ -6613,6 +6699,7 @@ fn build_restriction_clause(
             | TargetFilter::TriggeringSourceController
             | TargetFilter::EventTargetController
             | TargetFilter::ParentTargetSlot { .. }
+            | TargetFilter::DeclaredPlayer { .. }
             | TargetFilter::ParentTargetController
             | TargetFilter::ParentTargetOwner
             | TargetFilter::SourceChosenPlayer
@@ -7328,7 +7415,10 @@ fn try_parse_copula_goaded_clause(
 /// threaded into the emitted `GainLife.player`. CR 108.3 distinguishes owner
 /// from controller (CR 109.4); they differ when the spell controller doesn't own
 /// the targeted permanent.
-pub(super) fn try_parse_targeted_controller_gain_life(text: &str) -> Option<ParsedEffectClause> {
+pub(super) fn try_parse_targeted_controller_gain_life(
+    text: &str,
+    ctx: &mut ParseContext,
+) -> Option<ParsedEffectClause> {
     let lower = text.to_lowercase();
     let (after_prefix, _) = opt(tag::<_, _, OracleError<'_>>("then "))
         .parse(lower.as_str())
@@ -7361,45 +7451,17 @@ pub(super) fn try_parse_targeted_controller_gain_life(text: &str) -> Option<Pars
     ))
     .parse(after_prefix)
     .ok()?;
-    if !nom_primitives::scan_contains(&lower, "gain")
-        || !nom_primitives::scan_contains(&lower, "life")
-    {
-        return None;
-    }
-    let amount = if nom_primitives::scan_contains(&lower, "equal to its power")
-        || nom_primitives::scan_contains(&lower, "its power")
-    {
-        QuantityExpr::Ref {
-            qty: QuantityRef::Power {
-                scope: crate::types::ability::ObjectScope::Target,
-            },
-        }
-    } else if nom_primitives::scan_contains(&lower, "equal to its toughness")
-        || nom_primitives::scan_contains(&lower, "its toughness")
-    {
-        QuantityExpr::Ref {
-            qty: QuantityRef::Toughness {
-                scope: crate::types::ability::ObjectScope::Target,
-            },
-        }
-    } else if nom_primitives::scan_contains(&lower, "equal to its mana value")
-        || nom_primitives::scan_contains(&lower, "its mana value")
-    {
-        QuantityExpr::Ref {
-            qty: QuantityRef::ObjectManaValue {
-                scope: crate::types::ability::ObjectScope::Target,
-            },
-        }
-    } else {
-        // Try to parse a fixed amount: "its controller gains 3 life"
-        let after = alt((tag::<_, _, OracleError<'_>>("gains "), tag("gain ")))
-            .parse(after_subject)
-            .map(|(rest, _)| rest)
-            .unwrap_or(after_subject);
-        QuantityExpr::Fixed {
-            value: parse_number(after).map(|(n, _)| n as i32).unwrap_or(1),
-        }
-    };
+    let (count_text, _) = alt((tag::<_, _, OracleError<'_>>("gains "), tag("gain ")))
+        .parse(after_subject)
+        .ok()?;
+    // CR 119.3: the life amount is the shared count position ("4 life", "life
+    // equal to its power", "that much life").
+    let mut amount = super::parse_verb_count_slot(&text[text.len() - count_text.len()..], ctx)
+        .filter(|slot| super::imperative::is_life_noun(slot.noun))?
+        .count;
+    // CR 608.2b: "its" is the parent target; reading it from the target keeps
+    // the illegal-target information rule on the count.
+    super::rebind_anaphoric_object_scope(&mut amount, ObjectScope::Target);
     Some(parsed_clause(Effect::GainLife {
         amount,
         player: player_filter,
@@ -8191,7 +8253,7 @@ mod tests {
     use crate::types::ability::AttackerBlockStatus;
     use crate::types::ability::{
         AbilityKind, BasicLandType, ChoiceType, ContinuousModification, ControllerRef, Effect,
-        TypeFilter,
+        QuantityRef, TypeFilter,
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::statics::BlockExceptionKind;
@@ -8219,6 +8281,43 @@ mod tests {
             resolve_they_pronoun(&mut with_opponent),
             TargetFilter::ParentTargetSlot { index: 1 },
             "the sole genuine player slot must remain unambiguous"
+        );
+    }
+
+    /// CR 608.2c: "they" after a declared player is that player, but every scope and
+    /// trigger reading of "they" keeps its own value.
+    #[test]
+    fn they_after_a_declared_player_yields_to_scope_and_trigger_readings() {
+        let they = |scope: Option<ControllerRef>, subject: Option<TargetFilter>, declared| {
+            resolve_they_pronoun(&mut ParseContext {
+                prior_player_declaration: declared,
+                relative_player_scope: scope,
+                subject,
+                ..Default::default()
+            })
+        };
+        assert_eq!(they(None, None, true), TargetFilter::ParentTargetController);
+        assert_eq!(they(None, None, false), TargetFilter::ParentTarget);
+        for (scope, expected) in [
+            (ControllerRef::ScopedPlayer, TargetFilter::ScopedPlayer),
+            (
+                ControllerRef::ParentTargetOwner,
+                TargetFilter::ParentTargetOwner,
+            ),
+            (
+                ControllerRef::DefendingPlayer,
+                TargetFilter::DefendingPlayer,
+            ),
+            (
+                ControllerRef::TriggeringPlayer,
+                TargetFilter::TriggeringPlayer,
+            ),
+        ] {
+            assert_eq!(they(Some(scope), None, true), expected);
+        }
+        assert_eq!(
+            they(None, Some(TargetFilter::Player), true),
+            TargetFilter::TriggeringPlayer
         );
     }
 
@@ -10117,6 +10216,7 @@ mod tests {
     fn targeted_controller_gains_life_equal_to_target_toughness() {
         let clause = try_parse_targeted_controller_gain_life(
             "Its controller gains life equal to its toughness.",
+            &mut ParseContext::default(),
         )
         .expect("targeted controller gain life clause");
 
@@ -10137,6 +10237,7 @@ mod tests {
     fn targeted_controller_gains_life_equal_to_target_mana_value() {
         let clause = try_parse_targeted_controller_gain_life(
             "Its controller gains life equal to its mana value.",
+            &mut ParseContext::default(),
         )
         .expect("targeted controller mana value gain life clause");
 
@@ -10157,6 +10258,7 @@ mod tests {
     fn targeted_controller_gain_life_accepts_then_prefix() {
         let clause = try_parse_targeted_controller_gain_life(
             "Then its controller gains life equal to its mana value.",
+            &mut ParseContext::default(),
         )
         .expect("chained targeted controller mana value gain life clause");
 
@@ -10175,8 +10277,11 @@ mod tests {
 
     #[test]
     fn targeted_controller_gains_fixed_life_still_parses() {
-        let clause = try_parse_targeted_controller_gain_life("Its controller gains 3 life.")
-            .expect("targeted controller fixed gain life clause");
+        let clause = try_parse_targeted_controller_gain_life(
+            "Its controller gains 3 life.",
+            &mut ParseContext::default(),
+        )
+        .expect("targeted controller fixed gain life clause");
 
         assert!(matches!(
             clause.effect,
@@ -10247,8 +10352,11 @@ mod tests {
         // Misfortune's Gain / Path of Peace: "Its owner gains 4 life." The
         // GainLife player slot must be ParentTargetOwner, not the default
         // Controller. Reverting the fix makes this ParentTargetController.
-        let clause = try_parse_targeted_controller_gain_life("Its owner gains 4 life.")
-            .expect("targeted owner fixed gain life clause");
+        let clause = try_parse_targeted_controller_gain_life(
+            "Its owner gains 4 life.",
+            &mut ParseContext::default(),
+        )
+        .expect("targeted owner fixed gain life clause");
 
         assert!(matches!(
             clause.effect,
@@ -10265,6 +10373,7 @@ mod tests {
         // combinator (parse_det_noun_owner) yields ParentTargetOwner.
         let clause = try_parse_targeted_controller_gain_life(
             "That creature's owner gains life equal to its power.",
+            &mut ParseContext::default(),
         )
         .expect("'that noun's owner' phrasing should route to ParentTargetOwner");
 
@@ -10284,8 +10393,11 @@ mod tests {
     #[test]
     fn targeted_controller_gains_fixed_life_still_routes_to_controller_after_owner_split() {
         // No-regression: the controller arm of the same alt is unaffected.
-        let clause = try_parse_targeted_controller_gain_life("Its controller gains 4 life.")
-            .expect("controller gain life still parses");
+        let clause = try_parse_targeted_controller_gain_life(
+            "Its controller gains 4 life.",
+            &mut ParseContext::default(),
+        )
+        .expect("controller gain life still parses");
         assert!(matches!(
             clause.effect,
             Effect::GainLife {
@@ -10300,6 +10412,7 @@ mod tests {
         // Solitude: "That creature's controller gains life equal to its power."
         let clause = try_parse_targeted_controller_gain_life(
             "That creature's controller gains life equal to its power.",
+            &mut ParseContext::default(),
         )
         .expect("'that noun's controller' phrasing should route to ParentTargetController");
 
@@ -10321,6 +10434,7 @@ mod tests {
         // "The permanent's controller gains life equal to its toughness."
         let clause = try_parse_targeted_controller_gain_life(
             "The permanent's controller gains life equal to its toughness.",
+            &mut ParseContext::default(),
         )
         .expect("'the noun's controller' phrasing should route to ParentTargetController");
 
@@ -10575,6 +10689,31 @@ mod tests {
             "should parse another creature controlled by target player, got {:?}",
             app.affected
         );
+    }
+
+    /// CR 608.2c: the "each <type phrase>" arm binds "that player" to the
+    /// caller's player antecedent; a literal "you" stays the controller
+    /// (CR 109.5).
+    #[test]
+    fn parse_subject_each_type_phrase_binds_that_player_to_relative_scope() {
+        for (text, expected) in [
+            (
+                "each creature that player controls",
+                ControllerRef::TargetPlayer,
+            ),
+            ("each creature you control", ControllerRef::You),
+        ] {
+            let mut ctx = ParseContext {
+                relative_player_scope: Some(ControllerRef::TargetPlayer),
+                ..ParseContext::default()
+            };
+            let app = parse_subject_application(text, &mut ctx).expect(text);
+            let TargetFilter::Typed(typed) = &app.affected else {
+                panic!("{text}: expected a typed filter, got {:?}", app.affected);
+            };
+            assert!(typed.type_filters.contains(&TypeFilter::Creature), "{text}");
+            assert_eq!(typed.controller, Some(expected), "{text}");
+        }
     }
 
     /// "another target A or B you control" excludes the source from
@@ -11283,8 +11422,8 @@ mod tests {
         assert!(mods.contains(&ContinuousModification::AddKeyword {
             keyword: Keyword::Trample
         }));
-        // No leading duration in the trigger-body form.
-        assert_eq!(duration, None);
+        // CR 611.2a: an enclosing duration may still override this unset sentinel.
+        assert_eq!(duration, Some(Duration::Permanent));
     }
 
     #[test]
@@ -11851,8 +11990,8 @@ mod tests {
     /// CR 608.2c: a non-targeted MASS player subject ("each opponent") stated
     /// once at the head of a same-sentence verb list must govern every
     /// subjectless conjugated continuation after it, exactly like the
-    /// targeted (`CarriedPlayerSubject::Targeted`) and phase-scoped
-    /// (`::Scoped`) cases already covered by
+    /// declared (`CarriedPlayerSubject::Declared`) and phase-scoped
+    /// (`Reference { filter: ScopedPlayer, .. }`) cases already covered by
     /// `targeted_player_subject_carries_to_conjugated_predicates` above. This
     /// carry does NOT run through `CarriedPlayerSubject` — "each opponent " is
     /// peeled off the chunk's leading text before subject-application parsing

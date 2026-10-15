@@ -836,9 +836,8 @@ fn payment_population_is_stable(state: &GameState, caster: PlayerId, spell_id: O
     }
     if state.players[caster.0 as usize]
         .mana_pool
-        .mana
-        .iter()
-        .any(|unit| !unit.grants.is_empty())
+        .shapes()
+        .any(|(unit, _)| !unit.grants.is_empty())
     {
         return false;
     }
@@ -951,6 +950,7 @@ fn definition_is_componentwise_known_zero(
         || definition.announced_x.is_some()
         || definition.min_x_value != 0
         || definition.cant_be_copied
+        || !definition.illegal_targets_disposition.is_does_not_resolve()
         || definition.cost_reduction.is_some()
         || definition.forward_result
         || definition.player_scope.is_some()
@@ -1763,7 +1763,8 @@ mod tests {
         TurnJournalKind, REMOVE_COUNTER_COST_X,
     };
     use engine::types::ability::{
-        QuantityModification, ReplacementDefinition, ReplacementPlayerScope,
+        IllegalTargetsDisposition, QuantityModification, ReplacementDefinition,
+        ReplacementPlayerScope,
     };
     use engine::types::card::{CardFace, CleaveVariant, LayoutKind};
     use engine::types::counter::{CounterMatch, CounterType};
@@ -5975,6 +5976,28 @@ mod tests {
             true,
             false,
         ));
+
+        // CR 608.2b + CR 101.1: a definition that still resolves with illegal
+        // targets is not the plain zero shape. Reach guard: the unmutated
+        // definition IS known-zero, so the refusal belongs to the disposition.
+        assert!(definition_is_componentwise_known_zero(
+            state,
+            &zero_gain_definition(),
+            P0,
+            source,
+            true,
+            false,
+        ));
+        let mut still_resolves = zero_gain_definition();
+        still_resolves.illegal_targets_disposition = IllegalTargetsDisposition::StillResolves;
+        assert!(!definition_is_componentwise_known_zero(
+            state,
+            &still_resolves,
+            P0,
+            source,
+            true,
+            false,
+        ));
     }
 
     #[test]
@@ -6265,7 +6288,8 @@ mod tests {
         );
 
         let mut unfunded = funded.clone();
-        unfunded.players[P0.0 as usize].mana_pool.mana = pooled_mana(ManaType::Colorless, 1);
+        unfunded.players[P0.0 as usize].mana_pool =
+            engine::types::mana::ManaPool::from_units(pooled_mana(ManaType::Colorless, 1));
         assert!(
             !spell_cost_is_payable_from_pool(&unfunded, P0, congregate),
             "removing only pool coverage forces the gate to inspect available sources"
@@ -6505,27 +6529,31 @@ mod tests {
     fn zero_cast_mana_spell_grants_are_paired_for_pool_and_source_paths() {
         let (mut pool_state, congregate) = funded_zero_congregate_state();
         let pool_grant_source = add_plain_colorless_mana_source(&mut pool_state, 91_210);
-        pool_state.players[P0.0 as usize].mana_pool.mana[0].source_id = pool_grant_source;
-        pool_state.players[P0.0 as usize].mana_pool.mana[0]
-            .grants
-            .push(ManaSpellGrant::TriggerOnSpend {
+        let edit_first_unit = |state: &mut GameState, edit: &dyn Fn(&mut ManaUnit)| {
+            let pool = &mut state.players[P0.0 as usize].mana_pool;
+            let mut units: Vec<ManaUnit> = pool.units().collect();
+            edit(&mut units[0]);
+            *pool = engine::types::mana::ManaPool::from_units(units);
+        };
+        edit_first_unit(&mut pool_state, &|unit| {
+            unit.source_id = pool_grant_source;
+            unit.grants.push(ManaSpellGrant::TriggerOnSpend {
                 filter: TargetFilter::Any,
                 ability: Box::new(zero_gain_definition()),
             });
+        });
         assert!(
             zero_cast_is_retained(&pool_state, congregate),
             "a potentially spent pool grant preserves the engine-issued Auto cast"
         );
-        pool_state.players[P0.0 as usize].mana_pool.mana[0]
-            .grants
-            .clear();
+        edit_first_unit(&mut pool_state, &|unit| unit.grants.clear());
         assert!(
             !zero_cast_is_retained(&pool_state, congregate),
             "removing only the pool grant restores the known-zero rejection"
         );
 
         let (mut source_state, source_congregate) = funded_zero_congregate_state();
-        source_state.players[P0.0 as usize].mana_pool.mana.clear();
+        source_state.players[P0.0 as usize].mana_pool.clear();
         add_plain_colorless_mana_source(&mut source_state, 91_206);
         add_plain_colorless_mana_source(&mut source_state, 91_207);
         let grant_source = add_grant_mana_source(&mut source_state, 91_208);
@@ -6560,7 +6588,7 @@ mod tests {
     #[test]
     fn zero_cast_otherwise_only_source_mana_grant_is_paired() {
         let (mut state, congregate) = funded_zero_congregate_state();
-        state.players[P0.0 as usize].mana_pool.mana.clear();
+        state.players[P0.0 as usize].mana_pool.clear();
         add_plain_colorless_mana_source(&mut state, 91_211);
         add_plain_colorless_mana_source(&mut state, 91_212);
         let source = add_otherwise_only_grant_mana_source(&mut state, 91_213);
