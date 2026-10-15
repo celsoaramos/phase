@@ -3290,7 +3290,9 @@ fn winter_soldier_equipment_count_scales_power_dynamically() {
                 } => {
                     assert_eq!(*type_filters, vec![TypeFilter::Subtype("Equipment".into())]);
                     assert!(
-                        properties.contains(&FilterProp::AttachedToSource),
+                        properties.contains(&FilterProp::AttachedTo {
+                            to: crate::types::ability::AttachmentReferent::Source
+                        }),
                         "must carry AttachedToSource, got {properties:?}"
                     );
                 }
@@ -3921,10 +3923,20 @@ fn turtle_van_attack_trigger_conditional_double_counters() {
         );
     let trigger = r.triggers.first().expect("attack trigger");
     let execute = trigger.execute.as_deref().expect("execute ability");
-    assert!(
-        matches!(&*execute.effect, Effect::PutCounter { .. }),
-        "head clause must be PutCounter, got {:?}",
-        execute.effect
+    // CR 115.1 + CR 601.2c + CR 702.122c: "that crewed it this turn" restricts
+    // which creature is a legal target — the crewer side of the per-turn crew
+    // relation.
+    let Effect::PutCounter { target, .. } = &*execute.effect else {
+        panic!("expected a PutCounter head, got {:?}", execute.effect);
+    };
+    assert_eq!(
+        *target,
+        TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::CrewedThisTurn {
+                relation: crate::types::ability::CrewRelation::CrewedSource,
+            }])
+        ),
+        "the counter's target must be a creature that crewed the Vehicle this turn"
     );
     let sub = execute
         .sub_ability
@@ -3946,6 +3958,49 @@ fn turtle_van_attack_trigger_conditional_double_counters() {
     assert!(
         matches!(filter, TargetFilter::Or { filters } if filters.len() == 3),
         "gate must be an Or of three subtypes, got {filter:?}"
+    );
+}
+
+/// CR 702.122c + CR 400.7: the crew-history quantity guard is typed and
+/// position-independent. A filter-bearing quantity over the crew relation is
+/// refused wherever it sits (here, nested in a trigger condition); the same
+/// relation as a plain TARGET filter is not a quantity and is left alone, and
+/// the same quantity over an unrelated filter is left alone.
+#[test]
+fn crew_history_quantity_guard_is_typed_and_position_independent() {
+    let crew = FilterProp::CrewedThisTurn {
+        relation: crate::types::ability::CrewRelation::CrewedSource,
+    };
+    let crew_filter = TargetFilter::Typed(TypedFilter::creature().properties(vec![crew]));
+    let count = |filter: TargetFilter| QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCount { filter },
+    };
+    let nested_condition = |filter: TargetFilter| TriggerCondition::Not {
+        condition: Box::new(TriggerCondition::QuantityComparison {
+            lhs: count(filter),
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 2 },
+        }),
+    };
+
+    let crew_count = serde_json::to_value(nested_condition(crew_filter.clone())).unwrap();
+    assert!(mentions_crew_history(&crew_count));
+    assert!(holds_crew_history_quantity(&crew_count));
+
+    let plain_count = serde_json::to_value(nested_condition(TargetFilter::Typed(
+        TypedFilter::creature(),
+    )))
+    .unwrap();
+    assert!(!holds_crew_history_quantity(&plain_count));
+
+    let crew_target = serde_json::to_value(&crew_filter).unwrap();
+    assert!(
+        mentions_crew_history(&crew_target),
+        "reach guard: the prefilter sees the relation"
+    );
+    assert!(
+        !holds_crew_history_quantity(&crew_target),
+        "a target filter is not a quantity"
     );
 }
 
@@ -12603,11 +12658,12 @@ fn triggered_modal_labeled_modes_strip_labels_before_effect_parse() {
     ));
 }
 
-// CR 702.xxx: Prepare (Strixhaven) — Biblioplex Tomekeeper's ETB is a
+// CR 722.3a + CR 722.3b: Prepare — Biblioplex Tomekeeper's ETB is a
 // modal trigger whose branches invoke the `becomes prepared` / `becomes
 // unprepared` imperatives. The modal-branch builder must route each
 // branch body through the same effect-chain parser that recognizes these
-// imperatives at the top level. Assign when WotC publishes SOS CR update.
+// imperatives at the top level. Both "Target creature ..." branches are the
+// single scope (the paired `All` row is Codie's activated ability below).
 #[test]
 fn biblioplex_modal_etb_routes_becomes_prepared_branches() {
     let r = parse(
@@ -12631,13 +12687,124 @@ fn biblioplex_modal_etb_routes_becomes_prepared_branches() {
     // First branch: Target creature becomes prepared.
     assert!(matches!(
         *execute.mode_abilities[0].effect,
-        Effect::BecomePrepared { .. }
+        Effect::BecomePrepared {
+            scope: EffectScope::Single,
+            ..
+        }
     ));
     // Second branch: Target creature becomes unprepared.
     assert!(matches!(
         *execute.mode_abilities[1].effect,
-        Effect::BecomeUnprepared { .. }
+        Effect::BecomeUnprepared {
+            scope: EffectScope::Single,
+            ..
+        }
     ));
+}
+
+/// CR 115.10a + CR 722.3a: Codie, Ravenous Codex's "{W}{U}{B}{R}{G}, {T}: Each
+/// creature you control becomes prepared." names no target: the activated
+/// ability carries the untargeted population `Typed(Creature, You)` under
+/// `EffectScope::All`, and `target_filter()` builds no slot from it.
+#[test]
+fn codie_activated_ability_is_an_untargeted_population() {
+    let r = parse(
+        "Whenever you cast a prepared spell, copy it. You may choose new targets for the copy.\n{W}{U}{B}{R}{G}, {T}: Each creature you control becomes prepared. (Only creatures with prepare spells can become prepared.)",
+        "Codie, Ravenous Codex",
+        &[],
+        &["Artifact", "Creature"],
+        &["Book", "Construct"],
+    );
+    // Reach guard: the whole card parsed — its trigger is the prepared-spell
+    // copy trigger, and the activated ability is the prepare effect.
+    assert_eq!(r.triggers.len(), 1);
+    assert!(matches!(
+        &r.triggers[0].valid_card,
+        Some(TargetFilter::Typed(typed)) if typed.properties.contains(&FilterProp::PrepareSpell)
+    ));
+    assert!(matches!(
+        r.triggers[0].execute.as_deref().map(|def| &*def.effect),
+        Some(Effect::CopySpell { .. })
+    ));
+    assert_eq!(r.abilities.len(), 1);
+    let effect = &*r.abilities[0].effect;
+    assert_eq!(
+        *effect,
+        Effect::BecomePrepared {
+            target: TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+            scope: EffectScope::All,
+        }
+    );
+    assert!(
+        effect.target_filter().is_none(),
+        "CR 115.10a: the population is not a target"
+    );
+}
+
+/// CR 722.3a: Skycoach Waypoint's "Target creature becomes prepared." is the
+/// single scope (the paired `All` row is Codie's activated ability above). Only
+/// the scope is asserted here.
+#[test]
+fn skycoach_waypoint_targeted_prepare_is_single_scope() {
+    let r = parse(
+        "{T}: Add {C}.\n{3}, {T}: Target creature becomes prepared. (Only creatures with prepare spells can become prepared.)",
+        "Skycoach Waypoint",
+        &[],
+        &["Land"],
+        &[],
+    );
+    assert_eq!(r.abilities.len(), 2);
+    assert!(matches!(
+        *r.abilities[1].effect,
+        Effect::BecomePrepared {
+            scope: EffectScope::Single,
+            ..
+        }
+    ));
+}
+
+/// CR 722.3b + CR 608.2c: Infinite Coursework's "It becomes unprepared." is an
+/// anaphor of the tapped enchanted creature, so the derivation keeps it
+/// `Single` (the control that it does not widen an anaphor into a population).
+/// Asserts scope only: which object the anaphor resolves to is not measured
+/// here.
+#[test]
+fn infinite_coursework_anaphoric_unprepare_is_single_scope() {
+    let r = parse(
+        "Enchant creature\nWhen this Aura enters, tap enchanted creature. It becomes unprepared.\nEnchanted creature loses all abilities and doesn't untap during its controller's untap step.",
+        "Infinite Coursework",
+        &[],
+        &["Enchantment"],
+        &["Aura"],
+    );
+    assert_eq!(r.triggers.len(), 1);
+    let execute = r.triggers[0]
+        .execute
+        .as_deref()
+        .expect("the ETB trigger has an execute");
+    // Reach guard: the head of the chain is the tap, so the sentence pair parsed.
+    assert!(matches!(
+        *execute.effect,
+        Effect::SetTapState {
+            scope: EffectScope::Single,
+            ..
+        }
+    ));
+    let sub = execute
+        .sub_ability
+        .as_deref()
+        .expect("\"It becomes unprepared.\" is the chained sub-ability");
+    assert!(
+        matches!(
+            *sub.effect,
+            Effect::BecomeUnprepared {
+                scope: EffectScope::Single,
+                ..
+            }
+        ),
+        "got {:?}",
+        sub.effect
+    );
 }
 
 #[test]
@@ -13798,7 +13965,9 @@ fn make_a_splash_tap_cap_counts_us_in_name_stickers_on_self() {
 }
 
 /// SHAPE (negative): Disemvowel counts vowels in the creature's *name* (CR
-/// 201), not on a name sticker (CR 123.6), so it keeps its base parse.
+/// 201), not on a name sticker (CR 123.6), so it is not read as a sticker
+/// count. No count reads "unique vowel in the creature's name", so the life
+/// clause is an honest gap rather than a one-life loss (CR 119.3).
 #[test]
 fn disemvowel_is_not_a_name_sticker_count() {
     let parsed = parse_oracle_text(
@@ -13817,13 +13986,7 @@ fn disemvowel_is_not_a_name_sticker_count() {
     );
     let sub = spell.sub_ability.as_deref().expect("life-loss clause");
     assert!(
-        matches!(
-            sub.effect.as_ref(),
-            Effect::LoseLife {
-                amount: QuantityExpr::Fixed { value: 1 },
-                target: Some(TargetFilter::ParentTargetController),
-            }
-        ),
+        matches!(sub.effect.as_ref(), Effect::Unimplemented { .. }),
         "{:?}",
         sub.effect
     );
@@ -26566,6 +26729,7 @@ fn target_has_pt_threshold_gate_lowers_to_target_filter() {
                     &*gated.effect,
                     Effect::BecomePrepared {
                         target: TargetFilter::SelfRef,
+                        scope: EffectScope::Single,
                     }
                 ),
                 "{name}: gated body prepares the source: {:?}",
@@ -27186,19 +27350,38 @@ fn reflexive_entry_rider_voices_all_stay_on_the_trigger_path() {
          from your graveyard to the battlefield. If a creature is put onto the battlefield \
          this way, it enters with an additional +1/+1 counter on it.";
 
+    // Premise for the Passive Voice row (this is what makes its negative below
+    // non-vacuous and pins the revert): handed the WHOLE line, the replacement
+    // parser really does claim it. Only the head-scoped `enters with` gate keeps
+    // the interceptor from reaching this and dropping the reanimation instruction.
+    assert!(
+        crate::parser::oracle_replacement::parse_replacement_line(
+            PASSIVE_VOICE,
+            "Passive Voice Reanimator"
+        )
+        .is_some(),
+        "Passive Voice Reanimator: premise — the un-scoped line is claimable by the \
+         replacement parser"
+    );
+    // Premise for the Winter Soldier row (#9657): its first "with" belongs to the
+    // reanimated card's filter ("card with mana value less than or equal to …"),
+    // and the enters-with count/type grammar rejects the prose payload that
+    // follows it, so the whole line is no longer claimable by the replacement
+    // parser. The row still pins that the line stays on the trigger path below.
+    assert!(
+        crate::parser::oracle_replacement::parse_replacement_line(
+            WINTER_SOLDIER,
+            "Winter Soldier, Reborn Avenger"
+        )
+        .is_none(),
+        "Winter Soldier, Reborn Avenger: premise — the count/type grammar rejects the \
+         filter prose, so the un-scoped line is not claimable by the replacement parser"
+    );
+
     for (name, oracle) in [
         ("Winter Soldier, Reborn Avenger", WINTER_SOLDIER),
         ("Passive Voice Reanimator", PASSIVE_VOICE),
     ] {
-        // Premise (this is what makes the negative below non-vacuous and pins the
-        // revert): handed the WHOLE line, the replacement parser really does claim
-        // it. Only the head-scoped `enters with` gate keeps the interceptor from
-        // reaching this and dropping the reanimation instruction.
-        assert!(
-            crate::parser::oracle_replacement::parse_replacement_line(oracle, name).is_some(),
-            "{name}: premise — the un-scoped line is claimable by the replacement parser"
-        );
-
         let parsed = parse(oracle, name, &[], &["Creature"], &[]);
 
         // Reach-guard: the line really produced a trigger, so the
@@ -30371,7 +30554,7 @@ fn you_attack_trigger_binds_its_attacked_player_object() {
 /// Revert-to-red: removing the `GrantReplacement` arm (falling through to the
 /// wildcard `_ => {}`) leaves the raw placeholder character in the nested
 /// definition's description, so the `assert_eq!` below prints the escaped
-/// `\u{e0002}` where the granting card's printed name belongs.
+/// `\u{e0004}` where the granting card's printed name belongs.
 #[test]
 fn render_modification_descriptions_reaches_grant_replacement() {
     let mut replacement = ReplacementDefinition::new(ReplacementEvent::Moved);
@@ -30875,6 +31058,7 @@ fn render_net_reaches_every_nested_description_carrier() {
         target: TargetFilter::Any,
         source_rider: Some(CounterSourceRider::LosesAbilities {
             static_def: Box::new(counter_static),
+            source_filter: None,
             duration: Box::new(Duration::UntilHostLeavesPlay),
         }),
         countered_spell_zone: None,
@@ -31294,16 +31478,16 @@ fn guard_walk_reaches_every_continuous_modification_carrier() {
 /// resolution-time grant onto a target. This route is a PRE-EXISTING PARSER
 /// LEAK at BASE_SHA: `try_parse_gain_quoted_ability` sets the description
 /// directly and never went through `parse_quoted_ability`'s old sanitizer, so
-/// the parser would emit a raw U+E0002 into `client/public/card-data.json` for
+/// the parser would emit a raw U+E0004 into `client/public/card-data.json` for
 /// any card with this shape. MEASURED: no card in the current corpus parses to
-/// that shape — a scan of the exported `card-data.json` finds zero U+E0002,
+/// that shape — a scan of the exported `card-data.json` finds zero U+E0004,
 /// raw or escaped, on either side of the change — so the leak is LATENT IN
 /// THE PARSER, not shipped. The `GenericEffect | Token` arm is what closes it;
 /// the arm is load-bearing for this fixture regardless of corpus coverage.
 ///
 /// Revert-to-red: delete the `GenericEffect | Token` arm from
 /// `render_effect_descriptions` — the outer description reverts to
-/// `gain "{T}, Sacrifice \u{e0002}: Draw a card."`.
+/// `gain "{T}, Sacrifice \u{e0004}: Draw a card."`.
 #[test]
 fn resolution_time_grant_renders_the_granter_in_both_descriptions() {
     let parsed = parse(
@@ -31362,7 +31546,7 @@ fn resolution_time_grant_renders_the_granter_in_both_descriptions() {
 /// leaking.
 ///
 /// Revert-to-red: delete that arm — the token static's description reverts to
-/// `Sacrifice \u{e0002}: Draw a card.`.
+/// `Sacrifice \u{e0004}: Draw a card.`.
 #[test]
 fn token_body_grant_renders_the_granter() {
     let parsed = parse(
@@ -31403,7 +31587,7 @@ fn token_body_grant_renders_the_granter() {
 ///
 /// Revert-to-red: delete the `render_modal_descriptions` call from
 /// `render_granting_self_descriptions` — `mode_descriptions[0]` reverts to
-/// `Target creature gains "Sacrifice \u{e0002}: Draw a card." until end of turn.`
+/// `Target creature gains "Sacrifice \u{e0004}: Draw a card." until end of turn.`
 #[test]
 fn modal_mode_description_renders_the_granter() {
     let parsed = parse(
@@ -33242,4 +33426,27 @@ fn lich_as_enters_life_loss_parses_as_moved_self_replacement() {
         .statics
         .iter()
         .any(|def| matches!(def.mode, StaticMode::CantLoseTheGame)));
+}
+
+/// CR 201.5a: the two-layer IR facade lowers a refused quoted granter name to the same
+/// unsupported residual as the production pipeline.
+#[test]
+fn ir_facade_demotes_a_refused_granter_name() {
+    let mut ir = parse_oracle_ir(
+        "Equipped creature gets +2/+1 and has \"{T}, Unattach Heartseeker: Destroy target creature.\"\nEquip {5}",
+        "Heartseeker",
+        &[],
+        &["Artifact".to_string()],
+        &["Equipment".to_string()],
+    );
+    assert!(
+        ir.granter_name_refusals.contains(&0),
+        "reach-guard: {ir:#?}"
+    );
+    let parsed = lower_oracle_ir(&mut ir);
+    assert!(parsed.statics.is_empty(), "{parsed:#?}");
+    assert!(parsed.abilities.iter().any(|def| matches!(
+        &*def.effect,
+        Effect::Unimplemented { name, .. } if name == "granter_reference_unreached"
+    )));
 }
