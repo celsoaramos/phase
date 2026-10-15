@@ -5547,10 +5547,19 @@ fn finish_exile_selection_for_cost(
         if let Some(obj) = state.objects.get(&first) {
             // CR 107.3a + CR 118.9: Shoal-style alternative costs ("exile a
             // [color] card with mana value X") define X from the pitched card's
-            // mana value rather than a prior announcement.
+            // mana value rather than a prior announcement. Accepting a non-mana
+            // alternative cost empties the base (it is paid rather than the mana
+            // cost), so the X it defines is read off the spell's own mana cost.
+            let alternative_defines_x = pending.base_cost.as_ref()
+                == Some(&crate::types::mana::ManaCost::zero())
+                && state
+                    .objects
+                    .get(&pending.object_id)
+                    .is_some_and(|spell| cost_has_x(&spell.mana_cost));
             if pending.ability.chosen_x.is_none()
-                && pending.cost == crate::types::mana::ManaCost::NoCost
-                && pending.base_cost.as_ref().is_some_and(cost_has_x)
+                && ((pending.cost == crate::types::mana::ManaCost::NoCost
+                    && pending.base_cost.as_ref().is_some_and(cost_has_x))
+                    || alternative_defines_x)
             {
                 // CR 202.3d + CR 709.4b: the pitched card is exiled from hand
                 // (off the stack), so a split card defines X from its combined
