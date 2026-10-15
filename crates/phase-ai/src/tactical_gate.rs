@@ -357,11 +357,11 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject;
     }
 
-    if is_redundant_creature_only_removal(ctx, &effects) {
+    if is_proven_damage_whiff(ctx, &effects) {
         return GateDecision::Reject;
     }
 
-    if is_proven_damage_whiff(ctx, &effects) {
+    if is_redundant_creature_only_removal(ctx, &effects) {
         return GateDecision::Reject;
     }
 
