@@ -195,5 +195,8 @@
   },
   {
     "branch": "card/counter-hexproof-spell"
+  },
+  {
+    "branch": "ai/nonlethal-burn-gate"
   }
 ]
