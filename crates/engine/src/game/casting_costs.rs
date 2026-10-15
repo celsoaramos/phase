@@ -729,7 +729,18 @@ pub(crate) fn handle_decide_additional_cost(
                             recompute_choice_cost = true;
                             None
                         }
-                        _ => Some(preferred.clone()),
+                        // CR 118.9 + CR 601.2f: an alternative cost that is not purely
+                        // mana is still paid RATHER than the mana cost, so the base the
+                        // total is recomputed from is nothing — never the printed cost
+                        // kept in `base_cost`. Its own mana parts ("pay {W} and tap four
+                        // untapped creatures you control with flying", Sephara, Sky's
+                        // Blade) are declared on top of that empty base, and cost
+                        // increases and reductions then apply to the result.
+                        _ => {
+                            alternative_base_override = Some(ManaCost::zero());
+                            recompute_choice_cost = true;
+                            Some(preferred.clone())
+                        }
                     }
                 } else {
                     Some(preferred.clone())
