@@ -4536,6 +4536,7 @@ mod tests {
             target: TargetFilter::Any,
             source_rider: Some(CounterSourceRider::LosesAbilities {
                 static_def: Box::new(counter_static),
+                source_filter: None,
                 duration: Box::new(crate::types::ability::Duration::UntilHostLeavesPlay),
             }),
             countered_spell_zone: None,

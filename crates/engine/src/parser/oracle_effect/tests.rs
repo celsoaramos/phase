@@ -7845,7 +7845,11 @@ fn effect_counter_ability_with_source_static_absorption() {
         "sub_ability should be absorbed"
     );
     if let Effect::Counter { source_rider, .. } = &*ability.effect {
-        let CounterSourceRider::LosesAbilities { static_def, .. } = source_rider
+        let CounterSourceRider::LosesAbilities {
+            static_def,
+            source_filter,
+            duration,
+        } = source_rider
             .as_ref()
             .expect("should have a LosesAbilities source_rider")
         else {
@@ -7856,9 +7860,95 @@ fn effect_counter_ability_with_source_static_absorption() {
             static_def.modifications,
             vec![ContinuousModification::RemoveAllAbilities]
         );
+        assert_eq!(**duration, Duration::WhileHostOnBattlefield);
+        // CR 608.2c + CR 109.2: the printed type list is carried as the typed
+        // gate on the countered ability's source — exactly artifact, creature
+        // and planeswalker (no land, no enchantment).
+        let TargetFilter::Or { filters } = &**source_filter
+            .as_ref()
+            .expect("the printed type list must be carried as source_filter")
+        else {
+            panic!("expected an Or of three type filters, got {source_filter:?}");
+        };
+        let mut types: Vec<TypeFilter> = Vec::new();
+        for f in filters {
+            let TargetFilter::Typed(tf) = f else {
+                panic!("expected a Typed leg, got {f:?}");
+            };
+            assert_eq!(tf.type_filters.len(), 1, "each leg is a single card type");
+            types.extend(tf.type_filters.iter().cloned());
+        }
+        types.sort_by_key(|t| format!("{t:?}"));
+        assert_eq!(
+            types,
+            vec![
+                TypeFilter::Artifact,
+                TypeFilter::Creature,
+                TypeFilter::Planeswalker
+            ]
+        );
     } else {
         panic!("expected Counter effect");
     }
+}
+
+/// CR 608.2c: the untyped conditional "if a permanent's ability is countered
+/// this way, that permanent loses all abilities ..." carries NO type gate
+/// (`source_filter: None`) — the sibling-negative of the typed rider above.
+#[test]
+fn effect_counter_ability_untyped_loses_abilities_rider_has_no_source_filter() {
+    use crate::types::ability::CounterSourceRider;
+
+    let ability = parse_effect_chain(
+            "counter up to one target activated or triggered ability. If a permanent's ability is countered this way, that permanent loses all abilities for as long as ~ remains on the battlefield",
+            AbilityKind::Spell,
+        );
+    assert!(ability.sub_ability.is_none());
+    let Effect::Counter { source_rider, .. } = &*ability.effect else {
+        panic!("expected Counter effect, got {:?}", ability.effect);
+    };
+    assert!(
+        matches!(
+            source_rider,
+            Some(CounterSourceRider::LosesAbilities {
+                source_filter: None,
+                ..
+            })
+        ),
+        "expected an untyped LosesAbilities rider, got {source_rider:?}"
+    );
+}
+
+/// CR 608.2c: a type list the type-phrase reader cannot read must NOT be
+/// silently treated as an unrestricted rider, nor fall to the generic path as a
+/// `RemoveAllAbilities` sub-ability on the parent target. The rider-shaped clause
+/// is claimed and the whole counter is gapped with a strict-failure marker.
+#[test]
+fn effect_counter_ability_unreadable_source_type_list_is_not_an_unrestricted_rider() {
+    let ability = parse_effect_chain(
+            "counter up to one target activated or triggered ability. If an ability of a zorgle is countered this way, that permanent loses all abilities for as long as ~ remains on the battlefield",
+            AbilityKind::Spell,
+        );
+    // The clause is honestly gapped: a strict-failure marker, no executable counter.
+    let Effect::Unimplemented { name, description } = &*ability.effect else {
+        panic!("expected a strict-failure marker, got {:?}", ability.effect);
+    };
+    assert_eq!(name, "counter_source_rider_type_list");
+    assert!(
+        description.as_deref().is_some_and(|d| d.contains("zorgle")),
+        "the marker must carry the printed clause, got {description:?}"
+    );
+    // No generic-path mis-parse: no RemoveAllAbilities anywhere in the chain.
+    assert!(
+        ability.sub_ability.is_none(),
+        "the clause must not survive as a sub-ability, got {:?}",
+        ability.sub_ability
+    );
+    let rendered = format!("{ability:?}");
+    assert!(
+        !rendered.contains("RemoveAllAbilities"),
+        "no RemoveAllAbilities may be emitted for an unreadable gate: {rendered}"
+    );
 }
 
 /// CR 701.8 + CR 608.2c: "If a permanent's ability is countered this way,
@@ -20784,6 +20874,127 @@ fn put_counter_each_of_exact_count_target_is_exactly_multi_targeted() {
     }
 }
 
+/// Predictive Preparations (FRA): "put … counter(s) on [each of ]one or two
+/// target …" and "[each of ]one, two, or three target …" announce a bounded
+/// target set, stamped `fixed(1, 2)` / `fixed(1, 3)`.
+/// CR 115.1a + CR 601.2c + CR 122.1:
+/// the stem recognition is the shared `parse_bounded_target_cardinality`
+/// helper; min is 1, so CR 115.6 (zero-target legality) does not apply.
+/// Parity row: the chain, the counter parser, and the counter-placement
+/// recovery agree on the same spec for the same text.
+#[test]
+fn put_counter_each_of_bounded_count_target_is_bounded_multi_targeted() {
+    for (text, spec) in [
+        (
+            "Put a +1/+1 counter on each of one or two target creatures.",
+            MultiTargetSpec::fixed(1, 2),
+        ),
+        (
+            "Put a +1/+1 counter on each of one, two, or three target creatures.",
+            MultiTargetSpec::fixed(1, 3),
+        ),
+        (
+            "Put a +1/+1 counter on each of one or two other target creatures.",
+            MultiTargetSpec::fixed(1, 2),
+        ),
+        (
+            "Put a +1/+1 counter on one or two another target creature.",
+            MultiTargetSpec::fixed(1, 2),
+        ),
+    ] {
+        let def = parse_effect_chain(text, AbilityKind::Spell);
+        assert_eq!(def.multi_target, Some(spec.clone()), "{text}");
+        assert!(
+            matches!(
+                def.effect.as_ref(),
+                Effect::PutCounter {
+                    counter_type: ct,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Typed(_),
+                } if *ct == CounterType::Plus1Plus1
+            ),
+            "{text}: expected a targeted PutCounter, got {:?}",
+            def.effect
+        );
+
+        let lower = text.to_lowercase();
+        let (_, _, parser_spec) =
+            counter::try_parse_put_counter(&lower, text, &mut ParseContext::default())
+                .unwrap_or_else(|| panic!("{text}: the counter parser must accept the placement"));
+        assert_eq!(parser_spec, Some(spec), "{text}: counter parser's count");
+        assert_eq!(
+            extract_put_counter_multi_target(text),
+            parser_spec,
+            "{text}: the recovery must agree with the counter parser"
+        );
+    }
+}
+
+/// Negative guards: without the inter-word space ("twotarget") or without the
+/// target article ("one or two creatures") no bounded spec is stamped.
+/// The valid neighboring placement is parsed first in this same test as the
+/// reach-guard: it proves the bounded recognizer is enabled, so the malformed
+/// rows below cannot pass vacuously.
+#[test]
+fn put_counter_bounded_count_without_space_or_article_is_not_multi_targeted() {
+    // Reach-guard: the enabled recognizer stamps the valid placement through
+    // every seam with a consumed remainder.
+    let valid = "Put a +1/+1 counter on each of one or two target creatures.";
+    let (effect, remainder, parser_spec) =
+        counter::try_parse_put_counter(&valid.to_lowercase(), valid, &mut ParseContext::default())
+            .unwrap_or_else(|| panic!("{valid}: the counter parser must accept the placement"));
+    assert!(
+        matches!(
+            effect,
+            Effect::PutCounter {
+                counter_type: ref ct,
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Typed(_),
+            } if *ct == CounterType::Plus1Plus1
+        ),
+        "{valid}: expected a targeted PutCounter, got {effect:?}"
+    );
+    assert_eq!(parser_spec, Some(MultiTargetSpec::fixed(1, 2)), "{valid}");
+    assert!(
+        remainder.trim_matches(['.', ' ']).is_empty(),
+        "{valid}: remainder must be consumed, got {remainder:?}"
+    );
+    assert_eq!(
+        extract_put_counter_multi_target(valid),
+        parser_spec,
+        "{valid}: the recovery must agree with the counter parser"
+    );
+
+    for text in [
+        "Put a +1/+1 counter on each of one or twotarget creatures.",
+        "Put a +1/+1 counter on each of one or two creatures.",
+    ] {
+        assert_eq!(
+            parse_effect_chain(text, AbilityKind::Spell).multi_target,
+            None,
+            "{text}"
+        );
+        // Unconditional: intentional rejection may decline inside placement
+        // (Some with no spec) or upstream of it (None). Both outcomes are
+        // named explicitly here; the reach-guard above proves the recognizer
+        // runs, and the chain/extractor pins below carry the rejection.
+        let direct = counter::try_parse_put_counter(
+            &text.to_lowercase(),
+            text,
+            &mut ParseContext::default(),
+        );
+        assert!(
+            matches!(direct, Some((_, _, None)) | None),
+            "{text}: placement must decline the bounded spec"
+        );
+        assert_eq!(
+            extract_put_counter_multi_target(text),
+            None,
+            "{text}: the recovery must decline"
+        );
+    }
+}
+
 /// Phase 11 Q-3 (iv) (preservation). The "up to" placement, a single-target
 /// placement and a distribution (CR 601.2d) keep their base specs.
 #[test]
@@ -25353,6 +25564,52 @@ fn connive_where_x_is_creatures_died_this_turn() {
             }
         ),
         "connive count should be creatures-died-this-turn, got {count:?}"
+    );
+}
+
+/// CR 701.50d + CR 608.2c: the connive arm's target sub-parse is speculative —
+/// the bound where-X clause it reads is not a target phrase, and the subject
+/// replaces its `Any`. So a caller context carrying a player antecedent must
+/// not receive that discarded parse's `TargetFallback` (Spymaster's Vault).
+#[test]
+fn connive_where_x_keeps_discarded_target_fallback_off_the_caller() {
+    let mut ctx = ParseContext {
+        relative_player_scope: Some(ControllerRef::TargetPlayer),
+        ..ParseContext::default()
+    };
+    let def = parse_effect_chain_with_context(
+        "Target creature you control connives X, where X is the number of creatures that died this turn.",
+        AbilityKind::Activated,
+        &mut ctx,
+    );
+    // Reach guard: the connive arm produced the card's effect — subject target,
+    // where-X bound count.
+    let Effect::Connive { target, count } = &*def.effect else {
+        panic!("expected Connive, got {:?}", def.effect);
+    };
+    assert_eq!(
+        *target,
+        TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You))
+    );
+    assert!(
+        matches!(
+            count,
+            QuantityExpr::Ref {
+                qty: QuantityRef::ZoneChangeCountThisTurn {
+                    from: Some(Zone::Battlefield),
+                    to: Some(Zone::Graveyard),
+                    ..
+                },
+            }
+        ),
+        "connive count should be the bound X, got {count:?}"
+    );
+    assert!(
+        !ctx.diagnostics
+            .iter()
+            .any(|diagnostic| matches!(diagnostic, OracleDiagnostic::TargetFallback { .. })),
+        "the discarded connive target parse must not leak a TargetFallback: {:?}",
+        ctx.diagnostics
     );
 }
 
@@ -39585,7 +39842,8 @@ fn craterhoof_where_x_binds_dynamic_pump_to_object_count() {
 /// Regression pin: the binding previously degraded to the lossy
 /// `PtValue::Variable("<raw oracle text>")` fallback, which `resolve_variable_pt`
 /// (game/effects/pump.rs) resolves to `None` — so the pump silently applied
-/// NOTHING. `QuantityRef::ExiledCardPower` is the typed home for this quantity.
+/// NOTHING. CR 607.2a + CR 607.3: X is the summed power of the cards in exile
+/// linked to this object, the `ExiledBySource` population aggregate.
 #[test]
 fn where_x_power_of_the_exiled_card_binds_exiled_card_power() {
     let def = parse_effect_chain(
@@ -39599,14 +39857,22 @@ fn where_x_power_of_the_exiled_card_binds_exiled_card_power() {
         panic!("expected Pump, got {:?}", def.effect);
     };
     let expected = QuantityExpr::Ref {
-        qty: QuantityRef::ExiledCardPower { index: 0 },
+        qty: QuantityRef::PropertyAggregate(
+            PropertyAggregate::new(
+                AggregateFunction::Sum,
+                ObjectProperty::Power,
+                CardTypeSetSource::ExiledBySource,
+            )
+            .expect("statically valid property aggregate"),
+        ),
     };
     for (stat, value) in [("power", power), ("toughness", toughness)] {
         assert_eq!(
             value,
             &PtValue::Quantity(expected.clone()),
-            "X must bind to ExiledCardPower in {stat}; an unbound PtValue::Variable \
-             resolves to no modification at all (silent no-op), got {value:?}"
+            "X must bind to the linked-exile power sum in {stat}; an unbound \
+             PtValue::Variable resolves to no modification at all (silent no-op), \
+             got {value:?}"
         );
     }
 }
@@ -65596,6 +65862,7 @@ fn prop_has_chosen_color(p: &FilterProp) -> bool {
         | FilterProp::Untapped
         | FilterProp::IsSaddled
         | FilterProp::SaddledSource
+        | FilterProp::CrewedThisTurn { .. }
         | FilterProp::ConvokedSource
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::HasHasteOrControlledSinceTurnBegan
@@ -81986,6 +82253,263 @@ fn compound_subject_each_over_a_disjunction_fails_closed() {
     );
     let chunks = super::sequence::split_clause_sequence("draw a card, then discard a card");
     assert_eq!(chunks.len(), 2, "{chunks:?}");
+}
+
+/// Zurzoth, Chaos Rider's attack line, verbatim.
+const ZURZOTH_ATTACK_LINE: &str = "Whenever one or more Devils you control attack one or more players, you and those players each draw a card, then discard a card at random.";
+
+/// The attacked players of the trigger's attack event (CR 508.6).
+fn event_attackers() -> PlayerFilter {
+    PlayerFilter::OpponentAttacked {
+        subject: AttackSubject::EventAttackers,
+        scope: CombatHistoryScope::ThisCombat,
+    }
+}
+
+/// The single trigger `text` parses to.
+fn only_trigger(text: &str) -> TriggerDefinition {
+    let mut triggers = parse_oracle_text(text, "Probe Card", &[], &[], &[]).triggers;
+    assert_eq!(triggers.len(), 1, "{text:?}: {triggers:#?}");
+    triggers.remove(0)
+}
+
+/// P-1. CR 508.3a + CR 508.6 + CR 603.2c: Zurzoth's head is one batched attack
+/// trigger on Devils you control, restricted to player attacks, and "you and those
+/// players" binds both body links to `AnyOf[Controller, the event's attacked
+/// players]`.
+#[test]
+fn zurzoth_attack_head_binds_those_players_to_the_event_attackers() {
+    let trigger = only_trigger(ZURZOTH_ATTACK_LINE);
+    assert_eq!(trigger.mode, TriggerMode::Attacks);
+    assert!(
+        trigger.batched,
+        "one or more Devils: one trigger per declaration"
+    );
+    assert_eq!(
+        trigger.valid_card,
+        Some(TargetFilter::Typed(
+            TypedFilter::default()
+                .subtype("Devil".to_string())
+                .controller(ControllerRef::You)
+        ))
+    );
+    assert_eq!(
+        trigger.attack_target_filter,
+        Some(crate::types::triggers::AttackTargetFilter::Player),
+        "CR 508.3a: a planeswalker or battle attack does not trigger it"
+    );
+    let execute = trigger.execute.as_deref().expect("execute");
+    let links = coordinated_chain_links(execute);
+    assert_eq!(links.len(), 2, "{execute:#?}");
+    assert!(
+        matches!(
+            &*links[0].effect,
+            Effect::Draw {
+                target: TargetFilter::ScopedPlayer,
+                ..
+            }
+        ),
+        "{:#?}",
+        links[0].effect
+    );
+    assert!(
+        matches!(
+            &*links[1].effect,
+            Effect::Discard {
+                target: TargetFilter::ScopedPlayer,
+                selection: CardSelectionMode::Random,
+                ..
+            }
+        ),
+        "{:#?}",
+        links[1].effect
+    );
+    for link in links {
+        assert_eq!(link.player_scope, coordinated_set(event_attackers()));
+    }
+}
+
+/// P-2. CR 508.6: "those players" binds only under an attack head that names its
+/// attacked players, and only through the coordinated channel. Every other head
+/// or conjunct stays the `unbound_subject` gap quoting `clause`, never the halves
+/// rewrite that would bind the set as one recipient. One test per row, so each
+/// row's verdict is observable on its own. Paired positives: P-1 and P-3.
+fn assert_those_players_declines(text: &str, clause: &str) {
+    let trigger = only_trigger(text);
+    let execute = trigger.execute.as_deref().expect("execute");
+    assert_coordinated_decline_text(execute, clause);
+    assert_no_player_set_recipient(execute, text);
+}
+
+/// P-2, damage head: a damage head's damaged players are not the attack antecedent.
+#[test]
+fn those_players_declines_under_a_damage_head() {
+    assert_those_players_declines(
+        "Whenever one or more creatures you control deal combat damage to one or more players, you and those players each draw a card.",
+        "you and those players each draw a card",
+    );
+}
+
+/// P-2, enchanted-player attack head: its antecedent is the enchanted player.
+#[test]
+fn those_players_declines_under_an_enchanted_player_attack_head() {
+    assert_those_players_declines(
+        "Whenever enchanted player is attacked, you and those players each draw a card.",
+        "you and those players each draw a card",
+    );
+}
+
+/// P-2, cast head: no player antecedent.
+#[test]
+fn those_players_declines_under_a_cast_head() {
+    assert_those_players_declines(
+        "Whenever you cast a spell, you and those players each draw a card.",
+        "you and those players each draw a card",
+    );
+}
+
+/// P-2, bare spell: no head, no antecedent. The channel's decline is the
+/// effect-level `unbound_subject` gap. At card level the dispatcher reports the
+/// unparsed spell line under its own gap name; it stays a gap with no scope.
+#[test]
+fn those_players_declines_in_a_spell() {
+    let text = "you and those players each draw a card";
+    let def = parse_effect_chain(text, AbilityKind::Spell);
+    assert_coordinated_decline(&def, text);
+    assert_no_player_set_recipient(&def, text);
+
+    let card = "You and those players each draw a card.";
+    let parsed = parse_oracle_text(card, "Probe Card", &[], &[], &[]);
+    let [spell] = parsed.abilities.as_slice() else {
+        panic!("{card:?}: one spell ability, got {:#?}", parsed.abilities);
+    };
+    assert!(
+        matches!(&*spell.effect, Effect::Unimplemented { .. }),
+        "{card:?}: {spell:#?}"
+    );
+    assert!(
+        coordinated_chain_links(spell)
+            .iter()
+            .all(|link| link.player_scope.is_none()),
+        "{card:?}: {spell:#?}"
+    );
+    assert_no_player_set_recipient(spell, card);
+}
+
+/// P-2, object first conjunct under the attack head: "~" is not the coordinated
+/// "you", so the channel never names a member.
+#[test]
+fn those_players_declines_after_an_object_first_conjunct() {
+    assert_those_players_declines(
+        "Whenever one or more Devils you control attack one or more players, ~ and those players each draw a card.",
+        "~ and those players each draw a card",
+    );
+}
+
+/// P-2, pre-scoped body under the attack head: a body that carries its own
+/// player scope is refused by the channel.
+#[test]
+fn those_players_declines_a_body_with_its_own_player_scope() {
+    assert_those_players_declines(
+        "Whenever one or more Devils you control attack one or more players, you and those players each draw a card, then each player discards a card at random.",
+        "you and those players each draw a card, then each player discards a card at random",
+    );
+}
+
+/// No link of `def` names the "those players" set as a recipient.
+fn assert_no_player_set_recipient(def: &AbilityDefinition, text: &str) {
+    for link in coordinated_chain_links(def) {
+        assert!(
+            !matches!(
+                extract_target_filter_from_effect(&link.effect),
+                Some(TargetFilter::PlayerMatching { .. })
+            ),
+            "{text:?}: {:#?}",
+            link.effect
+        );
+    }
+}
+
+/// P-3. Building block: the singular attack head "attacks a player" introduces
+/// the same attacked-player antecedent, so "you and those players" binds the
+/// event's attacked players on any body.
+#[test]
+fn singular_attack_head_binds_those_players_to_the_event_attackers() {
+    let trigger = only_trigger(
+        "Whenever a creature you control attacks a player, you and those players each draw a card.",
+    );
+    let execute = trigger.execute.as_deref().expect("execute");
+    assert!(
+        matches!(
+            &*execute.effect,
+            Effect::Draw {
+                target: TargetFilter::ScopedPlayer,
+                ..
+            }
+        ),
+        "{execute:#?}"
+    );
+    assert_eq!(execute.player_scope, coordinated_set(event_attackers()));
+    assert!(execute.sub_ability.is_none(), "{execute:#?}");
+}
+
+/// P-4. Preservation: the plural damage heads keep their base parse — one
+/// batched `DamageDone` trigger on creatures you control, with no player set on
+/// any link. Contaminant Grafter's body is `Proliferate`. The Destined Thief's
+/// body is not asserted: its "instead" branch is a pre-existing suspicion this
+/// change does not touch.
+#[test]
+fn plural_damage_heads_keep_their_parse() {
+    for (text, body_is_proliferate) in [
+        (
+            "Whenever one or more creatures you control deal combat damage to one or more players, proliferate.",
+            true,
+        ),
+        (
+            "Whenever one or more creatures you control deal combat damage to one or more players, draw a card, then discard a card. If you have a full party, instead draw three cards.",
+            false,
+        ),
+    ] {
+        let trigger = only_trigger(text);
+        assert_eq!(trigger.mode, TriggerMode::DamageDone, "{text:?}");
+        assert!(trigger.batched, "{text:?}");
+        assert_eq!(
+            trigger.valid_source,
+            Some(TargetFilter::Typed(
+                TypedFilter::creature().controller(ControllerRef::You)
+            )),
+            "{text:?}"
+        );
+        let execute = trigger.execute.as_deref().expect("execute");
+        assert!(
+            coordinated_chain_links(execute)
+                .iter()
+                .all(|link| link.player_scope.is_none()),
+            "{text:?}: {execute:#?}"
+        );
+        if body_is_proliferate {
+            assert_eq!(*execute.effect, Effect::Proliferate, "{text:?}");
+            assert!(execute.sub_ability.is_none(), "{text:?}");
+        }
+    }
+}
+
+/// P-5. CR 508.6: the "one or more players" antecedent is confined to attack
+/// heads. Zurzoth's head introduces the attacked (defending) players; the plural
+/// damage head, whose players are damaged rather than attacked, introduces none.
+#[test]
+fn one_or_more_players_antecedent_is_confined_to_attack_heads() {
+    let scope = crate::parser::oracle_trigger::relative_player_scope_for_condition;
+    assert_eq!(
+        scope("whenever one or more devils you control attack one or more players"),
+        Some(ControllerRef::DefendingPlayer)
+    );
+    assert_eq!(
+        scope(
+            "whenever one or more creatures you control deal combat damage to one or more players"
+        ),
+        None
+    );
 }
 
 /// CR 601.2b + CR 601.2h + CR 608.2c: "if you revealed a <type> card or controlled a

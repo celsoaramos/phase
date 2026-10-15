@@ -3346,7 +3346,26 @@ mod tests {
         }
     }
 
-    /// The bump this number is at: `GameEvent::AbilityActivated` gains
+    /// v142: `LinkedExileSnapshot` gains `incarnation` (CR 400.7), carried in
+    /// `GameState::linked_exile_lki` and the trigger and zone-change linked-exile
+    /// snapshots; a v141 peer re-encoding state drops it, so it must be refused
+    /// before it receives v142 state.
+    ///
+    /// v141: `ExileLinkKind` gains `CastCost` (CR 607.2q cast-cost exile links),
+    /// carried in `GameState::exile_links`; a v140 peer cannot parse the tag, so
+    /// it must be refused before it receives v141 state.
+    ///
+    /// v140: `AttackSubject` gains `EventAttackers` (the players a trigger's
+    /// attack event's attackers attacked), carried in a resolving or pending
+    /// ability's `player_scope` inside `GameState`; a v139 peer cannot parse the
+    /// tag, so it must be refused before it receives v140 state.
+    ///
+    /// v139: CR 702.122c per-turn crew relation —
+    /// `GameState::crew_history_this_turn` and `FilterProp::CrewedThisTurn`, both
+    /// inside `GameState`; a v138 peer cannot parse the new filter tag, so it
+    /// must be refused before it receives v139 state.
+    ///
+    /// v134: `GameEvent::AbilityActivated` gains
     /// `stack_entry`, the stack object a stack-using activation created, carried
     /// in `GameState`'s trigger events; an older peer drops it silently and
     /// resolves an activation trigger's "copy that ability" differently, so it
@@ -3534,8 +3553,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_134_for_activation_stack_entry() {
-        assert_eq!(PROTOCOL_VERSION, 134);
+    fn protocol_version_is_142_for_linked_exile_snapshot_incarnation() {
+        assert_eq!(PROTOCOL_VERSION, 142);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3546,7 +3565,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_134_for_activation_stack_entry` stays
+    /// `protocol_version_is_142_for_linked_exile_snapshot_incarnation` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

@@ -49,6 +49,7 @@ use super::oracle_nom::primitives::{
 };
 use super::oracle_nom::target::parse_chosen_object_reference;
 use super::oracle_nom::target::parse_type_phrase as parse_type_phrase_nom;
+use super::oracle_nom::target::{controller_phrase_among, ControllerPhrase};
 use super::oracle_static::{
     add_property, parse_commander_subject_filter_prefix, typed_filter_for_subtype,
 };
@@ -1074,6 +1075,20 @@ fn parse_referenced_player_phrase(input: &str) -> OracleResult<'_, ()> {
     .parse(input)
 }
 
+/// CR 508.6: the players an attack head names. Adds the plural set
+/// ("one or more players", Zurzoth, Chaos Rider) to the single referents
+/// of `parse_referenced_player_phrase`. Attack heads only: a damage head's
+/// damaged players are not a `DefendingPlayer` antecedent.
+fn parse_attacked_player_phrase(input: &str) -> OracleResult<'_, ()> {
+    alt((
+        parse_referenced_player_phrase,
+        // CR 508.6: "one or more players" — the attacked players a plural attack
+        // head introduces (Zurzoth, Chaos Rider).
+        value((), tag::<_, _, OracleError<'_>>("one or more players")),
+    ))
+    .parse(input)
+}
+
 /// CR 508.3e: the attacked-player OBJECT of a bare "you attack …" trigger
 /// condition, i.e. the `[another player]` slot in "Whenever [a player] attacks
 /// [another player], . . .".
@@ -1126,7 +1141,7 @@ fn condition_introduces_defending_player(cond_lower: &str) -> bool {
     while !remaining.is_empty() {
         if let Ok((after_actor, ())) = parse_trigger_actor(remaining) {
             if let Ok((after_verb, ())) = parse_attack_verb(after_actor) {
-                if parse_referenced_player_phrase(after_verb).is_ok() {
+                if parse_attacked_player_phrase(after_verb).is_ok() {
                     return true;
                 }
             }
@@ -1139,7 +1154,7 @@ fn condition_introduces_defending_player(cond_lower: &str) -> bool {
         // unambiguous in trigger-condition text — "attack" never appears as a
         // noun before "a player" here.
         if let Ok((after_verb, ())) = parse_attack_verb(remaining) {
-            if parse_referenced_player_phrase(after_verb).is_ok() {
+            if parse_attacked_player_phrase(after_verb).is_ok() {
                 return true;
             }
         }
@@ -3815,6 +3830,11 @@ fn lift_filter_shared_quality_parent_target_to_triggering_source(filter: &mut Ta
 /// (`reveal_hand::effect_parks_reveal_card_choice`) also returns `true`: a later
 /// `ParentTarget` binds to the chosen revealed card, whatever player the reveal
 /// targets.
+///
+/// A zone choice (`Effect::ChooseFromZone`, every form) also returns `true`: it
+/// hands the chosen card(s) to the next instruction, so a later `ParentTarget`
+/// binds to the pick and never to the trigger event (Gorex, the Tombshell's
+/// dies half).
 fn introduces_chosen_object_target(effect: &Effect) -> bool {
     // CR 608.2c + CR 603.2g: Effects that populate state.last_revealed_ids
     // introduce revealed objects. Sub-ability ParentTarget binds to those
@@ -3838,6 +3858,17 @@ fn introduces_chosen_object_target(effect: &Effect) -> bool {
     // scope, `TriggeringPlayer`, …) is not a chosen object filter, so the `Typed`
     // test below cannot see it. Shares the resolver's card-parking authority.
     if crate::game::effects::reveal_hand::effect_parks_reveal_card_choice(effect) {
+        return true;
+    }
+    // CR 608.2c + CR 608.2d: a zone choice ("choose a card at random exiled
+    // with ~", "choose a creature card in your hand", "for each opponent,
+    // choose …") hands its pick to the next instruction — as that
+    // instruction's targets, or as the chain's tracked set for the per-player
+    // form — so a later "that card" names the chosen card, never the trigger
+    // event. Gorex, the Tombshell's dies half (CR 603.10a + CR 607.2q) chooses
+    // among the cards exiled with it; Gorex itself, now in the graveyard, is
+    // never one of them.
+    if matches!(effect, Effect::ChooseFromZone { .. }) {
         return true;
     }
     fn is_chosen(filter: &TargetFilter) -> bool {
@@ -9614,7 +9645,11 @@ fn try_parse_ability_activation_trigger(lower: &str) -> Option<(TriggerMode, Tri
         // player (Avalanche of Sector 7). Only a third-person subject can be its
         // antecedent.
         let (rest, they_control) = if person == SubjectPerson::Third {
-            opt(value((), tag(" they control"))).parse(rest)?
+            opt(preceded(
+                tag(" "),
+                controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]),
+            ))
+            .parse(rest)?
         } else {
             (rest, None)
         };
@@ -13214,7 +13249,9 @@ fn parse_single_subject<'a>(text: &'a str, ctx: &mut ParseContext) -> (TargetFil
     // "another <type phrase>" — compose with FilterProp::Another
     if let Ok((after_another, ())) = value((), tag::<_, _, OracleError<'_>>("another ")).parse(text)
     {
-        let (filter, rest) = parse_type_phrase_folding(after_another);
+        let (filter, rest) = ctx.with_player_antecedents(|scoped| {
+            parse_type_phrase_folding_with_ctx(after_another, scoped)
+        });
         let with_another = add_another_prop(filter);
         return (with_another, rest);
     }
@@ -13261,7 +13298,10 @@ fn parse_single_subject<'a>(text: &'a str, ctx: &mut ParseContext) -> (TargetFil
             return (filter, trimmed);
         }
 
-        let (filter, rest) = parse_type_phrase_folding(after_quantifier);
+        let (filter, rest) = parse_type_phrase_folding_with_ctx(
+            after_quantifier,
+            &mut ctx.clone_player_antecedents(),
+        );
         if rest.len() < after_quantifier.len() {
             return (filter, rest);
         }
@@ -13323,7 +13363,10 @@ fn parse_single_subject<'a>(text: &'a str, ctx: &mut ParseContext) -> (TargetFil
         .parse(rest)
         {
             if let Some((clause_text, verb_rest)) = find_clause_verb_boundary(after_who) {
-                let (clause_filter, clause_remainder) = parse_type_phrase_folding(clause_text);
+                let (clause_filter, clause_remainder) = parse_type_phrase_folding_with_ctx(
+                    clause_text,
+                    &mut ctx.clone_player_antecedents(),
+                );
                 // Only treat this as a control-relative clause when the clause
                 // text parsed cleanly into a typed filter.
                 if clause_remainder.trim().is_empty() && !matches!(clause_filter, TargetFilter::Any)
@@ -13356,7 +13399,8 @@ fn parse_single_subject<'a>(text: &'a str, ctx: &mut ParseContext) -> (TargetFil
         return (filter, rest.trim_start());
     }
 
-    let (filter, rest) = parse_type_phrase_folding(text);
+    let (filter, rest) =
+        parse_type_phrase_folding_with_ctx(text, &mut ctx.clone_player_antecedents());
     if rest.len() < text.len() {
         return (filter, rest);
     }
@@ -14586,6 +14630,9 @@ fn try_parse_event(
                     preceded(tag(" "), parse_one_of_your_opponents),
                 ),
                 value(AttackTargetFilter::Player, tag(" a player")),
+                // CR 508.3a: an attack head naming players restricts its
+                // attackers to player attacks.
+                value(AttackTargetFilter::Player, tag(" one or more players")),
                 // CR 102.1 + CR 508.1b: "attacks the player with the most life or
                 // tied for most life" (Preacher of the Schism, Seraphic
                 // Greatsword, Undercover Butler). Only matched when the whole
@@ -15849,7 +15896,10 @@ fn try_parse_event(
                 if matches!(subject, TargetFilter::SelfRef) {
                     // Pattern 1: "Whenever ~ becomes attached to [host]"
                     if !remaining.is_empty() {
-                        let (filter, rest) = parse_type_phrase_folding(remaining);
+                        let (filter, rest) = parse_type_phrase_folding_with_ctx(
+                            remaining,
+                            &mut ctx.clone_player_antecedents(),
+                        );
                         if !rest.trim().is_empty() {
                             return None;
                         }
@@ -24047,5 +24097,36 @@ mod saga_chapter_ability_trigger_tests {
                 scope: ObjectScope::EventSource
             }
         );
+    }
+}
+
+/// Structural-marker site: "<source> they control" after an activation trigger's
+/// third-person subject. The phrase is a marker; the construct binds the
+/// source's controller to the activating player.
+#[cfg(test)]
+mod structural_marker_tests {
+    use super::try_parse_ability_activation_trigger;
+    use crate::types::ability::{ControllerRef, TargetFilter};
+
+    #[test]
+    fn ability_object_they_control_marker() {
+        let parse = |controller: &str| {
+            try_parse_ability_activation_trigger(&format!(
+                "whenever an opponent activates an ability of an artifact {controller}"
+            ))
+        };
+        let (_, def) = parse("they control").expect("activation trigger");
+        let Some(TargetFilter::Typed(source)) = def.valid_card else {
+            panic!("typed source filter: {:?}", def.valid_card);
+        };
+        assert_eq!(source.controller, Some(ControllerRef::TriggeringPlayer));
+        for declined in [
+            "you control",
+            "that player controls",
+            "controlled by that player",
+            "the chosen player controls",
+        ] {
+            assert!(parse(declined).is_none(), "{declined:?}");
+        }
     }
 }
