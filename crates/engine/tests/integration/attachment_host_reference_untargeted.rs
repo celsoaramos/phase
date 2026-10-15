@@ -740,14 +740,13 @@ fn penumbra_umbra_with_its_host_exiled_copies_nothing() {
     assert_eq!(copies, 0, "no token is created");
 }
 
-/// Review probe F1, disclosed limit (fail closed): Stamina, "Sacrifice this
-/// Aura: Regenerate enchanted creature." The cost moves the Aura to the
-/// graveyard before the ability is put on the stack, so the incarnation the
-/// ability records is the sacrificed card's, which never left the
-/// battlefield; there is no record proving the host, and nothing is
-/// regenerated (base: no shield either).
+/// CR 608.2h + CR 602.2b: Stamina, "Sacrifice this Aura: Regenerate enchanted
+/// creature." The cost moves the Aura to the graveyard before the ability is
+/// put on the stack, so the incarnation the ability records is the one that
+/// departure produced; that departure's record proves the host, which gets the
+/// shield.
 #[test]
-fn stamina_sacrificed_as_cost_regenerates_nothing() {
+fn stamina_sacrificed_as_cost_regenerates_its_host() {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let host = sc.add_creature(P0, "Grizzly Bears", 2, 2).id();
@@ -782,8 +781,8 @@ fn stamina_sacrificed_as_cost_regenerates_nothing() {
         "reach: the ability resolved"
     );
     assert!(
-        !has_regeneration_shield(&runner, host),
-        "no provable host, so no shield"
+        has_regeneration_shield(&runner, host),
+        "the departure record proves the host, so it gets the shield"
     );
 }
 
@@ -981,12 +980,12 @@ fn last_voyage_host_blinked_after_the_aura_left_sacrifices_nothing() {
     assert_eq!(runner.state().objects[&host].zone, Zone::Battlefield);
 }
 
-/// Base-untargeted, cost-moved source, disclosed limit: "{3}{W}{W}, Sacrifice
-/// this Aura: Exile enchanted creature." The cost moves the Aura before the
-/// ability is put on the stack, so no record proves its host and nothing is
-/// exiled — the same as base, whose filter scan found nothing either.
+/// CR 608.2h + CR 602.2b: "{3}{W}{W}, Sacrifice this Aura: Exile enchanted
+/// creature." The cost moves the Aura before the ability is put on the stack;
+/// the departure that produced the captured incarnation proves its host, which
+/// is exiled.
 #[test]
-fn choking_restraints_sacrificed_as_cost_exiles_nothing() {
+fn choking_restraints_sacrificed_as_cost_exiles_its_host() {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let host = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
@@ -1032,17 +1031,17 @@ fn choking_restraints_sacrificed_as_cost_exiles_nothing() {
     );
     assert_eq!(
         runner.state().objects[&host].zone,
-        Zone::Battlefield,
-        "no provable host, so nothing is exiled (as at base)"
+        Zone::Exile,
+        "the departure record proves the host, so it is exiled"
     );
 }
 
-/// Base-untargeted, cost-moved source, disclosed limit: Krasis Incubation,
-/// "{1}{G}{U}, Return this Aura to its owner's hand: Put two +1/+1 counters on
-/// enchanted creature." No record proves the host, so no counters — the same
-/// as base.
+/// CR 608.2h + CR 602.2b: Krasis Incubation, "{1}{G}{U}, Return this Aura to its
+/// owner's hand: Put two +1/+1 counters on enchanted creature." The departure
+/// that produced the captured incarnation proves the host, which gets both
+/// counters.
 #[test]
-fn krasis_incubation_returned_as_cost_counters_nothing() {
+fn krasis_incubation_returned_as_cost_counters_its_host() {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let host = sc.add_creature(P0, "Grizzly Bears", 2, 2).id();
@@ -1098,8 +1097,8 @@ fn krasis_incubation_returned_as_cost_counters_nothing() {
             .get(&CounterType::Plus1Plus1)
             .copied()
             .unwrap_or(0),
-        0,
-        "no provable host, so no counters (as at base)"
+        2,
+        "the departure record proves the host, so it gets both counters"
     );
 }
 

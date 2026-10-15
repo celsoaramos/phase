@@ -1752,7 +1752,9 @@ fn captured_source_ref(
 /// - The captured source incarnation has left the battlefield: CR 608.2h, the
 ///   source's own information is its last known information, so its exact
 ///   departure record says what it was attached to. An explicit "attached to
-///   nothing" there wins. The named host is admitted, as a live object, only
+///   nothing" there wins. A source moved as the ability's own cost (CR 602.2b +
+///   CR 601.2h) captured the incarnation that departure produced, so the
+///   departure whose successor is the captured incarnation counts as its own. The named host is admitted, as a live object, only
 ///   while it has had no zone change since that departure — then its current
 ///   incarnation is the one the source was attached to. No information about
 ///   the host itself is ever read from last known information.
@@ -1768,12 +1770,32 @@ pub(crate) fn source_attachment_host(
         Some(object) => object.attached_to?.as_object()?,
         None => {
             let records = &state.zone_changes_this_turn;
-            let departure = records.iter().rposition(|record| {
+            let identity_of = |record: &crate::types::game_state::ZoneChangeRecord| {
+                record
+                    .trigger_source_context()
+                    .map(|context| context.identity.reference)
+            };
+            // CR 602.2b + CR 601.2h: a source moved as its own cost ("Sacrifice this
+            // Aura: …") left the battlefield before the ability was put on the stack,
+            // so the ability captured the incarnation that departure PRODUCED. That
+            // successor is read from the next record naming the object or, absent
+            // one, from the live object — never derived by arithmetic.
+            let produced_by = |index: usize| match records
+                .iter()
+                .skip(index + 1)
+                .find(|record| record.object_id == source.object_id)
+            {
+                Some(next) => identity_of(next),
+                None => state
+                    .objects
+                    .get(&source.object_id)
+                    .map(ObjectIncarnationRef::from_object),
+            };
+            let departure = records.iter().enumerate().rposition(|(index, record)| {
                 record.object_id == source.object_id
                     && record.from_zone == Some(Zone::Battlefield)
-                    && record
-                        .trigger_source_context()
-                        .is_some_and(|context| context.identity.reference == source)
+                    && (identity_of(record) == Some(source)
+                        || (identity_of(record).is_some() && produced_by(index) == Some(source)))
             })?;
             let host = records[departure].attached_to?.as_object()?;
             if records
