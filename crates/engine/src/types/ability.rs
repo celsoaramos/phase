@@ -23101,6 +23101,7 @@ impl Effect {
             | Effect::Intensify { .. }
             | Effect::DraftFromSpellbook { .. }
             | Effect::ChooseOneOf { .. }
+            | Effect::CreateCardCopyByName { .. }
             | Effect::Unimplemented { .. } => AttachmentHostSlot::Operand,
         }
     }
