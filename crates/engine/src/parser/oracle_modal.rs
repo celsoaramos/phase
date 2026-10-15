@@ -1046,6 +1046,14 @@ fn reflexive_modal_connector(
             )));
         }
         (Some((guard, LeadingConditionRoute::General)), _) => {
+            // CR 603.12 + CR 603.4: a zone-change guard cannot be a reflexive's
+            // intervening "if" (see `AbilityCondition::zone_changed_this_way_head`).
+            if guard.has_root_zone_changed_this_way() {
+                return Err(Box::new(Effect::unimplemented(
+                    "modal_reflexive_condition",
+                    &header.raw,
+                )));
+            }
             return Ok(AbilityCondition::when_you_do_with_guard(guard));
         }
         (None, _) => {}
@@ -1480,10 +1488,15 @@ fn parse_modal_mode_irs(
             // `base_ctx` holds — a reset base stays reset, and no mode can
             // invent authority its parent lacked.
             mode_ctx.subject = mode_anaphor_subject(mode_ctx.subject.take());
+            // CR 700.2: declared-slot numbering is mode-local at runtime, so a
+            // mode never admits a declared-slot referent.
+            mode_ctx.body_scope = super::oracle_ir::context::BodyScope::ModalMode;
             mode_ctx.diagnostics.clear();
             let mut ability = parse_ability_ir_with_context(&mode.body, kind, &mut mode_ctx);
             guard_unsupported_mode_qualifiers_ir(&mut ability, kind, &mode_ctx);
             base_ctx.diagnostics.extend(mode_ctx.diagnostics);
+            // CR 700.2: the selected modes resolve as one chain, so their declared-player groups must not repeat.
+            base_ctx.next_declared_player_group = mode_ctx.next_declared_player_group;
             ModalModeIr {
                 source_text: mode.source_text.clone(),
                 source_line: mode.source_line,
