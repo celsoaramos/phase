@@ -1551,6 +1551,12 @@ pub enum GameEvent {
     },
     DayNightChanged {
         new_state: String,
+        /// CR 731.1a: the designation the game held before this event. `None` when the
+        /// game had neither (CR 731.1 — the first "it becomes day/night"); equal to the
+        /// new designation when an effect re-asserted the current one. Only a `Some`
+        /// that differs from `new_state` is "day becomes night" / "night becomes day".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous: Option<super::game_state::DayNight>,
     },
     TurnedFaceUp {
         object_id: ObjectId,

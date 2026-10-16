@@ -377,6 +377,16 @@ pub enum DayNight {
     Night,
 }
 
+impl DayNight {
+    /// The wire/log label carried by `GameEvent::DayNightChanged::new_state`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DayNight::Day => "Day",
+            DayNight::Night => "Night",
+        }
+    }
+}
+
 /// CR 702.51a / Waterbend: Determines tap-to-pay behavior during mana payment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConvokeMode {
@@ -44692,6 +44702,7 @@ mod tests {
     fn day_night_changed_event_roundtrips() {
         let event = GameEvent::DayNightChanged {
             new_state: "Night".to_string(),
+            previous: Some(DayNight::Day),
         };
         let serialized = serde_json::to_string(&event).unwrap();
         let deserialized: GameEvent = serde_json::from_str(&serialized).unwrap();

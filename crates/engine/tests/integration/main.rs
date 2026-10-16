@@ -468,6 +468,7 @@ mod game_state_stack_budget;
 mod game_state_stack_high_water;
 mod gather_the_townsfolk_fateful_hour;
 mod gatta_and_luzzu_regression;
+mod gavony_dawnguard_day_night_trigger;
 mod gemstone_caverns_begin_game;
 mod gemstone_mine_depletion_sacrifice_6507;
 mod gev_scaled_scorch_enter_counters;

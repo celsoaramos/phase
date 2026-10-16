@@ -37,10 +37,8 @@ pub fn check_day_night_transition(state: &mut GameState, events: &mut Vec<GameEv
     state.day_night = Some(new_state);
 
     events.push(GameEvent::DayNightChanged {
-        new_state: match new_state {
-            DayNight::Day => "Day".to_string(),
-            DayNight::Night => "Night".to_string(),
-        },
+        new_state: new_state.as_str().to_string(),
+        previous: Some(current),
     });
 
     // Transform all Daybound/Nightbound permanents
@@ -74,10 +72,8 @@ pub fn resolve_set_day_night(state: &mut GameState, to: DayNight, events: &mut V
     state.day_night = Some(to);
 
     events.push(GameEvent::DayNightChanged {
-        new_state: match to {
-            DayNight::Day => "Day".to_string(),
-            DayNight::Night => "Night".to_string(),
-        },
+        new_state: to.as_str().to_string(),
+        previous: current,
     });
 
     // Only transform permanents if the designation actually changed
@@ -113,8 +109,10 @@ pub fn initialize_day_night(state: &mut GameState, events: &mut Vec<GameEvent>) 
     }
 
     state.day_night = Some(DayNight::Day);
+    // CR 731.1: the game gains its first designation — not "night becomes day".
     events.push(GameEvent::DayNightChanged {
-        new_state: "Day".to_string(),
+        new_state: DayNight::Day.as_str().to_string(),
+        previous: None,
     });
 }
 
@@ -209,7 +207,7 @@ mod tests {
         assert_eq!(state.day_night, Some(DayNight::Night));
         assert!(events.iter().any(|e| matches!(
             e,
-            GameEvent::DayNightChanged { new_state } if new_state == "Night"
+            GameEvent::DayNightChanged { new_state, .. } if new_state == "Night"
         )));
     }
 
@@ -225,7 +223,7 @@ mod tests {
         assert_eq!(state.day_night, Some(DayNight::Day));
         assert!(events.iter().any(|e| matches!(
             e,
-            GameEvent::DayNightChanged { new_state } if new_state == "Day"
+            GameEvent::DayNightChanged { new_state, .. } if new_state == "Day"
         )));
     }
 
@@ -359,7 +357,7 @@ mod tests {
         assert_eq!(state.day_night, Some(DayNight::Day));
         assert!(events.iter().any(|e| matches!(
             e,
-            GameEvent::DayNightChanged { new_state } if new_state == "Day"
+            GameEvent::DayNightChanged { new_state, .. } if new_state == "Day"
         )));
     }
 

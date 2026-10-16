@@ -4066,7 +4066,16 @@ pub(super) fn match_manifest_dread(
     true
 }
 
-/// DayTimeChanges: fires when day/night changes.
+/// DayTimeChanges: "Whenever day becomes night or night becomes day" (Gavony
+/// Dawnguard).
+///
+/// CR 731.1a: the phrases refer to the game losing one designation and gaining the
+/// other, so only a `DayNightChanged` whose `previous` designation is set and differs
+/// from the new one matches. The game's first designation (CR 731.1, neither → day)
+/// and an effect re-asserting the current designation are not changes. The CR 731.2
+/// untap-step check and `Effect::SetDayNight` both emit `DayNightChanged` — the
+/// trigger index already keys this mode on that event; matching the never-emitted
+/// `EffectResolved { DayTimeChange }` placeholder left the trigger dead.
 pub(super) fn match_day_time_changes(
     event: &GameEvent,
     _trigger: &TriggerDefinition,
@@ -4075,10 +4084,10 @@ pub(super) fn match_day_time_changes(
 ) -> bool {
     matches!(
         event,
-        GameEvent::EffectResolved {
-            kind: EffectKind::DayTimeChange,
-            ..
-        }
+        GameEvent::DayNightChanged {
+            new_state,
+            previous: Some(previous),
+        } if previous.as_str() != new_state
     )
 }
 
