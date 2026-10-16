@@ -201,5 +201,8 @@
   },
   {
     "branch": "card/composite-alt-cost-base"
+  },
+  {
+    "branch": "card/day-night-change-trigger"
   }
 ]
