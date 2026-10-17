@@ -4231,7 +4231,24 @@ pub(crate) fn deterministic_choice(
             engine::types::ability::AdditionalCost::Choice(_, _) => true,
             engine::types::ability::AdditionalCost::Required(_) => true,
         };
-        return Some(GameAction::DecideOptionalCost { pay });
+        // CR 601.2 + CR 601.2f: when neither branch is payable — Deflecting Swat's free
+        // cast and its printed cost both out of reach under an opponent's per-target
+        // tax — the engine issues only `CancelCast`. Proposing a `DecideOptionalCost`
+        // outside the issued domain is refused and proposed again forever (measured:
+        // a MagicFinder AI x AI game froze in declare attackers). An empty `actions`
+        // is a rollout without a domain: keep the heuristic answer there.
+        let decision = GameAction::DecideOptionalCost { pay };
+        if !actions.is_empty() && !actions.contains(&decision) {
+            let other = GameAction::DecideOptionalCost { pay: !pay };
+            if actions.contains(&other) {
+                return Some(other);
+            }
+            if actions.contains(&GameAction::CancelCast) {
+                return Some(GameAction::CancelCast);
+            }
+            return None;
+        }
+        return Some(decision);
     }
 
     // CR 601.2b: Defiler — accept life payment when life cushion is sufficient.
@@ -13099,6 +13116,40 @@ mod tests {
             pending_cast: Box::new(pending),
         };
         state
+    }
+
+    /// CR 601.2: the engine issued only `CancelCast` (neither branch payable —
+    /// Deflecting Swat under an opponent's per-target tax). The answer must come
+    /// from that domain; a `DecideOptionalCost` outside it was refused and
+    /// re-proposed forever in a MagicFinder AI x AI game.
+    #[test]
+    fn optional_cost_answer_stays_inside_the_issued_domain() {
+        let state = multikicker_choice_state(2);
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        assert_eq!(
+            deterministic_choice(
+                &state,
+                PlayerId(0),
+                &config,
+                &[GameAction::CancelCast],
+                None
+            ),
+            Some(GameAction::CancelCast)
+        );
+        // Only the other answer is legal: take it rather than cancel.
+        let only_pay = [
+            GameAction::DecideOptionalCost { pay: true },
+            GameAction::CancelCast,
+        ];
+        assert_eq!(
+            deterministic_choice(&state, PlayerId(0), &config, &only_pay, None),
+            Some(GameAction::DecideOptionalCost { pay: true })
+        );
+        // No domain (a rollout): the heuristic answer is unchanged.
+        assert!(matches!(
+            deterministic_choice(&state, PlayerId(0), &config, &[], None),
+            Some(GameAction::DecideOptionalCost { .. })
+        ));
     }
 
     /// CR 702.33c: on a mana-tight board (untapped lands ≤ combined CMC of 2)
