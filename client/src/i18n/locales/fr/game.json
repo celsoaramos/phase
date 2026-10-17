@@ -10,6 +10,9 @@
   "manaSourceSelection": {
     "title": "Choisir une source de mana",
     "description": "Cette capacité de mana demande de sacrifier un permanent.",
+    "baseOutput_one": "Production de base : {{count}} mana",
+    "baseOutput_other": "Production de base : {{count}} manas",
+    "baseOutputVariable": "Quantité de base déterminée à l’activation",
     "sacrifice": "Sacrifier",
     "back": "Retour au paiement de mana",
     "unknownSource": "Source de mana"
@@ -102,6 +105,24 @@
     "subtitle": "Tous les joueurs doivent approuver avant que le moteur ne résolve un préfixe sûr de la pile.",
     "grant": "Approuver",
     "decline": "Garder la priorité"
+  },
+  "sandboxLifeCorrection": {
+    "open": "Corriger les points de vie",
+    "title": "Correction des points de vie Sandbox",
+    "description": "Utilisez les commandes habituelles de la main et de la pile pour lancer et résoudre une créature. Ce panneau envoie l'action SetLife de Sandbox via l'adaptateur de jeu existant.",
+    "scopeNote": "Cette correction passe par la modification du joueur dans le moteur ; elle ne représente ni des blessures ni un effet de carte. Cette version n'inclut pas la révélation d'une main cachée, la défausse selon les règles ni l'annulation préalablement convenue avant le lancement.",
+    "target": "Joueur",
+    "player": "{{name}} (joueur {{seat}})",
+    "you": "Vous",
+    "opponent": "Adversaire",
+    "currentLife": "Total de points de vie actuel",
+    "newLife": "Nouveau total de points de vie",
+    "submit": "Appliquer la correction",
+    "submitting": "Correction envoyée ; fermer ce panneau ne l'annule pas.",
+    "applied": "Total de points de vie actuel confirmé pour {{player}} : {{life}}.",
+    "notApplied": "Le moteur n'a pas confirmé cette correction. Vérifiez le snapshot actuel avant de réessayer.",
+    "failed": "La correction n'a pas pu être envoyée.",
+    "stale": "La partie a changé pendant la modification. Fermez puis rouvrez ce panneau pour repartir du snapshot actuel."
   },
   "debugCreate": {
     "copies": "Copies",
@@ -311,6 +332,10 @@
     "eligibleCount": "{{count}} légal(es)",
     "attackingCount": "att {{count}}",
     "selectedCount": "sél {{count}}",
+    "directBlockTargetCount": "cibles de blocage {{count}}",
+    "blockingWith": "Bloque avec {{name}}",
+    "blockedBy": "Bloqué par {{names}}",
+    "unblocked": "Non bloqué",
     "pickAll": "Tous",
     "pickNone": "Aucun",
     "underAttack_one": "Attaqué par {{count}} créature",
@@ -561,9 +586,6 @@
     "pendingCheaper": "Le prochain sort coûte {{amount}} de moins",
     "companion": "Compagnon",
     "unboundedTooltip": "{{resource}} illimité (∞)",
-    "unboundedScheduledTooltip": "{{resource}} illimité (∞) — réduction en attente ; un nombre fini sera choisi",
-    "unboundedScheduledYouTooltip": "{{resource}} illimité (∞) — réduction en attente ; vous indiquerez le nombre",
-    "unboundedScheduledGlyph": "∞→N",
     "unboundedConditionalTooltip": "{{resource}} illimité (∞) — réduction en attente ; cela peut rester illimité",
     "unboundedConditionalYouTooltip": "{{resource}} illimité (∞) — réduction en attente ; cela peut rester illimité, et sinon vous indiquerez le nombre",
     "unboundedMixedTooltip": "{{resource}} illimité (∞) — une partie de ce groupe a une réduction en attente ; une partie reste illimitée",
@@ -646,6 +668,7 @@
     "libraryCount_one": "Bibliothèque ({{count}} carte)",
     "libraryCount_other": "Bibliothèque ({{count}} cartes)",
     "playFromTop": "Jouer {{name}} depuis le dessus de la bibliothèque",
+    "activateFromTop": "Activer {{name}} depuis le dessus de la bibliothèque",
     "topOfLibrary": "dessus de la bibliothèque",
     "indicatorOpponentPrefix": "Adv ",
     "graveyardLower": "cimetière",
@@ -653,6 +676,7 @@
     "zoneTitle": "{{zone}} ({{count}})",
     "noCardsIn": "Aucune carte dans {{zone}}",
     "castFromZone": "Lancer depuis {{zone}} : {{name}}",
+    "activateFromZone": "Activer depuis {{zone}} : {{name}}",
     "viewCount": "Voir {{count}}",
     "castableCount": "{{zone}} — {{count}} lançable(s)"
   },
@@ -768,6 +792,8 @@
     "mustAttackSatisfiedBadge": "Attacking ✓",
     "mustBlockBadge": "Must block",
     "mustBlockExactBadge": "Doit bloquer {{attacker}}",
+    "mustBeBlockedBadge": "Doit être bloqué",
+    "bandBadge": "Bande {{n}}",
     "mustBlockSatisfiedBadge": "Blocking ✓",
     "cantAttackBadge": "Can't attack",
     "cantBlockBadge": "Can't block",
@@ -802,6 +828,7 @@
     "titleTargets": "Cibles : {{targets}}",
     "titlePaid": "Payé : {{paid}}",
     "titleContext": "Contexte : {{context}}",
+    "revealedCards": "Révélée : {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}} mana",
     "paidColorsSpent": "{{count}} couleurs",
@@ -833,8 +860,10 @@
     "chooseNewTargetForCopy": "Choisissez une nouvelle cible pour la copie",
     "chooseTargetForCopy": "Choisissez la cible de la copie",
     "chooseCreatureToExplore": "Choisissez quelle créature explore ensuite",
+    "chooseCreatureToEquip": "Choisissez une créature à équiper",
     "chooseCreatureTokenToPopulate": "Choisissez un jeton de créature à peupler",
     "chooseReturnAsAuraTarget": "Choisissez un permanent à enchanter",
+    "chooseTokenHost": "Choisissez un hôte pour le jeton",
     "tapUntappedCreatures_one": "Engagez {{count}} créature dégagée",
     "tapUntappedCreatures_other": "Engagez {{count}} créatures dégagées",
     "chooseTargetOf": "Choisissez la cible {{current}} sur {{total}}",
@@ -868,6 +897,7 @@
     },
     "confirmTap": "Confirmer l'engagement ({{selected}}/{{count}})",
     "keepCurrentTargets": "Conserver les cibles actuelles",
+    "keepCurrentTarget": "Conserver cette cible",
     "skip": "Ignorer",
     "opponentChoice": "(au choix de l'adversaire)",
     "chooseNewTarget": "Choisissez la nouvelle cible du sort",
@@ -1124,6 +1154,8 @@
       "usePowder": "Utiliser {{name}}",
       "powderDescription": "Exilez toutes les cartes en main, piochez le même nombre — pas un mulligan",
       "powderTooltip": "Exilez toutes les cartes de votre main et piochez le même nombre. Pas un mulligan — le compte et les cartes en dessous ne sont pas affectés.",
+      "freeReveal": "Révéler et repiocher (gratuit)",
+      "freeRevealDescription": "Révélez votre main, mélangez-la et piochez 7 — gratuit, aucune carte dessous, pas un mulligan",
       "eyebrowMulligan": "Mulligan {{count}} · Londres",
       "eyebrowOpening": "Main de départ · Mulligan de Londres",
       "reviewTitle": "Examinez votre main de départ",
@@ -1376,6 +1408,7 @@
       "target": "Cible",
       "return": "Renvoyer",
       "discard": "Défausser",
+      "reveal": "Révéler",
       "evidence": "Preuves",
       "manifest": "Manifester",
       "untap": "Dégager",
@@ -1426,7 +1459,16 @@
       "subtitleUpTo_other": "Sélectionnez jusqu'à {{count}} cartes à placer {{destination}}",
       "destinationTop": "au-dessus de votre bibliothèque",
       "destinationBattlefield": "sur le champ de bataille",
-      "destinationHand": "dans votre main"
+      "destinationHand": "dans votre main",
+      "titleSplit": "Répartir les cartes restantes",
+      "subtitleSplit_one": "Organisez les cartes : {{count}} ira sur le dessus de votre bibliothèque, les {{remaining}} autres iront dessous",
+      "subtitleSplit_other": "Organisez les cartes : {{count}} iront sur le dessus de votre bibliothèque, les {{remaining}} autres iront dessous",
+      "badgeTop": "Dessus {{order}}",
+      "badgeBottom": "Dessous",
+      "hintSplit": "Glissez pour réorganiser · les vertes vont dessus (la première tout en haut), les grises dessous",
+      "moveEarlier": "Déplacer {{card}} vers l’avant",
+      "moveLater": "Déplacer {{card}} vers l’arrière",
+      "hintSplitOrderOnly": "Glissez ou utilisez les flèches pour réorganiser dans chaque pile · un autre joueur a choisi les cartes qui vont dessus"
     },
     "surveil": {
       "title": "Surveillance",
@@ -1679,6 +1721,10 @@
       "title": "Renforcer Jace",
       "subtitle": "Choisissez un jeton Jace que vous contrôlez pour qu'il gagne +{{count}} de loyauté"
     },
+    "spellCopyOrder": {
+      "title": "Ordonner les copies",
+      "subtitle": "Choisissez le sort dont la copie va ensuite sur la pile"
+    },
     "collectEvidence": {
       "title": "Collecter des preuves",
       "subtitle": "Exilez des cartes de votre cimetière dont la valeur de mana totale est {{minimum}} ou plus"
@@ -1797,6 +1843,14 @@
       "subtitle_one": "Put {{count}} revealed card on the bottom of your library",
       "subtitle_other": "Put {{count}} revealed cards on the bottom of your library, in any order",
       "hint": "Drag to reorder · position 1 ends up on top of this pile"
+    },
+    "revealUntilBottom": {
+      "title": "Mettez le reste en dessous",
+      "subtitle_one": "Mettez {{count}} carte révélée au-dessous de votre bibliothèque",
+      "subtitle_other": "Mettez {{count}} cartes révélées au-dessous de votre bibliothèque, dans l'ordre de votre choix",
+      "hint": "Faites glisser pour réorganiser · la position 1 se retrouve au-dessus de ce tas",
+      "moveLeft": "Déplacer vers la gauche",
+      "moveRight": "Déplacer vers la droite"
     }
   },
   "specializeColor": {
@@ -1908,6 +1962,10 @@
     "prowlNormalLabel": "Lancer normalement",
     "prowlAltLabel": "Lancer avec Prowl",
     "prowlSubtitle": "Lancez {{name}} normalement, ou payez son coût de Prowl (disponible parce qu'une créature correspondante a infligé des blessures de combat à un joueur ce tour-ci).",
+    "surgeEyebrow": "Surge",
+    "surgeNormalLabel": "Lancer normalement",
+    "surgeAltLabel": "Lancer avec Surge",
+    "surgeSubtitle": "Lancez {{name}} normalement, ou payez son coût de Surge (disponible parce que vous ou un coéquipier avez lancé un autre sort ce tour-ci).",
     "overloadEyebrow": "Surcharge",
     "overloadNormalLabel": "Lancer normalement",
     "overloadAltLabel": "Lancer avec Surcharge",
@@ -1931,6 +1989,8 @@
     "additionalExile": "+ Exiler une carte",
     "additionalSacrifice": "+ Sacrifier un permanent",
     "additionalPayLife": "+ Payer des points de vie",
+    "additionalPayLifeAmount": "+ Payer {{amount}} points de vie",
+    "additionalCollectEvidence": "+ Rassembler des preuves {{amount}}",
     "additionalDiscard": "+ Se défausser d'une carte",
     "additionalTapCreatures": "+ Engager des créatures",
     "additionalGeneric": "+ {{type}}"
@@ -1975,7 +2035,11 @@
   },
   "zoneOpponentChooser": {
     "title": "Choisir un adversaire",
-    "subtitle": "Choisissez quel adversaire fait le choix."
+    "subtitle": "Choisissez quel adversaire fait le choix.",
+    "orderTitle": "Choisir le joueur suivant",
+    "orderSubtitle": "Choisissez pour qui faire la prochaine sélection.",
+    "substituteTitle": "Choisir un joueur",
+    "substituteSubtitle": "Choisissez qui fait ce choix."
   },
   "pileOpponent": {
     "title": "Choose Opponent",
@@ -2058,6 +2122,7 @@
     "variantForetell": "Lancer depuis la Prédiction",
     "variantOverload": "Lancer avec Surcharge",
     "variantBestow": "Lancer avec Don",
+    "variantBlitz": "Lancer avec Blitz",
     "variantFreerunning": "Lancer avec Freerunning",
     "variantFuse": "Lancer avec Fusion",
     "variantMutate": "Lancer avec Mutate",
@@ -2067,7 +2132,14 @@
     "variantMoreThanMeetsTheEye": "Cast Converted",
     "variantPrototype": "Lancer avec Prototype",
     "variantFaceDown": "Lancer face cachée",
-    "variantFallback": "Lancer avec {{type}}"
+    "variantFallback": "Lancer avec {{type}}",
+    "viaSource": "via {{name}}",
+    "extraCostAdditional": "+ {{cost}}",
+    "extraCostAlternative": "au lieu de son coût de mana : {{cost}}",
+    "entersWithCounter": "arrive avec un marqueur {{counter}}",
+    "slotPerType": "utilise son emplacement {{type}}",
+    "slotChooseType": "choisissez un type de permanent",
+    "slotOncePerTurn": "une fois ce tour"
   },
   "categoryChoice": {
     "title": "Choisir les permanents à garder",
@@ -2225,7 +2297,9 @@
     "accept": "Oui",
     "decline": "Non",
     "sourceFallback": "Effet",
-    "entryLabel": "{{source}} — {{decision}}"
+    "entryLabel": "{{source}} — {{decision}}",
+    "optionalTriggers": "Capacités déclenchées facultatives ({{count, number}})",
+    "replacementChoices": "Choix de remplacement ({{count, number}})"
   },
   "optionalEffect": {
     "sourceFallback": "Effet",
@@ -2234,6 +2308,12 @@
     "no": "Non",
     "dontAskAgain": "Ne plus demander pendant cette partie",
     "dontAskAgainForSameCard": "Utiliser ce choix pour chaque copie de cette carte dans cette partie"
+  },
+  "keywordDetail": {
+    "selfManaCost": "son coût de mana",
+    "selfManaValue": "sa valeur de mana",
+    "manaCostReduced": "son coût de mana réduit de {{reduction}}",
+    "spliceOnto": "sur {{subtype}} {{cost}}"
   },
   "resolutionOptionalPayment": {
     "title": "Choisissez un paiement optionnel",
@@ -2252,7 +2332,8 @@
       "zoneExile": "l’exil",
       "zoneHand": "votre main",
       "discard": "Défaussez-vous de {{count}} {{cards}}",
-      "exile": "Exilez {{count}} {{cards}} depuis {{zone}}"
+      "exile": "Exilez {{count}} {{cards}} depuis {{zone}}",
+      "reveal": "Révélez {{count}} {{cards}} de {{zone}}"
     }
   },
   "topOrBottom": {
@@ -2298,6 +2379,8 @@
     "confirm": "Confirmer"
   },
   "replacement": {
+    "remember": "Mémoriser ce choix pour cette partie",
+    "savedChoice": "Remplacement : {{choice}}",
     "eyebrow": "Ordre de résolution",
     "title": "Effets de remplacement",
     "orderSubtitle": "Ces effets modifient tous la façon dont cet événement se produit. Faites glisser pour définir l'ordre d'application : le dernier appliqué est celui qui prend effet (CR 616.1).",
@@ -2324,7 +2407,8 @@
     "confirm": "Confirmer",
     "badgeNewTarget": "Nouvelle cible",
     "slotLabel": "Cible {{index}} : {{current}} → {{chosen}}",
-    "unselected": "inchangée"
+    "unselected": "inchangée",
+    "keep": "Conserver"
   },
   "separatePiles": {
     "chooserName": "Joueur {{number}}",
@@ -2541,8 +2625,8 @@
     "close": "Fermer la fenêtre de décision de l’IA"
   },
   "status": {
-    "yourPriority": "Your priority",
-    "yourPriorityReason": "Your priority — {{reason}}",
+    "yourPriority": "Votre priorité",
+    "yourPriorityReason": "Votre priorité — {{reason}}",
     "waitingFor": "Waiting for <player>{{player}}</player>",
     "waitingForReason": "Waiting for <player>{{player}}</player> — {{reason}}",
     "reason": {

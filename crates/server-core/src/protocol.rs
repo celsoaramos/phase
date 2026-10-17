@@ -1141,7 +1141,8 @@ mod tests {
     use engine::types::game_state::ProductionOverride;
     use engine::types::identifiers::ObjectIncarnationRef;
     use engine::types::mana::{
-        ManaSourcePenalty, ManaSourceSelection, ManaType, TapsForManaSelection,
+        ManaSourceOutput, ManaSourcePenalty, ManaSourceQuantity, ManaSourceSelection, ManaType,
+        TapsForManaSelection,
     };
     use serde_json::Value;
 
@@ -1239,6 +1240,33 @@ mod tests {
                 action: restored_action,
             } => assert_eq!(restored_action, generic),
             _ => panic!("wrong variant"),
+        }
+
+        let GameAction::ActivateManaSource { mut selection } = generic else {
+            unreachable!("fixture action is a generic mana-source selection");
+        };
+        selection.ability_index = Some(0);
+        selection.penalty = ManaSourcePenalty::Sacrifices;
+        selection.taps_for_mana.clear();
+        for quantity in [ManaSourceQuantity::Fixed(3), ManaSourceQuantity::Variable] {
+            selection.output = ManaSourceOutput::DeferredColorChoice { quantity };
+            selection.mana_type = ManaType::Colorless;
+            let msg = ClientMessage::Action {
+                action: GameAction::ActivateManaSource {
+                    selection: selection.clone(),
+                },
+            };
+            let json = serde_json::to_string(&msg).unwrap();
+            let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
+            let ClientMessage::Action { action } = parsed else {
+                panic!("wrong variant");
+            };
+            assert_eq!(
+                action,
+                GameAction::ActivateManaSource {
+                    selection: selection.clone()
+                }
+            );
         }
     }
 
@@ -3318,18 +3346,226 @@ mod tests {
         }
     }
 
-    /// `ReductionProvenance::{AbilityCostRider, TransientEffect}` are new in
-    /// serialized full-game state (the CR 601.2f + CR 602.2b activated-ability
-    /// cost-reduction election); a v78 peer cannot parse either tag, so it must
-    /// be refused before it receives v79 state.
+    /// v144: one-time boons (#7495) add `Effect::CreateBoon`, `Effect::NoteNumber`,
+    /// the `HasBoon` conditions, and `WaitingFor::ChooseTokenHost` tags, and
+    /// retype the perpetual P/T edit's `power_delta`/`toughness_delta` to
+    /// required `QuantityExpr` `power`/`toughness`. A v143 peer cannot parse
+    /// the new shapes, so it must be refused before it receives v144 state.
+    ///
+    /// v143: `GameState::modal_modes_chosen_this_turn` / `_this_game` retype to
+    /// `(ObjectIncarnationRef, usize)` (CR 400.7 incarnation-keyed modal
+    /// history); a v142 peer cannot decode the object-shaped key, so it must be
+    /// refused before it receives v143 state.
+    ///
+    /// v142: `LinkedExileSnapshot` gains `incarnation` (CR 400.7), carried in
+    /// `GameState::linked_exile_lki` and the trigger and zone-change linked-exile
+    /// snapshots; a v141 peer re-encoding state drops it, so it must be refused
+    /// before it receives v142 state.
+    ///
+    /// v141: `ExileLinkKind` gains `CastCost` (CR 607.2q cast-cost exile links),
+    /// carried in `GameState::exile_links`; a v140 peer cannot parse the tag, so
+    /// it must be refused before it receives v141 state.
+    ///
+    /// v140: `AttackSubject` gains `EventAttackers` (the players a trigger's
+    /// attack event's attackers attacked), carried in a resolving or pending
+    /// ability's `player_scope` inside `GameState`; a v139 peer cannot parse the
+    /// tag, so it must be refused before it receives v140 state.
+    ///
+    /// v139: CR 702.122c per-turn crew relation —
+    /// `GameState::crew_history_this_turn` and `FilterProp::CrewedThisTurn`, both
+    /// inside `GameState`; a v138 peer cannot parse the new filter tag, so it
+    /// must be refused before it receives v139 state.
+    ///
+    /// v134: `GameEvent::AbilityActivated` gains
+    /// `stack_entry`, the stack object a stack-using activation created, carried
+    /// in `GameState`'s trigger events; an older peer drops it silently and
+    /// resolves an activation trigger's "copy that ability" differently, so it
+    /// must be refused before it receives v134 state.
+    ///
+    /// v133: CR 614.12a pre-entry as-enters choices —
+    /// `NamedChoiceSourceBinding::PendingEntry`, `ProposedEvent::ZoneChange`'s
+    /// `enter_with_choices` and `PendingReplacement::delivery_boundary`, all
+    /// inside `GameState`; a v132 peer cannot parse the new binding tag, so it
+    /// must be refused before it receives v133 state.
+    ///
+    /// v132: `GameObject::exile_from_stack_linked_source`
+    /// carries the stamping incarnation (`ObjectIncarnationRef`, CR 400.7); a
+    /// v131 peer cannot decode a set rider, so it must be refused before it
+    /// receives v132 state.
+    ///
+    /// v131: `PlayerFilter` gains `AnyOf { filters }` and
+    /// `TargetPlayer`, carried in a resolving or pending ability's `player_scope`
+    /// inside `GameState`; a v130 peer cannot parse either tag, so it must be
+    /// refused before it receives v131 state.
+    ///
+    /// v130: `GameState::linked_exile_lki` holds one incarnation-bounded
+    /// `LinkedExileLki` per departure (CR 400.7); a v129 peer cannot decode a
+    /// non-empty map, so it must be refused before it receives v130 state.
+    ///
+    /// v129: `WaitingFor::LoopShortcut` and
+    /// `ShortcutProposal` gained a required `road: OfferRoad`. A v128 peer drops
+    /// the key from every frame it re-encodes, so the handshake refuses the
+    /// pairing rather than leave the road to the legacy-offer migration's
+    /// inference.
+    ///
+    /// The resolved-rules journal admits a land-play `rebound_from` on a
+    /// `ResolvedZoneChangeCommand` (Library/Graveyard/Exile -> Battlefield); a v123
+    /// peer rejects that `GameState.resolved_rules_journal`, so it must be refused
+    /// before it receives v124 state.
+    /// `MulliganDecisionEntry` and `MulliganDeclaration` gain `free_reveals_taken`; a
+    /// v124 peer drops the count, so it must be refused before it receives v125 state.
+    /// `ZoneChangeRecord` gains `arrival`; a v125 peer rejects the journal when the
+    /// departure owner differs from the command owner, so it must be refused before it
+    /// receives v126 state.
+    /// `TargetFilter::DeclaredPlayer` is new in serialized full-game state
+    /// (CR 608.2c + CR 115.1a); a v127 peer cannot deserialize it, so it must be
+    /// refused before it receives v128 state. `SpellContext` also gains
+    /// `outer_declared_players` (CR 603.7a), the players a delayed ability's
+    /// creating chain named by group, omitted when empty; amended in place, not
+    /// bumped.
+    /// `FilterProp::PrepareSpell` (CR 722.3d), the `scope` field on
+    /// `Effect::BecomePrepared` / `BecomeUnprepared` (CR 722.3a + CR 115.10a),
+    /// `SpellCastRecord::prepared_copy_source`, `CopiableValues::prepare_face`
+    /// and `GameObject::copied_prepare_face` are new in serialized full-game
+    /// state; a v122 peer cannot parse the new `FilterProp` tag and would read a
+    /// mass prepare as a single-target one, so it must be refused before it
+    /// receives v123 state.
+    /// `PermissionGrantee` gains `TriggeringSourceController` (a cast grant bound to
+    /// the triggering object's controller, CR 603.2 + CR 109.4), and damage events
+    /// carry the source incarnation (CR 400.7); a v121 peer cannot deserialize
+    /// the tag, so it must be refused before it receives v122 state.
+    /// The successful-mana-history ledger now stores the actual receiving
+    /// player with each trigger definition. A v120 peer cannot decode a
+    /// nonempty pair ledger, so it must be refused before v121 state.
+    /// `FilterProp`'s attachment-referent siblings are one parameterized
+    /// `FilterProp::AttachedTo { to: AttachmentReferent }` (CR 701.3a + CR
+    /// 303.4b); a v126 peer cannot parse the `"AttachedTo"` tag carried in
+    /// `GameState` ability definitions, so it must be refused before it
+    /// receives v127 state. v127 also carries the positional retarget wire
+    /// (`RetargetSpell` `null` keeps, engine-derived copy-walk keep
+    /// permissions), which a v126 peer cannot parse or render.
+    /// (Reserved as 119 and then 121 while under review; it landed after 126, so 119 stays unused.)
+    /// The CR 601.2a spell announcement adds `GameObject::spell_announcement`,
+    /// `GameState::next_spell_announcement` and `GameEvent::BecomesTarget.targeter`;
+    /// a v119 peer cannot decode v120 state, so it must be refused before state
+    /// delivery. (v119 is reserved for the Legends of Jidoor PR.)
+    /// `ManaColorSpent` on `AbilityCondition` and `TriggerCondition` retypes `color`
+    /// to `SpentColor` (word versus symbol provenance, CR 612.2); a v117 peer cannot
+    /// deserialize the tagged color, so it must be refused before it receives v118
+    /// state.
+    /// `DerivedViews` gains `shared_piles` (the seat storing a shared library and
+    /// graveyard); a v116 peer drops the key and renders per-seat piles for a
+    /// state whose other seat's containers are empty, so it must be refused before
+    /// it receives v117 state.
+    /// `DrawSequenceFrame` gains `dealer` (the in-game simultaneous-draw dealer),
+    /// serialized in the resolution frames behind `RESOLUTION_STATE_WIRE_VERSION`
+    /// 5; a v115 peer refuses that resolution state, so it must be refused before it
+    /// receives v116 state.
+    /// `MulliganChoice` gains `FreeReveal` and `MulliganDeclaration` gains `kind`
+    /// (the Dandân free reveal mulligan); a v114 peer cannot deserialize the
+    /// choice and would carry out a held free reveal as a regular mulligan, so it
+    /// must be refused before it receives v115 state.
+    /// `WaitingFor::MulliganDecision` gains `declared` (CR 103.5 declare round),
+    /// serialized in `GameState.waiting_for`; a v113 peer would drop it silently,
+    /// so it must be refused before it receives v114 state.
+    /// `ResolvedZoneChangeCommand` gains `rebound_from` (CR 108.3 as modified by
+    /// the Dandân hand-entry rebind), serialized inside
+    /// `GameState.resolved_rules_journal`; a v112 peer would drop it silently,
+    /// so it must be refused before it receives v113 state.
+    /// `ContinuousModification` gains `SubstituteTextWord` (CR 612.1), serialized
+    /// inside `GameState`'s transient continuous effects; a v111 peer cannot parse
+    /// the tag, so it must be refused before it receives v112 state.
+    /// `GameFormat` gains `Dandan`, which serializes as its `Display` string and
+    /// deserializes through `FromStr`; a v110 peer cannot parse a `GameState`
+    /// whose format names it, so it must be refused before it receives v111
+    /// state.
+    /// `GameState.deferred_spell_delivery` (CR 608.2n + CR 608.2g) is new in
+    /// serialized state. A v109 peer would leave a spell paused on its own
+    /// free-cast window on the stack in no zone, so the handshake must refuse
+    /// the mismatch before it receives v110 state. The same version adds
+    /// `WaitingFor::SpellCopyOrderChoice` and
+    /// `PendingRepeatIteration.copy_order_fixed` (CR 405.3).
+    /// The CR 201.5a granter binding adds `ObjectScope::GrantingObject` /
+    /// `ObjectScope::SpecificObject`, `TargetFilter::GrantingObject { bound }`,
+    /// `PlayerFilter::GrantingObjectCaster` and the `granting_object` stamp; v108 state
+    /// cannot decode as v109 state, so it must be refused before state delivery.
+    /// `IllegalTargetsDisposition::StillResolves` is serialized on the root
+    /// ability. A v107 peer would silently apply ordinary non-resolution
+    /// after target invalidation, so the handshake must refuse the mismatch
+    /// before it receives v108 state.
+    /// `UntilCondition::NextMatches.count` (CR 608.2c), the paused loop's `hits`,
+    /// `ZoneChoiceCandidateSource::ParentTargets` and
+    /// `SpellContext.exile_until_batch` are new in serialized
+    /// full-game state; a v106 peer would run a counted loop as a one-card loop,
+    /// so it must be refused before it receives v107 state.
+    /// `PendingCast` gains `delved_cards` and the pending cost-move resume swaps
+    /// `DelveManaPayment` for `FinalizeDelvedCast` (#9400); a v103 peer cannot
+    /// parse the parked delve commit, so it must be refused before it receives
+    /// v104 state.
+    /// `GameEvent::AbilityActivated` now carries `kind: "Mana"` for mana-ability
+    /// activations and an optional `departed_source_lki`; a v100 peer cannot
+    /// parse the `Mana` kind, so it must be refused before it receives v101 state.
+    /// `Effect::AdditionalPhase` now carries a `TurnSegment` in place of its
+    /// `phase` field and an `ExtraPhaseRecipient` in place of its `target`
+    /// field; a v99 peer cannot parse it, so it must be refused before it
+    /// receives v100 state.
+    /// `GraveyardCastPermission.pool` (CR 404.1 + CR 601.3) is new in serialized
+    /// full-game state; a v98 peer would default it to the own graveyard and
+    /// refuse a cast from any graveyard the permission allows, so it must be
+    /// refused before it receives v99 state.
+    /// `ZoneOpponentChooserPurpose::PerPlayerChoiceOrder` (CR 101.4c) and
+    /// `SubstituteChooser` (CR 800.4g), the per-player frame's `current` and
+    /// `nominee` fields, and `PerPlayerScope::Opponents` (CR 102.2 + CR 102.3)
+    /// are serialized; a v97 peer cannot deserialize them, so it must be
+    /// refused before it receives v98 state.
+    /// `ResolvedAbility.target_reads` and `AbilityDefinition.target_reads`
+    /// (`TargetReadOrigin`, CR 115.1 + CR 608.2c) are serialized; a v96 peer
+    /// would default the field and rebuild a target slot the rules do not
+    /// announce, so it must be refused before it receives v97 state.
+    /// `FilterProp::Unblocked` is reshaped to `FilterProp::BlockStatus { status:
+    /// AttackerBlockStatus }` (CR 509.1h); a v94 peer cannot parse the new
+    /// `"BlockStatus"` tag carried in `GameState` ability definitions, so it must
+    /// be refused before it receives v95 state.
+    /// `SpellContext.creation_lookback_event` and `TriggerSourceContext.mana_cost`
+    /// are new in serialized full-game state (CR 603.7 + CR 603.10a + CR 608.2h,
+    /// CR 707.2); a v93 peer would drop both and resolve a phase-delayed
+    /// departure look-back differently, so it must be refused before it
+    /// receives v94 state.
+    /// `ReductionProvenance` gains `SacrificedForCost`, the reduction an Emerge
+    /// or Offering sacrifice earns before a deferred target declaration; v92
+    /// state cannot decode a v93 provenance, so it must be refused before
+    /// state delivery.
+    /// `ResolvedAbility.parent_target_missing_reason` is serialized and gains
+    /// `ParentTargetMissingReason::RevealUntil`, and `EffectOutcomeSignal` gains
+    /// `RevealUntilMatched`, and the CR 701.20a reveal lease adds
+    /// `ResolvedInformationLifetime::UntilStackObjectLeaves` plus
+    /// `GameState.stack_bound_reveals` (CR 701.20a + CR 603.12), presented through
+    /// `DerivedViews.stack_revealed_cards`; a v91 peer cannot parse
+    /// the tags and would drop a paused reveal-until whiff's verdict, so it must
+    /// be refused before it receives v92 state.
+    /// `PendingManaAbility` now carries required `chosen_counter_counts`
+    /// instead of `chosen_counter_count` (#9207); v90 state cannot decode as
+    /// v91 state, so it must be refused before state delivery.
+    /// `FormatConfig` gained `allow_experimental_dungeons`; a v89 peer fails
+    /// the flag closed to `false` and runs the game without the experimental
+    /// dungeon pool the host chose, so it must be refused before it receives
+    /// v90 state.
+    /// `GraveyardCastPermission.required_cast_keyword` (CR 118.9b) is new in
+    /// serialized full-game state; a v88 peer would drop it silently and admit
+    /// a printed-cost graveyard cast the permission forbids, so it must be
+    /// refused before it receives v89 state. v89 also carries the announced
+    /// graveyard permission (CR 601.2a + CR 601.2b: the casting-menu option's
+    /// `authority`, the slot prompt's `permission`, the cast's latched terms).
+    /// The preceding v88 bump gave `WaitingFor::DeclareBlockers` its
+    /// `block_capacities` (CR 509.1a + CR 101.1).
     ///
     /// The name embeds the numeral deliberately: `assert_eq!(PROTOCOL_VERSION,
     /// <n>)` under a function named for `<n-1>` is green, so
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_79_for_activation_cost_election() {
-        assert_eq!(PROTOCOL_VERSION, 79);
+    fn protocol_version_is_144_for_one_time_boons() {
+        assert_eq!(PROTOCOL_VERSION, 144);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3340,7 +3576,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_79_for_activation_cost_election` stays
+    /// `protocol_version_is_144_for_one_time_boons` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

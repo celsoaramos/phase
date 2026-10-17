@@ -432,6 +432,11 @@ fn handle_replacement_choice_inner(
                                 &events[delivery_start..],
                             ),
                         );
+                        effects::settle_replaced_forwarded_zone_delivery(
+                            state,
+                            paused.member,
+                            &events[delivery_start..],
+                        );
                     }
                     if let Some(provenance) = parked_sacrifice_provenance {
                         if provenance.object_id == object_id {
@@ -591,10 +596,7 @@ fn handle_replacement_choice_inner(
                     )
                     .is_ok()
                     {
-                        events.push(GameEvent::PermanentTapped {
-                            object_id,
-                            caused_by: None,
-                        });
+                        events.push(GameEvent::permanent_tapped(state, object_id, None));
                     }
                 }
                 // CR 701.26b: Untap accepted after replacement choice.
@@ -1452,6 +1454,13 @@ fn handle_replacement_choice_inner(
                         pending.sacrifice_provenance = Some(provenance);
                     }
                 }
+                // CR 616.1f + CR 614.12a: a re-park of the SAME zone change keeps
+                // the event its logical owner parked on, so the eventual resume
+                // settles that owner's paused delivery even though an answered
+                // choice or applied replacement has changed the proposal since.
+                if let Some(paused) = parked_zone_change_delivery.as_ref() {
+                    pending.inherit_delivery_boundary(&paused.expected_event);
+                }
             }
             Ok(super::replacement::replacement_choice_waiting_for(
                 player, state,
@@ -1465,6 +1474,7 @@ fn handle_replacement_choice_inner(
                     &[],
                     crate::types::game_state::ZoneMoveCompletion::Prevented,
                 );
+                effects::settle_replaced_forwarded_zone_delivery(state, paused.member, &[]);
             }
             // CR 616.1f + CR 701.50a: a full-substitution applier (the Leader,
             // Super-Genius connive replacement) can park its OWN interactive
@@ -1744,6 +1754,9 @@ pub(super) fn handle_entry_controller_choice(
             "entry controller choice has an invalid replacement resume".to_string(),
         ));
     }
+    // The logical owner parked on the unanswered event; keep that boundary
+    // before the answer changes the proposal.
+    pending.pin_delivery_boundary();
     let ProposedEvent::ZoneChange {
         controller_override,
         to: Zone::Battlefield,
@@ -1765,6 +1778,50 @@ pub(super) fn handle_entry_controller_choice(
     // Mark before re-entering the ordinary handler so the pre-entry chooser
     // is not offered again while that handler applies this same replacement.
     pending.proposed.mark_applied(pending.candidates[0]);
+    handle_replacement_choice(state, 0, events)
+}
+
+/// CR 614.12a + CR 614.12: answer path for a pre-entry as-enters choice
+/// ("As ~ enters, choose …"). The parked entry's single candidate is the
+/// entrant's own choice replacement. The answer rides the entry event
+/// (`enter_with_choices`) so the CR 616.1f re-scan sees the permanent as it
+/// would exist, and delivery installs it on the new object (CR 400.7). The
+/// event the logical owner parked on is kept as the pending record's
+/// `delivery_boundary` before the proposal changes, so the shared resume settles
+/// the same paused delivery.
+pub(super) fn handle_entry_named_choice(
+    state: &mut GameState,
+    choice_type: &crate::types::ability::ChoiceType,
+    choice: &str,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    if !super::replacement::pending_entry_named_choice_is_live(state) {
+        return Err(EngineError::InvalidAction(
+            "as-enters choice has no pending battlefield entry".to_string(),
+        ));
+    }
+    let pending = state
+        .pending_replacement
+        .as_mut()
+        .expect("a live pre-entry choice owns the pending replacement");
+    pending.pin_delivery_boundary();
+    let rid = pending.candidates[0];
+    let ProposedEvent::ZoneChange {
+        enter_with_choices, ..
+    } = &mut pending.proposed
+    else {
+        unreachable!("a live pre-entry choice parks a battlefield ZoneChange");
+    };
+    enter_with_choices
+        .get_or_insert_with(Default::default)
+        .0
+        .extend(effects::choose::chosen_attributes_for_choice(
+            choice_type,
+            choice,
+        ));
+    // Mark before re-entering the ordinary handler so the choice is not raised
+    // again while that handler applies this same replacement.
+    pending.proposed.mark_applied(rid);
     handle_replacement_choice(state, 0, events)
 }
 
@@ -1791,7 +1848,7 @@ fn handle_persist_chosen_attribute_choice(
     )?;
     // CR 111.1 + CR 707.2: art routing follows the copy (token vs printed
     // source), captured alongside the values — NOT a copiable value itself.
-    let (display_source, printed_ref, token_image_ref) = state
+    let (display_source, printed_ref, token_image_ref, token_art) = state
         .objects
         .get(&donor_id)
         .map(|o| {
@@ -1799,6 +1856,7 @@ fn handle_persist_chosen_attribute_choice(
                 o.display_source,
                 o.printed_ref.clone(),
                 o.token_image_ref.clone(),
+                o.token_art.clone(),
             )
         })
         .unwrap_or_default();
@@ -1920,6 +1978,7 @@ fn handle_persist_chosen_attribute_choice(
         display_source,
         printed_ref,
         token_image_ref,
+        token_art,
         additional_modifications: Vec::new(),
         effect_kind: crate::types::ability::EffectKind::ChoosePermanent,
     };
@@ -3050,6 +3109,18 @@ pub(super) fn apply_post_replacement_effect(
     };
     let mut resolved =
         build_resolved_from_def_with_targets(effect_def, source_id, controller, targets);
+    // CR 121.6b + CR 616.1g: a nested replacement may temporarily become the
+    // resident drain while this chain is suspended on its child draw. Capture
+    // this continuation's own event target on the chain now so a later sibling
+    // (for example, Alms Collector's "that player" draw) cannot read the nested
+    // child's event target when it resumes.
+    if ability_definition_uses_post_replacement_event_target(effect_def) {
+        if let Some(target) = state.post_replacement_event_target() {
+            if !resolved.targets.contains(target) {
+                resolved.push_target(target.clone());
+            }
+        }
+    }
     // CR 109.5: "that player" / "its controller" — the player the replaced
     // event acted on, bound only when that is somebody other than "you" (see
     // `distinct_scoped_player` above). Applied to the whole chain so a rider
@@ -3060,6 +3131,37 @@ pub(super) fn apply_post_replacement_effect(
     }
     resolved.set_replacement_applied_recursive(replacement_applied);
     resolve_post_replacement_chain(state, &resolved, events)
+}
+
+fn ability_definition_uses_post_replacement_event_target(ability: &AbilityDefinition) -> bool {
+    fn filter_uses_event_target(filter: &TargetFilter) -> bool {
+        match filter {
+            TargetFilter::PostReplacementDamageTarget => true,
+            TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+                filters.iter().any(filter_uses_event_target)
+            }
+            TargetFilter::Not { filter } => filter_uses_event_target(filter),
+            _ => false,
+        }
+    }
+
+    ability
+        .effect
+        .target_filter()
+        .is_some_and(filter_uses_event_target)
+        || ability
+            .sub_ability
+            .as_deref()
+            .is_some_and(ability_definition_uses_post_replacement_event_target)
+        || ability
+            .else_ability
+            .as_deref()
+            .is_some_and(ability_definition_uses_post_replacement_event_target)
+        || matches!(
+            ability.effect.as_ref(),
+            Effect::ChooseOneOf { branches, .. }
+                if branches.iter().any(ability_definition_uses_post_replacement_event_target)
+        )
 }
 
 /// CR 608.2c: execute instructions in the order written.
@@ -3790,7 +3892,7 @@ mod tests {
     use crate::game::replacement::{self as replacement_mod, ReplacementResult};
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityKind, QuantityExpr, ReplacementDefinition, ReplacementMode,
+        AbilityKind, ChooseOneOfKind, QuantityExpr, ReplacementDefinition, ReplacementMode,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
@@ -3884,6 +3986,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
         state.waiting_for = replacement_mod::replacement_choice_waiting_for(PlayerId(0), &state);
 
@@ -4560,6 +4663,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
         state.waiting_for = replacement_mod::replacement_choice_waiting_for(PlayerId(0), &state);
         state.priority_player = PlayerId(0);
@@ -5091,6 +5195,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: std::collections::HashSet::new(),
@@ -5245,6 +5350,7 @@ mod tests {
                             make_branch("Cat", vec!["Creature", "Cat"], vec![ManaColor::White]),
                             make_branch("Dog", vec!["Creature", "Dog"], vec![ManaColor::Green]),
                         ],
+                        kind: ChooseOneOfKind::Ordinary,
                     },
                 )),
         );
@@ -5390,6 +5496,7 @@ mod tests {
                     make_token("Cat", vec!["Creature", "Cat"], vec![ManaColor::White]),
                     dog_then_cat,
                 ],
+                kind: ChooseOneOfKind::Ordinary,
             },
         );
         jinnie.replacement_definitions.push(
@@ -5404,6 +5511,7 @@ mod tests {
                             nested_choice,
                             make_token("Dog", vec!["Creature", "Dog"], vec![ManaColor::Green]),
                         ],
+                        kind: ChooseOneOfKind::Ordinary,
                     },
                 )),
         );
@@ -5569,6 +5677,7 @@ mod tests {
             Effect::ChooseOneOf {
                 chooser: PlayerFilter::Controller,
                 branches: vec![make_gain_life(1), make_gain_life(2)],
+                kind: ChooseOneOfKind::Ordinary,
             },
         );
         choose_then_token.sub_ability = Some(Box::new(make_token(
@@ -5854,6 +5963,7 @@ mod tests {
             Effect::ChooseOneOf {
                 chooser: PlayerFilter::Controller,
                 branches: vec![make_gain_life(), make_gain_life()],
+                kind: ChooseOneOfKind::Ordinary,
             },
         );
         branch_with_nontoken_choice.sub_ability = Some(Box::new(make_token(
@@ -5873,6 +5983,7 @@ mod tests {
                             branch_with_nontoken_choice,
                             make_token("Cat", vec!["Creature", "Cat"], vec![ManaColor::White]),
                         ],
+                        kind: ChooseOneOfKind::Ordinary,
                     },
                 )),
         );
@@ -7423,6 +7534,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: std::collections::HashSet::new(),
@@ -7632,6 +7744,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: std::collections::HashSet::new(),
@@ -7757,6 +7870,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: std::collections::HashSet::new(),
@@ -7938,6 +8052,7 @@ mod tests {
                 display_source: crate::game::game_object::DisplaySource::Token,
                 printed_ref: None,
                 token_image_ref: None,
+                token_art: None,
                 extra_keywords: Vec::new(),
                 additional_modifications: Vec::new(),
                 tapped: false,
@@ -8217,6 +8332,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: std::collections::HashSet::new(),
@@ -8379,11 +8495,12 @@ mod tests {
             source_id: source,
             branches,
             branch_descriptions: Vec::new(),
-            parent_targets: Vec::new(),
+            parent_occurrences: Default::default(),
             context: Default::default(),
             continuation: None,
             replacement_applied: Default::default(),
             remaining_players: Vec::new(),
+            trigger_context: None,
         };
         state.priority_player = PlayerId(0);
         assert!(
@@ -8966,17 +9083,7 @@ mod tests {
         );
     }
 
-    /// The post-replacement dispatch binds the REPLACEMENT SOURCE'S player, not the active player
-    /// — the other half of the universe argument the block-(3) `execute` firewall relief
-    /// (`analysis::resource::reveal_from_hand_execute_provably_excludes_class`) rests on. That arm
-    /// censuses `players[replacement_source_player(source)].hand`, which is the right pool only if
-    /// THIS dispatch binds the same authority: bound to `state.active_player` instead, the arm
-    /// would census one player's hand while the effect read another's, and the relief would be
-    /// unsound wherever the reveal land's controller is not the active player. A
-    /// `-> source.controller` divergence is deliberately not registered as a mutation, because
-    /// `controller_or_owner()` returns `controller` for every `Zone::Battlefield` source and the
-    /// firewall walk yields only `[Battlefield, Command]` sources with non-emblem Command dropped
-    /// upstream — no input it can produce distinguishes the two.
+    /// The post-replacement dispatch binds the REPLACEMENT SOURCE'S player, not the active player.
     ///
     /// REVERT / MUTATION PROBE: bind `apply_post_replacement_effect`'s `controller` to
     /// `state.active_player` ⇒ **this row FAILS** (the prompt goes to `PlayerId(0)`).
