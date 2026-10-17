@@ -1454,6 +1454,13 @@ fn handle_replacement_choice_inner(
                         pending.sacrifice_provenance = Some(provenance);
                     }
                 }
+                // CR 616.1f + CR 614.12a: a re-park of the SAME zone change keeps
+                // the event its logical owner parked on, so the eventual resume
+                // settles that owner's paused delivery even though an answered
+                // choice or applied replacement has changed the proposal since.
+                if let Some(paused) = parked_zone_change_delivery.as_ref() {
+                    pending.inherit_delivery_boundary(&paused.expected_event);
+                }
             }
             Ok(super::replacement::replacement_choice_waiting_for(
                 player, state,
@@ -1747,6 +1754,9 @@ pub(super) fn handle_entry_controller_choice(
             "entry controller choice has an invalid replacement resume".to_string(),
         ));
     }
+    // The logical owner parked on the unanswered event; keep that boundary
+    // before the answer changes the proposal.
+    pending.pin_delivery_boundary();
     let ProposedEvent::ZoneChange {
         controller_override,
         to: Zone::Battlefield,
@@ -1768,6 +1778,50 @@ pub(super) fn handle_entry_controller_choice(
     // Mark before re-entering the ordinary handler so the pre-entry chooser
     // is not offered again while that handler applies this same replacement.
     pending.proposed.mark_applied(pending.candidates[0]);
+    handle_replacement_choice(state, 0, events)
+}
+
+/// CR 614.12a + CR 614.12: answer path for a pre-entry as-enters choice
+/// ("As ~ enters, choose …"). The parked entry's single candidate is the
+/// entrant's own choice replacement. The answer rides the entry event
+/// (`enter_with_choices`) so the CR 616.1f re-scan sees the permanent as it
+/// would exist, and delivery installs it on the new object (CR 400.7). The
+/// event the logical owner parked on is kept as the pending record's
+/// `delivery_boundary` before the proposal changes, so the shared resume settles
+/// the same paused delivery.
+pub(super) fn handle_entry_named_choice(
+    state: &mut GameState,
+    choice_type: &crate::types::ability::ChoiceType,
+    choice: &str,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    if !super::replacement::pending_entry_named_choice_is_live(state) {
+        return Err(EngineError::InvalidAction(
+            "as-enters choice has no pending battlefield entry".to_string(),
+        ));
+    }
+    let pending = state
+        .pending_replacement
+        .as_mut()
+        .expect("a live pre-entry choice owns the pending replacement");
+    pending.pin_delivery_boundary();
+    let rid = pending.candidates[0];
+    let ProposedEvent::ZoneChange {
+        enter_with_choices, ..
+    } = &mut pending.proposed
+    else {
+        unreachable!("a live pre-entry choice parks a battlefield ZoneChange");
+    };
+    enter_with_choices
+        .get_or_insert_with(Default::default)
+        .0
+        .extend(effects::choose::chosen_attributes_for_choice(
+            choice_type,
+            choice,
+        ));
+    // Mark before re-entering the ordinary handler so the choice is not raised
+    // again while that handler applies this same replacement.
+    pending.proposed.mark_applied(rid);
     handle_replacement_choice(state, 0, events)
 }
 
@@ -3838,7 +3892,7 @@ mod tests {
     use crate::game::replacement::{self as replacement_mod, ReplacementResult};
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityKind, QuantityExpr, ReplacementDefinition, ReplacementMode,
+        AbilityKind, ChooseOneOfKind, QuantityExpr, ReplacementDefinition, ReplacementMode,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
@@ -3932,6 +3986,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
         state.waiting_for = replacement_mod::replacement_choice_waiting_for(PlayerId(0), &state);
 
@@ -4608,6 +4663,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
         state.waiting_for = replacement_mod::replacement_choice_waiting_for(PlayerId(0), &state);
         state.priority_player = PlayerId(0);
@@ -5139,6 +5195,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: std::collections::HashSet::new(),
@@ -5293,6 +5350,7 @@ mod tests {
                             make_branch("Cat", vec!["Creature", "Cat"], vec![ManaColor::White]),
                             make_branch("Dog", vec!["Creature", "Dog"], vec![ManaColor::Green]),
                         ],
+                        kind: ChooseOneOfKind::Ordinary,
                     },
                 )),
         );
@@ -5438,6 +5496,7 @@ mod tests {
                     make_token("Cat", vec!["Creature", "Cat"], vec![ManaColor::White]),
                     dog_then_cat,
                 ],
+                kind: ChooseOneOfKind::Ordinary,
             },
         );
         jinnie.replacement_definitions.push(
@@ -5452,6 +5511,7 @@ mod tests {
                             nested_choice,
                             make_token("Dog", vec!["Creature", "Dog"], vec![ManaColor::Green]),
                         ],
+                        kind: ChooseOneOfKind::Ordinary,
                     },
                 )),
         );
@@ -5617,6 +5677,7 @@ mod tests {
             Effect::ChooseOneOf {
                 chooser: PlayerFilter::Controller,
                 branches: vec![make_gain_life(1), make_gain_life(2)],
+                kind: ChooseOneOfKind::Ordinary,
             },
         );
         choose_then_token.sub_ability = Some(Box::new(make_token(
@@ -5902,6 +5963,7 @@ mod tests {
             Effect::ChooseOneOf {
                 chooser: PlayerFilter::Controller,
                 branches: vec![make_gain_life(), make_gain_life()],
+                kind: ChooseOneOfKind::Ordinary,
             },
         );
         branch_with_nontoken_choice.sub_ability = Some(Box::new(make_token(
@@ -5921,6 +5983,7 @@ mod tests {
                             branch_with_nontoken_choice,
                             make_token("Cat", vec!["Creature", "Cat"], vec![ManaColor::White]),
                         ],
+                        kind: ChooseOneOfKind::Ordinary,
                     },
                 )),
         );
@@ -7471,6 +7534,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: std::collections::HashSet::new(),
@@ -7680,6 +7744,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: std::collections::HashSet::new(),
@@ -7805,6 +7870,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: std::collections::HashSet::new(),
@@ -8266,6 +8332,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: std::collections::HashSet::new(),
@@ -8433,6 +8500,7 @@ mod tests {
             continuation: None,
             replacement_applied: Default::default(),
             remaining_players: Vec::new(),
+            trigger_context: None,
         };
         state.priority_player = PlayerId(0);
         assert!(

@@ -7790,6 +7790,7 @@ mod tests {
                 continuation: None,
                 replacement_applied: HashSet::new(),
                 remaining_players: Vec::new(),
+                trigger_context: None,
             },
         );
         crate::game::effects::choose_one_of::resume_pending(&mut choose_one_of, &mut Vec::new());
@@ -8613,6 +8614,7 @@ mod tests {
             lifelink_bonus: 0,
             may_cost_paid: false,
             may_cost_remaining: None,
+            delivery_boundary: None,
         });
         spell.waiting_for =
             crate::game::replacement::replacement_choice_waiting_for(PlayerId(0), &spell);

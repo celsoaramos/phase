@@ -20,7 +20,7 @@ use crate::types::game_state::{
     ChainStep, GameState, PtDirection, RetargetSlotAddress, TargetEffectDetail,
     TargetSelectionConstraint, TargetSelectionProgress, TargetSelectionSlot,
 };
-use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
+use crate::types::identifiers::{ObjectId, ObjectIncarnationRef, LEGACY_INCARNATION};
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
 use rand::seq::IndexedRandom;
@@ -1033,11 +1033,29 @@ fn modal_selection_condition_matches(
     }
 }
 
-/// Returns mode indices unavailable due to NoRepeatThisTurn/NoRepeatThisGame constraints.
-/// CR 700.2: Checks per-turn and per-game tracking maps for previously chosen modes.
-pub fn compute_unavailable_modes(
+/// CR 400.7 + CR 700.2: the modal no-repeat history key for a source whose mode
+/// choice is made while it is a live object — an activated ability (CR 602.2b:
+/// modes are chosen before costs, so the source has not yet moved) or a spell.
+/// A source with no live object cannot prove its incarnation and binds
+/// `LEGACY_INCARNATION`, which matches no live object's history.
+pub(crate) fn live_modal_history_source(
     state: &GameState,
     source_id: ObjectId,
+) -> ObjectIncarnationRef {
+    state.objects.get(&source_id).map_or(
+        ObjectIncarnationRef::of(source_id, LEGACY_INCARNATION),
+        ObjectIncarnationRef::from_object,
+    )
+}
+
+/// Returns mode indices unavailable due to NoRepeatThisTurn/NoRepeatThisGame constraints.
+/// CR 700.2: Checks per-turn and per-game tracking maps for previously chosen modes.
+/// CR 400.7: history belongs to the exact `source` incarnation; a triggered
+/// ability passes its captured source (CR 603.10a look-back), every other
+/// caller passes `live_modal_history_source`.
+pub fn compute_unavailable_modes(
+    state: &GameState,
+    source: ObjectIncarnationRef,
     modal: &ModalChoice,
 ) -> Vec<usize> {
     let mut unavailable = Vec::new();
@@ -1047,7 +1065,7 @@ pub fn compute_unavailable_modes(
                 for mode_idx in 0..modal.mode_count {
                     if state
                         .modal_modes_chosen_this_turn
-                        .contains(&(source_id, mode_idx))
+                        .contains(&(source, mode_idx))
                     {
                         unavailable.push(mode_idx);
                     }
@@ -1057,7 +1075,7 @@ pub fn compute_unavailable_modes(
                 for mode_idx in 0..modal.mode_count {
                     if state
                         .modal_modes_chosen_this_game
-                        .contains(&(source_id, mode_idx))
+                        .contains(&(source, mode_idx))
                     {
                         unavailable.push(mode_idx);
                     }
@@ -1110,7 +1128,8 @@ pub fn spell_modal_unavailable_modes(
     modal: &ModalChoice,
     mode_abilities: &[AbilityDefinition],
 ) -> Vec<usize> {
-    let mut unavailable_modes = compute_unavailable_modes(state, source_id, modal);
+    let mut unavailable_modes =
+        compute_unavailable_modes(state, live_modal_history_source(state, source_id), modal);
     let x_dependent_modal_targets = state
         .objects
         .get(&source_id)
@@ -1134,6 +1153,88 @@ pub fn spell_modal_unavailable_modes(
         );
     }
     unavailable_modes
+}
+
+/// CR 700.2a + CR 601.2b-c: Whether a mode selection the rules accept exists
+/// once `unavailable_modes` (repeat constraints and modes with no legal target
+/// assignment) are excluded. A mode that requires a target with no legal
+/// choice can't be chosen; when the spell's minimum number of modes can't be
+/// met from the modes that can, the spell can't be cast at all.
+///
+/// - CR 700.2d: Without repeats, at least `min_choices` distinct choosable
+///   modes are needed ("choose two" with one choosable mode has no legal
+///   selection); with repeats, one choosable mode can fill every pick.
+/// - CR 700.2 + CR 601.2b: For a count-capped modal the maximum number of
+///   modes must not be below the minimum; the announced selection has to
+///   satisfy both, so an inverted range admits no selection.
+/// - CR 700.2i: For a pawprint points-budget modal, the cheapest
+///   `min_choices` choosable modes must fit within the point budget.
+/// - CR 700.2a + CR 115.1: Modal target constraints (each mode targets a
+///   different player) must admit a legal assignment for a selection the
+///   modal allows: at least `min_choices` modes, within the mode-count cap or
+///   the pawprint budget (`modal_choice_with_target_assignment_limit`, the
+///   authority the activated and triggered mode prompts also apply).
+///
+/// `modal` is the effective choice the prompt would present (conditional and
+/// dynamic maxima already resolved).
+pub fn modal_has_legal_mode_selection(
+    state: &GameState,
+    source_id: ObjectId,
+    controller: PlayerId,
+    modal: &ModalChoice,
+    mode_abilities: &[AbilityDefinition],
+    unavailable_modes: &[usize],
+) -> bool {
+    // CR 700.2: the instruction sets how many modes are chosen; "choose up to
+    // N" admits choosing none.
+    if modal.min_choices == 0 {
+        return true;
+    }
+    let available: Vec<usize> = (0..modal.mode_count)
+        .filter(|idx| !unavailable_modes.contains(idx))
+        .collect();
+    let enough_modes = if modal.mode_pawprints.is_empty() {
+        // CR 700.2 + CR 601.2b: the instruction fixes how many modes are
+        // announced, and `max_choices` is that count here; a maximum below the
+        // minimum admits no selection (`validate_modal_indices` rejects every
+        // length).
+        modal.min_choices <= modal.max_choices
+            && if modal.allow_repeat_modes {
+                !available.is_empty()
+            } else {
+                available.len() >= modal.min_choices
+            }
+    } else {
+        let mut weights: Vec<u32> = available
+            .iter()
+            .filter_map(|&idx| modal.mode_pawprints.get(idx).copied().map(u32::from))
+            .collect();
+        weights.sort_unstable();
+        let cheapest = if modal.allow_repeat_modes {
+            weights
+                .first()
+                .map(|&weight| weight.saturating_mul(modal.min_choices as u32))
+        } else {
+            weights
+                .get(..modal.min_choices)
+                .map(|cheapest| cheapest.iter().sum::<u32>())
+        };
+        cheapest.is_some_and(|spent| spent <= modal.max_choices as u32)
+    };
+    // CR 700.2a + CR 700.2d + CR 700.2i: `modal_choice_with_target_assignment_limit`
+    // weighs only the selections the modal allows (`min_choices` or more modes
+    // within the count cap or the pawprint budget), so `Some` means such a
+    // selection has a legal combined target assignment, and `None` that none does.
+    enough_modes
+        && modal_choice_with_target_assignment_limit(
+            state,
+            source_id,
+            controller,
+            modal,
+            mode_abilities,
+            unavailable_modes,
+        )
+        .is_some()
 }
 
 /// Spell-kind abilities on a modal spell object — one entry per printed mode.
@@ -1215,6 +1316,11 @@ pub fn filter_modes_by_target_legality(
 /// Per-mode filtering only proves each mode is individually legal. Modal
 /// constraints such as `DifferentTargetPlayers` can make a larger selected set
 /// impossible even when every selected mode is legal on its own.
+///
+/// CR 700.2i: A pawprint modal's `max_choices` is a point budget, not a mode
+/// count, so it is never reduced to a selection size; the result is `Some`
+/// when one budget-legal selection of at least `min_choices` modes has a legal
+/// combined target assignment, and `None` when none does.
 pub fn modal_choice_with_target_assignment_limit(
     state: &GameState,
     source_id: ObjectId,
@@ -1224,29 +1330,55 @@ pub fn modal_choice_with_target_assignment_limit(
     unavailable_modes: &[usize],
 ) -> Option<ModalChoice> {
     let target_constraints = target_constraints_from_modal(modal);
-    if target_constraints.is_empty() || !modal.mode_pawprints.is_empty() {
+    if target_constraints.is_empty() {
         return Some(modal.clone());
     }
 
-    let max_legal_choices = generate_modal_index_sequences(modal)
+    let mut witnesses = assignable_modal_index_sequences(
+        state,
+        source_id,
+        controller,
+        modal,
+        mode_abilities,
+        unavailable_modes,
+        &target_constraints,
+    );
+    if modal.mode_pawprints.is_empty() {
+        let max_legal_choices = witnesses.map(|indices| indices.len()).max()?;
+        let mut effective = modal.clone();
+        effective.max_choices = effective.max_choices.min(max_legal_choices);
+        Some(effective)
+    } else {
+        witnesses.next().map(|_| modal.clone())
+    }
+}
+
+/// CR 700.2a + CR 700.2i + CR 115.1: The selections
+/// `generate_modal_index_sequences` allows (mode-count range, or pawprint
+/// budget with at least `min_choices` modes), none using an unavailable mode,
+/// whose combined targets have a legal assignment under `target_constraints`.
+fn assignable_modal_index_sequences<'a>(
+    state: &'a GameState,
+    source_id: ObjectId,
+    controller: PlayerId,
+    modal: &ModalChoice,
+    mode_abilities: &'a [AbilityDefinition],
+    unavailable_modes: &'a [usize],
+    target_constraints: &'a [TargetSelectionConstraint],
+) -> impl Iterator<Item = Vec<usize>> + 'a {
+    generate_modal_index_sequences(modal)
         .into_iter()
-        .filter(|indices| indices.iter().all(|idx| !unavailable_modes.contains(idx)))
-        .filter(|indices| {
+        .filter(move |indices| indices.iter().all(|idx| !unavailable_modes.contains(idx)))
+        .filter(move |indices| {
             modal_indices_have_legal_target_assignment(
                 state,
                 source_id,
                 controller,
                 mode_abilities,
                 indices,
-                &target_constraints,
+                target_constraints,
             )
         })
-        .map(|indices| indices.len())
-        .max()?;
-
-    let mut effective = modal.clone();
-    effective.max_choices = effective.max_choices.min(max_legal_choices);
-    Some(effective)
 }
 
 fn modal_indices_have_legal_target_assignment(
@@ -1272,9 +1404,11 @@ fn modal_indices_have_legal_target_assignment(
 
 /// Records chosen mode indices for NoRepeat constraint enforcement.
 /// CR 700.2: Inserts into per-turn and/or per-game tracking maps.
+/// CR 400.7: `source` must be the same incarnation key the matching
+/// `compute_unavailable_modes` call read for this choice.
 pub fn record_modal_mode_choices(
     state: &mut GameState,
-    source_id: ObjectId,
+    source: ObjectIncarnationRef,
     modal: &ModalChoice,
     indices: &[usize],
 ) {
@@ -1282,12 +1416,12 @@ pub fn record_modal_mode_choices(
         match constraint {
             ModalSelectionConstraint::NoRepeatThisTurn => {
                 for &idx in indices {
-                    state.modal_modes_chosen_this_turn.insert((source_id, idx));
+                    state.modal_modes_chosen_this_turn.insert((source, idx));
                 }
             }
             ModalSelectionConstraint::NoRepeatThisGame => {
                 for &idx in indices {
-                    state.modal_modes_chosen_this_game.insert((source_id, idx));
+                    state.modal_modes_chosen_this_game.insert((source, idx));
                 }
             }
             _ => {}
@@ -1878,8 +2012,9 @@ pub fn random_select_modal_indices(
     };
     let min = modal.min_choices.min(max);
     if max == 0 {
-        // "Choose up to one ... at random" with no legal mode to pick resolves
-        // with no instructions (CR 700.2a) — represented by an empty index set.
+        // "Choose up to one ... at random" with no legal mode to pick chooses no
+        // mode: an empty index set. A triggered caller removes the ability from
+        // the stack (CR 603.3c + CR 700.2b).
         return Some(Vec::new());
     }
 
@@ -2880,7 +3015,8 @@ fn validate_targets_in_chain_inner(
     // CR 608.2b: the nearest DECLARING ancestor's own occurrences, every one
     // with the verdict its validation reached (an ancestor that declares
     // nothing — an inheriting rider, a paid-"instead" delegator — passes its
-    // own parent's block through). Read by the implicit-fight referent.
+    // own parent's block through). Read by the implicit-fight referent and by
+    // the generic arm's prior-object recheck (`target_filter_binds_prior_target`).
     parent_block: &[JudgedOccurrence],
 ) -> ResolvedAbility {
     // Classify provenance before pruning the parent's declaration.
@@ -3483,7 +3619,50 @@ fn validate_targets_in_chain_inner(
                 }
                 verdicts
             }
-            Some(filter) => against_filter(filter),
+            Some(filter) => {
+                // CR 608.2b + CR 601.2c: a slot whose legality reads the object
+                // announced for an EARLIER slot that a declaring ancestor holds
+                // ("another target creature that player controls") is judged
+                // against that ancestor's first object occurrence, bound as at
+                // announcement, never against this node's own first target. An
+                // illegal referent supplies no information, so the dependent
+                // occurrences are illegal too.
+                let ancestor_bound = || -> Option<Vec<OccurrenceVerdict>> {
+                    if validated.target_choice_timing != TargetChoiceTiming::Stack
+                        || !target_filter_binds_prior_target(filter)
+                    {
+                        return None;
+                    }
+                    let (referent, verdict) =
+                        parent_block
+                            .iter()
+                            .find_map(|((target, _), verdict)| match target {
+                                TargetRef::Object(id) => Some((*id, *verdict)),
+                                TargetRef::Player(_) => None,
+                            })?;
+                    if verdict != OccurrenceVerdict::Legal {
+                        return Some(vec![OccurrenceVerdict::Dropped; occurrence_count]);
+                    }
+                    let bound = resolved_ability_with_bound_object_target(&validated, referent);
+                    let legal = slot_legal_targets(
+                        view,
+                        state,
+                        AbilityTargetSlot::Unpositioned(filter),
+                        &bound,
+                    );
+                    Some(
+                        (0..occurrence_count)
+                            .map(|position| {
+                                legal_or_dropped(
+                                    legal.contains(&validated.targets[position])
+                                        && target_is_current_at(&validated, position, state),
+                                )
+                            })
+                            .collect(),
+                    )
+                };
+                ancestor_bound().unwrap_or_else(|| against_filter(filter))
+            }
             // CR 608.2b: A context-ref filter (`ParentTarget`,
             // `TriggeringSource`, etc.) carries a resolution-time *snapshot*,
             // not a player-chosen target. `extract_target_filter_from_effect`
@@ -5075,6 +5254,7 @@ fn filter_prop_contains_quantity_scope(prop: &FilterProp, scope: ObjectScope) ->
         | FilterProp::Untapped
         | FilterProp::IsSaddled
         | FilterProp::SaddledSource
+        | FilterProp::CrewedThisTurn { .. }
         | FilterProp::ConvokedSource
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::HasHasteOrControlledSinceTurnBegan
@@ -5160,17 +5340,20 @@ fn filter_prop_contains_quantity_scope(prop: &FilterProp, scope: ObjectScope) ->
     }
 }
 
-/// CR 601.2c: does this slot filter reference an object chosen in an EARLIER
-/// slot of the same ability, in a form a `.targets`-prefilled ability actually
-/// resolves? Exactly two encodings, both measured in the corpus:
+/// CR 115.1 + CR 601.2c: does this slot filter reference an object chosen in an
+/// EARLIER slot of the same ability, in a form a `.targets`-prefilled ability
+/// actually resolves? Exactly three encodings:
 ///
 ///   * `ObjectScope::Target` inside a quantity threshold (Puca's Mischief `Cmc`,
 ///     Spawnbroker `PtComparison`) — resolved by `quantity::object_id_for_scope`.
 ///   * `FilterProp::SharesQuality { reference: Some(ParentTarget) }` (Daring
 ///     Thief) — resolved by `filter::parent_target_shared_quality_values`.
+///   * a `ParentTargetController` controller ("another target creature that
+///     player controls", Mutiny) — resolved by `filter::parent_target_controller_player`
+///     through `ability_utils::parent_target_controller`.
 ///
-/// Both read `ability.targets` with `.find_map(first Object)` and NEITHER
-/// consults `target_incarnations`.
+/// Each reads the first entry of `ability.targets`, and none consults
+/// `target_incarnations`.
 ///
 /// DELIBERATELY EXCLUDED — the object-IDENTITY arm (`filter::filter_inner_for_object` —
 /// the `TargetFilter::ParentTarget` and `ParentTargetSlot { index }` arms) and
@@ -5187,7 +5370,12 @@ fn filter_prop_contains_quantity_scope(prop: &FilterProp, scope: ObjectScope) ->
 /// behaviour and avoids rerouting 30 corpus slots. See deferral D1.
 fn target_filter_binds_prior_target(filter: &TargetFilter) -> bool {
     crate::game::filter::filter_contains(filter, &|inner| match inner {
-        TargetFilter::Typed(typed) => typed.properties.iter().any(filter_prop_binds_prior_target),
+        TargetFilter::Typed(typed) => {
+            matches!(
+                typed.controller,
+                Some(ControllerRef::ParentTargetController)
+            ) || typed.properties.iter().any(filter_prop_binds_prior_target)
+        }
         _ => false,
     })
 }
@@ -5227,6 +5415,7 @@ fn filter_prop_binds_prior_target(prop: &FilterProp) -> bool {
         | FilterProp::Untapped
         | FilterProp::IsSaddled
         | FilterProp::SaddledSource
+        | FilterProp::CrewedThisTurn { .. }
         | FilterProp::ConvokedSource
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::HasHasteOrControlledSinceTurnBegan
@@ -5312,8 +5501,10 @@ fn filter_prop_binds_prior_target(prop: &FilterProp) -> bool {
 }
 
 /// Clone `ability` with `targets` replaced by exactly the single object
-/// `object_id`, so `ObjectScope::Target` / `SharesQuality{ParentTarget}`
-/// referents resolve against it during interactive enumeration.
+/// `object_id`, so the referent of every encoding
+/// `target_filter_binds_prior_target` admits resolves against it during
+/// interactive enumeration and at the CR 608.2b recheck
+/// (`validate_targets_in_chain_inner`).
 ///
 /// CR 400.7 + CR 603.7c: `target_incarnations` is CLEARED, not merely assumed
 /// empty. The object-IDENTITY arms (`filter::filter_inner`'s
@@ -5329,7 +5520,7 @@ fn filter_prop_binds_prior_target(prop: &FilterProp) -> bool {
 /// `target_pin_is_current` returns `true` for any id absent from the pin list —
 /// and would also discard the creation-time snapshot a `ParentTarget` referent
 /// is supposed to read. Clearing keeps the clone's referent surface to exactly
-/// the two encodings the predicate admits.
+/// the encodings the predicate admits.
 fn resolved_ability_with_bound_object_target(
     ability: &ResolvedAbility,
     object_id: ObjectId,
@@ -5341,14 +5532,15 @@ fn resolved_ability_with_bound_object_target(
 }
 
 /// Clone `ability` with `targets` prefilled from the FIRST object selected in a
-/// prior slot, so `ObjectScope::Target` and `SharesQuality{ParentTarget}`
-/// referents resolve during the interactive walk. CR 603.3d is why this matters:
-/// mid-walk the real `ability.targets` is still empty, so both referents fail
+/// prior slot, so the referent of every encoding
+/// `target_filter_binds_prior_target` admits resolves during the interactive
+/// walk. CR 603.3d is why this matters:
+/// mid-walk the real `ability.targets` is still empty, so every referent fails
 /// closed and the dependent slot collapses, removing the ability from the stack.
 ///
 /// FILL SHAPE: exactly one element, the first prior object. NOT index-aligned,
-/// not padded — the two admitted consumers both read
-/// `targets.iter().find_map(first Object)`, and `ParentTargetSlot { index }` is
+/// not padded — the three admitted consumers read the first entry of
+/// `ability.targets`, and `ParentTargetSlot { index }` is
 /// excluded from `target_filter_binds_prior_target`, so no positional consumer
 /// is reachable. No `TargetRef::Player` is written, so every player-axis reader
 /// (`filter::target_player_from_ability_or_root`) sees exactly what it sees
@@ -5400,10 +5592,11 @@ fn first_prior_object_slot(existing_slots: &[TargetSelectionSlot]) -> Option<&Ta
 /// first prior OBJECT slot in turn. Dedup with the same
 /// `if !legal_targets.contains(&target)` idiom the player loop at :5196 uses.
 ///
-/// The union is EXACT for this class (a narrowed slot's legality depends only
-/// on the single prior object), so "union non-empty <=> some assignment
-/// exists" holds — the CR 603.3d removal decision at the `collect_target_slots`
-/// call site stays correct. Narrower per-assignment legality is enforced
+/// The union is exact for each encoding's prior-object criterion. A slot that
+/// also carries `FilterProp::Another` can have a non-empty union and no
+/// assignment, so the CR 603.3d decision is
+/// `has_legal_target_assignment_for_ability`'s completion check, not this
+/// union's emptiness. Narrower per-assignment legality is enforced
 /// separately at `legal_targets_for_selected_slot` (exact binding, not union).
 fn union_over_prior_object_candidates(
     state: &GameState,
@@ -11826,6 +12019,65 @@ pub(crate) fn retarget_declared_view(
         .collect()
 }
 
+/// CR 115.7d + CR 601.2c: the earlier target a retarget position at `path` of
+/// `chain` is judged against when its `filter` reads an object announced for
+/// an earlier slot that a DECLARING ANCESTOR holds ("another target creature
+/// that player controls": Mutiny) — that ancestor's address and first object
+/// occurrence, as `chain` holds them. The same referent the CR 608.2b recheck
+/// binds (`validate_targets_in_chain_inner`'s `parent_block`): the nearest
+/// ancestor that declares a target of its own, its first object, and no
+/// further ancestor when that one declares only players. `None` when the
+/// filter reads no earlier object or no ancestor declares one; the position's
+/// own node then supplies the referent, as it does when both slots share a
+/// node.
+fn retarget_prior_object_referent(
+    chain: &ResolvedAbility,
+    path: &[ChainStep],
+    filter: &TargetFilter,
+) -> Option<(RetargetSlotAddress, ObjectId)> {
+    if !target_filter_binds_prior_target(filter) {
+        return None;
+    }
+    // The walk is pre-order, so the last ancestor it reports is the nearest.
+    let mut nearest: Option<Vec<ChainStep>> = None;
+    walk_declared_slots(chain, &mut |node, node_path, first_slot| {
+        if first_slot.is_some()
+            && node_path.len() < path.len()
+            && path.starts_with(node_path)
+            && !chain_node_positions(node).is_empty()
+        {
+            nearest = Some(node_path.to_vec());
+        }
+    });
+    let ancestor_path = nearest?;
+    let ancestor = node_at(chain, &ancestor_path)?;
+    chain_node_positions(ancestor)
+        .into_iter()
+        .find_map(|slot| match ancestor.targets[slot] {
+            TargetRef::Object(id) => Some((
+                RetargetSlotAddress {
+                    path: ancestor_path.clone(),
+                    slot,
+                },
+                id,
+            )),
+            TargetRef::Player(_) => None,
+        })
+}
+
+/// CR 115.7d + CR 601.2c: `node` (the node at `path` of `chain`) bound to its
+/// [`retarget_prior_object_referent`], or `None` when the node itself is the
+/// referent's carrier.
+fn retarget_node_bound_to_prior_object(
+    chain: &ResolvedAbility,
+    path: &[ChainStep],
+    node: &ResolvedAbility,
+    filter: &TargetFilter,
+) -> Option<ResolvedAbility> {
+    retarget_prior_object_referent(chain, path, filter)
+        .map(|(_, referent)| resolved_ability_with_bound_object_target(node, referent))
+}
+
 /// CR 115.7d (second clause) + CR 115.7e ("only the final set of targets is
 /// evaluated"): every UNCHANGED addressed slot that was LEGAL in `pre` must
 /// still be legal in `post`. A slot that was ALREADY illegal — not in the
@@ -11834,7 +12086,9 @@ pub(crate) fn retarget_declared_view(
 /// CR 115.7d's FIRST clause. `Legacy` bindings are skipped (no filter).
 /// Legality uses the slot's addressed node and `pool_controller` (the
 /// retarget pool's controller authority); a filter that reads another declared
-/// slot is evaluated against [`retarget_declared_view`] of the respective chain.
+/// slot is evaluated against [`retarget_declared_view`] of the respective chain,
+/// and one that reads an ancestor's earlier object against
+/// [`retarget_prior_object_referent`] of the respective chain.
 ///
 /// Extracted from `engine::apply_retarget`'s unchanged-position pass so that
 /// copy retargeting (CR 707.10c, which "chooses new targets") applies the same
@@ -11848,6 +12102,7 @@ pub(crate) fn unchanged_targets_stay_legal(
     pool_controller: PlayerId,
 ) -> Result<(), EngineError> {
     let slot_is_legal = |chain: &ResolvedAbility,
+                         path: &[ChainStep],
                          node: &ResolvedAbility,
                          filter: &TargetFilter,
                          position: usize,
@@ -11859,12 +12114,18 @@ pub(crate) fn unchanged_targets_stay_legal(
         if !target_is_current_at(node, position, state) {
             return false;
         }
+        // CR 115.7d + CR 601.2c: a slot that reads an earlier object a
+        // declaring ancestor holds is judged against that ancestor's target in
+        // `chain`, so changing the ancestor's target is checked against the
+        // unchanged dependent one.
+        let bound = retarget_node_bound_to_prior_object(chain, path, node, filter);
+        let judged = bound.as_ref().unwrap_or(node);
         if crate::game::filter::filter_reads_declared_slot(filter) {
             let view = retarget_declared_view(pre, chain);
             targeting::find_legal_targets_for_ability_with_view(
                 state,
                 filter,
-                node,
+                judged,
                 pool_controller,
                 &view,
             )
@@ -11873,7 +12134,7 @@ pub(crate) fn unchanged_targets_stay_legal(
             targeting::find_legal_targets_for_ability_with_controller(
                 state,
                 filter,
-                node,
+                judged,
                 pool_controller,
             )
             .contains(current)
@@ -11896,7 +12157,14 @@ pub(crate) fn unchanged_targets_stay_legal(
         let Some(pre_current) = pre_node.targets.get(binding.address.slot) else {
             continue;
         };
-        if !slot_is_legal(pre, pre_node, filter, binding.address.slot, pre_current) {
+        if !slot_is_legal(
+            pre,
+            &binding.address.path,
+            pre_node,
+            filter,
+            binding.address.slot,
+            pre_current,
+        ) {
             // CR 115.7d FIRST clause: an already-illegal unchanged target
             // stays accepted.
             continue;
@@ -11907,7 +12175,14 @@ pub(crate) fn unchanged_targets_stay_legal(
         let Some(post_current) = post_node.targets.get(binding.address.slot) else {
             continue;
         };
-        if !slot_is_legal(post, post_node, filter, binding.address.slot, post_current) {
+        if !slot_is_legal(
+            post,
+            &binding.address.path,
+            post_node,
+            filter,
+            binding.address.slot,
+            post_current,
+        ) {
             return Err(EngineError::InvalidAction(
                 "Retarget: the change would make an unchanged target illegal".to_string(),
             ));
@@ -11917,11 +12192,13 @@ pub(crate) fn unchanged_targets_stay_legal(
 }
 
 /// CR 115.7a + CR 115.7d + CR 115.7e: every CHANGED addressed slot whose
-/// filter reads another declared slot must be legal for the EDITED referent —
-/// the final set is what is evaluated. A dependent slot's stored candidate
-/// pool over-approximates (it cannot know which referent the same submission
-/// elects), so this is the exact check for those slots. Slots whose filter
-/// reads no declared slot are untouched (the stored pool is already exact).
+/// filter reads another declared slot, or an earlier object a declaring
+/// ancestor holds ([`retarget_prior_object_referent`]), must be legal for the
+/// EDITED referent — the final set is what is evaluated. A dependent slot's
+/// stored candidate pool over-approximates (it cannot know which referent the
+/// same submission elects), so this is the exact check for those slots. Slots
+/// whose filter reads neither are untouched (the stored pool is already
+/// exact).
 pub(crate) fn changed_dependent_targets_are_legal(
     state: &GameState,
     pre: &ResolvedAbility,
@@ -11938,24 +12215,36 @@ pub(crate) fn changed_dependent_targets_are_legal(
         let SlotEnforcement::Filtered(filter) = &binding.enforcement else {
             continue;
         };
-        if !crate::game::filter::filter_reads_declared_slot(filter) {
-            continue;
-        }
         let Some(post_node) = node_at(post, &binding.address.path) else {
             continue;
         };
+        let bound =
+            retarget_node_bound_to_prior_object(post, &binding.address.path, post_node, filter);
+        let reads_declared_slot = crate::game::filter::filter_reads_declared_slot(filter);
+        if !reads_declared_slot && bound.is_none() {
+            continue;
+        }
         let Some(post_current) = post_node.targets.get(binding.address.slot) else {
             continue;
         };
-        if !targeting::find_legal_targets_for_ability_with_view(
-            state,
-            filter,
-            post_node,
-            pool_controller,
-            &view,
-        )
-        .contains(post_current)
-        {
+        let judged = bound.as_ref().unwrap_or(post_node);
+        let legal = if reads_declared_slot {
+            targeting::find_legal_targets_for_ability_with_view(
+                state,
+                filter,
+                judged,
+                pool_controller,
+                &view,
+            )
+        } else {
+            targeting::find_legal_targets_for_ability_with_controller(
+                state,
+                filter,
+                judged,
+                pool_controller,
+            )
+        };
+        if !legal.contains(post_current) {
             return Err(EngineError::InvalidAction(
                 "Retarget: a new target is illegal for the edited selection".to_string(),
             ));
@@ -11993,8 +12282,12 @@ pub(crate) fn declared_position_addresses(
 /// legal set with that referent in the declared view. A pool cannot know
 /// which referent the same submission elects, so it over-approximates;
 /// [`changed_dependent_targets_are_legal`] and [`unchanged_targets_stay_legal`]
-/// are the exact checks on the final set (CR 115.7e). Pools of positions whose
-/// filter reads no declared slot, or reads several, are left untouched.
+/// are the exact checks on the final set (CR 115.7e). A position whose filter
+/// instead reads an earlier object a declaring ancestor holds
+/// ([`retarget_prior_object_referent`]) is widened the same way, with each
+/// referent bound as at announcement (`resolved_ability_with_bound_object_target`).
+/// Pools of positions whose filter reads neither, or reads several declared
+/// slots, are left untouched.
 pub(crate) fn widen_dependent_retarget_pools(
     state: &GameState,
     stack_ability: &ResolvedAbility,
@@ -12008,6 +12301,48 @@ pub(crate) fn widen_dependent_retarget_pools(
         let SlotEnforcement::Filtered(filter) = &bindings[i].enforcement else {
             continue;
         };
+        // CR 115.7d + CR 601.2c: "another target creature that player
+        // controls" is legal only for the controller of the object the
+        // ancestor's slot holds after the edit — its current object or any
+        // member of its own addressed pool. A declared-slot read takes
+        // precedence, as it does when the targets are announced.
+        if !crate::game::filter::filter_reads_declared_slot(filter) {
+            if let Some((referent_address, current)) =
+                retarget_prior_object_referent(stack_ability, &bindings[i].address.path, filter)
+            {
+                let Some(node) = node_at(stack_ability, &bindings[i].address.path) else {
+                    continue;
+                };
+                let mut referents = vec![current];
+                let referent_pool = bindings
+                    .iter()
+                    .position(|b| b.address == referent_address)
+                    .and_then(|j| pools.get(j));
+                for target in referent_pool.into_iter().flatten() {
+                    if let TargetRef::Object(id) = target {
+                        if !referents.contains(id) {
+                            referents.push(*id);
+                        }
+                    }
+                }
+                let mut widened = Vec::new();
+                for referent in referents {
+                    let bound = resolved_ability_with_bound_object_target(node, referent);
+                    for target in targeting::find_legal_targets_for_ability_with_controller(
+                        state,
+                        filter,
+                        &bound,
+                        pool_controller,
+                    ) {
+                        if !widened.contains(&target) {
+                            widened.push(target);
+                        }
+                    }
+                }
+                pools[i] = widened;
+                continue;
+            }
+        }
         let [slot] = declared_slots_read_by(filter)[..] else {
             continue;
         };
@@ -17967,10 +18302,504 @@ mod tests {
         assert!(validate_modal_indices(&modal, &[0], &[1]).is_ok());
     }
 
+    /// Two "target opponent" modes under "each mode must target a different
+    /// player", in a two-player game: either mode alone has a legal target,
+    /// but no two modes can be chosen together.
+    fn different_opponents_modal(min_choices: usize) -> (ModalChoice, Vec<AbilityDefinition>) {
+        let modal = ModalChoice {
+            min_choices,
+            max_choices: 2,
+            mode_count: 2,
+            constraints: vec![ModalSelectionConstraint::DifferentTargetPlayers],
+            ..Default::default()
+        };
+        let target_opponent_mode = |value| {
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::LoseLife {
+                    amount: QuantityExpr::Fixed { value },
+                    target: Some(TargetFilter::Typed(
+                        TypedFilter::default().controller(ControllerRef::Opponent),
+                    )),
+                },
+            )
+        };
+        (
+            modal,
+            vec![target_opponent_mode(2), target_opponent_mode(3)],
+        )
+    }
+
+    #[test]
+    fn modal_selection_needs_its_minimum_under_target_constraints() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Modal Spell".to_string(),
+            Zone::Hand,
+        );
+
+        // Reach guard: each mode alone has a legal target assignment, so
+        // "choose one or both" is satisfiable and its cap drops to one mode.
+        let (one_or_both, modes) = different_opponents_modal(1);
+        let capped = modal_choice_with_target_assignment_limit(
+            &state,
+            source,
+            PlayerId(0),
+            &one_or_both,
+            &modes,
+            &[],
+        )
+        .expect("a one-mode selection has a legal target assignment");
+        assert_eq!(capped.max_choices, 1);
+        assert!(modal_has_legal_mode_selection(
+            &state,
+            source,
+            PlayerId(0),
+            &one_or_both,
+            &modes,
+            &[],
+        ));
+
+        // CR 700.2a + CR 700.2d: "choose two" needs both modes, which would
+        // have to target two different opponents — there is only one.
+        let (choose_two, modes) = different_opponents_modal(2);
+        assert!(!modal_has_legal_mode_selection(
+            &state,
+            source,
+            PlayerId(0),
+            &choose_two,
+            &modes,
+            &[],
+        ));
+    }
+
+    /// Untargeted spell modes, so `modal_choice_with_target_assignment_limit`
+    /// returns `Some` and the verdict isolates the count and budget arithmetic.
+    fn untargeted_spell_modes(count: usize) -> Vec<AbilityDefinition> {
+        (0..count)
+            .map(|_| {
+                AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn modal_selection_minimum_zero_and_pawprint_budget() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Modal Spell".to_string(),
+            Zone::Hand,
+        );
+        let verdict = |modal: &ModalChoice, unavailable: &[usize]| {
+            modal_has_legal_mode_selection(
+                &state,
+                source,
+                PlayerId(0),
+                modal,
+                &untargeted_spell_modes(modal.mode_count),
+                unavailable,
+            )
+        };
+
+        // (i-a) CR 700.2 + CR 700.2d: "choose up to two" with repeats allowed
+        // (the Moment of Reckoning shape) admits choosing no modes, so it has
+        // a legal selection even when every mode is unavailable.
+        let up_to_two_repeatable = ModalChoice {
+            min_choices: 0,
+            max_choices: 2,
+            mode_count: 2,
+            allow_repeat_modes: true,
+            ..Default::default()
+        };
+        assert!(verdict(&up_to_two_repeatable, &[0, 1]));
+
+        // (i-b) CR 700.2: the same without repeats (the Call Damage Control
+        // shape) — zero modes still meets "choose up to two".
+        let up_to_two = ModalChoice {
+            allow_repeat_modes: false,
+            ..up_to_two_repeatable
+        };
+        assert!(verdict(&up_to_two, &[0, 1]));
+
+        // (ii) CR 700.2i: a pawprint modal's `max_choices` is its point
+        // budget. With a budget of 1 and the 1-point mode unavailable, no
+        // choosable mode fits, though two modes remain choosable by count.
+        let one_point_budget = ModalChoice {
+            min_choices: 1,
+            max_choices: 1,
+            mode_count: 3,
+            mode_pawprints: vec![1, 2, 3],
+            ..Default::default()
+        };
+        assert!(!verdict(&one_point_budget, &[0]));
+
+        // (iii) CR 700.2i: reach guard for (ii) — with the 1-point mode
+        // choosable, it fits the budget.
+        assert!(verdict(&one_point_budget, &[]));
+
+        // (iv) CR 700.2d + CR 700.2i: with repeats, the one choosable 1-point
+        // mode fills both required picks within the 2-point budget (1+1 <= 2).
+        let two_point_budget_repeatable = ModalChoice {
+            min_choices: 2,
+            max_choices: 2,
+            mode_count: 3,
+            allow_repeat_modes: true,
+            mode_pawprints: vec![1, 2, 3],
+            ..Default::default()
+        };
+        assert!(verdict(&two_point_budget_repeatable, &[1, 2]));
+    }
+
+    /// Whether any choice of up to three modes passes `validate_modal_indices`,
+    /// the validation every real mode answer goes through. Ignores target
+    /// constraints, so it is only a reference for unconstrained modals.
+    fn some_selection_passes_validation(modal: &ModalChoice, unavailable: &[usize]) -> bool {
+        let mut sequences: Vec<Vec<usize>> = vec![Vec::new()];
+        let mut frontier = sequences.clone();
+        for _ in 0..3 {
+            frontier = frontier
+                .iter()
+                .flat_map(|prefix| {
+                    (0..modal.mode_count).map(move |idx| {
+                        let mut next = prefix.clone();
+                        next.push(idx);
+                        next
+                    })
+                })
+                .collect();
+            sequences.extend(frontier.iter().cloned());
+        }
+        sequences
+            .iter()
+            .any(|indices| validate_modal_indices(modal, indices, unavailable).is_ok())
+    }
+
+    #[test]
+    fn modal_selection_maximum_below_minimum_has_no_selection() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Modal Spell".to_string(),
+            Zone::Hand,
+        );
+        let verdict = |modal: &ModalChoice| {
+            modal_has_legal_mode_selection(
+                &state,
+                source,
+                PlayerId(0),
+                modal,
+                &untargeted_spell_modes(modal.mode_count),
+                &[],
+            )
+        };
+        let modal = |min_choices, max_choices, mode_count, allow_repeat_modes| ModalChoice {
+            min_choices,
+            max_choices,
+            mode_count,
+            allow_repeat_modes,
+            ..Default::default()
+        };
+
+        // CR 700.2 + CR 601.2b: a maximum below the minimum admits no
+        // selection, however many modes are choosable. Each negative is paired
+        // with a control that differs only in `max_choices`.
+        let rows = [
+            (modal(1, 0, 1, false), false),
+            (modal(1, 1, 1, false), true),
+            (modal(1, 0, 1, true), false),
+            (modal(1, 1, 1, true), true),
+            (modal(2, 1, 2, false), false),
+            (modal(2, 2, 2, false), true),
+            // "choose up to N" with N = 0 is the empty selection.
+            (modal(0, 0, 1, false), true),
+        ];
+        for (modal, expected) in &rows {
+            assert_eq!(verdict(modal), *expected, "predicate verdict for {modal:?}");
+            // The predicate must agree with what `validate_modal_indices`
+            // accepts, which also proves each negative reached the arithmetic
+            // (the controls find a passing sequence, the negatives none).
+            assert_eq!(
+                some_selection_passes_validation(modal, &[]),
+                *expected,
+                "validate_modal_indices reference for {modal:?}"
+            );
+        }
+
+        // Constrained pair (CR 700.2a): the same board and constraint, only
+        // `max_choices` differs. Already false at base through the empty
+        // `min..=max` range; a consistency pin, not a revert-failing row.
+        let (one_or_both, modes) = different_opponents_modal(1);
+        let verdict_constrained = |modal: &ModalChoice| {
+            modal_has_legal_mode_selection(&state, source, PlayerId(0), modal, &modes, &[])
+        };
+        assert!(verdict_constrained(&one_or_both));
+        let inverted = ModalChoice {
+            max_choices: 0,
+            ..one_or_both
+        };
+        assert!(!verdict_constrained(&inverted));
+    }
+
+    /// Two `target opponent` modes weighing one pawprint each, under "each mode
+    /// must target a different player".
+    fn different_opponents_pawprint_modal(
+        min_choices: usize,
+        budget: usize,
+    ) -> (ModalChoice, Vec<AbilityDefinition>) {
+        let (_, modes) = different_opponents_modal(1);
+        (
+            ModalChoice {
+                min_choices,
+                max_choices: budget,
+                mode_count: 2,
+                mode_pawprints: vec![1, 1],
+                constraints: vec![ModalSelectionConstraint::DifferentTargetPlayers],
+                ..Default::default()
+            },
+            modes,
+        )
+    }
+
+    #[test]
+    fn pawprint_selection_needs_a_combined_target_assignment() {
+        let mut two_player = GameState::new_two_player(42);
+        let source_two = create_object(
+            &mut two_player,
+            CardId(1),
+            PlayerId(0),
+            "Modal Spell".to_string(),
+            Zone::Hand,
+        );
+        let mut three_player = GameState::new(FormatConfig::standard(), 3, 42);
+        let source_three = create_object(
+            &mut three_player,
+            CardId(1),
+            PlayerId(0),
+            "Modal Spell".to_string(),
+            Zone::Hand,
+        );
+        let predicate = |state: &GameState,
+                         source: ObjectId,
+                         modal: &ModalChoice,
+                         modes: &[AbilityDefinition],
+                         unavailable: &[usize]| {
+            modal_has_legal_mode_selection(state, source, PlayerId(0), modal, modes, unavailable)
+        };
+        let helper = |state: &GameState,
+                      source: ObjectId,
+                      modal: &ModalChoice,
+                      modes: &[AbilityDefinition],
+                      unavailable: &[usize]| {
+            modal_choice_with_target_assignment_limit(
+                state,
+                source,
+                PlayerId(0),
+                modal,
+                modes,
+                unavailable,
+            )
+        };
+
+        // CR 700.2a + CR 700.2i: two required one-point modes with a two-point
+        // budget fit by weight, but their combined targets need two different
+        // opponents and a two-player game has one.
+        let (choose_two, modes) = different_opponents_pawprint_modal(2, 2);
+        assert!(!predicate(
+            &two_player,
+            source_two,
+            &choose_two,
+            &modes,
+            &[]
+        ));
+        assert!(helper(&two_player, source_two, &choose_two, &modes, &[]).is_none());
+        // Reach guard: without the constraint the same modal passes the weight
+        // precheck and the helper, so the constraint alone refuses.
+        let unconstrained = ModalChoice {
+            constraints: vec![],
+            ..choose_two.clone()
+        };
+        assert!(predicate(
+            &two_player,
+            source_two,
+            &unconstrained,
+            &modes,
+            &[]
+        ));
+        // Control (b): three players give two distinct opponents. `max_choices`
+        // stays the point budget and `min_choices` the mode minimum.
+        assert!(predicate(
+            &three_player,
+            source_three,
+            &choose_two,
+            &modes,
+            &[]
+        ));
+        let kept = helper(&three_player, source_three, &choose_two, &modes, &[])
+            .expect("two distinct opponents admit both modes");
+        assert_eq!((kept.min_choices, kept.max_choices), (2, 2));
+
+        // Control (a): one required mode fits; CR 700.2i the budget is not
+        // capped to the selected count of one.
+        let (one_required, modes) = different_opponents_pawprint_modal(1, 2);
+        assert!(predicate(
+            &two_player,
+            source_two,
+            &one_required,
+            &modes,
+            &[]
+        ));
+        let kept = helper(&two_player, source_two, &one_required, &modes, &[])
+            .expect("a single mode has a legal target");
+        assert_eq!(kept.max_choices, 2, "the point budget is not a mode count");
+
+        // Budget stays a budget with unequal weights: the 2-point mode alone
+        // spends the whole budget.
+        let weighted = ModalChoice {
+            mode_pawprints: vec![1, 2],
+            ..one_required.clone()
+        };
+        assert!(predicate(&two_player, source_two, &weighted, &modes, &[]));
+        assert_eq!(
+            helper(&two_player, source_two, &weighted, &modes, &[])
+                .expect("one mode fits the budget")
+                .max_choices,
+            2
+        );
+
+        // Unavailable modes: the witness uses only mode 1; with both
+        // unavailable there is none.
+        assert!(predicate(
+            &two_player,
+            source_two,
+            &one_required,
+            &modes,
+            &[0]
+        ));
+        assert!(!predicate(
+            &two_player,
+            source_two,
+            &one_required,
+            &modes,
+            &[0, 1]
+        ));
+
+        // "Up to" pawprint (min 0): the empty selection is a witness, so the
+        // helper does not newly refuse it.
+        let up_to = ModalChoice {
+            min_choices: 0,
+            ..choose_two.clone()
+        };
+        assert!(predicate(&two_player, source_two, &up_to, &modes, &[]));
+        assert!(helper(&two_player, source_two, &up_to, &modes, &[]).is_some());
+
+        // Repeat branch (`allow_repeat_modes` enumerates a different sequence
+        // set): with mode 1 unavailable only [0, 0] fits the budget, and two
+        // `target opponent` slots of one mode cannot be filled with two
+        // opponents in a two-player game.
+        let repeatable = ModalChoice {
+            allow_repeat_modes: true,
+            mode_pawprints: vec![1, 2],
+            ..choose_two.clone()
+        };
+        assert!(!predicate(
+            &two_player,
+            source_two,
+            &repeatable,
+            &modes,
+            &[1]
+        ));
+        assert!(helper(&two_player, source_two, &repeatable, &modes, &[1]).is_none());
+        let repeatable_unconstrained = ModalChoice {
+            constraints: vec![],
+            ..repeatable.clone()
+        };
+        assert!(predicate(
+            &two_player,
+            source_two,
+            &repeatable_unconstrained,
+            &modes,
+            &[1]
+        ));
+        assert!(predicate(
+            &three_player,
+            source_three,
+            &repeatable,
+            &modes,
+            &[1]
+        ));
+        assert_eq!(
+            helper(&three_player, source_three, &repeatable, &modes, &[1])
+                .expect("two opponents fill both picks of mode 0")
+                .max_choices,
+            2
+        );
+    }
+
+    #[test]
+    fn execute_targets_satisfiable_needs_a_combined_pawprint_assignment() {
+        let (choose_two, modes) = different_opponents_pawprint_modal(2, 2);
+        let execute_with = |modal: ModalChoice| {
+            let mut execute = AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            );
+            execute.modal = Some(modal);
+            execute.mode_abilities = modes.clone();
+            execute
+        };
+        let satisfiable = |mut state: GameState, modal: ModalChoice| {
+            let source_id = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(0),
+                "Modal Trigger Source".to_string(),
+                Zone::Battlefield,
+            );
+            let source = state.objects.get(&source_id).unwrap();
+            execute_targets_satisfiable(&state, source, &execute_with(modal))
+        };
+
+        // CR 603.3c + CR 700.2b + CR 700.2i: no budget-legal selection has a
+        // combined assignment in a two-player game.
+        assert!(!satisfiable(
+            GameState::new_two_player(42),
+            choose_two.clone()
+        ));
+        // Reach guard: the same execute without the constraint is satisfiable,
+        // so neither the per-mode filter nor the all-unavailable exit decided.
+        let unconstrained = ModalChoice {
+            constraints: vec![],
+            ..choose_two.clone()
+        };
+        assert!(satisfiable(GameState::new_two_player(42), unconstrained));
+        // Control: three players supply two distinct opponents.
+        assert!(satisfiable(
+            GameState::new(FormatConfig::standard(), 3, 42),
+            choose_two
+        ));
+    }
+
     #[test]
     fn compute_unavailable_modes_returns_previously_chosen() {
         let mut state = GameState::new_two_player(42);
-        let source_id = ObjectId(100);
+        let source = ObjectIncarnationRef::of(ObjectId(100), 0);
 
         let modal = ModalChoice {
             min_choices: 1,
@@ -17981,23 +18810,32 @@ mod tests {
         };
 
         // No modes chosen yet.
-        assert!(compute_unavailable_modes(&state, source_id, &modal).is_empty());
+        assert!(compute_unavailable_modes(&state, source, &modal).is_empty());
 
         // Record mode 1 chosen.
-        record_modal_mode_choices(&mut state, source_id, &modal, &[1]);
-        assert_eq!(
-            compute_unavailable_modes(&state, source_id, &modal),
-            vec![1]
-        );
+        record_modal_mode_choices(&mut state, source, &modal, &[1]);
+        assert_eq!(compute_unavailable_modes(&state, source, &modal), vec![1]);
 
-        // Different source_id is unaffected.
-        assert!(compute_unavailable_modes(&state, ObjectId(200), &modal).is_empty());
+        // CR 400.7: a later incarnation of the same storage id is a new object.
+        assert!(compute_unavailable_modes(
+            &state,
+            ObjectIncarnationRef::of(ObjectId(100), 1),
+            &modal
+        )
+        .is_empty());
+        // Different source is unaffected.
+        assert!(compute_unavailable_modes(
+            &state,
+            ObjectIncarnationRef::of(ObjectId(200), 0),
+            &modal
+        )
+        .is_empty());
     }
 
     #[test]
     fn record_modal_mode_choices_tracks_game_scoped() {
         let mut state = GameState::new_two_player(42);
-        let source_id = ObjectId(100);
+        let source = ObjectIncarnationRef::of(ObjectId(100), 0);
 
         let modal = ModalChoice {
             min_choices: 1,
@@ -18007,10 +18845,18 @@ mod tests {
             ..Default::default()
         };
 
-        record_modal_mode_choices(&mut state, source_id, &modal, &[2]);
-        assert!(state.modal_modes_chosen_this_game.contains(&(source_id, 2)));
+        record_modal_mode_choices(&mut state, source, &modal, &[2]);
+        assert!(state.modal_modes_chosen_this_game.contains(&(source, 2)));
         // Turn-scoped map should NOT be populated for game-scoped constraint.
-        assert!(!state.modal_modes_chosen_this_turn.contains(&(source_id, 2)));
+        assert!(!state.modal_modes_chosen_this_turn.contains(&(source, 2)));
+        assert_eq!(compute_unavailable_modes(&state, source, &modal), vec![2]);
+        // CR 400.7: the game-scoped history is per incarnation too.
+        assert!(compute_unavailable_modes(
+            &state,
+            ObjectIncarnationRef::of(ObjectId(100), 1),
+            &modal
+        )
+        .is_empty());
     }
 
     #[test]
@@ -25647,6 +26493,158 @@ mod tests {
         );
     }
 
+    /// Mutiny's two slots across two nodes, as parsed: the root `TargetOnly`
+    /// declares "target creature an opponent controls" (A), and the
+    /// `DealDamage` sub declares "another target creature that player
+    /// controls" (B), whose controller is A's.
+    fn mutiny_slot_b_node(b: ObjectId) -> ResolvedAbility {
+        ResolvedAbility::new(
+            Effect::DealDamage {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::Power {
+                        scope: ObjectScope::Target,
+                    },
+                },
+                target: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature],
+                    controller: Some(ControllerRef::ParentTargetController),
+                    properties: vec![FilterProp::Another],
+                }),
+                damage_source: Some(DamageSource::Target),
+                excess: None,
+            },
+            vec![TargetRef::Object(b)],
+            ObjectId(100),
+            PlayerId(0),
+        )
+    }
+
+    fn mutiny_chain(a: ObjectId, b: ObjectId) -> ResolvedAbility {
+        let mut root = ResolvedAbility::new(
+            Effect::TargetOnly {
+                target: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature],
+                    controller: Some(ControllerRef::Opponent),
+                    properties: vec![],
+                }),
+            },
+            vec![TargetRef::Object(a)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        root.sub_ability = Some(Box::new(mutiny_slot_b_node(b)));
+        root
+    }
+
+    /// P1's two creatures A (3/3) and B (2/2); the spell's controller is P0.
+    fn mutiny_board() -> (GameState, ObjectId, ObjectId) {
+        let mut state = GameState::new_two_player(42);
+        let a = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "A".to_string(),
+            Zone::Battlefield,
+        );
+        let b = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "B".to_string(),
+            Zone::Battlefield,
+        );
+        for (id, size) in [(a, 3), (b, 2)] {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(size);
+            obj.toughness = Some(size);
+        }
+        (state, a, b)
+    }
+
+    fn chain_targets(validated: &ResolvedAbility) -> (Vec<TargetRef>, Vec<TargetRef>) {
+        let sub = validated
+            .sub_ability
+            .as_deref()
+            .expect("the DealDamage node survives validation");
+        (validated.targets.clone(), sub.targets.clone())
+    }
+
+    /// V18 (CR 608.2b + CR 601.2c): a slot that reads a prior object slot held
+    /// by its declaring ancestor ("another target creature that player
+    /// controls") is rechecked against the ancestor's occurrence, not its own.
+    #[test]
+    fn validate_targets_in_chain_rechecks_slot_b_against_the_ancestors_slot_a() {
+        // Control: both targets legal.
+        let (state, a, b) = mutiny_board();
+        assert_eq!(
+            chain_targets(&validate_targets_in_chain(&state, &mutiny_chain(a, b))),
+            (vec![TargetRef::Object(a)], vec![TargetRef::Object(b)]),
+            "control: B is controlled by A's controller"
+        );
+
+        // B changes controller: "that player" (A's controller, P1) no longer
+        // controls B.
+        let (mut state, a, b) = mutiny_board();
+        state.objects.get_mut(&b).unwrap().controller = PlayerId(0);
+        assert_eq!(
+            chain_targets(&validate_targets_in_chain(&state, &mutiny_chain(a, b))),
+            (vec![TargetRef::Object(a)], vec![]),
+            "CR 608.2b: B is no longer controlled by A's controller and is dropped"
+        );
+
+        // A changes controller: A is no longer "a creature an opponent
+        // controls", so the information "that player" needs is unavailable.
+        let (mut state, a, b) = mutiny_board();
+        state.objects.get_mut(&a).unwrap().controller = PlayerId(0);
+        assert_eq!(
+            chain_targets(&validate_targets_in_chain(&state, &mutiny_chain(a, b))),
+            (vec![], vec![]),
+            "CR 608.2b: an illegal referent makes the dependent target illegal"
+        );
+
+        // A leaves the battlefield.
+        let (mut state, a, b) = mutiny_board();
+        let mut events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, a, Zone::Hand, &mut events);
+        assert_eq!(
+            chain_targets(&validate_targets_in_chain(&state, &mutiny_chain(a, b))),
+            (vec![], vec![]),
+            "CR 608.2b: A left the battlefield, so B cannot be judged against it"
+        );
+    }
+
+    /// V18 narrowness: the recheck reads only a DECLARING ANCESTOR's
+    /// occurrence of a Stack-timed slot. A chain root has no ancestor, and a
+    /// resolution-time choice is not a target, so both keep the old reading.
+    #[test]
+    fn validate_targets_in_chain_prior_object_recheck_is_narrow() {
+        // As a chain root the node judges B against its own first target (B):
+        // "that player" is B's own controller, so B stays legal.
+        let (mut state, _, b) = mutiny_board();
+        state.objects.get_mut(&b).unwrap().controller = PlayerId(0);
+        assert_eq!(
+            validate_targets_in_chain(&state, &mutiny_slot_b_node(b)).targets,
+            vec![TargetRef::Object(b)],
+            "a chain root has no declaring ancestor, so the old reading stands"
+        );
+
+        // A Resolution-timed sub is not rechecked against the ancestor.
+        let (mut state, a, b) = mutiny_board();
+        state.objects.get_mut(&b).unwrap().controller = PlayerId(0);
+        let mut chain = mutiny_chain(a, b);
+        chain
+            .sub_ability
+            .as_deref_mut()
+            .unwrap()
+            .target_choice_timing = TargetChoiceTiming::Resolution;
+        assert_eq!(
+            chain_targets(&validate_targets_in_chain(&state, &chain)),
+            (vec![TargetRef::Object(a)], vec![TargetRef::Object(b)]),
+            "the recheck applies only to a Stack-timed slot"
+        );
+    }
+
     /// CR 701.12a: "exchange control of target nonland permanent you control
     /// and target permanent an opponent controls that shares a card type with
     /// it" (Daring Thief, verbatim) — parses correctly at BASE_SHA already, so
@@ -26241,9 +27239,10 @@ mod tests {
     }
 
     /// T13: the narrowed predicate does NOT fire on the object-identity arm
-    /// (deferral D1) or a bare `DifferentNameFrom{ParentTarget}`, and DOES
-    /// fire on the two admitted encodings (quantity-Target, SharesQuality{
-    /// ParentTarget}).
+    /// (deferral D1), a bare `DifferentNameFrom{ParentTarget}`, or any player
+    /// reference other than a `ParentTargetController` controller, and DOES
+    /// fire on the three admitted encodings (quantity-Target, SharesQuality{
+    /// ParentTarget}, a `ParentTargetController` controller).
     #[test]
     fn target_filter_binds_prior_target_is_narrow() {
         let identity_and = TargetFilter::And {
@@ -26313,6 +27312,52 @@ mod tests {
             target_filter_binds_prior_target(&quantity),
             "Cmc{{Target}} must bind"
         );
+
+        // CR 115.1 + CR 601.2c: Mutiny's slot 2, "another target creature that
+        // player controls" — the controller of slot 1's object.
+        let parent_target_controller = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Creature],
+            controller: Some(ControllerRef::ParentTargetController),
+            properties: vec![FilterProp::Another],
+        });
+        assert!(
+            target_filter_binds_prior_target(&parent_target_controller),
+            "a ParentTargetController controller must bind"
+        );
+        let parent_target_owner = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Creature],
+            controller: Some(ControllerRef::ParentTargetOwner),
+            properties: vec![],
+        });
+        let owned_by_parent_target_controller = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Card],
+            controller: None,
+            properties: vec![FilterProp::Owned {
+                controller: ControllerRef::ParentTargetController,
+            }],
+        });
+        let prior_player = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Creature],
+            controller: Some(ControllerRef::TargetPlayer),
+            properties: vec![],
+        });
+        for (label, filter) in [
+            ("Typed{controller: ParentTargetOwner}", &parent_target_owner),
+            (
+                "Typed{Owned{ParentTargetController}}",
+                &owned_by_parent_target_controller,
+            ),
+            (
+                "TargetFilter::ParentTargetController",
+                &TargetFilter::ParentTargetController,
+            ),
+            ("Typed{controller: TargetPlayer}", &prior_player),
+        ] {
+            assert!(
+                !target_filter_binds_prior_target(filter),
+                "[{label}] only a ParentTargetController controller binds a prior object slot"
+            );
+        }
     }
 
     /// T9: the parameterized quantity-scope classifier is STRICTLY more
