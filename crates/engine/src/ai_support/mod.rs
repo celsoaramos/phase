@@ -316,7 +316,7 @@ pub(crate) fn structurally_valid_named_choice_answer(
     // CR 201.4 + CR 107.1a/b: card names (CR 201.4) and free-entry numbers
     // (CR 107.1a/b) are supplied by the player and validated by rule rather than
     // by option membership, so they stay on the simulation.
-    if matches!(choice_type, ChoiceType::CardName) || choice_type.free_entry().is_some() {
+    if matches!(choice_type, ChoiceType::CardName { .. }) || choice_type.free_entry().is_some() {
         return false;
     }
 
