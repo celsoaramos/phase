@@ -206,6 +206,9 @@
     "branch": "card/day-night-change-trigger"
   },
   {
+    "branch": "card/tyvar-bellicose-mana-ability-resolves"
+  },
+  {
     "branch": "ai/optional-benefit-accept"
   },
   {
