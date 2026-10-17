@@ -158,6 +158,10 @@ pub fn classify_payment_continuation(state: &GameState) -> PaymentContinuationSt
             pending_mana_ability: mana_ability,
             ..
         }
+        | WaitingFor::ManaAbilityManaPayment {
+            pending_mana_ability: mana_ability,
+            ..
+        }
         | WaitingFor::PayAmountChoice {
             pending_mana_ability: Some(mana_ability),
             ..
@@ -757,6 +761,9 @@ fn classify_deferred_life_root(
                     PaymentContinuationUnsupported::PayerMismatch,
                 )
             }
+            ManaAbilityResume::ManaAbilityManaPayment {
+                pending_mana_ability,
+            } => classify_pending_mana_ability(state, pending_mana_ability),
             ManaAbilityResume::PhyrexianCastPayment { .. }
             | ManaAbilityResume::FinalizePendingManaPayment { .. } => {
                 PaymentContinuationState::UnsupportedAffiliated(
@@ -857,6 +864,10 @@ fn record_root_from_resume(
         ManaAbilityResume::FinalizePendingManaPayment { player } => {
             Some(root_from_global(state, *player)?)
         }
+        // The outer mana ability's own root, if it pays a cast.
+        ManaAbilityResume::ManaAbilityManaPayment {
+            pending_mana_ability,
+        } => root_from_pending_mana_ability(state, pending_mana_ability)?,
         // Special actions and effect payments are not a CAST's payment root:
         // they carry their own typed continuation and never resume into a
         // pending cast (CR 116.1 — a special action does not use the stack).
@@ -908,6 +919,10 @@ fn waiting_for_contains_root(waiting_for: &WaitingFor, root: &PaymentContinuatio
             ..
         }
         | WaitingFor::PayManaAbilityMana {
+            pending_mana_ability: mana_ability,
+            ..
+        }
+        | WaitingFor::ManaAbilityManaPayment {
             pending_mana_ability: mana_ability,
             ..
         }
@@ -1025,6 +1040,12 @@ fn mana_resume_matches_root(resume: &ManaAbilityResume, root: &PaymentContinuati
             PaymentContinuationRoot::Spell { payer, .. }
             | PaymentContinuationRoot::Activation { payer, .. },
         ) => player == payer,
+        (
+            ManaAbilityResume::ManaAbilityManaPayment {
+                pending_mana_ability,
+            },
+            root,
+        ) => pending_mana_contains_root(pending_mana_ability, root),
         _ => false,
     }
 }
