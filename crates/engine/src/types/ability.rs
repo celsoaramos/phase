@@ -23937,7 +23937,6 @@ impl Effect {
             | Effect::RememberCard { target }
             | Effect::PairWith { target }
             | Effect::Destroy { target, .. }
-            | Effect::Regenerate { target, .. }
             | Effect::RemoveAllDamage { target, .. }
             | Effect::Counter { target, .. }
             | Effect::RemoveCounter { target, .. }
@@ -24098,6 +24097,15 @@ impl Effect {
                 ..
             } => Some(target),
             Effect::Transform {
+                scope: EffectScope::All,
+                ..
+            } => None,
+            Effect::Regenerate {
+                scope: EffectScope::Single,
+                target,
+                ..
+            } => Some(target),
+            Effect::Regenerate {
                 scope: EffectScope::All,
                 ..
             } => None,
