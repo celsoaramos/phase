@@ -206,12 +206,15 @@
     "branch": "card/day-night-change-trigger"
   },
   {
+    "branch": "card/tyvar-bellicose-mana-ability-resolves"
+  },
+  {
     "branch": "ai/optional-benefit-accept"
   },
   {
     "branch": "card/delayed-trigger-projection-token"
   },
   {
-    "branch": "card/tyvar-bellicose-mana-ability-resolves"
+    "branch": "card/baleful-mastery-printed-cost"
   }
 ]
