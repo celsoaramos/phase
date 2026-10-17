@@ -3346,6 +3346,17 @@ mod tests {
         }
     }
 
+    /// v144: one-time boons (#7495) add `Effect::CreateBoon`, `Effect::NoteNumber`,
+    /// the `HasBoon` conditions, and `WaitingFor::ChooseTokenHost` tags, and
+    /// retype the perpetual P/T edit's `power_delta`/`toughness_delta` to
+    /// required `QuantityExpr` `power`/`toughness`. A v143 peer cannot parse
+    /// the new shapes, so it must be refused before it receives v144 state.
+    ///
+    /// v143: `GameState::modal_modes_chosen_this_turn` / `_this_game` retype to
+    /// `(ObjectIncarnationRef, usize)` (CR 400.7 incarnation-keyed modal
+    /// history); a v142 peer cannot decode the object-shaped key, so it must be
+    /// refused before it receives v143 state.
+    ///
     /// v142: `LinkedExileSnapshot` gains `incarnation` (CR 400.7), carried in
     /// `GameState::linked_exile_lki` and the trigger and zone-change linked-exile
     /// snapshots; a v141 peer re-encoding state drops it, so it must be refused
@@ -3553,8 +3564,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_142_for_linked_exile_snapshot_incarnation() {
-        assert_eq!(PROTOCOL_VERSION, 142);
+    fn protocol_version_is_144_for_one_time_boons() {
+        assert_eq!(PROTOCOL_VERSION, 144);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3565,7 +3576,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_142_for_linked_exile_snapshot_incarnation` stays
+    /// `protocol_version_is_144_for_one_time_boons` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
