@@ -4335,15 +4335,14 @@ fn board_covers_modulo_fodder(
     // in both partitions and unequal on `object_content_eq`'s `zone` conjunct, so a one-sided
     // strip would leave it refusing exactly the departures the certificate exists to admit.
     // An id the certificate does NOT name stays here and is refused as before.
-    let stable =
-        |state: &GameState| -> im::HashMap<ObjectId, GameObject, rustc_hash::FxBuildHasher> {
-            state
-                .objects
-                .iter()
-                .filter(|(id, o)| !growing.contains(id) && !fodder_content_eq(o, fodder_class))
-                .map(|(id, o)| (*id, o.clone()))
-                .collect()
-        };
+    let stable = |state: &GameState| -> crate::types::object_map::ObjectMap {
+        state
+            .objects
+            .iter()
+            .filter(|(id, o)| !growing.contains(id) && !fodder_content_eq(o, fodder_class))
+            .map(|(id, o)| (*id, o.clone()))
+            .collect()
+    };
     if !crate::types::game_state::objects_content_eq(&stable(prior), &stable(current)) {
         return false;
     }
@@ -4945,6 +4944,7 @@ history_members! {
         CreaturesBlockedThisTurn => creatures_blocked_this_turn: false,
         CrewActivatedThisTurn => crew_activated_this_turn: false,
         CrewResolvedThisTurn => crew_resolved_this_turn: false,
+        CrewHistoryThisTurn => crew_history_this_turn: false,
         ExileCastPermissionsUsed => exile_cast_permissions_used: false,
         ExilePlayPermissionsUsed => exile_play_permissions_used: false,
         GraveyardCastPermissionsUsed => graveyard_cast_permissions_used: false,
@@ -5565,7 +5565,7 @@ fn board_covers(prior: &GameState, current: &GameState, grown: &HashSet<ObjectId
     // id-keyed content equality with `prior`. A stray extra object in ANY zone (or
     // a content drift on a shared object) fails the `objects_content_eq` len/all
     // check — fail-safe.
-    let current_nongrown: im::HashMap<ObjectId, GameObject, rustc_hash::FxBuildHasher> = current
+    let current_nongrown: crate::types::object_map::ObjectMap = current
         .objects
         .iter()
         .filter(|(id, _)| !grown.contains(id))
@@ -7368,6 +7368,10 @@ fn project_out_player_consumables(p: &mut Player) {
         status: _,
         companion: _,
         chosen_attributes: _,
+        // Digital-only Alchemy (no CR entry): the noted number is durable
+        // per-player state like `chosen_attributes` — strict equality, not
+        // a projected consumable.
+        noted_number: _,
         can_look_at_top_of_library: _,
         commander_color_identity: _,
     } = p;
@@ -7670,6 +7674,7 @@ fn projected_player_axes(p: &Player) -> Vec<i64> {
         status: _,
         companion: _,
         chosen_attributes: _,
+        noted_number: _,
         can_look_at_top_of_library: _,
         commander_color_identity: _,
     } = p;
@@ -7727,6 +7732,7 @@ fn projected_player_maps(
         status: _,
         companion: _,
         chosen_attributes: _,
+        noted_number: _,
         can_look_at_top_of_library: _,
         commander_color_identity: _,
     } = p;
