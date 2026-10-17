@@ -1,4 +1,4 @@
-use engine::types::ability::{Effect, ResolvedAbility, TargetFilter};
+use engine::types::ability::{Effect, EffectScope, ResolvedAbility, TapStateChange, TargetFilter};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::game_state::{GameState, WaitingFor};
@@ -171,6 +171,61 @@ fn effect_is_beneficial(state: &GameState, ai: PlayerId, effect: &Effect) -> boo
         Effect::SearchLibrary { target_player, .. } => target_player.as_ref().is_none_or(is_own),
         Effect::Investigate | Effect::Proliferate | Effect::Populate => true,
         Effect::Mana { .. } | Effect::GainEnergy { .. } => true,
+        // CR 701.26b: "you may untap ~" (Blasting Station, Arcanis-style engines) —
+        // untapping the source itself; measured declined 4 of 5 in AI × AI games.
+        Effect::SetTapState {
+            target: TargetFilter::SelfRef,
+            scope: EffectScope::Single,
+            state: TapStateChange::Untap,
+        } => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn untap(target: TargetFilter, state: TapStateChange) -> Effect {
+        Effect::SetTapState {
+            target,
+            scope: EffectScope::Single,
+            state,
+        }
+    }
+
+    #[test]
+    fn untapping_the_source_itself_is_beneficial_but_tapping_or_untapping_others_is_not() {
+        let gs = GameState::new_two_player(7);
+        let ai = PlayerId(0);
+        assert!(effect_is_beneficial(
+            &gs,
+            ai,
+            &untap(TargetFilter::SelfRef, TapStateChange::Untap)
+        ));
+        assert!(!effect_is_beneficial(
+            &gs,
+            ai,
+            &untap(TargetFilter::SelfRef, TapStateChange::Tap)
+        ));
+        assert!(!effect_is_beneficial(
+            &gs,
+            ai,
+            &untap(TargetFilter::Any, TapStateChange::Untap)
+        ));
+    }
+
+    #[test]
+    fn a_draw_from_an_almost_empty_library_is_left_to_the_search() {
+        let gs = GameState::new_two_player(7);
+        let draw = Effect::Draw {
+            count: engine::types::ability::QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        };
+        assert!(
+            gs.players[0].library.len() <= 3,
+            "fixture: a fresh state has no library"
+        );
+        assert!(!effect_is_beneficial(&gs, PlayerId(0), &draw));
     }
 }
