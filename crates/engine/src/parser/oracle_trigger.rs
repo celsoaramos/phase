@@ -7610,9 +7610,9 @@ fn extract_if_condition_with_card_name(
         scan_preceded(&lower, parse_source_and_others_attacked_this_combat)
     {
         let clause_len = lower.len() - prefix.len() - rest.len();
-        return (
+        return IfExtraction::hoisted(
             strip_condition_clause(text, prefix.len(), clause_len),
-            Some(TriggerCondition::SourceAndOthersAttackedThisCombat { others }),
+            TriggerCondition::SourceAndOthersAttackedThisCombat { others },
         );
     }
 
