@@ -204,5 +204,11 @@
   },
   {
     "branch": "card/day-night-change-trigger"
+  },
+  {
+    "branch": "ai/optional-benefit-accept"
+  },
+  {
+    "branch": "card/delayed-trigger-projection-token"
   }
 ]
