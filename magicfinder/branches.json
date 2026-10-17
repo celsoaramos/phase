@@ -219,5 +219,8 @@
   },
   {
     "branch": "card/repeated-payment-frame-deadlock"
+  },
+  {
+    "branch": "ai/prospective-payment-budget"
   }
 ]
