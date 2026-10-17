@@ -3483,6 +3483,7 @@ fn filter_prop_recipient_read(prop: &FilterProp) -> RecipientRead {
         | FilterProp::DistinctFrom { .. }
         | FilterProp::Targets { .. }
         | FilterProp::TargetsOnly { .. }
+        | FilterProp::AttachedToMatching { .. }
         | FilterProp::ControllerMatches { .. }
         | FilterProp::DealtDamageThisTurn { .. }
         | FilterProp::Counters { .. }
