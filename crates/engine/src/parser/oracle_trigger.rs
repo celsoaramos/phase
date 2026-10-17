@@ -12493,6 +12493,13 @@ pub(crate) fn parse_trigger_condition(
         return result;
     }
 
+    // CR 605.1b: "whenever a mana ability of <subject> resolves" — same reason
+    // as the Saga arm above: the grammatical subject is an ABILITY, and the
+    // generic path would bind "mana ability" as the object filter.
+    if let Some(result) = try_parse_mana_ability_resolves_trigger(&lower) {
+        return result;
+    }
+
     // --- Phase triggers: "At the beginning of..." ---
     if let Some(result) = try_parse_phase_trigger(&lower) {
         return result;
@@ -22680,6 +22687,47 @@ fn try_parse_saga_chapter_ability_trigger(lower: &str) -> Option<(TriggerMode, T
     Some((mode, def))
 }
 
+/// CR 605.1b: "Whenever a mana ability of \<subject\> resolves" — Tyvar the
+/// Bellicose's granted "Whenever a mana ability of this creature resolves, …".
+///
+/// The event is `GameEvent::ManaAbilityProduced`: one aggregate event per mana
+/// ability resolution, tap cost or not (CR 106.12a's "is tapped for mana" is a
+/// narrower event and keeps its own `TapsForMana` mode). The observed source is
+/// an ordinary trigger subject, so `~` / "this creature" (after `~`
+/// normalization) and typed subjects ("a land you control") all flow through
+/// the shared `parse_trigger_subject` building block; the matcher applies the
+/// filter to the event's mana source.
+///
+/// Anything after "resolves" is grammar this combinator did not model, so it
+/// fails closed rather than accept a clause whose remainder carries meaning.
+fn try_parse_mana_ability_resolves_trigger(
+    lower: &str,
+) -> Option<(TriggerMode, TriggerDefinition)> {
+    let (subject_text, _) = (
+        alt((
+            value((), tag::<_, _, OracleError<'_>>("whenever ")),
+            value((), tag("when ")),
+        )),
+        tag("a mana ability of "),
+    )
+        .parse(lower)
+        .ok()?;
+
+    let (filter, remainder) = parse_trigger_subject(subject_text, &mut ParseContext::default());
+
+    let (remainder, _) = tag::<_, _, OracleError<'_>>("resolves")
+        .parse(remainder.trim_start())
+        .ok()?;
+    if !remainder.trim().is_empty() {
+        return None;
+    }
+
+    let mut def = make_base();
+    def.mode = TriggerMode::ManaAbilityProduced;
+    def.valid_card = Some(filter);
+    Some((TriggerMode::ManaAbilityProduced, def))
+}
+
 fn try_parse_sacrifice_trigger(
     lower: &str,
     make_base: &dyn Fn() -> TriggerDefinition,
@@ -24374,5 +24422,55 @@ mod structural_marker_tests {
         ] {
             assert!(parse(declined).is_none(), "{declined:?}");
         }
+    }
+}
+
+/// CR 605.1b: the mana-ability-resolution observer building block —
+/// "whenever a mana ability of \<subject\> resolves". Exercises the shared
+/// subject grammar (self-reference and typed subjects) and the fail-closed
+/// remainder, not one card's printed line.
+#[cfg(test)]
+mod mana_ability_resolves_trigger_tests {
+    use super::parse_trigger_line;
+    use crate::types::ability::{ControllerRef, TargetFilter, TypeFilter};
+    use crate::types::triggers::TriggerMode;
+
+    /// Tyvar the Bellicose's granted body, after `~` normalization.
+    #[test]
+    fn self_reference_subject() {
+        let def = parse_trigger_line(
+            "Whenever a mana ability of ~ resolves, put a +1/+1 counter on it.",
+            "Test",
+        );
+        assert_eq!(def.mode, TriggerMode::ManaAbilityProduced);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+        assert!(def.execute.is_some());
+    }
+
+    /// The subject is an ordinary trigger subject, so a typed one flows through
+    /// the same combinator instead of needing its own grammar.
+    #[test]
+    fn typed_subject() {
+        let def = parse_trigger_line(
+            "Whenever a mana ability of a land you control resolves, you gain 1 life.",
+            "Test",
+        );
+        assert_eq!(def.mode, TriggerMode::ManaAbilityProduced);
+        let Some(TargetFilter::Typed(typed)) = def.valid_card else {
+            panic!("expected a typed subject, got {:?}", def.valid_card);
+        };
+        assert!(typed.type_filters.contains(&TypeFilter::Land));
+        assert_eq!(typed.controller, Some(ControllerRef::You));
+    }
+
+    /// Unmodeled grammar after "resolves" must not be swallowed into a
+    /// trigger that silently ignores it.
+    #[test]
+    fn trailing_qualifier_fails_closed() {
+        let def = parse_trigger_line(
+            "Whenever a mana ability of ~ resolves for an opponent, draw a card.",
+            "Test",
+        );
+        assert_ne!(def.mode, TriggerMode::ManaAbilityProduced);
     }
 }

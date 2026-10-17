@@ -5890,6 +5890,36 @@ pub(crate) fn parse_mana_spent_self_subject(input: &str) -> OracleResult<'_, Cas
     .parse(input)
 }
 
+/// CR 605.1b + CR 603.7c: "[the] amount of mana <source> produced" — Tyvar the
+/// Bellicose: "put a number of +1/+1 counters on it equal to the amount of mana
+/// this creature produced."
+///
+/// The produced mana is a property of the mana ability resolution that
+/// triggered the ability, not of the object, so every source phrasing — the
+/// self-anaphora ("this creature", "~", "it") and the demonstrative ("that
+/// creature") — reads the same triggering-event amount
+/// (`QuantityRef::EventContextAmount`, which extracts it from
+/// `GameEvent::ManaAbilityProduced`).
+pub(crate) fn parse_event_mana_produced_amount(input: &str) -> OracleResult<'_, QuantityRef> {
+    value(
+        QuantityRef::EventContextAmount,
+        (
+            opt(tag("the ")),
+            tag("amount of mana "),
+            alt((
+                tag("this creature"),
+                tag("this permanent"),
+                tag("that creature"),
+                tag("that permanent"),
+                tag("~"),
+                super::primitives::parse_object_recipient_pronoun,
+            )),
+            tag(" produced"),
+        ),
+    )
+    .parse(input)
+}
+
 /// CR 122.1 + CR 122.6: Parse post-"for each" counter-placement history,
 /// e.g. "+1/+1 counter you've put on creatures under your control this turn".
 pub fn parse_counter_added_this_turn_for_each(input: &str) -> OracleResult<'_, QuantityRef> {
@@ -7504,6 +7534,26 @@ mod tests {
         SharedQuality, SharedQualityRelation, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::mana::ManaColor;
+
+    /// CR 605.1b + CR 603.7c: every source phrasing reads the triggering
+    /// resolution's mana amount; a non-"produced" verb is not this block.
+    #[test]
+    fn event_mana_produced_amount_reads_the_triggering_resolution() {
+        for phrase in [
+            "the amount of mana this creature produced",
+            "amount of mana this permanent produced",
+            "the amount of mana that creature produced",
+            "the amount of mana ~ produced",
+            "the amount of mana it produced",
+        ] {
+            assert_eq!(
+                parse_event_mana_produced_amount(phrase).ok(),
+                Some(("", QuantityRef::EventContextAmount)),
+                "{phrase}",
+            );
+        }
+        assert!(parse_event_mana_produced_amount("the amount of mana spent to cast it").is_err());
+    }
 
     // ── U1.1 building-block tests: `PlayerProperty` / `parse_player_property_keyword`
     // / `player_property_quantity` / `player_property_leader_filter`. Test the

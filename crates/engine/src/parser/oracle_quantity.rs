@@ -2131,6 +2131,13 @@ pub(crate) fn parse_event_context_quantity_with_context(
         return Some(QuantityExpr::Ref { qty });
     }
 
+    // CR 605.1b + CR 603.7c: "the amount of mana <source> produced" — the
+    // output of the mana ability resolution that triggered this ability
+    // (Tyvar the Bellicose). Reads the triggering event, not game state.
+    if let Ok(("", qty)) = nom_quantity::parse_event_mana_produced_amount(lower) {
+        return Some(QuantityExpr::Ref { qty });
+    }
+
     // CR 608.2k / CR 608.2c: Decompose possessive noun phrases: "{referent}'s {property}".
     // The prefix classifier (`classify_possessive_referent`) picks the
     // ObjectScope per the prefix's grammatical role:

@@ -1529,6 +1529,7 @@ mod twilight_prophet_upkeep_drain_1375;
 mod type_phrase_union_rows;
 mod typhoon_per_opponent_island_count;
 mod tyvar_activate_as_though_haste;
+mod tyvar_bellicose_mana_ability_resolves;
 mod ultimate_nullification;
 mod ultimate_spider_man_mass_counter_double;
 mod unholy_citadel_legendary_color_banding_grant;

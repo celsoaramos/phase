@@ -2715,6 +2715,9 @@ pub(crate) fn extract_source_from_event(
         // CR 106.12a: `TappedForMana` is the per-resolution event a `TapsForMana`
         // trigger fires from; `source_id` is the permanent tapped for mana.
         GameEvent::TappedForMana { source_id, .. } => Some(*source_id),
+        // CR 605.1b: a `ManaAbilityProduced` trigger's "it" / "this creature"
+        // is the source whose mana ability resolved (Tyvar the Bellicose).
+        GameEvent::ManaAbilityProduced { source_id, .. } => Some(*source_id),
         GameEvent::CounterAdded { object_id, .. } => Some(*object_id),
         // CR 608.2k + CR 714.2e: "that Saga" in "each opponent loses X life …
         // where X is that Saga's mana value" (Narci, Fable Singer) is an
@@ -2993,6 +2996,8 @@ pub(crate) fn extract_player_from_event(
         // CR 106.12a + CR 605.1b: `TappedForMana` carries the player who tapped
         // the source for mana — the triggering player for `TapsForMana`.
         GameEvent::TappedForMana { player_id, .. } => Some(*player_id),
+        // CR 605.1b: the player who received that resolution's mana.
+        GameEvent::ManaAbilityProduced { player_id, .. } => Some(*player_id),
         GameEvent::CardsDrawn { player_id, .. } => Some(*player_id),
         GameEvent::CardDrawn { player_id, .. } => Some(*player_id),
         GameEvent::Discarded { player_id, .. } => Some(*player_id),
@@ -3099,6 +3104,11 @@ pub(crate) fn extract_amount_from_event(event: &crate::types::events::GameEvent)
         // matching source set. For DamageDoneOnceByController triggers, this is
         // the filtered total stamped by matching_damage_done_once_by_controller_event.
         GameEvent::CombatDamageDealtToPlayer { total_damage, .. } => Some(*total_damage as i32),
+        // CR 605.1b + CR 603.7c: one aggregate event per mana ability
+        // resolution, carrying one entry per mana unit that resolution
+        // produced — "the amount of mana this creature produced" (Tyvar the
+        // Bellicose).
+        GameEvent::ManaAbilityProduced { produced, .. } => Some(produced.len() as i32),
         _ => None,
     }
 }
