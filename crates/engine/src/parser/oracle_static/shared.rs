@@ -2959,11 +2959,9 @@ fn parse_static_line_multi_dispatch(text: &str) -> Vec<StaticDefinition> {
         ];
     }
 
-    // CR 121.3 + CR 119.7: "Players can't draw cards or gain life" (Mornsong
-    // Aria) — CantDraw plus CantGainLife for the same subject.
-    if let Some(defs) =
-        parse_cant_draw_cards_or_gain_life(&TextPair::new(&stripped, &lower), &stripped)
-    {
+    // CR 101.2 + CR 121.3 + CR 119.7: "Players can't draw cards or gain life"
+    // (Mornsong Aria) — CantDraw plus CantGainLife for the same subject.
+    if let Some(defs) = parse_cant_draw_cards_or_gain_life(tp.lower, &stripped) {
         return defs;
     }
 
