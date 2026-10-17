@@ -1597,7 +1597,7 @@ fn target_is_provably_futile(
                 })
             };
             if !kills(*object_id) && live_alternative() {
-                return Some(GateDecision::Reject);
+                return true;
             }
         }
     }
