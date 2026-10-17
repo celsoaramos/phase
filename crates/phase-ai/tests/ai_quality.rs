@@ -2828,3 +2828,139 @@ fn focus_fire_whiff_stays_available_with_a_prowess_payoff() {
         "a prowess payoff makes the cast not a provable whiff"
     );
 }
+
+// ── Conditional removal that can't kill (Fatal Push, field report 2026-10-17) ──
+
+const FATAL_PUSH_ORACLE: &str = "Destroy target creature if it has mana value 2 or less.\nRevolt — Destroy that creature if it has mana value 4 or less instead if a permanent you controlled left the battlefield this turn.";
+
+/// The AI (P0) is in its first main phase holding Fatal Push with {B}
+/// floating; the opponent controls one creature per entry of `opposing_mv`.
+/// Returns the runner, the opposing creatures and Fatal Push.
+fn fatal_push_board(
+    opposing_mv: &[u32],
+    revolt: bool,
+) -> (engine::game::scenario::GameRunner, Vec<ObjectId>, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let fodder = scenario.add_creature(P0, "AI Fodder", 1, 1).id();
+    let mut theirs = Vec::new();
+    for (i, mv) in opposing_mv.iter().enumerate() {
+        theirs.push(
+            scenario
+                .add_creature(P1, &format!("Opposing {mv}-drop {i}"), 2, 2)
+                .with_mana_cost(ManaCost::generic(*mv))
+                .id(),
+        );
+    }
+    let fatal_push = scenario
+        .add_spell_to_hand_from_oracle(P0, "Fatal Push", true, FATAL_PUSH_ORACLE)
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![ManaUnit::new(
+            ManaType::Black,
+            ObjectId(9_999),
+            false,
+            vec![],
+        )],
+    );
+    let mut runner = scenario.build();
+    if revolt {
+        // CR 700.12 (Revolt): a permanent the AI controlled left the battlefield.
+        engine::game::zones::move_to_zone(
+            runner.state_mut(),
+            fodder,
+            engine::types::zones::Zone::Graveyard,
+            &mut Vec::new(),
+        );
+    }
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+    (runner, theirs, fatal_push)
+}
+
+fn assert_fatal_push_castable(state: &engine::types::game_state::GameState, spell: ObjectId) {
+    assert!(
+        engine::ai_support::build_decision_context(state)
+            .candidates
+            .iter()
+            .any(|c| matches!(c.action, GameAction::CastSpell { object_id, .. } if object_id == spell)),
+        "Fatal Push must be a legal, affordable cast — otherwise the test is vacuous"
+    );
+}
+
+/// Field report: the bot pushed Ezuri, Renegade Leader (mana value 3) with no
+/// permanent of its own gone that turn. Fatal Push targets "target creature"
+/// (CR 601.2c) and checks mana value only on resolution (CR 608.2c), so the
+/// card resolved and Ezuri stayed. Without revolt nothing here can die.
+#[test]
+fn does_not_cast_fatal_push_at_a_three_drop_without_revolt() {
+    let (runner, _theirs, fatal_push) = fatal_push_board(&[3], false);
+    assert_fatal_push_castable(runner.state(), fatal_push);
+    for diff in [
+        AiDifficulty::Easy,
+        AiDifficulty::Medium,
+        AiDifficulty::Hard,
+        AiDifficulty::VeryHard,
+    ] {
+        assert!(
+            !offers_cast(runner.state(), diff, fatal_push),
+            "{diff:?}: Fatal Push can't destroy a 3-drop without revolt"
+        );
+    }
+}
+
+/// Sibling: with revolt on, the 3-drop is inside "mana value 4 or less".
+#[test]
+fn fatal_push_stays_available_at_a_three_drop_with_revolt() {
+    let (runner, _theirs, fatal_push) = fatal_push_board(&[3], true);
+    assert_fatal_push_castable(runner.state(), fatal_push);
+    assert!(
+        offers_cast(runner.state(), AiDifficulty::Easy, fatal_push),
+        "revolt makes the 3-drop a real Fatal Push target"
+    );
+}
+
+/// Sibling: a 2-drop on the other side keeps the cast, and the target choice
+/// goes to the creature that dies, never the 3-drop.
+#[test]
+fn fatal_push_targets_the_two_drop_not_the_three_drop() {
+    let (mut runner, theirs, fatal_push) = fatal_push_board(&[3, 2], false);
+    let (three_drop, two_drop) = (theirs[0], theirs[1]);
+    assert!(
+        offers_cast(runner.state(), AiDifficulty::Easy, fatal_push),
+        "a 2-drop is a real Fatal Push target"
+    );
+    let cast = engine::ai_support::build_decision_context(runner.state())
+        .candidates
+        .into_iter()
+        .find(|c| matches!(c.action, GameAction::CastSpell { object_id, .. } if object_id == fatal_push))
+        .expect("cast candidate")
+        .action;
+    runner.act(cast).expect("cast Fatal Push");
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ),
+        "two legal targets → the engine asks, got {:?}",
+        runner.state().waiting_for
+    );
+    for diff in [AiDifficulty::Easy, AiDifficulty::VeryHard] {
+        let action = ai_choose(runner.state(), diff);
+        assert!(
+            !matches!(
+                action,
+                GameAction::ChooseTarget { target: Some(TargetRef::Object(id)) } if id == three_drop
+            ),
+            "{diff:?}: must not push the 3-drop, chose {action:?}"
+        );
+        assert!(
+            matches!(
+                action,
+                GameAction::ChooseTarget { target: Some(TargetRef::Object(id)) } if id == two_drop
+            ),
+            "{diff:?}: expected the 2-drop, chose {action:?}"
+        );
+    }
+}
