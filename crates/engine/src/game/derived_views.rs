@@ -2,10 +2,10 @@
 //! Engine-authored presentation projections over `GameState`.
 //!
 //! These "derived views" are computed just-in-time at serialization
-//! boundaries (the WASM getter, the server-core broadcast) and sent to
-//! clients alongside the raw state. Display consumers (React components)
-//! consume the pre-grouped shape directly and never compute game logic
-//! themselves — per CLAUDE.md's "engine owns all logic" invariant.
+//! boundaries and sent to clients alongside the viewer-filtered state.
+//! Display consumers (React components) consume the pre-grouped shape
+//! directly and never compute game logic themselves — per CLAUDE.md's
+//! "engine owns all logic" invariant.
 //!
 //! Contrast with `crates/engine/src/game/derived.rs`, which contains
 //! engine-internal state derivation (summoning sickness, commander damage
@@ -13,13 +13,17 @@
 //! that composes those helpers into a client-ready shape.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::analysis::resource::ResourceAxis;
-use crate::game::ability_utils::flatten_targets_in_chain;
+use crate::game::ability_utils::declared_targets_in_chain;
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::game_object::{AttachTarget, DisplaySource};
-use crate::game::stack::{effective_stack_ability, stack_display_groups, StackDisplayGroup};
+use crate::game::stack::{
+    effective_stack_ability, stack_display_groups, stack_display_groups_revealing,
+    stack_revealed_card_names, StackDisplayGroup,
+};
 use crate::types::ability::{
     ContinuousModification, Duration, GameRestriction, KeywordAction, ProhibitedActivity,
     RestrictionExpiry, RestrictionPlayerScope, TargetFilter, TargetRef,
@@ -35,6 +39,7 @@ use crate::types::game_state::{
     SyntheticTriggerProvenance, WaitingFor,
 };
 use crate::types::identifiers::ObjectId;
+use crate::types::interaction::InteractionId;
 use crate::types::keywords::Keyword;
 use crate::types::layers::Layer;
 use crate::types::mana::ManaCost;
@@ -203,27 +208,6 @@ pub enum UnboundedFamily {
     Triggers,
 }
 
-/// Whether the boundary can still fail to apply this scheduled collapse. No CR governs it — it is
-/// derived from `engine_resolution_choices::materialization_certainty`, which reads the boundary's
-/// own non-push-exit census, never a copy of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CollapseCertainty {
-    Committed,
-    Conditional,
-}
-
-impl CollapseCertainty {
-    /// `Conditional` wins: a family is only as certain as its least certain member. No CR governs
-    /// this — it is a meet over a display promise, not a rules behavior (cf. `game/filter.rs`'s
-    /// `context_free_prop_matches_face` Kleene `AnyOf` arm).
-    fn weaker(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Committed, Self::Committed) => Self::Committed,
-            _ => Self::Conditional,
-        }
-    }
-}
-
 /// This family's collapse coverage. `Scheduled` displays
 /// `GameState::pending_unbounded_materialization` — growth whose count was fixed at accept and
 /// which is in flight along CR 732.2c's advance to the proposal's ending point, that point being a
@@ -231,9 +215,7 @@ impl CollapseCertainty {
 /// (`types/game_state.rs`'s `scheduled_collapse_axes` doc, and this file's
 /// `THE WINDOW'S TIMING IS CR 732.2c'S ADVANCE` block). An earlier version of this doc called that
 /// stash unlicensed; it is not — see `scheduled_collapse_axes` for the four-position reading.
-/// `Scheduled` is nonetheless a WEAKER claim than `Committed`, and that distinction is the point of
-/// this enum: `Committed` is what licenses the `∞→N` badge, which is a promise about what will
-/// land, and the engine makes that promise only where it can keep it. `Mixed` is a join result.
+/// `Mixed` is a join result.
 ///
 /// `Unscheduled` is the one variant a CR describes, and only in the SHAPED sense the rest of this
 /// crate uses (this file's `IS AN ENGINE-STATE ARGUMENT, NOT A RULES ONE` block): CR 732.1b's
@@ -249,7 +231,6 @@ pub enum FamilyCollapseState {
     Unscheduled,
     Mixed,
     Scheduled {
-        certainty: CollapseCertainty,
         /// CR 732.2a: the seat that will be asked to name the "specified number of times" when
         /// this collapse cashes out — the loop's CONTROLLER, emitted because it is NOT
         /// recoverable from [`UnboundedFamilyView::player`] (the ATTRIBUTION seat, which for
@@ -269,7 +250,7 @@ pub enum FamilyCollapseState {
 }
 
 impl FamilyCollapseState {
-    /// Join: `Scheduled ⊔ Scheduled = Scheduled(weaker certainty, met seat)`,
+    /// Join: `Scheduled ⊔ Scheduled = Scheduled(met seat)`,
     /// `Unscheduled ⊔ Scheduled { .. } = Mixed`, `Mixed` is top. Commutative + associative +
     /// idempotent because it IS a join — load-bearing: the FE fold it replaces documented a
     /// last-wins order hazard, and its open question ("what would make the over-report
@@ -291,17 +272,7 @@ impl FamilyCollapseState {
             (Self::Unscheduled, Self::Unscheduled) => Self::Unscheduled,
             (Self::Unscheduled, Self::Scheduled { .. })
             | (Self::Scheduled { .. }, Self::Unscheduled) => Self::Mixed,
-            (
-                Self::Scheduled {
-                    certainty: a,
-                    prompted: p,
-                },
-                Self::Scheduled {
-                    certainty: b,
-                    prompted: q,
-                },
-            ) => Self::Scheduled {
-                certainty: a.weaker(b),
+            (Self::Scheduled { prompted: p }, Self::Scheduled { prompted: q }) => Self::Scheduled {
                 prompted: if p == q { p } else { None },
             },
         }
@@ -331,8 +302,7 @@ impl FamilyCollapseState {
 /// priority window per CR 732.2a, not the CR 500.5 boundary itself
 /// (`types/game_state.rs`'s `scheduled_collapse_axes` doc). It is still not a GUARANTEE of the
 /// final amount: the boundary's growth re-check and the controller's CR 732.2a count choice can
-/// both reduce what lands, which is why the display carries certainty rather than a
-/// number. A second channel mirroring
+/// both reduce what lands, which is why the display carries no number. A second channel mirroring
 /// the stash is no longer "a contract with no reader", which it genuinely was when that objection
 /// was written:
 /// THIS is the reader — `usePlayerDesignations` → `UnboundedBadge`, pinned on the wire by
@@ -343,36 +313,14 @@ impl FamilyCollapseState {
 /// objection, and a reader still sees it on screen. Only THIS channel carries a collapse state.
 /// `unbounded_pile` (card groups) and `counter_display` (counter pills) are `ObjectId`-keyed and
 /// carry no collapse projection at all, so during the accept→boundary window one loop can show
-/// `∞→N` on the badge and a plain `∞` on its own token group and counter pill in the SAME frame.
-/// Witnessed rather than asserted:
-/// `kilo_live_offer_from_real_dump::kilo_accept_marks_pentad_charge_as_unbounded_display_target`
-/// pins `counter_display[Pentad]` as a single `charge` row carrying [`CounterMagnitude`]'s
-/// `Unbounded` — a bare `∞` pill — in the exact frame whose golden family state is
-/// `Scheduled(Committed)`.
+/// a scheduled badge and a plain `∞` on its own token group and counter pill in the SAME frame.
 ///
 /// THE ANSWER, not a disclosure: this is not the `Mana(_)` false-promise case. The collapse really
 /// IS scheduled for that axis, so the quiet surfaces under-announce; none of them promises a bound
 /// it will not keep. Announcing it on the object-keyed channels would require a
 /// `(player, family)` → `ObjectId` join that the engine does not put on the wire, and computing
 /// that join downstream is precisely the display-layer computation this channel exists to remove
-/// (see `CLAUDE.md`). `Mana(_)` is different in kind — its promise is false the moment it is made —
-/// and it is handled by exclusion upstream at `scheduled_display_axes`, not by this asymmetry.
-///
-/// THE SECOND ASYMMETRY, ACROSS THE BOUNDARY RATHER THAN INSIDE THE WINDOW — disclosed, measured,
-/// and deliberately kept. `∞` counter targets are registered for the whole beneficial-counter
-/// partition, while a `DriveSequence` collapse names only the axes its own proposal carried. At the
-/// boundary, `types::game_state::clear_collapsed_materializations` filters the registered pairs by
-/// the collapsed axes and RE-INSERTS the survivors, and the counter-pill loop below is ungated on
-/// `unbounded_resources` — so a registered pair whose derived axis was NOT in the driven collapse
-/// keeps rendering `∞` on its own pill for one boundary after its family row is gone. The rules
-/// state is untouched: that pair's axis was never collapsed, so per CR 732.2c nothing about it has
-/// ended, and the axis-removal set and the `unbounded_loop_enablers` lockstep both move exactly as
-/// they did before the widening. Fixing the pill by stripping unmatched pairs would trade this
-/// display over-KEEP for a display over-DROP, which the subsystem's stated polarity forbids: it may
-/// only ever leave an `∞` standing one boundary longer than it should, never hide a real one.
-/// Pinned by `types::game_state`'s
-/// `widened_counter_registration_survives_a_driven_collapse_without_moving_the_axis_set` and its
-/// matched negative `a_counter_pair_on_the_driven_axis_is_dropped_at_the_boundary`.
+/// (see `CLAUDE.md`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnboundedFamilyView {
     pub player: PlayerId,
@@ -604,32 +552,20 @@ pub struct DungeonRoomView {
     pub rooms: Vec<DungeonRoomNodeView>,
 }
 
-/// The printed dungeon card, as the client looks it up on Scryfall.
-///
-/// Identity plumbing, not a rule — deliberately unannotated.
-///
-/// Both ids ride along because the five dungeons are not indexed uniformly by
-/// the client's Scryfall sidecars — Undercity is a `double_faced_token` that
-/// only `scryfall-token-images.json` carries. See `dungeon::DungeonCardRef`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DungeonCardView {
-    pub oracle_id: String,
-    pub scryfall_id: String,
-    pub face_name: String,
-}
+/// Re-exported from `dungeon`, the canonical home of the wire shapes: the
+/// venture-marker panel (`DungeonRoomView`) and the dungeon-choice preview
+/// (`dungeon::DungeonPreview`) describe the same cards and rooms, so the types
+/// live once, beside the static tables, rather than once per surface.
+pub use crate::game::dungeon::{DungeonCardView, DungeonRoomNodeView};
 
-/// CR 309.4: One room as the client draws it — its preview, its outgoing
-/// edges, and its position on the printed card face.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DungeonRoomNodeView {
-    #[serde(flatten)]
-    pub room: crate::game::dungeon::RoomPreview,
-    /// CR 309.5a: the rooms the venture marker may move to from here. Empty
-    /// for the bottommost room (CR 309.5).
-    pub next_rooms: Vec<u8>,
-    /// Where this room is drawn on the card. Permille of the image — see
-    /// `RoomMarkerPoint`, which documents why it is not a fraction.
-    pub marker: crate::game::dungeon::RoomMarkerPoint,
+/// CR 400.1 as modified by the format's shared-zone axis: which seat's
+/// container stores each shared pile. A zone absent here is per-player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedPilesView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library: Option<PlayerId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graveyard: Option<PlayerId>,
 }
 
 /// Engine-authored projections used by the display layer. Keep this struct
@@ -642,6 +578,10 @@ pub struct DerivedViews {
     /// when there is no actor or multiple distinct authorized submitters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unique_authorized_submitter: Option<PlayerId>,
+    /// The authorized viewer's Scry identity, retained when the bounded
+    /// interaction projection omits its opportunities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scry_prompt_id: Option<InteractionId>,
     /// Viewer-visible object ids in each player's shared exile pile. This is
     /// projected after face-down visibility filtering so the client can anchor
     /// rejection feedback without reimplementing private-information rules.
@@ -652,6 +592,10 @@ pub struct DerivedViews {
     /// intentionally narrow so a debug browser can select a card by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub debug_library_cards: Vec<DebugLibraryCardView>,
+    /// Present only for a format that shares a library or graveyard; names the
+    /// seat whose `Player` container stores each shared pile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_piles: Option<SharedPilesView>,
     /// The live (post-layer) keyword badges each battlefield permanent should
     /// display. The engine classifies the complete keyword list so the client
     /// can render the compact strip without reinterpreting keyword timing.
@@ -678,6 +622,9 @@ pub struct DerivedViews {
     /// next one belongs too.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub battlefield_keyword_badges: HashMap<ObjectId, Vec<Keyword>>,
+    /// CR 400.7 + CR 607.2a: the cards currently exiled with each battlefield permanent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub linked_exile_ids: BTreeMap<ObjectId, Vec<ObjectId>>,
 
     /// CR 509.1b + CR 611.2c: creatures with a live, temporary
     /// `CantBeBlocked` grant. The optional value is the granting source only
@@ -777,6 +724,19 @@ pub struct DerivedViews {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub stack_entry_details: HashMap<ObjectId, StackEntryDisplay>,
 
+    /// CR 701.20a: the cards each stack entry keeps revealed ("If revealing a
+    /// card causes a triggered ability to trigger, the card remains revealed
+    /// until that triggered ability leaves the stack"), by name, keyed by the
+    /// public stack entry id. Built from the authoritative lease map, so it
+    /// disappears when the lease ends.
+    ///
+    /// CR 401.2: deliberately unindexed. A leased card that sits in a library
+    /// stays a hidden object in the projected state, because naming that
+    /// object would disclose its library position; this map is the only place
+    /// its public identity appears, with no object id attached.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stack_revealed_cards: BTreeMap<ObjectId, Vec<String>>,
+
     /// CR 702.40a: the public number of copies the current Storm trigger will
     /// create, or that a newly cast Storm spell would create when no Storm
     /// trigger is pending. It is table-wide; spell copies never increment it.
@@ -802,11 +762,11 @@ pub struct DerivedViews {
     pub auras_attached_to_player: BTreeMap<PlayerId, Vec<ObjectId>>,
 
     /// CR 702.188a + 604.1: web-slinging alt-cost the VIEWING player may pay for each
-    /// qualifying card in their OWN hand (incl. statically-granted web-slinging). Keyed by
-    /// hand ObjectId. Populated ONLY for the `viewer` passed to derive_views and ONLY from
-    /// that viewer's hand — never another player's — so it cannot leak which opponent/AI
-    /// cards qualify, even on the unfiltered get_game_state() path. Empty when no viewer,
-    /// no granting static, or no qualifying card.
+    /// qualifying card in their OWN hand. Keyed by hand ObjectId. Populated ONLY for
+    /// the `viewer` passed to derive_views and ONLY from that viewer's hand — never
+    /// another player's — so it cannot leak which opponent/AI cards qualify, even
+    /// when derive_views is handed an unfiltered state. Empty when no viewer, no
+    /// granting static, or no qualifying card.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub web_slinging_costs: HashMap<ObjectId, ManaCost>,
 
@@ -984,15 +944,14 @@ pub struct DerivedViews {
     pub counter_display: HashMap<ObjectId, ObjectCounterDisplay>,
 }
 
-/// Serialize-only wrapper: the WASM getter passes `&GameState` by reference
-/// to avoid an O(n) clone of `state.objects` and other owned collections
-/// (GameState is not rpds-backed at the top level). The wire shape is
+/// Serialize-only wrapper. The wire shape is
 /// `{ state: <GameState>, derived: <DerivedViews> }`.
 #[derive(Debug)]
 pub struct ClientGameStateRef<'a> {
-    pub state: &'a GameState,
-    pub derived: DerivedViews,
-    display_visible_object_ids: Option<BTreeSet<ObjectId>>,
+    /// Owned when [`Self::wrap`] computed the projection, borrowed when a
+    /// [`Self::wrap_filtered`] caller supplied it.
+    state: Cow<'a, GameState>,
+    derived: DerivedViews,
 }
 
 impl Serialize for ClientGameStateRef<'_> {
@@ -1006,8 +965,7 @@ impl Serialize for ClientGameStateRef<'_> {
             derived: &'a DerivedViews,
         }
 
-        let state = client_state_wire_value(self.state, self.display_visible_object_ids.as_ref())
-            .map_err(serde::ser::Error::custom)?;
+        let state = client_state_wire_value(&self.state).map_err(serde::ser::Error::custom)?;
         ClientGameStateEnvelope {
             state: &state,
             derived: &self.derived,
@@ -1020,39 +978,19 @@ impl Serialize for ClientGameStateRef<'_> {
 /// persistence schema of [`GameState`]. Delayed-trigger receipts and their
 /// allocators authorize replay/transition handling; clients receive neither
 /// those private capabilities nor the resolved journal that contains them.
-fn client_state_wire_value(
-    state: &GameState,
-    display_visible_object_ids: Option<&BTreeSet<ObjectId>>,
-) -> serde_json::Result<serde_json::Value> {
+fn client_state_wire_value(state: &GameState) -> serde_json::Result<serde_json::Value> {
     let projected_state = crate::game::visibility::project_paid_cast_cleanup_authority(state);
     let mut value = serde_json::to_value(&projected_state)?;
     let Some(root) = value.as_object_mut() else {
         return Ok(value);
     };
 
-    if let Some(display_visible_object_ids) = display_visible_object_ids {
-        if let Some(objects) = root
-            .get_mut("objects")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            for object in objects.values_mut() {
-                if let Some(object) = object.as_object_mut() {
-                    object.remove("display_visible_to_viewer");
-                }
-            }
-            for object_id in display_visible_object_ids {
-                if let Some(object) = objects
-                    .get_mut(&object_id.0.to_string())
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    object.insert(
-                        "display_visible_to_viewer".to_string(),
-                        serde_json::Value::Bool(true),
-                    );
-                }
-            }
-        }
-    }
+    // This JSON-only marker records provenance for persistence ingress. It is
+    // intentionally not a `GameState` field: client projections remain
+    // transportable, but a projection must never be accepted as a trusted
+    // restore authority. A positive marker avoids inferring provenance from
+    // mutable redaction lists or from private execution carriers.
+    root.insert("wire_projection".to_string(), serde_json::Value::Bool(true));
 
     root.remove("next_delayed_trigger_token");
     root.remove("next_delayed_trigger_instance");
@@ -1062,9 +1000,8 @@ fn client_state_wire_value(
     root.remove("resolving_trigger_firing");
     root.remove("resolved_rules_journal");
     root.remove("stack_resolution_session");
-    // CR 605.4a + CR 117.3c: Defense in depth for direct `ClientGameStateRef`
-    // callers that did not first run `visibility::filter_state_for_viewer`.
-    // Both are trusted persistence authorities, never client schema.
+    // CR 605.4a + CR 117.3c: Defense in depth. Both are trusted persistence
+    // authorities, never client schema.
     root.remove("pending_triggered_mana_resume");
     root.remove("pending_trigger_construction_priority_recipient");
     // Same defense in depth for the original Cube multiset: undealt entries and
@@ -1110,24 +1047,15 @@ impl<'a> ClientGameStateRef<'a> {
     /// Viewer-filtered paths must use [`Self::wrap_filtered`] so redaction cannot
     /// erase an authoritative decision projection.
     pub fn wrap(state: &'a GameState, viewer: Option<PlayerId>) -> Self {
-        let filtered_state =
-            viewer.map(|viewer| crate::game::visibility::filter_state_for_viewer(state, viewer));
-        let display_visible_object_ids = filtered_state.as_ref().map(|filtered| {
-            filtered
-                .objects
-                .iter()
-                .filter_map(|(id, object)| object.display_visible_to_viewer.then_some(*id))
-                .collect()
-        });
-        let mut derived = derive_views(state, viewer);
-        if let Some(filtered) = filtered_state.as_ref() {
-            derived.visible_exile_object_ids = visible_exile_object_ids(filtered);
-        }
-        Self {
-            state,
-            derived,
-            display_visible_object_ids,
-        }
+        // CR 601.2h + CR 608.2c: direct client snapshots must pass through the
+        // same identity/knowledge redaction as the filtered-viewer path. An
+        // unscoped wire has no authenticated actor, so it must keep the canonical
+        // base and never materialize a staged shadow.
+        let projection = match viewer {
+            Some(viewer) => crate::game::visibility::filter_state_for_viewer(state, viewer),
+            None => crate::game::visibility::filter_state_for_unseated_viewer(state),
+        };
+        Self::from_projection(state, Cow::Owned(projection), viewer)
     }
 
     /// Wrap a viewer-filtered state while deriving rules-authoritative fields
@@ -1138,11 +1066,24 @@ impl<'a> ClientGameStateRef<'a> {
         filtered_state: &'a GameState,
         viewer: Option<PlayerId>,
     ) -> Self {
+        Self::from_projection(authoritative_state, Cow::Borrowed(filtered_state), viewer)
+    }
+
+    fn from_projection(
+        authoritative_state: &GameState,
+        projection: Cow<'a, GameState>,
+        viewer: Option<PlayerId>,
+    ) -> Self {
+        let derived = derive_filtered_views(authoritative_state, &projection, viewer);
         Self {
-            state: filtered_state,
-            derived: derive_filtered_views(authoritative_state, filtered_state, viewer),
-            display_visible_object_ids: None,
+            state: projection,
+            derived,
         }
+    }
+
+    /// The state the envelope's `state` half is serialized from.
+    pub fn state(&self) -> &GameState {
+        &self.state
     }
 }
 
@@ -1177,15 +1118,9 @@ pub struct ClientGameState {
 /// cast — activated-ability mana payment keeps its full-cost display, and
 /// convoke/improvise/delve pay via board taps tracked by their own staged UI.
 ///
-/// KNOWN LIMITATION: reduces with `any_color = false` and no life-for-color
-/// permissions, so under an any-color spend permission (Chromatic Orrery) or a
-/// K'rrik-style life-as-colored-mana grant the displayed residual can over-state
-/// the cost (a colorless unit pinned toward `{R}` reads as not covering it).
-/// This is deliberately consistent with the pin-eligibility gate
-/// (`mana_unit_eligible_for_cost`), which is also `any_color`-blind and would
-/// reject such a pin — both layers agree on the stricter behavior, and the
-/// common cases (generic + plain colored costs) are exact. Threading the real
-/// permission bundle through both sites is the follow-up to lift this.
+/// Uses the current spell's typed mana-spend permission when matching pinned
+/// units to colored or colorless requirements. This projection subtracts only
+/// pinned mana units; it does not subtract life payments.
 fn pending_payment_remaining(state: &GameState, viewer: PlayerId) -> Option<ManaCost> {
     use crate::types::game_state::WaitingFor;
     use crate::types::mana::{ManaPool, PaymentContext};
@@ -1212,12 +1147,12 @@ fn pending_payment_remaining(state: &GameState, viewer: PlayerId) -> Option<Mana
 
     // Scratch pool of ONLY the pinned units = the player's current selection.
     let player_obj = state.players.iter().find(|p| p.id == viewer)?;
-    let mut selected = ManaPool::default();
-    for unit in &player_obj.mana_pool.mana {
-        if pending.pinned_pool_units.contains(&unit.pip_id) {
-            selected.add(unit.clone());
-        }
-    }
+    let selected = ManaPool::from_units(
+        player_obj
+            .mana_pool
+            .units()
+            .filter(|unit| pending.pinned_pool_units.contains(&unit.pip_id)),
+    );
 
     // CR 106.6: reduce under the SAME spend-restriction context the finalize
     // spend uses, so restricted mana the spell can't accept stays in the residual.
@@ -1227,43 +1162,14 @@ fn pending_payment_remaining(state: &GameState, viewer: PlayerId) -> Option<Mana
         &selected,
         &cost,
         ctx.as_ref(),
-        false,
+        crate::game::casting::player_mana_spend_permission_for_payment(
+            state,
+            viewer,
+            Some(pending.object_id),
+            ctx.as_ref(),
+        ),
         None,
     ))
-}
-
-/// Project the printed dungeon card's Scryfall identity.
-fn dungeon_card_view(dungeon: crate::game::dungeon::DungeonId) -> DungeonCardView {
-    let card = crate::game::dungeon::card_ref(dungeon);
-    DungeonCardView {
-        oracle_id: card.oracle_id.to_string(),
-        scryfall_id: card.scryfall_id.to_string(),
-        face_name: card.face_name.to_string(),
-    }
-}
-
-/// CR 309.4 + CR 309.5a: Project the whole dungeon graph — every room, its
-/// outgoing edges, and where it is drawn on the card.
-///
-/// The client needs all of it at once: it places the marker on the current room
-/// and marks the rooms reachable from it (CR 309.5a), and neither is derivable
-/// from the current room alone.
-fn dungeon_room_nodes(dungeon: crate::game::dungeon::DungeonId) -> Vec<DungeonRoomNodeView> {
-    let markers = crate::game::dungeon::marker_points(dungeon);
-    (0..crate::game::dungeon::room_count(dungeon))
-        .filter_map(|index| {
-            // `dungeon_marker_points_cover_every_room` pins these lists to the
-            // same length, so a miss is unreachable. Skipping rather than
-            // indexing keeps a future table edit from panicking the whole state
-            // projection on a purely cosmetic field.
-            let marker = *markers.get(index as usize)?;
-            Some(DungeonRoomNodeView {
-                room: crate::game::dungeon::room_preview(dungeon, index),
-                next_rooms: crate::game::dungeon::next_rooms(dungeon, index).to_vec(),
-                marker,
-            })
-        })
-        .collect()
 }
 
 /// CR 309.4a-c: name the room each venturing player's marker currently sits on.
@@ -1287,8 +1193,8 @@ fn dungeon_rooms(state: &GameState) -> BTreeMap<PlayerId, DungeonRoomView> {
                         .to_string(),
                     room: crate::game::dungeon::room_preview(dungeon, progress.current_room),
                     room_count: crate::game::dungeon::room_count(dungeon),
-                    card: dungeon_card_view(dungeon),
-                    rooms: dungeon_room_nodes(dungeon),
+                    card: crate::game::dungeon::card_view(dungeon),
+                    rooms: crate::game::dungeon::room_nodes(dungeon),
                 },
             ))
         })
@@ -1542,8 +1448,11 @@ fn temporary_cant_be_blocked_source(
 pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews {
     let mut views = DerivedViews {
         unique_authorized_submitter: unique_authorized_submitter(state),
+        scry_prompt_id: viewer
+            .and_then(|viewer| crate::game::interaction::scry_prompt_id_for_viewer(state, viewer)),
         blocker_assignment_pairs: blocker_assignment_pairs(state),
         debug_library_cards: debug_library_cards(state, viewer),
+        shared_piles: shared_piles(state),
         current_target_kind: current_target_kind(state),
         dungeon_rooms: dungeon_rooms(state),
         storm_count: storm_count(state),
@@ -1557,6 +1466,7 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
         views.stack_display_groups = stack_display_groups(state);
         views.stack_entry_details = stack_entry_details(state);
     }
+    views.stack_revealed_cards = stack_revealed_card_names(state);
 
     // CR 303.4 + CR 702.5: Walk the battlefield once and bucket Player-host
     // attachments by their host PlayerId. Object-host attachments are skipped
@@ -1581,6 +1491,12 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
             .collect();
         if !badges.is_empty() {
             views.battlefield_keyword_badges.insert(obj_id, badges);
+        }
+        let linked: Vec<ObjectId> = crate::game::exile_links::live_links_for_source(state, obj_id)
+            .map(|link| link.exiled_id)
+            .collect();
+        if !linked.is_empty() {
+            views.linked_exile_ids.insert(obj_id, linked);
         }
         if let Some(source_id) = temporary_cant_be_blocked_source(state, obj_id) {
             views.temporary_cant_be_blocked.insert(obj_id, source_id);
@@ -1831,8 +1747,7 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
     // rules-correct about WHEN the loop closes is not the same as knowing WHAT NUMBER will land.
     // The boundary re-checks whether the growth is still observed, and the controller names the
     // count at the ending point (CR 732.2a's "specified number of times"), so the final amount is
-    // not knowable while the badge is on screen. `∞→N` is a promise; the engine makes it only for
-    // a family whose amount it can already stand behind, and shows `∞→?` otherwise.
+    // not knowable while the badge is on screen, so a scheduled family shows `∞→?`.
     //
     // The two CRs this code does rely on, each for what it actually governs:
     //  • CR 732.2c — the shortcut is taken at the count every player accepted, so the collapse may
@@ -1935,15 +1850,14 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
     // (`attribution_player`) AND the display family (`family_of`).
     let mut families: BTreeMap<(PlayerId, UnboundedFamily), FamilyCollapseState> = BTreeMap::new();
     for (&controller, axes) in &state.unbounded_resources {
-        // Which axes THIS controller has an accepted-but-unapplied collapse for, and how certain
-        // each one is. Resolved once per controller, on the controller key, BEFORE attribution
+        // Which axes THIS controller has an accepted-but-unapplied collapse for. Resolved once per
+        // controller, on the controller key, BEFORE attribution
         // rewrites `player` — that ordering is the whole point. After `attribution_player` runs, a
         // victim-attributed axis no longer carries the identity of the loop that produced it, so no
         // downstream consumer (engine or frontend) can answer this correctly; two controllers
         // draining one victim would collide. This reads the ENGINE'S DEFERRAL STASH, which no CR
         // licenses (see `FamilyCollapseState`) — it is not a projection of CR 732.2c.
         let accepted_axes = accepted_collapse_axes(state, controller);
-        let scheduled_axes = scheduled_display_axes(&accepted_axes);
         for &axis in axes {
             // CR 732.2a + CR 110.1: an object-growth ∞ whose ENTIRE registered display set
             // has left the battlefield has no live board backing left — drop the row rather
@@ -1953,32 +1867,23 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
             //
             // CR 732.2c binds the shortcut the instant the last player accepts, so an agreed
             // collapse is NOT cancelled by its board backing dying — its row survives the
-            // departure and keeps announcing the growth that will still land. The FACT set is
-            // read here, deliberately not the display-filtered one: `object_growth_backing`
-            // returns `None` for `Mana(_)` today, so the two happen to agree — an accident
-            // between two functions, not an invariant either of them states.
-            //
-            // A mana axis now reaches here with `accepted_axes` HOLDING it, so its row is kept
-            // solely by `object_growth_backing`'s `None` arm. If that arm ever moves, `Mana(_)`
-            // rows start disappearing during the accept→boundary window — decide it there,
-            // deliberately. Pinned by
-            // `combo_infinite_pile::low3_mixed_axis_replay_collapses_only_the_deferred_life_axis`.
-            if !accepted_axes.contains_key(&axis)
+            // departure and keeps announcing the growth that will still land.
+            if !accepted_axes.contains(&axis)
                 && object_growth_backing(state, controller, axis) == Some(false)
             {
                 continue;
             }
             let player = attribution_player(axis, controller);
-            let state_for_axis = match scheduled_axes.get(&axis) {
-                Some(&certainty) => FamilyCollapseState::Scheduled {
-                    certainty,
+            let state_for_axis = if accepted_axes.contains(&axis) {
+                FamilyCollapseState::Scheduled {
                     // The prompted seat is THIS loop's controller, captured here, in the only
                     // scope that still knows it: one line below, `attribution_player` may
                     // replace `player` with the victim, and from that point the controller is
                     // unrecoverable.
                     prompted: Some(controller),
-                },
-                None => FamilyCollapseState::Unscheduled,
+                }
+            } else {
+                FamilyCollapseState::Unscheduled
             };
             families
                 .entry((player, family_of(axis)))
@@ -2022,13 +1927,14 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
     views.counter_display = counter_display_views(state);
 
     // CR 732.2a: an open shortcut window states the largest number of repetitions its proposal may
-    // specify. Publish that count; nothing downstream may re-derive it. The `is_bounded()` guard is
-    // the single authority for "the producer narrowed the bound"; an unnarrowed offer publishes
-    // nothing. Emitted HERE, above the Commander short-circuit below, for the same reason the
-    // channels above are.
+    // specify — the capacity the declare handler will accept, never the threshold its producer
+    // measured. Publish that count; nothing downstream may re-derive it. The `is_bounded()` guard
+    // is the single authority for "the producer measured a threshold"; an offer that measured none
+    // publishes nothing. Emitted HERE, above the Commander short-circuit below, for the same
+    // reason the channels above are.
     views.bounded_loop_max_repetitions = match &state.waiting_for {
         WaitingFor::LoopShortcut { schema, .. } if schema.is_bounded() => {
-            Some(schema.max_iterations)
+            Some(schema.deliverable_capacity)
         }
         _ => None,
     };
@@ -2169,12 +2075,23 @@ pub fn derive_filtered_views(
 ) -> DerivedViews {
     let mut views = derive_views(filtered_state, viewer);
     views.unique_authorized_submitter = unique_authorized_submitter(authoritative_state);
+    views.scry_prompt_id = viewer.and_then(|viewer| {
+        crate::game::interaction::scry_prompt_id_for_viewer(authoritative_state, viewer)
+    });
     views.debug_library_cards = debug_library_cards(authoritative_state, viewer);
     views.visible_exile_object_ids = visible_exile_object_ids(filtered_state);
     // CR 509.1g: blocking relationships are public information. Preserve this
     // display projection even when a viewer-safe state intentionally omits raw
     // combat records unrelated to rendering.
     views.blocker_assignment_pairs = blocker_assignment_pairs(authoritative_state);
+    // CR 701.20a: the viewer copy carries no lease map (it is a position
+    // channel), so the public presentation is rebuilt from rules state, and
+    // the stack grouping keeps entries with different reveals apart.
+    views.stack_revealed_cards = stack_revealed_card_names(authoritative_state);
+    if !filtered_state.stack.is_empty() {
+        views.stack_display_groups =
+            stack_display_groups_revealing(filtered_state, &views.stack_revealed_cards);
+    }
     views
 }
 
@@ -2235,6 +2152,14 @@ fn visible_exile_object_ids(state: &GameState) -> BTreeMap<PlayerId, Vec<ObjectI
         .collect()
 }
 
+fn shared_piles(state: &GameState) -> Option<SharedPilesView> {
+    let view = SharedPilesView {
+        library: state.shared_zone_holder(Zone::Library),
+        graveyard: state.shared_zone_holder(Zone::Graveyard),
+    };
+    (view.library.is_some() || view.graveyard.is_some()).then_some(view)
+}
+
 fn debug_library_cards(state: &GameState, viewer: Option<PlayerId>) -> Vec<DebugLibraryCardView> {
     let Some(viewer) = viewer else {
         return Vec::new();
@@ -2247,7 +2172,7 @@ fn debug_library_cards(state: &GameState, viewer: Option<PlayerId>) -> Vec<Debug
         .iter()
         .find(|player| player.id == viewer)
         .into_iter()
-        .flat_map(|player| player.library.iter())
+        .flat_map(|player| state.library_of(player.id).iter())
         .filter_map(|object_id| {
             state
                 .objects
@@ -2351,107 +2276,14 @@ fn turn_order_views(
     (turn_order, viewer_turn_number)
 }
 
-/// CR 732.2c: THE FACT — the axes `controller` has an accepted, not-yet-applied collapse for.
-///
-/// The KEYS are the fact (which axes an accepted collapse names). The VALUES are
-/// `engine_resolution_choices::possible_hold`'s display encoding ([`CollapseCertainty`], typed as a
-/// display promise by its own doc there), carried alongside because every consumer that needs the
-/// fact also needs to know what may be promised about it. No display judgement is applied here —
-/// that is [`scheduled_display_axes`]'s job, and the split is what keeps a RULES consumer (the row
-/// loop's acceptance gate) from silently inheriting a DISPLAY exclusion.
-///
-/// This reads the stash of growth in flight along CR 732.2c's advance to the proposal's ending
-/// point — a priority window per CR 732.2a, reached after the CR 500.5 boundary where the growth
-/// lands. What it reports is therefore a real accepted result, not a parking spot; the reason the
-/// value is CERTAINTY rather than a number is that the boundary re-checks whether the growth is
-/// still observed and the controller names the count at the ending point (CR 732.2a). See
-/// [`FamilyCollapseState`], the `THE WINDOW'S TIMING IS CR 732.2c'S ADVANCE` block above, and
-/// `types/game_state.rs`'s `scheduled_collapse_axes` doc for the reading.
-fn accepted_collapse_axes(
-    state: &GameState,
-    controller: PlayerId,
-) -> BTreeMap<ResourceAxis, CollapseCertainty> {
-    let mut axes: BTreeMap<ResourceAxis, CollapseCertainty> = BTreeMap::new();
-    let Some(items) = state.pending_unbounded_materialization.get(&controller) else {
-        return axes;
-    };
-    for item in items {
-        // Per ITEM, so each axis inherits the certainty of the kind that actually scheduled it;
-        // two items naming the same axis merge to the weaker answer.
-        let certainty = crate::game::engine_resolution_choices::materialization_certainty(item);
-        for axis in state.scheduled_collapse_axes(std::slice::from_ref(item)) {
-            axes.entry(axis)
-                .and_modify(|acc| *acc = acc.weaker(certainty))
-                .or_insert(certainty);
-        }
-    }
-    axes
-}
-
-/// THE ANNOUNCEMENT — the fact ([`accepted_collapse_axes`]) minus what the badge cannot honestly
-/// promise, as the HUD should announce it, each axis carrying how CERTAIN that collapse is.
-///
-/// Takes the fact BY REFERENCE rather than re-deriving it: the signature is the guarantee that no
-/// caller can compute one without holding the other, so the two cannot drift into agreeing by
-/// coincidence. The `Mana(_)` exclusion below is the ONLY display judgement in the pair, which is
-/// what makes the FACT/ANNOUNCEMENT split meaningful at all.
-///
-/// Named rather than inlined into its one caller because the SCOPE LIMIT below is a rule, not a
-/// line of the row loop, and it has already proved it drifts when written twice: an earlier cut of
-/// this change had a second consumer (a `scheduled_collapse` tag channel, since removed for having
-/// no reader) and the guard lived in that consumer alone, so mana rows shipped flagged while the
-/// tag omitted them. Any future second consumer calls THIS, and inherits the limit; a consumer that
-/// needs the unfiltered rules answer calls [`accepted_collapse_axes`] instead, and the type it asks
-/// for says which of the two it got.
-///
-/// SCOPE LIMIT — `Mana(_)` is excluded. This is about what the badge would TELL the player, not
-/// about which code path ends the axis, and it is scoped to THE WINDOW THE BADGE RENDERS IN
-/// (accept → CR 500.5 boundary). Inside that window:
-/// - The pool is already unbounded and spendable — `mana_payment::refill_infinite_mana` re-tops it
-///   off the store after every action — so the chosen `N` does not bound what the player may
-///   spend. "A finite amount will be chosen" is false for this axis while it is true for every
-///   deferred one, and the badge is only on screen here.
-/// - CR 500.5 ends the badge at the step/phase end when the pool empties, on a schedule the
-///   accepted count does not move.
-///
-/// ACROSS the boundary it is not unconditional, and the sentence above is deliberately not written
-/// as if it were: a `DriveSequence` collapse replays the captured sequence `N` times after that
-/// empty, so the post-collapse pool genuinely is bounded by `N`. The badge is gone by then.
-///
-/// THE OTHER OVER-PROMISE — NOW TYPED, NOT DISCLOSED. `Counters` and `Life` axes can be scheduled
-/// here and then NOT collapse: the boundary re-runs the observed-growth firewall
-/// (`engine_resolution_choices`) and DECLINES the batched apply if a counter/life observer (Heliod,
-/// Corpsejack) appeared during the accept→boundary window, and a `Tokens` axis can park on a
-/// replacement choice instead. Each kind's answer comes from
-/// `engine_resolution_choices::materialization_certainty`, which reads that loop's own non-push-exit
-/// census rather than a copy of it, and it lands here as [`CollapseCertainty`]: `Conditional` for
-/// the three kinds with a hold, `Committed` only for `DriveSequence`, which cannot park. Witnessed
-/// by `combo_infinite_pile::real_4p_counter_observer_drift_in_window_declines_batched_counter_but_still_mints_tokens`.
-///
-/// It is NOT fixable at flag time — the observer can appear after this projection ran, so no value
-/// computed here can be right for the whole window — and THAT is precisely why `Conditional` is a
-/// variant rather than an apology: the badge stops promising a bound it cannot keep and says
-/// "collapse pending; this may stay unbounded" instead. `Mana(_)` is excluded above because its
-/// promise is false the moment it is made; this one can only become false later, which is why the
-/// two are handled differently.
-///
-/// This exclusion answers a DIFFERENT question from the collapse filter at the registration site:
-/// what the badge may PROMISE during the accept→boundary window, versus which authority ends the
-/// axis. The collapse no longer drops the `Mana(_)` axis at all —
-/// `game::engine::materialize_object_growth_shortcut` stores only `DeferredAccrual` axes in a
-/// `DriveSequence`'s `collapsed_axes` (`analysis::resource::ResourceAxis::unbounded_mark_kind`),
-/// and the batched items never named one — so no `PersistentAxisMaterialization` kind can schedule
-/// a `Mana(_)` axis, and this `retain` is a no-op on every production path today.
-///
-/// It is kept deliberately, as DEFENSE IN DEPTH: a future stash kind that scheduled a mana axis
-/// would otherwise silently start promising a bound on a pool the player is already spending
-/// without bound. The badge must not promise a bound the player's spendable pool never had.
-fn scheduled_display_axes(
-    accepted: &BTreeMap<ResourceAxis, CollapseCertainty>,
-) -> BTreeMap<ResourceAxis, CollapseCertainty> {
-    let mut axes = accepted.clone();
-    axes.retain(|axis, _| !matches!(axis, ResourceAxis::Mana(_)));
-    axes
+/// CR 732.2c: the axes `controller` has an accepted, not-yet-applied collapse for — growth in
+/// flight along CR 732.2c's advance to the proposal's ending point (see [`FamilyCollapseState`]).
+fn accepted_collapse_axes(state: &GameState, controller: PlayerId) -> BTreeSet<ResourceAxis> {
+    state
+        .pending_unbounded_materialization
+        .get(&controller)
+        .map(|items| state.scheduled_collapse_axes(items))
+        .unwrap_or_default()
 }
 
 /// The seat a resource axis LANDS ON, for the four axes that name one — and `None` for every
@@ -2930,7 +2762,7 @@ fn stack_entry_targets(state: &GameState, entry: &StackEntry) -> Vec<StackTarget
         StackEntryKind::KeywordAction { action } => keyword_action_targets(action),
         _ => effective_stack_ability(state, entry)
             .ability
-            .map(flatten_targets_in_chain)
+            .map(declared_targets_in_chain)
             .unwrap_or_default(),
     };
     targets
@@ -3049,7 +2881,7 @@ fn trigger_event_display(state: &GameState, event: &GameEvent) -> Option<Trigger
                 zone_label(Some(*to))
             ),
             object_id: Some(*object_id),
-            player: Some(record.controller),
+            player: Some(record.arrival.controller),
         }),
         // CR 701.17a: an action-worded mill trigger's event slot holds only
         // `Milled`, so this is the arm the stack tooltip reads. `fallback` is
@@ -3182,8 +3014,8 @@ mod tests {
     use crate::game::triggers::{PendingTrigger, PendingTriggerContext};
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        DelayedTriggerCondition, Duration, Effect, EffectKind, ModalChoice, ResolvedAbility,
-        RestrictionExpiry, StaticCondition, TargetFilter, TargetRef,
+        DelayedTriggerCondition, DelayedTriggerKind, Duration, Effect, EffectKind, ModalChoice,
+        ResolvedAbility, RestrictionExpiry, StaticCondition, TargetFilter, TargetRef,
     };
     use crate::types::card_type::CoreType;
     use crate::types::format::FormatConfig;
@@ -3200,6 +3032,49 @@ mod tests {
     use crate::types::statics::ActivationExemption;
     use crate::types::zones::Zone;
     use std::collections::HashMap;
+
+    /// CR 108.3 + CR 400.7: the player a zone-change trigger shows is the
+    /// identity the move installed, not the one the card had when it left.
+    #[test]
+    fn a_zone_change_trigger_display_names_the_installed_controller() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::dandan(), 2, 42);
+        let card = crate::game::zones::create_object(
+            &mut state,
+            crate::types::identifiers::CardId(1),
+            PlayerId(0),
+            "Pile Card".to_string(),
+            Zone::Library,
+        );
+        let record =
+            state.objects[&card].snapshot_for_zone_change(card, Some(Zone::Library), Zone::Hand);
+        let record = crate::game::zones::resolve_and_apply_zone_change(
+            &mut state,
+            card,
+            Zone::Library,
+            Zone::Hand,
+            PlayerId(0),
+            Some(PlayerId(1)),
+            record,
+        )
+        .expect("the rebinding move applies")
+        .zone_change_record;
+        assert_eq!(
+            (record.owner, record.controller),
+            (PlayerId(0), PlayerId(0)),
+            "reach: the departure snapshot is the pile's"
+        );
+        let display = trigger_event_display(
+            &state,
+            &GameEvent::ZoneChanged {
+                object_id: card,
+                from: Some(Zone::Library),
+                to: Zone::Hand,
+                record: Box::new(record),
+            },
+        )
+        .expect("a zone change has a display");
+        assert_eq!(display.player, Some(PlayerId(1)));
+    }
 
     /// CR 701.17a: after the mill re-key, a `TriggerMode::Milled*` trigger's
     /// event slot holds only `Milled`, so `trigger_event_display` must answer for
@@ -3365,6 +3240,75 @@ mod tests {
         // Selects the dungeon half of `Undercity // The Initiative`.
         assert_eq!(room.card.face_name, "Undercity");
         assert_eq!(room.rooms.len(), 9);
+    }
+
+    /// The experimental 19-room dungeon projects the same shape the map panel
+    /// reads: card identity for the art hook, the whole room graph, and one
+    /// marker per room. Pinned separately from the generic marker-table tests
+    /// because the badge renders `room_count` ("room 8 of 19") and the popover
+    /// indexes `rooms` by the marker's room — a short or misordered graph here
+    /// misplaces the marker with no other failure.
+    #[test]
+    fn dungeon_rooms_projects_baldurs_gate_wilderness_with_all_19_rooms() {
+        use crate::game::dungeon::{DungeonId, DungeonProgress};
+
+        let mut state = GameState::new_two_player(42);
+        state.dungeon_progress.insert(
+            PlayerId(0),
+            DungeonProgress {
+                current_dungeon: Some(DungeonId::BaldursGateWilderness),
+                current_room: 7,
+                ..Default::default()
+            },
+        );
+
+        let views = derive_views(&state, None);
+        let room = views
+            .dungeon_rooms
+            .get(&PlayerId(0))
+            .expect("venturing player is projected");
+
+        assert_eq!(room.dungeon, DungeonId::BaldursGateWilderness);
+        assert_eq!(room.dungeon_name, "Baldur's Gate Wilderness");
+        assert_eq!(room.room.index, 7);
+        assert_eq!(room.room.name, "Grymforge");
+        assert_eq!(
+            room.room.text,
+            "For each opponent, goad up to one target creature that player controls."
+        );
+        assert_eq!(room.room_count, 19);
+
+        // `layout: "normal"`, so the card table carries it by oracle id (the
+        // Undercity token-table fallback is not this dungeon's path).
+        assert_eq!(room.card.oracle_id, "06b9590d-01bf-4fae-9837-352c9e04267a");
+        assert_eq!(
+            room.card.scryfall_id,
+            "a9d56324-8293-4500-a9ad-fed351ccf966"
+        );
+        assert_eq!(room.card.face_name, "Baldur's Gate Wilderness");
+
+        assert_eq!(
+            room.rooms.len(),
+            19,
+            "the whole graph ships, not just the current room"
+        );
+        // CR 309.5a: Grymforge (index 7) leads to Last Light Inn and
+        // Reithwin Tollhouse.
+        let current = &room.rooms[7];
+        assert_eq!(current.room.name, "Grymforge");
+        assert_eq!(current.next_rooms, vec![9, 10]);
+        // The card's bottom row holds three terminal rooms (CR 309.5).
+        for bottommost in [16, 17, 18] {
+            assert!(
+                room.rooms[bottommost].next_rooms.is_empty(),
+                "room {bottommost} is terminal on the printed card"
+            );
+        }
+        assert_eq!(room.rooms[18].room.name, "Temple of Bhaal");
+        // Every room carries a marker inside the card face.
+        for node in &room.rooms {
+            assert!(node.marker.x_permille <= 1000 && node.marker.y_permille <= 1000);
+        }
     }
 
     /// CR 309.7: a completed dungeon leaves a `current_dungeon: None` entry
@@ -4052,6 +3996,7 @@ mod tests {
                 display_source: DisplaySource::Card,
                 printed_ref: None,
                 token_image_ref: None,
+                token_art: None,
             }],
             None,
         );
@@ -4065,6 +4010,7 @@ mod tests {
                 display_source: DisplaySource::Card,
                 printed_ref: None,
                 token_image_ref: None,
+                token_art: None,
             }],
             None,
         );
@@ -4125,35 +4071,39 @@ mod tests {
         let values = crate::game::printed_cards::intrinsic_copiable_values(
             state.objects.get(&target).unwrap(),
         );
-        let tce_id = state.add_transient_continuous_effect_with_bindings(
-            source,
-            PlayerId(0),
-            Duration::ForAsLongAs {
-                condition: StaticCondition::IsTapped {
-                    scope: ObjectScope::Target,
+        let tce_id = state
+            .add_transient_continuous_effect_with_bindings(
+                source,
+                PlayerId(0),
+                Duration::ForAsLongAs {
+                    condition: StaticCondition::IsTapped {
+                        scope: ObjectScope::Target,
+                    },
                 },
-            },
-            TargetFilter::SpecificObject { id: source },
-            vec![ContinuousModification::CopyValues {
-                values: Box::new(values),
-                display_source: DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-            }],
-            None,
-            crate::types::game_state::TransientContinuousEffectBindings {
-                affected_recipient: Some(
-                    crate::types::identifiers::ObjectIncarnationRef::from_object(
-                        &state.objects[&source],
+                TargetFilter::SpecificObject { id: source },
+                vec![ContinuousModification::CopyValues {
+                    values: Box::new(values),
+                    display_source: DisplaySource::Card,
+                    printed_ref: None,
+                    token_image_ref: None,
+                    token_art: None,
+                }],
+                None,
+                crate::types::game_state::TransientContinuousEffectBindings {
+                    affected_recipient: Some(
+                        crate::types::identifiers::ObjectIncarnationRef::from_object(
+                            &state.objects[&source],
+                        ),
                     ),
-                ),
-                duration_subject: Some(
-                    crate::types::identifiers::ObjectIncarnationRef::from_object(
-                        &state.objects[&target],
+                    duration_subject: Some(
+                        crate::types::identifiers::ObjectIncarnationRef::from_object(
+                            &state.objects[&target],
+                        ),
                     ),
-                ),
-            },
-        );
+                    granting_object: None,
+                },
+            )
+            .expect("the fixture's duration begins");
 
         assert_eq!(
             derive_views(&state, None).copied_permanents,
@@ -4226,19 +4176,22 @@ mod tests {
         let values = crate::game::printed_cards::intrinsic_copiable_values(
             state.objects.get(&host).unwrap(),
         );
-        let independent_copy_effect_id = state.add_transient_continuous_effect(
-            host,
-            PlayerId(0),
-            Duration::Permanent,
-            TargetFilter::SpecificObject { id: host },
-            vec![ContinuousModification::CopyValues {
-                values: Box::new(values),
-                display_source: DisplaySource::Card,
-                printed_ref: None,
-                token_image_ref: None,
-            }],
-            None,
-        );
+        let independent_copy_effect_id = state
+            .add_transient_continuous_effect(
+                host,
+                PlayerId(0),
+                Duration::Permanent,
+                TargetFilter::SpecificObject { id: host },
+                vec![ContinuousModification::CopyValues {
+                    values: Box::new(values),
+                    display_source: DisplaySource::Card,
+                    printed_ref: None,
+                    token_image_ref: None,
+                    token_art: None,
+                }],
+                None,
+            )
+            .expect("the fixture's duration begins");
         assert_ne!(
             Some(independent_copy_effect_id),
             merge_effect_id,
@@ -4278,6 +4231,7 @@ mod tests {
                 display_source: DisplaySource::Card,
                 printed_ref: None,
                 token_image_ref: None,
+                token_art: None,
             }],
             None,
         );
@@ -4987,8 +4941,7 @@ mod tests {
         }
         let pip_ids: Vec<_> = state.players[0]
             .mana_pool
-            .mana
-            .iter()
+            .units()
             .map(|u| u.pip_id)
             .collect();
 
@@ -5324,6 +5277,10 @@ mod tests {
                 mana_value: 0,
                 controller: PlayerId(1),
                 owner: PlayerId(1),
+                arrival: crate::types::game_state::ArrivalIdentity {
+                    owner: PlayerId(1),
+                    controller: PlayerId(1),
+                },
                 from_zone: Some(Zone::Library),
                 cast_from_zone: None,
                 played_from_zone: None,
@@ -5357,7 +5314,7 @@ mod tests {
                 source_id: trigger_source,
                 ability: Box::new(ability),
                 condition: None,
-                trigger_event: Some(trigger_event),
+                trigger_event: Some(trigger_event.clone()),
                 description: Some("hidden-zone trigger".to_string()),
                 source_name: "Watcher".to_string(),
                 subject_match_count: None,
@@ -5383,6 +5340,29 @@ mod tests {
             "trigger context must not bypass multiplayer hidden-card filtering"
         );
         assert!(label.contains("Hidden Card"));
+
+        // CR 400.2 + CR 402.3: each serialized event carrier and its derived
+        // display must honor the same hidden-object decision for seated and
+        // unseated observers.
+        state
+            .stack_trigger_event_batches
+            .insert(ObjectId(900), vec![trigger_event.clone()]);
+        state.resolving_stack_entry = state.stack.front().cloned();
+        state.current_trigger_event = Some(trigger_event.clone());
+        state.current_trigger_events.push(trigger_event);
+        for viewer in [None, Some(PlayerId(0))] {
+            let wire = serde_json::to_value(ClientGameStateRef::wrap(&state, viewer))
+                .expect("serialize client envelope");
+            assert!(
+                !wire.to_string().contains("Secret Card"),
+                "client envelope must not reveal the library card to {viewer:?}"
+            );
+            let wire_label = wire["derived"]["stack_entry_details"]["900"]["trigger_context"][0]
+                ["label"]
+                .as_str()
+                .expect("serialized trigger context label");
+            assert!(wire_label.contains("Hidden Card"));
+        }
     }
 
     /// Wire-format round-trip: the JSON produced from `ClientGameStateRef`
@@ -5451,6 +5431,7 @@ mod tests {
             controller: PlayerId(0),
             source_id: source,
             one_shot: true,
+            kind: DelayedTriggerKind::Ordinary,
             provenance: crate::types::identifiers::DelayedInstallIdentity::ReceiptEligible(
                 provenance,
             ),
@@ -5875,6 +5856,16 @@ mod tests {
                     ))
                     .expect("viewer continuation wire serializes"),
                 ),
+                (
+                    // `wrap_filtered` takes any `&GameState`; this entry hands it the unprojected one.
+                    "unprojected wrap_filtered",
+                    serde_json::to_value(ClientGameStateRef::wrap_filtered(
+                        &stage_state,
+                        &stage_state,
+                        Some(owner),
+                    ))
+                    .expect("unprojected wrap_filtered wire serializes"),
+                ),
             ] {
                 let client_state = &projection["state"];
                 let object = client_state["objects"]
@@ -6181,8 +6172,8 @@ mod tests {
 
     /// CR 702.188a + CR 604.1: web-slinging costs are VIEWER-scoped. P0 controls
     /// the grantor; both P0 and P1 hold a qualifying spell. `derive_views` for P0
-    /// must surface ONLY P0's card (never P1's, even though the grant is symmetric
-    /// in the abstract) so the unfiltered path can't leak opponent hand contents.
+    /// must surface ONLY P0's card (never P1's) so `derive_views` over an
+    /// unfiltered state can't leak opponent hand contents.
     /// `derive_views(_, None)` must surface nothing.
     #[test]
     fn web_slinging_costs_are_viewer_scoped_and_leak_proof() {
@@ -6347,6 +6338,7 @@ mod tests {
                     single_use: false,
                     cast_cost_modifier: None,
                     alt_ability_cost: None,
+                    without_paying_mana_cost: false,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 });
         }
@@ -6518,6 +6510,7 @@ mod tests {
                 bypass_beneficiary: None,
                 protection_does_not_remove: None,
                 room_door: None,
+                granting_object: None,
             }]
             .into();
         }
@@ -6607,7 +6600,7 @@ mod tests {
     ///
     /// MUTATIONS THAT RED THIS (two-sided): (a) compute the state by testing each axis against the
     /// union of every controller's scheduled set — the `(player, axis)` join — instead of
-    /// `controller`'s own ⇒ the family comes back `Scheduled(Conditional)`; (b) never consult the
+    /// `controller`'s own ⇒ the family comes back `Scheduled`; (b) never consult the
     /// stash ⇒ it comes back `Unscheduled`.
     #[test]
     fn two_controllers_draining_one_victim_do_not_cross_schedule() {
@@ -6669,7 +6662,7 @@ mod tests {
             life_rows[0].state,
             FamilyCollapseState::Mixed,
             "P1 accepted a collapse and P0 did not, so the victim's life family is Mixed and \
-             renders a bare ∞ — a (player, axis) union join would say Scheduled(Conditional) and \
+             renders a bare ∞ — a (player, axis) union join would say Scheduled and \
              never consulting the stash would say Unscheduled; got {:?}",
             life_rows[0]
         );
@@ -6736,10 +6729,7 @@ mod tests {
         }
         assert_eq!(
             life_family_state(&both),
-            FamilyCollapseState::Scheduled {
-                certainty: CollapseCertainty::Conditional,
-                prompted: None,
-            },
+            FamilyCollapseState::Scheduled { prompted: None },
             "two controllers with accepted collapses on one victim's life family name two seats, \
              so the badge falls back to the seat-neutral voice"
         );
@@ -6763,10 +6753,7 @@ mod tests {
         let agreed_state = life_family_state(&agreed);
         assert_eq!(
             agreed_state,
-            FamilyCollapseState::Scheduled {
-                certainty: CollapseCertainty::Conditional,
-                prompted: Some(p1),
-            },
+            FamilyCollapseState::Scheduled { prompted: Some(p1) },
             "one controller, one accepted collapse ⇒ the badge names THAT controller"
         );
         let FamilyCollapseState::Scheduled { prompted, .. } = agreed_state else {
@@ -6881,7 +6868,7 @@ mod tests {
     }
 
     /// Minimal 1/1 token profile for the `Tokens` stash kind. Only the VARIANT matters to these
-    /// tests — `family_of` and `materialization_certainty` are both payload-independent.
+    /// tests — `family_of` is payload-independent.
     fn family_test_token_profile() -> Box<crate::types::ability::CopiableValues> {
         Box::new(crate::types::ability::CopiableValues {
             name: "Saproling".to_string(),
@@ -6899,6 +6886,7 @@ mod tests {
             replacement_definitions: std::sync::Arc::default(),
             static_definitions: std::sync::Arc::default(),
             room_halves: None,
+            prepare_face: None,
             name_origin: Default::default(),
         })
     }
@@ -6959,14 +6947,13 @@ mod tests {
                     player: PlayerId(0),
                     family: UnboundedFamily::Tokens,
                     state: FamilyCollapseState::Scheduled {
-                        certainty: CollapseCertainty::Conditional,
                         // The controller IS the attributed seat for an aggregate axis, so this
                         // fixture cannot tell the two apart — the divergent case is
                         // `two_controllers_draining_one_victim_do_not_cross_schedule`.
                         prompted: Some(PlayerId(0)),
                     },
                 }),
-            "an accepted Tokens collapse is Scheduled(Conditional) — never Committed; got {:?}",
+            "an accepted Tokens collapse is Scheduled; got {:?}",
             scheduled_views.unbounded_families
         );
 
@@ -6988,9 +6975,9 @@ mod tests {
     /// (an ADJACENT-VARIANT hostile fixture: the two axes are different `ResourceAxis`
     /// variants that must nonetheless share one badge).
     ///
-    /// MUTATIONS: (a) fold with OR ("scheduled if ANY member is") ⇒ `Scheduled(Conditional)`;
+    /// MUTATIONS: (a) fold with OR ("scheduled if ANY member is") ⇒ `Scheduled`;
     /// (b) fold with AND ⇒ `Unscheduled`. (c) MATCHED POSITIVE in this same test: the same
-    /// state without the `Poison` seed yields `Scheduled(Conditional)`, so a badge that never
+    /// state without the `Poison` seed yields `Scheduled`, so a badge that never
     /// reports a schedule at all cannot pass either.
     #[test]
     fn mixed_family_is_not_scheduled() {
@@ -7060,7 +7047,7 @@ mod tests {
             counters_rows[0].state,
             FamilyCollapseState::Mixed,
             "one scheduled axis and one unscheduled axis in the same family is Mixed — an OR fold \
-             would say Scheduled(Conditional), an AND fold Unscheduled; got {:?}",
+             would say Scheduled, an AND fold Unscheduled; got {:?}",
             counters_rows[0]
         );
 
@@ -7079,27 +7066,20 @@ mod tests {
         );
         assert_eq!(
             scheduled_rows[0].state,
-            FamilyCollapseState::Scheduled {
-                certainty: CollapseCertainty::Conditional,
-                prompted: Some(p0),
-            },
+            FamilyCollapseState::Scheduled { prompted: Some(p0) },
             "matched positive: with no unscheduled sibling the counters family IS scheduled, and \
-             a batched Counters collapse is Conditional; got {:?}",
+             a batched Counters collapse is Scheduled; got {:?}",
             scheduled_rows[0]
         );
     }
 
     /// M1-c (migrated from `PlayerHud.designations.test.tsx`, where the frontend used to do this
-    /// fold): two distinct `Mana(_)` axes collapse to ONE `mana` badge, and it is `Unscheduled` —
-    /// `scheduled_display_axes` excludes `Mana(_)` because the pool is spendable throughout the
-    /// window, so no `N` bounds it. Migrating the test IS the evidence the fold moved into the
-    /// engine.
+    /// fold): two distinct `Mana(_)` axes collapse to ONE `mana` badge, and it is `Unscheduled`.
+    /// Migrating the test IS the evidence the fold moved into the engine.
     ///
     /// MUTATION: key the accumulator by `axis` instead of `family` ⇒ two mana rows ⇒ RED.
-    /// MUTATION: drop the `Mana(_)` exclusion in `scheduled_display_axes` ⇒ `Mixed` ⇒ RED.
     #[test]
     fn two_mana_axes_fold_to_one_family_row() {
-        use crate::types::game_state::PersistentAxisMaterialization;
         use crate::types::mana::ManaType;
 
         let p0 = PlayerId(0);
@@ -7111,23 +7091,6 @@ mod tests {
                 ResourceAxis::Mana(ManaType::White),
             ],
         );
-        // A DELIBERATELY HOSTILE graft. Post-`ResourceAxis::unbounded_mark_kind`, production
-        // filters `Mana(_)` out of a `DriveSequence`'s `collapsed_axes`, so NO accept can build
-        // this stash. It is constructed by hand precisely so the `scheduled_display_axes`
-        // exclusion is still exercised: the row asks "if a mana axis DID reach the announcement,
-        // would the badge fold and stay `Unscheduled`?", which is a question about the PROJECTION,
-        // not about the filter. Do not "simplify" it to match production — that vacates the row.
-        state.register_pending_materialization(
-            p0,
-            PersistentAxisMaterialization::DriveSequence {
-                sequence: vec![],
-                collapsed_axes: vec![
-                    ResourceAxis::Mana(ManaType::Green),
-                    ResourceAxis::Mana(ManaType::White),
-                ],
-            },
-        );
-
         let views = derive_views(&state, None);
         assert_eq!(
             views.unbounded_resources.len(),
@@ -7142,8 +7105,7 @@ mod tests {
                 family: UnboundedFamily::Mana,
                 state: FamilyCollapseState::Unscheduled,
             }],
-            "two mana axes are ONE mana badge, and mana is never scheduled — the pool stays \
-             spendable for the whole window"
+            "two mana axes are ONE mana badge"
         );
     }
 
@@ -7256,23 +7218,14 @@ mod tests {
             FamilyCollapseState::Unscheduled,
             FamilyCollapseState::Mixed,
             FamilyCollapseState::Scheduled {
-                certainty: CollapseCertainty::Committed,
                 prompted: Some(PlayerId(0)),
             },
+            // DIFFERENT seat from the row above — the axis the seat meet added.
             FamilyCollapseState::Scheduled {
-                certainty: CollapseCertainty::Conditional,
-                prompted: Some(PlayerId(0)),
-            },
-            // Same certainty as the row above, DIFFERENT seat — the axis the seat meet added.
-            FamilyCollapseState::Scheduled {
-                certainty: CollapseCertainty::Conditional,
                 prompted: Some(PlayerId(1)),
             },
             // ⊥ of the seat lattice, reachable only as a meet result.
-            FamilyCollapseState::Scheduled {
-                certainty: CollapseCertainty::Conditional,
-                prompted: None,
-            },
+            FamilyCollapseState::Scheduled { prompted: None },
         ];
         for x in all {
             assert_eq!(x.merge(x), x, "idempotent: {x:?}");
@@ -7294,38 +7247,28 @@ mod tests {
         // The lattice's load-bearing shape, stated so a reader need not re-derive it.
         assert_eq!(
             FamilyCollapseState::Scheduled {
-                certainty: CollapseCertainty::Committed,
                 prompted: Some(PlayerId(0)),
             }
             .merge(FamilyCollapseState::Scheduled {
-                certainty: CollapseCertainty::Conditional,
                 prompted: Some(PlayerId(0)),
             }),
             FamilyCollapseState::Scheduled {
-                certainty: CollapseCertainty::Conditional,
                 prompted: Some(PlayerId(0)),
             },
-            "two schedules keep the WEAKER certainty, and an AGREED seat survives the meet"
+            "an AGREED seat survives the meet"
         );
         assert_eq!(
             FamilyCollapseState::Scheduled {
-                certainty: CollapseCertainty::Committed,
                 prompted: Some(PlayerId(0)),
             }
             .merge(FamilyCollapseState::Scheduled {
-                certainty: CollapseCertainty::Committed,
                 prompted: Some(PlayerId(1)),
             }),
-            FamilyCollapseState::Scheduled {
-                certainty: CollapseCertainty::Committed,
-                prompted: None,
-            },
-            "two DISTINCT seats meet to ⊥ (`None` = 'two or more seats', never 'nobody') while the \
-             certainty is untouched — the seat axis and the certainty axis meet independently"
+            FamilyCollapseState::Scheduled { prompted: None },
+            "two DISTINCT seats meet to ⊥ (`None` = 'two or more seats', never 'nobody')"
         );
         assert_eq!(
             FamilyCollapseState::Scheduled {
-                certainty: CollapseCertainty::Committed,
                 prompted: Some(PlayerId(0)),
             }
             .merge(FamilyCollapseState::Unscheduled),
@@ -7989,9 +7932,8 @@ mod tests {
         );
     }
 
-    /// CR 605.4a + CR 117.3c (plan Step 6, boundary 2): `client_state_wire_value`
-    /// is the defence-in-depth boundary for direct `ClientGameStateRef::wrap`
-    /// callers that never ran `visibility::filter_state_for_viewer`.
+    /// CR 605.4a + CR 117.3c: `client_state_wire_value` is a defence-in-depth
+    /// boundary.
     ///
     /// All four projections — direct `wrap` for the prompt owner and for an
     /// opponent, and `wrap_filtered` over both filtered states — must omit both
@@ -8056,6 +7998,7 @@ mod tests {
             is_activated: false,
             ability_index: None,
             ability_cost: None,
+            activation_cost_snapshot: None,
             unavailable_modes: Vec::new(),
         };
 
@@ -8119,12 +8062,8 @@ mod tests {
         );
     }
 
-    /// `ClientGameStateRef::wrap` serializes the state it is handed, filtered
-    /// or not, so a direct caller that never ran `filter_state_for_viewer` must
-    /// still not ship the original Cube multiset to a client.
-    ///
-    /// REVERT-PROBE: drop `root.remove("booster_pack_pool")` from
-    /// `client_state_wire_value` and both envelopes carry the key and sentinel.
+    /// A `ClientGameStateRef::wrap` envelope must not ship the original Cube
+    /// multiset to a client.
     #[test]
     fn client_wire_omits_the_original_cube_booster_pool() {
         const SENTINEL: &str = "Undealt cube wire sentinel";
@@ -8140,10 +8079,6 @@ mod tests {
             "test precondition: trusted persistence keeps the source under its snake-case key"
         );
 
-        // Both iterations guard `root.remove`: `wrap` serializes the state it
-        // was handed and uses its `filter_state_for_viewer` copy only for
-        // display ids. Server frames (`filter_state_for_player`) and
-        // `wrap_filtered` callers are redacted independently by visibility.rs.
         for viewer in [None, Some(PlayerId(1))] {
             let projection = serde_json::to_value(ClientGameStateRef::wrap(&state, viewer))
                 .expect("client envelope serializes");
@@ -8990,6 +8925,110 @@ mod tests {
             }),
             "the declared set holds a Land and would classify Permanent; the narrowed offer the \
              client actually renders holds only the creature"
+        );
+    }
+
+    fn shared_piles_wire(state: &GameState, viewer: Option<PlayerId>) -> serde_json::Value {
+        let filtered = match viewer {
+            Some(viewer) => crate::game::visibility::filter_state_for_viewer(state, viewer),
+            None => state.clone(),
+        };
+        let wire =
+            serde_json::to_value(ClientGameStateRef::wrap_filtered(state, &filtered, viewer))
+                .expect("serialize client state");
+        wire["derived"].clone()
+    }
+
+    #[test]
+    fn shared_piles_names_the_holder_for_a_shared_zone_format() {
+        let mut state = GameState::new(FormatConfig::dandan(), 2, 42);
+        let both = Some(SharedPilesView {
+            library: Some(PlayerId(0)),
+            graveyard: Some(PlayerId(0)),
+        });
+        assert_eq!(derive_views(&state, None).shared_piles, both);
+        let json = serde_json::to_value(derive_views(&state, None)).unwrap();
+        assert_eq!(
+            json["shared_piles"],
+            serde_json::json!({"library": 0, "graveyard": 0})
+        );
+
+        // The descriptor and the storage accessor agree on the holder.
+        let card = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Seat One Card".to_string(),
+            Zone::Library,
+        );
+        state.library_of_mut(PlayerId(1)).push_back(card);
+        assert!(state.players[0].library.contains(&card));
+        assert!(state.players[1].library.is_empty());
+    }
+
+    #[test]
+    fn shared_piles_is_absent_for_per_player_formats() {
+        let standard = GameState::new(FormatConfig::standard(), 2, 42);
+        assert_eq!(derive_views(&standard, None).shared_piles, None);
+        let json = serde_json::to_value(derive_views(&standard, None)).unwrap();
+        assert!(json.get("shared_piles").is_none());
+        let commander = GameState::new(FormatConfig::commander(), 2, 42);
+        assert_eq!(derive_views(&commander, None).shared_piles, None);
+        // Reach-guard: the same function answers `Some` for the shared format.
+        assert!(
+            derive_views(&GameState::new(FormatConfig::dandan(), 2, 42), None)
+                .shared_piles
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn shared_piles_survives_every_viewer_projection() {
+        let state = GameState::new(FormatConfig::dandan(), 2, 42);
+        for viewer in [Some(PlayerId(0)), Some(PlayerId(1)), None] {
+            assert_eq!(
+                shared_piles_wire(&state, viewer)["shared_piles"],
+                serde_json::json!({"library": 0, "graveyard": 0}),
+                "viewer {viewer:?}"
+            );
+        }
+        let local = serde_json::to_value(ClientGameStateRef::wrap(&state, Some(PlayerId(1))))
+            .expect("serialize local client state");
+        assert_eq!(
+            local["derived"]["shared_piles"],
+            serde_json::json!({"library": 0, "graveyard": 0})
+        );
+    }
+
+    #[test]
+    fn shared_piles_holder_is_the_lowest_seat_not_the_first_in_turn_order() {
+        let mut state = GameState::new(FormatConfig::dandan(), 2, 42);
+        state.seat_order = vec![PlayerId(1), PlayerId(0)];
+        assert_eq!(
+            derive_views(&state, None).shared_piles.unwrap().library,
+            Some(PlayerId(0))
+        );
+    }
+
+    #[test]
+    fn debug_library_projection_reads_the_shared_pile_for_the_non_holder_seat() {
+        let mut state = GameState::new(FormatConfig::dandan(), 2, 42);
+        state.debug_mode = true;
+        state.debug_permitted.insert(PlayerId(1));
+        let card = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Shared Pile Card".to_string(),
+            Zone::Library,
+        );
+        let views = derive_views(&state, Some(PlayerId(1)));
+        assert_eq!(
+            views.debug_library_cards,
+            vec![DebugLibraryCardView {
+                object_id: card,
+                name: "Shared Pile Card".to_string(),
+            }]
         );
     }
 }

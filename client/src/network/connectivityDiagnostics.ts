@@ -1,12 +1,19 @@
-import Peer, { type DataConnection } from "peerjs";
-
 import { connectionFailureSnapshot, fetchFreshTurnConfig, PEER_CONNECT_OPTIONS, safeConnectionError, safePeerError, TurnCredentialError } from "./connection";
+import { createPeer, selectPeerTransportFactory } from "./transport";
+import type { TransportConnection, TransportPeer } from "./transport";
 import { boundedDiagnosticProbe, projectCandidateStats, type DiagnosticProbeEvidence, type DiagnosticResult } from "../services/troubleshooting";
 
 const CHALLENGE = "phase-relay-check-v1";
 const CREDENTIAL_TIMEOUT_MS = 8_000;
 const SIGNALING_TIMEOUT_MS = 10_000;
 const RELAY_TIMEOUT_MS = 15_000;
+
+class DiagnosticStageTimeout extends Error {
+  constructor() {
+    super("timeout");
+    this.name = "DiagnosticStageTimeout";
+  }
+}
 
 /** An isolated PeerJS/BinaryPack round trip, using the game's signaling defaults. */
 export async function runConnectivityDiagnostics(signal: AbortSignal): Promise<DiagnosticResult[]> {
@@ -41,8 +48,8 @@ export async function runConnectivityDiagnostics(signal: AbortSignal): Promise<D
     signal.removeEventListener("abort", abortFetch);
   }
   signal.throwIfAborted();
-  const peers: Peer[] = [];
-  const connections: DataConnection[] = [];
+  const peers: TransportPeer[] = [];
+  const connections: TransportConnection[] = [];
   const removeListeners: (() => void)[] = [];
   const iceErrorCodes = new Set<number>();
   let relayCandidates = 0;
@@ -51,19 +58,19 @@ export async function runConnectivityDiagnostics(signal: AbortSignal): Promise<D
   let failStage: (error: unknown) => void = () => {};
   const onAbort = () => failStage(signal.reason);
   signal.addEventListener("abort", onAbort, { once: true });
-  const closeConnection = (connection: DataConnection) => { try { connection.close(); } catch { /* Continue disposing the remaining resources. */ } };
+  const closeConnection = (connection: TransportConnection) => { try { connection.close(); } catch { /* Continue disposing the remaining resources. */ } };
   const stage = <T>(timeoutMs: number, start: (resolve: (value: T) => void, reject: (error: unknown) => void) => void): Promise<T> => new Promise((resolve, reject) => {
     let finished = false;
     const finish = (done: () => void) => { if (finished || stopped) return; finished = true; clearTimeout(timer); done(); };
     failStage = (error) => finish(() => reject(error));
-    timer = setTimeout(() => failStage(new Error("timeout")), timeoutMs);
+    timer = setTimeout(() => failStage(new DiagnosticStageTimeout()), timeoutMs);
     try { signal.throwIfAborted(); start((value) => finish(() => resolve(value)), failStage); }
     catch (error) { failStage(error); }
   });
   let relayPeerError: ReturnType<typeof safePeerError> | undefined;
   let connectionFailure: DiagnosticProbeEvidence = {};
   const evidence = () => ({ ...connectionFailure, iceErrorCodes: [...iceErrorCodes], relayCandidates, ...(relayPeerError ? { peerError: relayPeerError } : {}) });
-  const rejectIncoming = (connection: DataConnection) => closeConnection(connection);
+  const rejectIncoming = (connection: TransportConnection) => closeConnection(connection);
   let signalingFailure: ReturnType<typeof safePeerError> | undefined;
   try {
     const ids = [crypto.randomUUID(), crypto.randomUUID()].map((id) => `phase-diagnostics-${id}`);
@@ -71,8 +78,12 @@ export async function runConnectivityDiagnostics(signal: AbortSignal): Promise<D
     let registered = 0;
     try {
       await stage<void>(SIGNALING_TIMEOUT_MS, (resolve, reject) => {
-        for (const id of ids) {
-          const peer = new Peer(id, { config: { ...config, iceTransportPolicy: "relay" } });
+        for (const [index, id] of ids.entries()) {
+          const factory = selectPeerTransportFactory({
+            role: index === 0 ? "guest" : "host",
+            hostPeerId: ids[1],
+          });
+          const peer = createPeer(id, { config: { ...config, iceTransportPolicy: "relay" } }, factory);
           peers.push(peer);
           const onError = (error: unknown) => {
             const type = safePeerError(error);
@@ -96,7 +107,7 @@ export async function runConnectivityDiagnostics(signal: AbortSignal): Promise<D
       add("signaling", "pass", "signalingReady", signalingStarted);
     } catch (error) {
       signal.throwIfAborted();
-      add("signaling", "error", registered < 2 && !signalingFailure && error instanceof Error && error.message === "timeout" ? "signalingTimeout" : "signalingFailed", signalingStarted, { peerError: signalingFailure ?? safePeerError(error) });
+      add("signaling", "error", registered < 2 && !signalingFailure && error instanceof DiagnosticStageTimeout ? "signalingTimeout" : "signalingFailed", signalingStarted, { peerError: signalingFailure ?? safePeerError(error) });
       add("relay", "unavailable", "prerequisiteFailed", Date.now());
       return results;
     }
@@ -109,7 +120,7 @@ export async function runConnectivityDiagnostics(signal: AbortSignal): Promise<D
     const route: { candidates: ReturnType<typeof projectCandidateStats> } = { candidates: null };
     try {
       await stage<void>(RELAY_TIMEOUT_MS, (resolve, reject) => {
-        const observe = (connection: DataConnection) => {
+        const observe = (connection: TransportConnection) => {
           connections.push(connection);
           const onError = (error: unknown) => {
             connectionFailure = { connectionError: safeConnectionError(error), connectionState: connectionFailureSnapshot(connection) };
@@ -128,11 +139,11 @@ export async function runConnectivityDiagnostics(signal: AbortSignal): Promise<D
           pc?.addEventListener("icecandidateerror", onIceError);
           removeListeners.push(() => { pc?.removeEventListener("icecandidate", onCandidate); pc?.removeEventListener("icecandidateerror", onIceError); });
         };
-        const send = (connection: DataConnection) => {
+        const send = (connection: TransportConnection) => {
           try { void Promise.resolve(connection.send(CHALLENGE)).catch(reject); }
           catch (error) { reject(error); }
         };
-        const onIncoming = (connection: DataConnection) => {
+        const onIncoming = (connection: TransportConnection) => {
           if (stopped || connection.peer !== ids[0] || connections.length > 1) { closeConnection(connection); return; }
           observe(connection);
           let replied = false;
@@ -156,9 +167,10 @@ export async function runConnectivityDiagnostics(signal: AbortSignal): Promise<D
           if (data !== CHALLENGE) { reject(new Error("payload")); return; }
           echoed = true;
           // Only selected-pair evidence can certify the relay round trip.
+          const peerConnection = outgoing.peerConnection;
           void Promise.resolve().then(() => {
-            if (stopped || signal.aborted || outgoing.peerConnection.signalingState === "closed") return null;
-            return outgoing.peerConnection.getStats();
+            if (stopped || signal.aborted || !peerConnection || peerConnection.signalingState === "closed") return null;
+            return peerConnection.getStats();
           }).then((stats) => {
             if (stopped) return;
             route.candidates = stats ? projectCandidateStats(stats) : null;
