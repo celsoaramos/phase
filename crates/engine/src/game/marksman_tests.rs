@@ -240,3 +240,66 @@ fn sequential_payment_snapshot_round_trips_mid_loop() {
         WaitingFor::OptionalEffectChoice { .. }
     ));
 }
+
+/// CR 603.12a + CR 608.2c through the REAL stack. Found in MagicFinder AI x AI games
+/// (4 of 6 with Hawkeye froze in declare attackers): the trigger resolves via
+/// `resolve_top`, which installs `resolving_stack_entry`; the completed payment
+/// frame (K retained for the reflexive modal) was only discarded by the prelude
+/// of the NEXT top-level resolution — which `resolve_top` refused to begin while
+/// the parent's carrier was still installed, and the carrier could not settle
+/// while that frame was live. Every pass returned the same priority window.
+/// `hawkeye_runtime` resolves the chain directly and never installs a carrier.
+#[test]
+fn hawkeye_attack_trigger_through_the_stack_resolves_its_reflexive() {
+    use crate::game::combat::AttackTarget;
+    use crate::types::phase::Phase;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_life(P1, 20);
+    let hawkeye = scenario
+        .add_creature_from_oracle(P0, "Hawkeye, Master Marksman", 3, 3, HAWKEYE_ORACLE)
+        .id();
+    // Lands, not a pool: the pool empties between steps (CR 500.4).
+    scenario.add_basic_land(P0, crate::types::mana::ManaColor::Red);
+    scenario.add_basic_land(P0, crate::types::mana::ManaColor::Red);
+    let mut runner = scenario.build();
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(hawkeye, AttackTarget::Player(P1))])
+        .expect("Hawkeye attacks and becomes tapped");
+
+    let mut paid = false;
+    let mut targeted = false;
+    for step in 0..80 {
+        let action = match &runner.state().waiting_for {
+            WaitingFor::OptionalEffectChoice { .. } => {
+                let accept = !paid;
+                paid = true;
+                GameAction::DecideOptionalEffect { accept }
+            }
+            WaitingFor::AbilityModeChoice { .. } => GameAction::SelectModes { indices: vec![1] },
+            WaitingFor::TriggerTargetSelection { .. } | WaitingFor::TargetSelection { .. } => {
+                targeted = true;
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Player(P1)),
+                }
+            }
+            // Measure as soon as the reflexive is gone, before combat damage.
+            WaitingFor::Priority { .. } if targeted && runner.state().stack.is_empty() => break,
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            other => panic!("step {step}: unexpected wait {other:?}"),
+        };
+        runner.act(action).expect("legal step");
+        assert!(
+            step < 79,
+            "the reflexive never resolved; stack = {:?}",
+            runner.stack_names()
+        );
+    }
+    assert_eq!(runner.state().players[1].life, 18, "Explosive deals 2");
+    assert!(
+        runner.state().resolving_stack_entry.is_none(),
+        "the parent's carrier was released"
+    );
+}
