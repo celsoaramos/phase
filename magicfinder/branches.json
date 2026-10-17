@@ -210,5 +210,8 @@
   },
   {
     "branch": "card/delayed-trigger-projection-token"
+  },
+  {
+    "branch": "card/baleful-mastery-printed-cost"
   }
 ]
