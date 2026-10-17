@@ -1012,10 +1012,17 @@ pub fn install_delayed_trigger(
             trigger.ability.effect.clone(),
         );
     }
-    let token = DelayedTriggerToken(state.next_delayed_trigger_token);
-    state.next_delayed_trigger_token = state.next_delayed_trigger_token.saturating_add(1);
-    let instance = DelayedTriggerInstanceId(state.next_delayed_trigger_instance);
-    state.next_delayed_trigger_instance = state.next_delayed_trigger_instance.saturating_add(1);
+    // CR 603.7: identities start at 1 — 0 is the "no provenance" value that
+    // `apply_resolved_delayed_trigger` refuses (`ZeroProvenance`). A viewer
+    // projection (`filter_state_for_viewer`) zeroes both allocators, and the
+    // viewer interaction runs payability simulations ON that projection: Opal
+    // Palace's "{1}, {T}" scan auto-taps a Brass Infiniscope, whose mana ability
+    // installs a delayed trigger, and the snapshot panicked. Minting from at
+    // least 1 keeps every clone's install valid without un-redacting the counter.
+    let token = DelayedTriggerToken(state.next_delayed_trigger_token.max(1));
+    state.next_delayed_trigger_token = token.0.saturating_add(1);
+    let instance = DelayedTriggerInstanceId(state.next_delayed_trigger_instance.max(1));
+    state.next_delayed_trigger_instance = instance.0.saturating_add(1);
     trigger.provenance = DelayedInstallIdentity::ReceiptEligible(DelayedTriggerOrigin {
         token,
         instance,
@@ -51041,5 +51048,66 @@ mod pending_trigger_pin_reassignment_tests {
             Some(expected),
             "assigning an unpinned ability must rebind the pin from the entry's own trigger event"
         );
+    }
+}
+
+#[cfg(test)]
+mod delayed_trigger_projection_token_tests {
+    use crate::game::visibility::filter_state_for_viewer;
+    use crate::types::ability::{
+        DelayedTriggerCondition, DelayedTriggerLifetime, Effect, QuantityExpr, ResolvedAbility,
+        TargetFilter, TriggerDefinition,
+    };
+    use crate::types::game_state::{DelayedTrigger, GameState};
+    use crate::types::identifiers::ObjectId;
+    use crate::types::player::PlayerId;
+    use crate::types::triggers::TriggerMode;
+
+    /// CR 603.7: the viewer projection zeroes the delayed-trigger allocators,
+    /// and the viewer interaction runs mana-payability simulations ON that
+    /// projection. Found in a MagicFinder Commander game (v0.110.0): scanning
+    /// Opal Palace's "{1}, {T}" auto-tapped a Brass Infiniscope inside the
+    /// simulation, its mana ability installed "when you next cast a spell with
+    /// {X}" with token 0, and `install_delayed_trigger` panicked
+    /// (`ZeroProvenance`) — the snapshot, and the WASM instance, died.
+    ///
+    /// Revert-failing: minting `next_delayed_trigger_token` as-is panics here.
+    #[test]
+    fn a_projection_with_zeroed_allocators_still_installs_a_delayed_trigger() {
+        let state = GameState::new_two_player(42);
+        let mut projection = filter_state_for_viewer(&state, PlayerId(0));
+        assert_eq!(
+            projection.next_delayed_trigger_token, 0,
+            "the projection redacts the allocator"
+        );
+
+        let source = ObjectId(9300);
+        let delayed = DelayedTrigger::new(
+            DelayedTriggerCondition::WhenNextEvent {
+                trigger: Box::new(TriggerDefinition::new(TriggerMode::SpellCast)),
+                or_trigger: None,
+                lifetime: DelayedTriggerLifetime::ThisTurn,
+            },
+            Box::new(ResolvedAbility::new(
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                vec![],
+                source,
+                PlayerId(0),
+            )),
+            PlayerId(0),
+            source,
+            true,
+        );
+        super::install_delayed_trigger(&mut projection, delayed, &mut Vec::new());
+
+        let origin = projection.delayed_triggers[0]
+            .provenance
+            .origin()
+            .expect("a live install mints a receipt root");
+        assert!(origin.token.0 >= 1 && origin.instance.0 >= 1);
+        assert_eq!(projection.next_delayed_trigger_token, origin.token.0 + 1);
     }
 }
