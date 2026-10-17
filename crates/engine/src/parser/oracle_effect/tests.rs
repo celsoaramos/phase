@@ -14380,6 +14380,33 @@ fn effect_copy_spell_retarget_descends_through_delayed_trigger() {
     );
 }
 
+/// CR 707.10 + CR 608.2k: "copy IT" in a when-next-cast delayed trigger names the
+/// spell that fired it — there is no parent target. As `ParentTarget` it fell to
+/// `stack.last()` at resolution and, with two such triggers stacked, copied the
+/// other trigger forever (Summon: G.F. Cerberus, in a MagicFinder game).
+#[test]
+fn when_next_cast_copy_it_binds_the_triggering_spell() {
+    let def = parse_effect_chain(
+        "When you next cast an instant or sorcery spell this turn, copy it. \
+             You may choose new targets for the copy.",
+        AbilityKind::Spell,
+    );
+    let Effect::CreateDelayedTrigger { effect: inner, .. } = &*def.effect else {
+        panic!("expected CreateDelayedTrigger, got {:?}", def.effect);
+    };
+    assert!(
+        matches!(
+            *inner.effect,
+            Effect::CopySpell {
+                target: TargetFilter::TriggeringSource,
+                ..
+            }
+        ),
+        "expected CopySpell on the triggering spell, got {:?}",
+        inner.effect
+    );
+}
+
 // ── CR 707.10c: copy-retarget binding across an intervening clause ──────────
 //
 // A "you may choose new targets for the copy/copies" sentence grants the copy's

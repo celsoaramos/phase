@@ -2870,6 +2870,19 @@ fn lift_generic_effect_parent_target_to_triggering_source_in_ability(
                 }
             }
         }
+        // CR 707.10 + CR 608.2k: "when you next cast an instant or sorcery spell this
+        // turn, copy IT" (Summon: G.F. Cerberus, Najal, Rimefire Torque, Adaptive
+        // Training Post) — the same missing parent target. Left as `ParentTarget`,
+        // `copy_spell::copy_source_entry` reaches its last fallback, `stack.last()`,
+        // which is the spell only by luck: with two of these delayed triggers on the
+        // stack (Cerberus's chapters II and III, or a Rhystic Study trigger above the
+        // spell) the top entry is the OTHER trigger, the copy duplicates that trigger,
+        // and the copy copies again — an endless loop measured in a MagicFinder game.
+        if let Effect::CopySpell { target, .. } = link.effect.as_mut() {
+            if matches!(target, TargetFilter::ParentTarget) {
+                *target = TargetFilter::TriggeringSource;
+            }
+        }
         node = link.sub_ability.as_deref_mut();
     }
 }
