@@ -159,6 +159,8 @@ pub enum PolicyId {
     CrewTiming,
     CombatWithdrawal,
     CommanderZoneReturn,
+    /// CR 603.5 + CR 608.2d: accept the AI's own beneficial "you may" instruction.
+    OptionalBenefitAccept,
     /// CR 608.2c: "return a land you control" self-bounce target choice.
     SelfBounceTarget,
     /// CR 601.2f: deploy a "spells you cast cost less" engine before the spells
@@ -415,6 +417,7 @@ impl Default for PolicyRegistry {
             Box::new(PlusOneCountersPolicy),
             Box::new(SpellslingerCastingPolicy),
             Box::new(CommanderZoneReturnPolicy),
+            Box::new(super::optional_benefit_accept::OptionalBenefitAcceptPolicy),
             Box::new(ReactiveSelfProtectionPolicy),
             Box::new(SacrificeCostManaGatePolicy),
             Box::new(SacrificeLandProtectionPolicy),
