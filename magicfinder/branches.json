@@ -216,5 +216,8 @@
   },
   {
     "branch": "card/baleful-mastery-printed-cost"
+  },
+  {
+    "branch": "ai/conditional-destroy-gate"
   }
 ]
