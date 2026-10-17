@@ -4977,6 +4977,27 @@ fn starts_independent_instruction(node: &ResolvedAbility) -> bool {
     }
 }
 
+/// CR 608.2c: the chain node a head whose own condition is FALSE hands off to.
+/// The direct sub, when it starts the next printed instruction or survives a
+/// false parent gate; otherwise the head's own resolution steps
+/// (`ContinuationStep`) are skipped with it and the walk resumes at the next
+/// printed instruction. Without the walk, a gated head made of several nodes
+/// swallowed every later instruction: Baleful Mastery's "If the {1}{B} cost was
+/// paid, an opponent draws a card. Exile target creature or planeswalker." is
+/// `Choose(Opponent) {gate} -> Draw (step) -> ChangeZone (sibling)`, and casting
+/// it for its printed cost exiled nothing. The caller still applies its own
+/// predicate to the node returned here.
+fn false_gate_handoff(ability: &ResolvedAbility) -> Option<&ResolvedAbility> {
+    let direct = ability.sub_ability.as_deref()?;
+    if starts_independent_instruction(direct) || sub_outlives_false_parent_gate(direct) {
+        return Some(direct);
+    }
+    std::iter::successors(direct.sub_ability.as_deref(), |node| {
+        node.sub_ability.as_deref()
+    })
+    .find(|node| starts_independent_instruction(node))
+}
+
 /// CR 608.2c: the "if you do" gate `gate` reduced to what still happens after
 /// the optional action before it was DECLINED: `gate` itself, whose own
 /// condition reads false on the decline path so its own effect never runs,
@@ -16356,7 +16377,7 @@ fn resolve_chain_body(
                     return Ok(());
                 }
                 resolve_ability_chain(state, &else_resolved, events, depth + 1)?;
-            } else if let Some(ref sub) = ability.sub_ability {
+            } else if let Some(sub) = false_gate_handoff(ability) {
                 // CR 608.2c: A skipped `IfYouDo` head whose effect
                 // did not happen must still hand off to a paired `Not(IfYouDo)`
                 // continuation. The head's own condition gates only the head's
@@ -16444,7 +16465,7 @@ fn resolve_chain_body(
                     || (sub.sub_link == SubAbilityLink::SequentialSibling
                         && (sub.condition.is_none() || is_ordinal_sequential_sibling))
                 {
-                    let mut sub_resolved = sub.as_ref().clone();
+                    let mut sub_resolved = sub.clone();
                     // CR 608.2d: a `Resolution`-timed sub makes its OWN
                     // untargeted choice at its own resolution (see the
                     // interactive `PutCounter` recipient prompt in this
