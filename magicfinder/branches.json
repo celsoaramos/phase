@@ -235,5 +235,8 @@
   },
   {
     "branch": "ai/x-repeat-and-zero-x"
+  },
+  {
+    "branch": "ai/tap-ability-timing"
   }
 ]
