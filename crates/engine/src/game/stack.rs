@@ -2462,17 +2462,29 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         // it (`deliver_deferred_spell`). A permanent spell keeps its earlier
         // handling: it stays where it is.
         //
-        // CR 608.2n + CR 616.1: the same holds for a spell paused on any other
-        // choice its instructions asked for ("you may …", a search). Moving it
-        // now would run its graveyard move under the pending choice, and a
-        // CR 616.1 ordering prompt for that move (two Rest in Peace) would
-        // overwrite the prompt its resolution is still waiting on.
+        // CR 608.2n + CR 616.1: a spell paused on another of its own choices
+        // ("you may …", a search) is held the same way when its move would
+        // itself ask a question (two Rest in Peace: the CR 616.1 order) —
+        // that prompt would overwrite the one its resolution still waits on.
+        // Probed on a copy so a move that needs no choice keeps its timing.
         let paused_on_resolution_choice = !matches!(
             state.waiting_for,
             WaitingFor::Priority { .. } | WaitingFor::GameOver { .. }
         );
         let delivery_held = paused_on_free_cast_window
-            || (paused_on_resolution_choice && dest != Zone::Battlefield);
+            || (paused_on_resolution_choice
+                && dest != Zone::Battlefield
+                && spell_still_on_stack(state, entry.id)
+                && !matches!(
+                    deliver_resolved_spell_off_stack(
+                        &mut state.clone(),
+                        entry.id,
+                        entry.controller,
+                        dest,
+                        &mut Vec::new(),
+                    ),
+                    ZoneMoveResult::Done
+                ));
         if delivery_held && dest != Zone::Battlefield {
             state.deferred_spell_delivery = Some(crate::types::game_state::DeferredSpellDelivery {
                 object_id: entry.id,
