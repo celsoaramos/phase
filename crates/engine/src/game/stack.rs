@@ -2461,7 +2461,19 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         // destination selected above; the continuation's completion delivers
         // it (`deliver_deferred_spell`). A permanent spell keeps its earlier
         // handling: it stays where it is.
-        if paused_on_free_cast_window && dest != Zone::Battlefield {
+        //
+        // CR 608.2n + CR 616.1: the same holds for a spell paused on any other
+        // choice its instructions asked for ("you may …", a search). Moving it
+        // now would run its graveyard move under the pending choice, and a
+        // CR 616.1 ordering prompt for that move (two Rest in Peace) would
+        // overwrite the prompt its resolution is still waiting on.
+        let paused_on_resolution_choice = !matches!(
+            state.waiting_for,
+            WaitingFor::Priority { .. } | WaitingFor::GameOver { .. }
+        );
+        let delivery_held = paused_on_free_cast_window
+            || (paused_on_resolution_choice && dest != Zone::Battlefield);
+        if delivery_held && dest != Zone::Battlefield {
             state.deferred_spell_delivery = Some(crate::types::game_state::DeferredSpellDelivery {
                 object_id: entry.id,
                 destination: dest,
@@ -2992,7 +3004,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
             // the source via `SelfRef`), the post-resolution default move must
             // be skipped — otherwise the spell card travels exile→graveyard
             // and undoes its own self-exile clause (issue #323).
-            if !paused_on_free_cast_window && spell_still_on_stack(state, entry.id) {
+            if !delivery_held && spell_still_on_stack(state, entry.id) {
                 // CR 608.2n + CR 614.6: route the spell's stack → graveyard/exile
                 // default move through the pipeline — see
                 // `deliver_resolved_spell_off_stack`.
@@ -3026,7 +3038,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
             }
         }
 
-        if !paused_on_free_cast_window {
+        if !delivery_held {
             finish_spell_stack_exit(state, entry.id, casting_variant, events);
         }
 
