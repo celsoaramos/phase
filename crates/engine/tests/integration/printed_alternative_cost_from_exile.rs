@@ -12,7 +12,7 @@
 //! NOT reach a cast whose authority already replaces the mana cost ("without
 //! paying its mana cost").
 
-use engine::game::casting::can_cast_object_now;
+use engine::game::casting::{can_cast_object_now, current_casting_variant_choice_options};
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
     CardPlayMode, CastCostModifier, CastingPermission, ContinuousModification, Duration,
@@ -634,10 +634,15 @@ fn face_down_fireblast_board(
 /// Printed sacrifice keeps Normal available, but cannot pay the face-down {3}.
 #[test]
 fn late_preview_only_uses_the_printed_option_for_normal_casts() {
+    let offers_face_down = |runner: &GameRunner, fireblast: ObjectId| {
+        current_casting_variant_choice_options(runner.state(), P0, fireblast)
+            .iter()
+            .any(|option| option.variant == CastingVariant::FaceDown)
+    };
+
     // Reach guard: with three mana and no Mountains the face-down {3} is the
     // only payable method, so this impulse grant does reach the face-down
-    // cast. The two-mana board below therefore pins the Normal-only guard
-    // rather than passing because face-down is never offered from exile.
+    // cast from exile.
     let (mut runner, fireblast, _) = face_down_fireblast_board(3, 0);
     assert!(can_cast_object_now(runner.state(), P0, fireblast));
     cast(&mut runner, fireblast, None);
@@ -645,7 +650,14 @@ fn late_preview_only_uses_the_printed_option_for_normal_casts() {
     assert_eq!(runner.state().objects[&fireblast].zone, Zone::Stack);
     assert!(runner.state().players[0].mana_pool.is_empty());
 
+    // Same two Mountains, only the mana differs: the face-down option is
+    // offered exactly when its own {3} is payable. With two mana the printed
+    // sacrifice must not stand in for the face-down cost (the Normal-only
+    // guard on the printed alternative).
+    let (runner, fireblast, _) = face_down_fireblast_board(3, 2);
+    assert!(offers_face_down(&runner, fireblast));
     let (mut runner, fireblast, mountains) = face_down_fireblast_board(2, 2);
+    assert!(!offers_face_down(&runner, fireblast));
     assert!(can_cast_object_now(runner.state(), P0, fireblast));
     let card_id = runner.state().objects[&fireblast].card_id;
     runner
