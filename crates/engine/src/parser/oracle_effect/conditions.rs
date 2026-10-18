@@ -20,8 +20,8 @@ use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_nom::quantity as nom_quantity;
 use super::super::oracle_quantity::{canonicalize_quantity_ref, parse_cda_quantity};
 use super::super::oracle_target::{
-    parse_target, parse_type_phrase_folding, parse_zone_word, peek_zone_boundary,
-    slot_matches_anaphor, slot_zone_class, AnaphorNoun, AnaphorZoneClass,
+    parse_target, parse_type_phrase_folding, parse_type_phrase_folding_with_ctx, parse_zone_word,
+    peek_zone_boundary, slot_matches_anaphor, slot_zone_class, AnaphorNoun, AnaphorZoneClass,
 };
 use super::super::oracle_util::{parse_comparison_suffix, parse_subtype, TextPair};
 #[cfg(test)]
@@ -1885,7 +1885,10 @@ fn parse_its_a_card_type_gate_body<'a>(
     // with TargetMatchesFilter (the same condition variant the sibling MV arms use).
     if type_word == "permanent" {
         let (mut filter, leftover) =
-            crate::parser::oracle_target::parse_type_phrase_folding("permanent card");
+            crate::parser::oracle_target::parse_type_phrase_folding_with_ctx(
+                "permanent card",
+                &mut ctx.clone_player_antecedents(),
+            );
         if !matches!(filter, TargetFilter::Any) && leftover.trim().is_empty() {
             let (after_type, chosen_type) = if let Ok((rest_after_chosen, _)) =
                 tag::<_, _, OracleError<'_>>(" of the chosen type").parse(after_type)
@@ -3102,7 +3105,8 @@ pub(super) fn strip_property_conditional(
     ] {
         if let Some((before, after)) = tp.rsplit_around(pattern) {
             let type_text = after.lower.trim_end_matches('.').trim();
-            let (filter, leftover) = parse_type_phrase_folding(type_text);
+            let (filter, leftover) =
+                parse_type_phrase_folding_with_ctx(type_text, &mut ctx.clone_player_antecedents());
             if !matches!(filter, TargetFilter::Any) && leftover.trim().is_empty() {
                 return (
                     Some(AbilityCondition::TargetMatchesFilter {
@@ -5986,6 +5990,9 @@ pub(crate) fn static_condition_to_ability_condition(
 ) -> Option<AbilityCondition> {
     match sc {
         StaticCondition::DuringYourTurn => Some(AbilityCondition::IsYourTurn),
+        // CR 500.8 + CR 506.1 + CR 608.2c: the shared phase-occurrence gate
+        // bridges 1:1 (the possessive composition arrives as an `And`).
+        StaticCondition::FirstCombatPhaseOfTurn => Some(AbilityCondition::FirstCombatPhaseOfTurn),
         StaticCondition::QuantityComparison {
             lhs,
             comparator,
@@ -6018,6 +6025,11 @@ pub(crate) fn static_condition_to_ability_condition(
             player: PlayerScope::Controller,
         } => Some(AbilityCondition::IsMonarch),
         StaticCondition::IsMonarch { .. } => None,
+        // Digital-only Alchemy (no CR entry): no `AbilityCondition` boon
+        // variant exists — "if you have a boon" is printed only as a
+        // trigger intervening-if (Underbridge Warlock), which bridges to
+        // `TriggerCondition::HasBoon` instead.
+        StaticCondition::HasBoon { .. } => None,
         StaticCondition::IsInitiative => Some(AbilityCondition::IsInitiative),
         StaticCondition::HasCityBlessing => Some(AbilityCondition::HasCityBlessing),
         // CR 702.195b: The enduring story designation is available to effects.
@@ -7153,12 +7165,12 @@ fn try_unrouted_nom_condition_tail(text: &str, ctx: &mut ParseContext) -> Option
         return Some(AbilityCondition::DayNightIsNeither);
     }
 
-    if tag::<_, _, OracleError<'_>>("it's the first combat phase of the turn")
-        .parse(lower.as_str())
-        .is_ok()
-    {
-        return Some(AbilityCondition::FirstCombatPhaseOfTurn);
-    }
+    // CR 500.8 + CR 506.1 + CR 109.5 + CR 608.2c: "it's the first combat phase
+    // of [the|your] turn" is recognized by the shared `parse_inner_condition`
+    // authority (`parse_first_combat_phase_of_turn`) and lowered through the
+    // generic fallback below, which requires the whole condition to be
+    // consumed. The possessive axis composes `IsYourTurn` there (CR 109.5), so
+    // no effect-local arm is needed.
 
     // CR 500.8 + CR 513.1: "it's the first end step of the turn" — end-step
     // sibling of the combat-phase gate above (Y'shtola Rhul's loop guard).
@@ -7362,7 +7374,10 @@ fn try_unrouted_nom_condition_tail(text: &str, ctx: &mut ParseContext) -> Option
                 .trim_end_matches(" card")
                 .trim();
             let (filter, leftover) =
-                crate::parser::oracle_target::parse_type_phrase_folding(type_text);
+                crate::parser::oracle_target::parse_type_phrase_folding_with_ctx(
+                    type_text,
+                    &mut ctx.clone_player_antecedents(),
+                );
             if !matches!(filter, TargetFilter::Any) && leftover.trim().is_empty() {
                 return Some(maybe_negate(
                     AbilityCondition::TargetMatchesFilter {
@@ -7449,7 +7464,10 @@ fn try_unrouted_nom_condition_tail(text: &str, ctx: &mut ParseContext) -> Option
         // in lockstep with strip_card_type_conditional's "permanent" arm.
         if rest == "permanent" {
             let (filter, leftover) =
-                crate::parser::oracle_target::parse_type_phrase_folding("permanent card");
+                crate::parser::oracle_target::parse_type_phrase_folding_with_ctx(
+                    "permanent card",
+                    &mut ctx.clone_player_antecedents(),
+                );
             if !matches!(filter, TargetFilter::Any) && leftover.trim().is_empty() {
                 return Some(maybe_negate(
                     AbilityCondition::TargetMatchesFilter {
@@ -7534,7 +7552,10 @@ fn try_unrouted_nom_condition_tail(text: &str, ctx: &mut ParseContext) -> Option
         // with empty leftover). Those belong to RevealedHasCardType, not the
         // present-target TargetMatchesFilter, so this arm fires only when the parsed
         // filter genuinely references a CR 205.3 subtype.
-        let (filter, leftover) = crate::parser::oracle_target::parse_type_phrase_folding(rest);
+        let (filter, leftover) = crate::parser::oracle_target::parse_type_phrase_folding_with_ctx(
+            rest,
+            &mut ctx.clone_player_antecedents(),
+        );
         if let TargetFilter::Typed(typed) = &filter {
             if leftover.trim().is_empty()
                 && typed
@@ -8438,7 +8459,10 @@ fn parse_objects_share_quality_reference<'a>(
             &text[offset..],
         ));
     }
-    let (filter, rest) = crate::parser::oracle_target::parse_target(text);
+    let (filter, rest) = crate::parser::oracle_target::parse_target_with_ctx(
+        text,
+        &mut ctx.clone_player_antecedents(),
+    );
     if matches!(filter, TargetFilter::Any) {
         return None;
     }
