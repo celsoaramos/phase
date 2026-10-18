@@ -1328,7 +1328,15 @@ fn counter_choice_root(state: &GameState) -> Option<CounterAnnouncementRoot> {
         WaitingFor::ChooseXValue { pending_cast, .. } => {
             // CR 107.3a + CR 107.3k: the reducer consumes the canonical pending
             // activation/spell X, independently of the source object's cast X.
-            if state.pending_cast.as_deref()? != pending_cast.as_ref()
+            // `PendingCast`'s derived `PartialEq` includes the crate-private
+            // activation-trigger carrier, which the engine keeps on only one
+            // live owner (#9758), so the canonical copy and this prompt's copy
+            // differ by design. Announcement identity is the "same
+            // announcement" test, the invariant `live_pending_cast_owners`
+            // asserts across owners.
+            let canonical = state.pending_cast.as_deref()?;
+            if canonical.object_id != pending_cast.object_id
+                || canonical.activation_ability_index != pending_cast.activation_ability_index
                 || pending_cast.ability.chosen_x.is_some()
             {
                 return None;
