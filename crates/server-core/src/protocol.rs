@@ -3473,9 +3473,19 @@ mod tests {
         }
     }
 
-    /// v148: `WaitingFor::ChooseGiftRecipient` distinguishes Gift from EffectCost.
-    /// A v147 peer would show gift copy for an effect-cost recipient prompt;
+    /// v152: `WaitingFor::ChooseGiftRecipient` distinguishes Gift from EffectCost.
+    /// A v151 peer would show gift copy for an effect-cost recipient prompt;
     /// full-game and P2P reject that pairing before receiving the state.
+    /// v151: populated Bestow form payloads require a versioned full-game peer.
+    /// v149: `GameState::deferred_spell_delivery` is gone and
+    /// `GameState::resolving_spell_final_part` marks the CR 608.2n final part a
+    /// paused instant or sorcery still owes; a v148 peer drops the key and would
+    /// move the spell before its paused instructions finish, so it must be refused
+    /// before it receives v149 state.
+    /// v148: Timesifter's top-card exile contest — `Effect::ExileTopCardContest`
+    /// in serialized ability definitions and the parked
+    /// `BatchCompletion::TopCardContestRoundComplete`; a v147 peer cannot parse
+    /// either tag, so it must be refused before it receives v148 state.
     /// v147: online physical contests (Eye to Eye, Mouth to Mouth) —
     /// `WaitingFor::PhysicalContest`, `Effect::PhysicalContest`, the two
     /// `PhysicalContest*` `GameEvent`s, `ClientMessage::ContestClick` and
@@ -3707,8 +3717,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_148_for_cast_recipient_purpose() {
-        assert_eq!(PROTOCOL_VERSION, 148);
+    fn protocol_version_is_152_for_cast_recipient_purpose() {
+        assert_eq!(PROTOCOL_VERSION, 152);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3719,7 +3729,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_148_for_cast_recipient_purpose` stays
+    /// `protocol_version_is_152_for_cast_recipient_purpose` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
