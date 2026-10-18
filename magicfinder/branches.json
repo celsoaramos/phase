@@ -223,5 +223,17 @@
   {
     "branch": "ai/prospective-payment-budget-mf",
     "pr": 10074
+  },
+  {
+    "branch": "card/tataru-taru"
+  },
+  {
+    "branch": "card/optional-frame-across-replacement-choice"
+  },
+  {
+    "branch": "card/adventure-offer-only-castable-faces"
+  },
+  {
+    "branch": "ai/x-repeat-and-zero-x"
   }
 ]
