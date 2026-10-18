@@ -1180,6 +1180,7 @@ mod metamorphic_alteration;
 mod militant_angel_attacked_opponents;
 mod mill_double_redirect_choice_continuation;
 mod mill_rest_in_peace_redirect;
+mod optional_frame_across_replacement_choice;
 mod mimeoplasm_interactive_exile;
 mod min_blocker_floor_block_candidates_7183;
 mod mindblade_render_warrior_intervening_if_2867;
