@@ -2726,6 +2726,15 @@ pub(crate) fn extract_source_from_event(
         GameEvent::SagaChapterAbilityResolved { saga, .. } => {
             Some(saga.identity.reference.object_id)
         }
+        // CR 702.122: "that Vehicle" on a crews trigger is the crewed Vehicle
+        // (Gearshift Ace), and CR 702.171: "that Mount" on a saddles trigger is
+        // the saddled Mount (Canyon Vaulter's "that Mount or Vehicle"). The
+        // parser routes the subject of "that Vehicle gains flying" through
+        // `TriggeringSource`; mirrors the `ParentTarget` arms of
+        // `resolve_event_context_target_for_event_or_state` and the triggers
+        // module's `seed_event_context_parent_targets`.
+        GameEvent::VehicleCrewed { vehicle_id, .. } => Some(*vehicle_id),
+        GameEvent::Saddled { mount_id, .. } => Some(*mount_id),
         GameEvent::Evolved { object_id } => Some(*object_id),
         GameEvent::CounterRemoved { object_id, .. } => Some(*object_id),
         GameEvent::TokenCreated { object_id, .. } => Some(*object_id),
