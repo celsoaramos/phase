@@ -7161,6 +7161,36 @@ fn trigger_attacks_you_or_planeswalker_not_split() {
     );
 }
 
+/// CR 508.5 + CR 603.4: Kazuul, Tyrant of the Cliffs — "if you're the
+/// defending player" after a bare attack head is the attack-target scope "you or
+/// a planeswalker you control", folded into the trigger head; the body keeps its
+/// token + "unless that creature's controller pays {3}".
+#[test]
+fn trigger_attacks_if_you_are_defending_player_folds_into_attack_scope() {
+    let triggers = parse_trigger_lines(
+        "Whenever a creature an opponent controls attacks, if you're the defending player, create a 3/3 red Ogre creature token unless that creature's controller pays {3}.",
+        "Kazuul, Tyrant of the Cliffs",
+    );
+    assert_eq!(triggers.len(), 1);
+    let trigger = &triggers[0];
+    assert_eq!(trigger.mode, TriggerMode::Attacks);
+    assert_eq!(
+        trigger.attack_target_filter,
+        Some(AttackTargetFilter::PlayerOrPlaneswalker)
+    );
+    assert_eq!(trigger.valid_target, Some(TargetFilter::Controller));
+    let execute = trigger.execute.as_deref().expect("trigger body");
+    assert!(
+        matches!(&*execute.effect, Effect::Token { .. }),
+        "body creates the Ogre, got {:?}",
+        execute.effect
+    );
+    assert!(
+        execute.unless_pay.is_some(),
+        "the {{3}} unless-payment survives"
+    );
+}
+
 /// CR 603.1 + CR 603.2: a SUBJECT disjunction ("<self> or <class> <verb>") is
 /// one trigger with an `Or` subject, not a cross-subject compound. The
 /// second-half event-verb gate in `split_cross_subject_event_compound` cannot

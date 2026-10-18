@@ -929,6 +929,35 @@ pub(crate) fn parse_trigger_lines_at_index_ir(
 /// (consistent with `scan_contains`), returning both the prefix and
 /// post-phrase remainder in a single pass — no `str::find` fallback.
 /// Returns stripped text and the detected "for the first time ..." trigger-event limit.
+/// CR 508.5 + CR 603.4: "Whenever <creature> attacks, if you're the defending
+/// player, …" (Kazuul, Tyrant of the Cliffs). The defending player is the player
+/// the creature attacks or the controller of the planeswalker it attacks, so the
+/// intervening-if is the attack-target scope "attacks you or a planeswalker you
+/// control" — fold it into the trigger head, where the attack matcher already
+/// evaluates it at declaration. (A battle's defending player is its protector,
+/// CR 310.8, which this scope does not admit.)
+fn fold_defending_player_intervening_if(condition: &str, effect: &str) -> Option<(String, String)> {
+    let condition_lower = condition.to_lowercase();
+    let effect_lower = effect.to_lowercase();
+    let (rest, _) = (
+        tag::<_, _, OracleError<'_>>("if you"),
+        alt((tag("'re"), tag("\u{2019}re"), tag(" are"))),
+        tag(" the defending player, "),
+    )
+        .parse(effect_lower.as_str())
+        .ok()?;
+    // The head must be a bare "<subject> attacks" with no attack target of its own.
+    // allow-noncombinator: terminal suffix probe on an already-isolated trigger head.
+    if !condition_lower.ends_with(" attacks") {
+        return None;
+    }
+    let body = &effect[effect.len() - rest.len()..];
+    Some((
+        format!("{condition} you or a planeswalker you control"),
+        body.to_string(),
+    ))
+}
+
 fn strip_first_time_each_turn_qualifier(condition: &str) -> (String, Option<FirstTimeLimit>) {
     const PHRASE: &str = "for the first time each turn";
     const PHRASE_PER_OPPONENT: &str = "for the first time during each of their turns";
@@ -1512,6 +1541,9 @@ pub(crate) fn parse_trigger_line_with_index_ir(
 
     // Split condition from effect at first ", " after the trigger phrase
     let (condition_text_raw, effect_text) = split_trigger(tp);
+    let (condition_text_raw, effect_text) =
+        fold_defending_player_intervening_if(&condition_text_raw, &effect_text)
+            .unwrap_or((condition_text_raw, effect_text));
 
     // CR-uniform: `"for the first time each turn"` in trigger CONDITION text is
     // a trigger-frequency qualifier that maps to `OncePerTurn`. Detect and strip
