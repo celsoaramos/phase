@@ -360,6 +360,10 @@ fn static_condition_to_restriction_condition(
         // restriction must not tell.
         StaticCondition::Unrecognized { .. } => None,
         // The absence of a condition. A restriction with no condition is not a restriction.
+        // CR 500.8 + CR 506.1 + CR 608.2c: a per-turn phase-occurrence gate has
+        // no exact restriction-surface representation, so it fails closed here
+        // rather than approximating.
+        StaticCondition::FirstCombatPhaseOfTurn => None,
         StaticCondition::None => None,
         // CR 118.12a + CR 508.1d + CR 509.1c: an optional-cost combat tax, resolved via a
         // `WaitingFor::CombatTaxPayment` round-trip at declaration time. It is not a
@@ -396,6 +400,7 @@ fn static_condition_to_restriction_condition(
         | StaticCondition::SourceAttackingAlone
         | StaticCondition::SourceIsBlocking
         | StaticCondition::IsMonarch { .. }
+        | StaticCondition::HasBoon { .. }
         | StaticCondition::IsInitiative
         | StaticCondition::NoMonarch
         | StaticCondition::WasStartingPlayer { .. }
@@ -424,12 +429,22 @@ fn static_condition_to_restriction_condition(
         | StaticCondition::TopOfLibraryMatches { .. }
         | StaticCondition::SourceIsPaired
         | StaticCondition::AdditionalCostPaid
-        // CR 508.6: "a player attacked you during their last turn" is a real
-        // game-state predicate (Avenge's cost reduction), but it is not a
-        // cast/activation restriction and has no `ParsedCondition` counterpart —
-        // it is evaluated via `layers::evaluate_condition` on the self-spell cost
-        // path, so lowering here returns `None`.
-        | StaticCondition::AnyPlayerAttackedYouLastTurn
+        // CR 508.6 + CR 601.2: a real game-state predicate on both scopes, but
+        // neither is a cast/activation restriction, and `None` is right for
+        // DIFFERENT reasons.
+        //
+        // Default (`AnyPlayer`) scope: it is evaluated via
+        // `layers::evaluate_condition` on the self-spell cost path, not at a
+        // cast/activation gate; there is no `ParsedCondition` counterpart.
+        //
+        // Anchored (`AttackedPlayer`) scope: a cast/activation gate is evaluated
+        // OUTSIDE combat declaration entirely — no `declared_attack` is bound and
+        // the caster need not be an attacking creature — so the anchor can never
+        // resolve at this boundary. Approximating it with the existential form
+        // would be a PERMISSIVE lie (it would pass whenever ANY player attacked
+        // you), the same failure mode this match rejects for
+        // `TopOfLibraryMatches` above.
+        | StaticCondition::AnyPlayerAttackedYouLastTurn { .. }
         | StaticCondition::CastingAsVariant { .. } => None,
     }
 }

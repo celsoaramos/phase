@@ -1,7 +1,8 @@
+use crate::types::game_state::RandomDraw;
 use rand::Rng;
 use std::collections::HashSet;
 
-use crate::game::quantity::resolve_quantity;
+use crate::game::quantity::{resolve_quantity, resolve_quantity_with_targets};
 use crate::game::replacement::{self, ReplacementResult};
 use crate::types::ability::{
     DieRollIgnoreRule, DieRollModifier, Effect, EffectError, EffectKind, ResolvedAbility,
@@ -11,9 +12,11 @@ use crate::types::game_state::{GameState, WaitingFor};
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
 use crate::types::proposed_event::ProposedEvent;
-use crate::types::resolution::{DieRollContinuation, PendingDieRoll, PendingDieRollInstruction};
+use crate::types::resolution::{
+    DieRollContinuation, PendingDieRoll, PendingDieRollInstruction, ResolutionFrame,
+};
 
-use super::resolve_ability_chain;
+use super::{resolve_ability_chain_step, ResolutionProgress};
 use crate::game::ability_utils::build_resolved_from_def_with_targets_and_chain_root;
 
 /// CR 706.2: Draw one natural result from the game's seeded RNG — "the number
@@ -26,9 +29,10 @@ use crate::game::ability_utils::build_resolved_from_def_with_targets_and_chain_r
 /// die, decide which are ignored from the NATURALS, and only THEN emit
 /// `DieRolled` — carrying the post-modifier value — for the survivors. An
 /// ignored roll "is considered to have never happened" (CR 706.6), so it must
-/// never reach the event log, which is also what keeps every events-slice reader
-/// correct: the die-roll trigger layer, `game/contraptions.rs`, and
-/// `game/effects/effect.rs`'s CR 611.2d snapshot.
+/// never emit `DieRolled`; only the display-only `DieRollIgnored` mirror reaches
+/// the event log. Rules-facing readers (`game/trigger_matchers.rs`,
+/// `game/contraptions.rs`, and the CR 611.2d snapshot in
+/// `game/effects/effect.rs`) exclude that mirror.
 ///
 /// `sides == 0` names no die and no distribution. `rand`'s `random_range`
 /// asserts on an empty range, so it would panic mid-resolution; callers are
@@ -41,7 +45,7 @@ pub(crate) fn roll_natural(state: &mut GameState, sides: u8) -> u8 {
         debug_assert!(false, "CR 706.1: a die roll must have at least one side");
         return 1;
     }
-    state.rng.random_range(1..=sides)
+    state.rng.draw(RandomDraw::Outcome).random_range(1..=sides)
 }
 
 /// CR 706.2: Apply a die roll's (optional) modifier to a natural result.
@@ -177,6 +181,14 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
+    resolve_step(state, ability, events).map(|_| ())
+}
+
+pub(crate) fn resolve_step(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+) -> Result<ResolutionProgress, EffectError> {
     let (count_expr, sides, results, modifier) = match &ability.effect {
         Effect::RollDie {
             count,
@@ -190,8 +202,7 @@ pub fn resolve(
     // CR 706.1: Resolve how many dice of this kind to roll, in the ability's
     // context; clamp at zero (a 0-count roll is a no-op). Each die is rolled
     // independently with the same sides/modifier/results table.
-    let count =
-        resolve_quantity(state, count_expr, ability.controller, ability.source_id).max(0) as u32;
+    let count = resolve_quantity_with_targets(state, count_expr, ability).max(0) as u32;
 
     let instruction = PendingDieRollInstruction {
         source_id: ability.source_id,
@@ -232,7 +243,7 @@ pub fn resolve(
         state.pending_die_roll_instruction = None;
     }
 
-    execute_roll(state, instruction, sides, proposal, events).map(|_| ())
+    execute_roll(state, instruction, sides, proposal, events)
 }
 
 /// CR 706.1 + CR 706.6: Carry out a die-roll instruction once its replacement
@@ -242,16 +253,15 @@ pub fn resolve(
 /// resume path (`resume_roll_dice_after_replacement`), so an ordering choice
 /// cannot silently take a different route than an unreplaced roll takes.
 ///
-/// Returns `Ok(Some(wf))` when the instruction suspended — for the CR 706.6
-/// ignore choice, for a results branch's own choice, or because the proposal
-/// itself is still suspended — and `Ok(None)` when it completed.
+/// Returns typed progress for a suspended proposal, ignore choice or results
+/// branch, and `ResolutionProgress::Complete` after the instruction settles.
 fn execute_roll(
     state: &mut GameState,
     instruction: PendingDieRollInstruction,
     sides: u8,
     proposal: RollProposal,
     events: &mut Vec<GameEvent>,
-) -> Result<Option<WaitingFor>, EffectError> {
+) -> Result<ResolutionProgress, EffectError> {
     // CR 706.1: a die roll is defined by its kind ("roll a d20"); a zero-sided
     // die names no distribution, so there is nothing to roll. This is not a
     // rules case but a fail-safe: `sides` reaches here from the proposed event,
@@ -281,9 +291,9 @@ fn execute_roll(
                 source_id: instruction.source_id,
                 subject: None,
             });
-            return Ok(None);
+            return Ok(ResolutionProgress::Complete);
         }
-        RollProposal::Suspended => return Ok(Some(state.waiting_for.clone())),
+        RollProposal::Suspended => return Ok(ResolutionProgress::Waiting),
     };
 
     // CR 706.2: roll every die first, collecting NATURAL results. Nothing is
@@ -365,9 +375,9 @@ fn execute_roll(
         ignorable_indices: outcome.tied,
         ignore_count: picks,
     };
-    state.waiting_for = waiting.clone();
+    state.waiting_for = waiting;
     state.push_die_roll_frame(pending);
-    Ok(Some(waiting))
+    Ok(ResolutionProgress::Waiting)
 }
 
 /// CR 616.1 + CR 706.1: Finish a die-roll instruction whose competing
@@ -386,13 +396,13 @@ pub(crate) fn resume_roll_dice_after_replacement(
     state: &mut GameState,
     event: ProposedEvent,
     events: &mut Vec<GameEvent>,
-) -> Result<Option<WaitingFor>, EffectError> {
+) -> Result<ResolutionProgress, EffectError> {
     let Some(instruction) = state.pending_die_roll_instruction.take() else {
         // No parked instruction: nothing proposed this roll through a path that
         // owns a continuation. Both production origins (`Effect::RollDie` and
         // the CR 703.4g roll-to-visit) park before proposing, so this is only
         // reachable for a foreign/synthetic `RollDice` event.
-        return Ok(None);
+        return Ok(ResolutionProgress::Complete);
     };
     let sides = match &event {
         ProposedEvent::RollDice { sides, .. } => *sides,
@@ -420,7 +430,7 @@ pub(crate) fn resume_roll_dice_after_replacement(
             proposal,
             events,
         );
-        return Ok(None);
+        return Ok(ResolutionProgress::Complete);
     }
 
     // CR 706.4 + CR 608.2: the CR 616.1 ordering choice was an action boundary,
@@ -429,6 +439,18 @@ pub(crate) fn resume_roll_dice_after_replacement(
     state.die_result_this_resolution = instruction.die_result;
 
     execute_roll(state, *instruction, sides, proposal, events)
+}
+
+/// CR 706.4 + CR 608.2c: the immediate parent resumes with the completed
+/// aggregate, replacing the partial per-survivor value captured at suspension.
+pub(crate) fn publish_completed_result_to_parent(state: &mut GameState) {
+    let result = state.die_result_this_resolution;
+    if let Some(context) = state
+        .active_ability_continuation_frame_mut()
+        .and_then(|frame| frame.pending.trigger_context.as_mut())
+    {
+        context.die_result = result;
+    }
 }
 
 /// CR 706.3a + CR 608.2c: Continue a die-roll instruction whose results-table
@@ -460,8 +482,8 @@ pub(crate) fn drain_active_die_roll(state: &mut GameState, events: &mut Vec<Game
         return;
     };
 
-    // CR 706.4 + CR 608.2: restore the instruction's die context around the
-    // continuation, exactly as the `SelectDieRolls` handler does.
+    // CR 706.4 + CR 608.2c: restore the instruction context; a completed
+    // aggregate stays live until the parent's later instructions consume it.
     let prev_die_result = state.die_result_this_resolution;
     state.die_result_this_resolution = pending.die_result;
     let ignore_indices = pending.forced_ignored.clone();
@@ -469,10 +491,17 @@ pub(crate) fn drain_active_die_roll(state: &mut GameState, events: &mut Vec<Game
         // Re-suspended on yet another branch choice: the frame re-parked itself
         // with the cursor advanced, so leave the restored context in place for
         // that continuation to read.
-        Ok(Some(_)) => {}
-        Ok(None) | Err(_) => {
-            state.die_result_this_resolution = prev_die_result;
+        Ok(ResolutionProgress::Waiting) => {}
+        Ok(ResolutionProgress::Complete) => {
+            publish_completed_result_to_parent(state);
+            super::drain_pending_continuation(state, events);
+            super::resume_resolution_frames(state, events);
         }
+        Ok(ResolutionProgress::Queued) => {
+            super::drain_pending_continuation(state, events);
+            super::resume_resolution_frames(state, events);
+        }
+        Err(_) => state.die_result_this_resolution = prev_die_result,
     }
 }
 
@@ -486,18 +515,18 @@ pub(crate) fn drain_active_die_roll(state: &mut GameState, events: &mut Vec<Game
 /// the no-prompt fast path calls straight into here.
 ///
 /// `ignore_indices` names the rolls that "never happened" (CR 706.6): they emit
-/// no event, receive no modifier, run no results branch, and contribute nothing
-/// to the aggregate.
+/// only a display mirror, receive no modifier, run no results branch, and
+/// contribute nothing to the aggregate.
 ///
-/// Returns `Ok(Some(wf))` when a results branch re-suspended for another
-/// interactive choice, and `Ok(None)` when the whole instruction completed; the
+/// Returns the branch verdict when its full instruction remains pending,
+/// and Complete when all survivors and their branches have settled; the
 /// caller then drains the continuation back to Priority.
-pub fn resume_after_ignore(
+pub(crate) fn resume_after_ignore(
     state: &mut GameState,
     pending: PendingDieRoll,
     ignore_indices: Vec<usize>,
     events: &mut Vec<GameEvent>,
-) -> Result<Option<WaitingFor>, EffectError> {
+) -> Result<ResolutionProgress, EffectError> {
     let PendingDieRoll {
         source_id,
         controller,
@@ -542,8 +571,15 @@ pub fn resume_after_ignore(
         .skip(next_index.min(results.len()))
     {
         // CR 706.6: an ignored roll is considered never to have happened — no
-        // event, no modifier, no results branch, no aggregate contribution.
+        // modifier, no results branch, no aggregate contribution. It still
+        // emits a DISPLAY-ONLY `DieRollIgnored` mirror (natural value) so the
+        // UI can show what the lowest roll was; no rules consumer may read it.
         if ignore_indices.contains(&index) {
+            events.push(GameEvent::DieRollIgnored {
+                player_id: roller,
+                sides,
+                result: natural,
+            });
             continue;
         }
 
@@ -587,7 +623,8 @@ pub fn resume_after_ignore(
                 targets.clone(),
                 chain_root_targets.clone(),
             );
-            resolve_ability_chain(state, &sub, events, 0)?;
+            let child_boundary = state.resolution_stack.capture_child_boundary();
+            let progress = resolve_ability_chain_step(state, &sub, events, 0)?;
 
             // CR 608.2c + CR 706.3a: a branch may itself have paused for a
             // player choice. The instruction is NOT finished — every die after
@@ -599,7 +636,10 @@ pub fn resume_after_ignore(
             // Without the re-park this would abandon the remaining dice: their
             // branches would never run and `die_result_this_resolution` would be
             // left at this single die's value rather than the survivors' total.
-            if super::waits_for_resolution_choice(&state.waiting_for) {
+            if matches!(
+                progress,
+                ResolutionProgress::Queued | ResolutionProgress::Waiting
+            ) {
                 let resumed = PendingDieRoll {
                     source_id,
                     controller,
@@ -624,19 +664,22 @@ pub fn resume_after_ignore(
                     forced_ignored: ignore_indices.clone(),
                     chain_root_targets: chain_root_targets.clone(),
                 };
-                // CR 706.3a: park the owner in the structurally valid slot.
-                // A results-table branch that suspended on its own prompt is
-                // above us, and this frame is an `AfterChild` owner past cursor
-                // 0 — so it must go BELOW that child, never on top of it. The
-                // helper discriminates re-park / push / insert-below; the old
-                // `.is_err()` fallback collapsed the last two and could bury an
-                // active `DirectChoice`.
-                state
-                    .park_die_roll_frame_for_resume(resumed)
-                    .map_err(|error| {
-                        EffectError::InvalidParam(format!("die-roll frame re-park: {error}"))
-                    })?;
-                return Ok(Some(state.waiting_for.clone()));
+                // CR 706.3a + CR 608.2c: the die owner waits outside the
+                // branch's entire child stack, not merely its top frame.
+                if state.resolution_stack.capture_child_boundary() > child_boundary {
+                    state
+                        .resolution_stack
+                        .insert_parent_at_child_boundary(
+                            ResolutionFrame::DieRoll(Box::new(resumed)),
+                            child_boundary,
+                        )
+                        .map_err(|error| {
+                            EffectError::InvalidParam(format!("die-roll frame re-park: {error}"))
+                        })?;
+                } else {
+                    state.push_die_roll_frame(resumed);
+                }
+                return Ok(progress);
             }
         }
     }
@@ -658,7 +701,7 @@ pub fn resume_after_ignore(
         subject: None,
     });
 
-    Ok(None)
+    Ok(ResolutionProgress::Complete)
 }
 
 #[cfg(test)]
@@ -1228,6 +1271,7 @@ mod tests {
             amount: 6,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         });
         let draw = ResolvedAbility::new(
             Effect::Draw {
@@ -1294,6 +1338,7 @@ mod tests {
             amount: 20,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         });
         let draw = ResolvedAbility::new(
             Effect::Draw {
@@ -1480,6 +1525,69 @@ mod tests {
         assert!(
             rolls.iter().all(|r| (1..=6).contains(r)),
             "every die result must be in 1..=6, got {rolls:?}"
+        );
+    }
+
+    /// CR 706.6 display mirror: an ignored die emits `DieRollIgnored` carrying
+    /// its NATURAL value, alongside the survivors' `DieRolled` events.
+    /// Removing the mirror emission flips the ignored assertion; the survivor
+    /// assertions pin that the mirror changes nothing else.
+    #[test]
+    fn ignored_rolls_emit_display_mirror_alongside_survivors() {
+        let mut state = GameState::new_two_player(42);
+        let pending = PendingDieRoll {
+            source_id: ObjectId(1),
+            controller: PlayerId(0),
+            roller: PlayerId(0),
+            targets: vec![],
+            sides: 20,
+            results: vec![4, 17],
+            ignore_rules: vec![],
+            results_table: vec![],
+            modifier: None,
+            die_result: None,
+            next_index: 0,
+            running_total: 0,
+            rolled_any: false,
+            forced_ignored: vec![],
+            chain_root_targets: vec![],
+        };
+        let mut events = Vec::new();
+        let waiting = resume_after_ignore(&mut state, pending, vec![0], &mut events).unwrap();
+        assert_eq!(
+            waiting,
+            ResolutionProgress::Complete,
+            "no branches means no suspension"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GameEvent::DieRollIgnored {
+                    player_id: PlayerId(0),
+                    sides: 20,
+                    result: 4
+                }
+            )),
+            "the ignored lowest die must emit its natural value, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GameEvent::DieRolled {
+                    player_id: PlayerId(0),
+                    sides: 20,
+                    result: Some(17)
+                }
+            )),
+            "the surviving die must still emit DieRolled, got {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, GameEvent::DieRolled { .. }))
+                .count(),
+            1,
+            "exactly one survivor event, got {events:?}"
         );
     }
 

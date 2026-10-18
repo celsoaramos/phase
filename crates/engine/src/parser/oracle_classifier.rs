@@ -9,9 +9,10 @@ use nom::Parser;
 use super::oracle_nom::condition::parse_reflexive_entry_this_way_rider;
 use super::oracle_nom::primitives as nom_primitives;
 use super::oracle_nom::primitives::scan_contains;
-use super::oracle_util::parse_mana_symbols;
+use super::oracle_util::{first_sentence, parse_mana_symbols};
 use crate::parser::oracle_effect::{
-    split_leading_conditional, try_parse_named_choice, try_parse_named_choice_conjunction,
+    excise_selection_qualifier, split_leading_conditional, try_parse_named_choice,
+    try_parse_named_choice_conjunction,
 };
 
 pub(crate) fn is_cant_win_lose_compound(lower: &str) -> bool {
@@ -32,11 +33,33 @@ pub(crate) fn is_instead_replacement_line(text: &str) -> bool {
     })
 }
 
+/// Digital-only Alchemy (no CR entry): true when the line grants a one-time
+/// boon — "you get a one-time boon with …", "target opponent gets a one-time
+/// boon with …", "that player gets a one-time boon with …", or the same grant
+/// as a trigger/activated consequence ("Whenever …, you get a one-time boon
+/// with …"). The quoted ability inside routinely contains replacement-shaped
+/// tokens ("enters", "counter"), so the top-level router must exclude these
+/// lines from the replacement interceptor and the replacement gate and let
+/// the effect chain parse the grant via `try_parse_boon_creation` instead.
+/// Matches on the wrapper head only — never on the quoted body — so
+/// "if you have a boon" (Underbridge Warlock, no "one-time boon with")
+/// never matches.
+pub(crate) fn is_one_time_boon_grant_line(lower: &str) -> bool {
+    scan_contains(lower, "one-time boon with \"")
+}
+
+/// CR 603.1: `When`/`Whenever`/`At` are the printed templating for triggered
+/// abilities. CR 701.27e adds one more head that is a triggered ability without
+/// using those words — `As ⟨this permanent⟩ transforms into ⟨name⟩, …` — and
+/// `parse_as_transforms_into_keyword` is narrow enough (it peeks the whole
+/// event head) that no CR 614.1c `As … enters …` replacement, `As long as …`
+/// static, or `As an additional cost …` line can reach this arm.
 pub(crate) fn has_trigger_prefix(lower: &str) -> bool {
     alt((
-        tag::<_, _, OracleError<'_>>("when "),
-        tag("whenever "),
-        tag("at "),
+        value((), tag::<_, _, OracleError<'_>>("when ")),
+        value((), tag("whenever ")),
+        value((), tag("at ")),
+        super::oracle_trigger::parse_as_transforms_into_keyword,
     ))
     .parse(lower)
     .is_ok()
@@ -272,25 +295,15 @@ fn is_self_conditional_flash_grant(lower: &str) -> bool {
     nom_primitives::parse_self_spell_has_flash_prefix(lower).is_ok()
 }
 
+/// CR 502.3 + CR 611.2a: Lines on an instant or sorcery containing a "doesn't/don't untap
+/// during ... next untap step" restriction are resolution-time continuous effects of the spell,
+/// not permanent-hosted static abilities.
 fn is_spell_resolution_next_untap_restriction(lower: &str) -> bool {
-    let has_next_untap_restriction = (scan_contains(lower, "doesn't untap during")
-        || scan_contains(lower, "doesn’t untap during"))
-        && scan_contains(lower, "next untap step");
-    if !has_next_untap_restriction {
-        return false;
-    }
-
-    alt((
-        tag::<_, _, OracleError<'_>>("put "),
-        tag("tap "),
-        tag("untap "),
-        tag("target "),
-        tag("that "),
-        tag("it "),
-        tag("those "),
-    ))
-    .parse(lower)
-    .is_ok()
+    (scan_contains(lower, "doesn't untap during")
+        || scan_contains(lower, "doesn’t untap during")
+        || scan_contains(lower, "don't untap during")
+        || scan_contains(lower, "don’t untap during"))
+        && scan_contains(lower, "next untap step")
 }
 
 fn is_spell_resolution_cast_from_hand_free(lower: &str) -> bool {
@@ -437,6 +450,14 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     // The "of ..." infix between "abilities" and "can't be activated" blocks the contiguous
     // scan above; recognize the dispatched prefix separately so parse_static_line is reached.
     "activated abilities of ",
+    // CR 606.3: loyalty-activation SET-cap statics — "You may activate the
+    // loyalty abilities of [subject] twice each turn rather than only once"
+    // (Oath of Teferi, Urza, Planeswalker). Census: exactly 4 distinct cards
+    // carry this tail, all loyalty-activation lines; the trigger-led
+    // (Kaito, Dancing Shadow) and saga-chapter (Urza Assembles the Titans III)
+    // members never reach the static slot, so only the Oath/Urza-PW lines can
+    // be claimed here.
+    "rather than only once",
     // CR 701.23 + CR 101.2: Ashiok-class search prohibition — a "can't search"
     // effect takes precedence over any effect directing a search.
     "can't cause their controller to search their library",
@@ -700,7 +721,7 @@ fn is_static_compound_pattern(lower: &str) -> bool {
     )
     .parse(lower)
     .is_ok()
-        && (scan_contains(lower, "from your graveyard")
+        && (super::oracle_static::is_graveyard_cast_permission_lead(lower)
             || (scan_contains(lower, "from your hand") && scan_contains(lower, "without paying"))
             // CR 401.5 + CR 118.9 + CR 601.2a: "you may [play|cast] X from the
             // top of your library" — top-of-library cast permission class
@@ -721,7 +742,16 @@ fn is_static_compound_pattern(lower: &str) -> bool {
             // the ExileCastPermission line routes to the static parser instead
             // of the Priority-8 replacement gate. Narrowly widens the exile
             // anchor to accept the ownership infix.
-            || scan_contains(lower, "from among cards you own exiled with"))
+            || scan_contains(lower, "from among cards you own exiled with")
+            // CR 601.2a + CR 400.7: the graveyard-side mirror of the exile
+            // anchors above — "cast a creature spell from among cards in your
+            // graveyard that were put there from anywhere other than the
+            // battlefield this turn" (Banon, the Returners' Leader; Kagha,
+            // Shadow Archdruid). The bare "from your graveyard" anchor on the
+            // first line of this disjunction does not match the pool form, so
+            // without this the line never reaches `parse_static_line` and the
+            // whole permission lowers to an `Unimplemented` gap.
+            || scan_contains(lower, "from among cards in your graveyard"))
     {
         return true;
     }
@@ -1069,7 +1099,7 @@ pub(crate) fn is_enters_with_counter_replacement_line(lower: &str) -> bool {
 ///
 /// Shared by `is_replacement_pattern_head_scoped` and
 /// `is_enters_with_counter_replacement_line` so the two cannot drift.
-fn has_enters_with_counter_tokens(lower: &str) -> bool {
+pub(crate) fn has_enters_with_counter_tokens(lower: &str) -> bool {
     (scan_contains(lower, "enters")
         || scan_contains(lower, "escapes")
         || scan_contains(lower, "enter with")
@@ -1191,7 +1221,39 @@ fn is_as_enters_choose_pattern(lower: &str) -> bool {
     // parses.
     let has_choose = nom_primitives::scan_at_word_boundaries(lower, |i| {
         verify(tag::<_, _, OracleError<'_>>("choose "), |_: &&str| {
+            // CR 608.2d (override) + CR 614.1c: the classifier must agree with
+            // `parse_as_enters_choose`, which EXCISES an "at random" qualifier
+            // before handing the phrase to the object table. Without the second
+            // disjunct the two disagree, and the disagreement is not uniform: the
+            // object table mixes PREFIX-`tag` arms (which tolerate a trailing
+            // qualifier — "a basic land type at random" still prefix-matches)
+            // with `all_consuming` arms (which cannot — a numeric or creature-type
+            // ENUMERATION declines on the trailing qualifier). So the classifier
+            // silently recognized the qualifier-bearing form of one half of the
+            // table and not the other, and every `all_consuming` object arm was
+            // invisible here whenever a selection qualifier was printed.
+            //
+            // The first disjunct is evaluated unchanged, so every line WITHOUT a
+            // qualifier takes a bit-identical path and this is purely additive.
+            // `excise_selection_qualifier` is the SINGLE excision authority,
+            // shared with `parse_as_enters_choose`. The classifier and the
+            // builder must derive the SAME object phrase — a local copy of this
+            // arithmetic here is the very drift the second disjunct exists to
+            // close.
+            //
+            // The builder additionally retries on the choice's OWN SENTENCE,
+            // so the classifier must accept the sentence-bounded rungs too:
+            // a two-sentence line (Haktos's "choose 2, 3, or 4 at random.
+            // Haktos has protection…") is otherwise rejected here before the
+            // builder that would parse it ever runs. Both rungs go through
+            // the shared `first_sentence`, so the two layers can never name
+            // different phrases again.
             try_parse_named_choice(i).is_some()
+                || try_parse_named_choice(first_sentence(i).trim()).is_some()
+                || excise_selection_qualifier(i).is_some_and(|excised| {
+                    try_parse_named_choice(&excised).is_some()
+                        || try_parse_named_choice(first_sentence(&excised).trim()).is_some()
+                })
         })
         .parse(i)
     })
@@ -1756,5 +1818,179 @@ mod tests {
                 "a non-rider sentence must be handed back untouched: {retained}"
             );
         }
+    }
+
+    /// CR 606.3: Oath of Teferi's loyalty-activation static tail routes to the
+    /// static parser.
+    #[test]
+    fn rather_than_only_once_tail_is_static() {
+        assert!(is_static_pattern(
+            "you may activate the loyalty abilities of planeswalkers you control twice each turn rather than only once."
+        ));
+        // Existing guard preserved: an effect-shaped line stays non-static.
+        assert!(!is_static_pattern("target creature gets +1/+1."));
+    }
+}
+
+/// The as-enters choice CLASSIFIER must agree with the as-enters choice BUILDER
+/// about what an "at random" qualifier does.
+///
+/// `is_as_enters_choose_pattern` gates the whole replacement tier. Its
+/// `has_choose` conjunct probes the object table, which MIXES two arm kinds:
+///
+///   * PREFIX-`tag` arms ("a basic land type", "a color", "a card type") — these
+///     tolerate a trailing qualifier, because a prefix match ignores the tail.
+///   * `all_consuming` arms (the numeric enumeration, the creature-type
+///     enumeration) — these CANNOT, because the trailing qualifier is unconsumed.
+///
+/// So before the excision landed, the classifier recognized the qualifier-bearing
+/// form of one half of the table and silently refused the other half — and a
+/// refused line never reaches `parse_replacement_line` at all, so the builder's
+/// own excision could never run. These tests pin the fix as a CLASS (two
+/// different `all_consuming` arms, one of which is not Haktos' shape at all),
+/// not as one card.
+#[cfg(test)]
+mod as_enters_choose_qualifier_classification_tests {
+    use super::is_as_enters_choose_pattern;
+
+    /// THE CLASS. Both members are `all_consuming` object arms carrying a
+    /// trailing selection qualifier, and both were refused before the fix.
+    /// A Haktos-shaped special case would pass the first and fail the second.
+    #[test]
+    fn every_all_consuming_object_arm_is_classified_through_a_trailing_qualifier() {
+        // Numeric enumeration (Haktos the Unscarred).
+        assert!(
+            is_as_enters_choose_pattern("as ~ enters, choose 2, 3, or 4 at random."),
+            "a numeric enumeration with a trailing qualifier must classify"
+        );
+        // Creature-type enumeration — a DIFFERENT `all_consuming` arm, and no
+        // printed card drives it, so this is the class check rather than a card
+        // check. If the fix were special-cased to digits this fails.
+        assert!(
+            is_as_enters_choose_pattern("as ~ enters, choose human, merfolk, or goblin at random."),
+            "a creature-type enumeration with a trailing qualifier must classify \
+             too — the fix is the qualifier axis, not the numeric arm"
+        );
+    }
+
+    /// THE REVIEWER'S CASE, full two-sentence lines: Haktos's choice sentence
+    /// followed by its protection continuation on the SAME line. The object
+    /// table's `all_consuming` numeric arm declines the protection tail, and
+    /// the qualifier excision preserves it — only the sentence-bounded rungs
+    /// restore agreement with the builder, which parses the choice's own
+    /// sentence. Without them the classifier rejects a line the builder
+    /// accepts, and the line never reaches `parse_replacement_line` at all.
+    #[test]
+    fn haktos_full_two_sentence_line_classifies() {
+        assert!(
+            is_as_enters_choose_pattern(
+                "as ~ enters, choose 2, 3, or 4 at random. ~ has protection from each mana value other than the chosen number."
+            ),
+            "the full two-sentence Haktos line must classify — the classifier retries on the choice's own sentence"
+        );
+        // Qualifier-free two-sentence shape: no printed card drives it, but
+        // the builder's sentence retry is unconditional, so the classifier's
+        // unexcised first-sentence rung must agree too. Same justification as
+        // the creature-type case above — the axis is sentences, not Haktos.
+        assert!(
+            is_as_enters_choose_pattern(
+                "as ~ enters, choose 2, 3, or 4. ~ has protection from each mana value other than the chosen number."
+            ),
+            "a qualifier-free two-sentence enumeration must classify on its first sentence"
+        );
+    }
+
+    /// The prefix-`tag` half of the table, which already worked, must keep
+    /// working — the excision is additive, not a replacement.
+    #[test]
+    fn prefix_matching_object_arms_still_classify_with_and_without_a_qualifier() {
+        for line in [
+            "as ~ enters, choose a basic land type at random.",
+            "as ~ enters, choose a basic land type.",
+            "as ~ enters, choose a creature type.",
+            "as ~ enters, choose a color.",
+        ] {
+            assert!(is_as_enters_choose_pattern(line), "{line}");
+        }
+    }
+
+    /// NEGATIVE, pinned rather than assumed: an as-enters line with NO qualifier
+    /// classifies exactly as it does at base. The first disjunct is evaluated
+    /// unchanged, so these take a bit-identical path.
+    #[test]
+    fn a_line_without_a_qualifier_is_unchanged() {
+        // Enumerations with no qualifier were already classified at base.
+        assert!(is_as_enters_choose_pattern(
+            "as ~ enters, choose 2, 3, or 4."
+        ));
+        // A non-contiguous enumeration reaches the labeled fallback at base and
+        // still does — the range lowering must not start claiming it.
+        assert!(is_as_enters_choose_pattern(
+            "as ~ enters, choose 1, 3, or 5."
+        ));
+    }
+
+    /// NEGATIVE, and the one the function's own comment calls out: OBJECT
+    /// choices are deliberately NOT replacement-classified here, because
+    /// claiming them as `Moved` without a proven `CopyChosen` consumer reshapes
+    /// the whole class. Asserted, not assumed — and asserted WITH a qualifier
+    /// too, so the excision cannot smuggle them in through the new disjunct.
+    #[test]
+    fn object_choices_are_still_excluded_with_or_without_a_qualifier() {
+        for line in [
+            // Metamorphic Alteration
+            "as ~ enters, choose a creature.",
+            "as ~ enters, choose a creature at random.",
+            // Dauntless Bodyguard
+            "as ~ enters, choose another creature you control.",
+            "as ~ enters, choose another creature you control at random.",
+            // Scheming Fence
+            "as ~ enters, you may choose a nonland permanent.",
+            "as ~ enters, you may choose a nonland permanent at random.",
+        ] {
+            assert!(
+                !is_as_enters_choose_pattern(line),
+                "object choices must stay out of the replacement tier: {line}"
+            );
+        }
+    }
+
+    /// HOSTILE FIXTURE — the qualifier belongs to a LATER SENTENCE and must not
+    /// be excised from this choice's object phrase.
+    ///
+    /// FIRST PRODUCTION BRANCH REACHED: the sentence-bounding `first_sentence`
+    /// inside `excise_selection_qualifier`, before `scan_at_random` ever runs.
+    /// The line still classifies (its object
+    /// is a plain prefix arm), so this pins the BOUNDING, and the builder-side
+    /// test pins that the exported mode stays `Chosen`.
+    #[test]
+    fn a_later_sentences_qualifier_is_not_excised_from_this_object() {
+        let line = "as ~ enters, choose a color. discard a card at random.";
+        assert!(is_as_enters_choose_pattern(line));
+        // The excision helper must decline: the object's own sentence carries no
+        // qualifier, so there is nothing to remove.
+        assert_eq!(
+            super::excise_selection_qualifier("choose a color. discard a card at random."),
+            None,
+            "the qualifier is in a later sentence and is out of this clause's scope"
+        );
+    }
+
+    /// The excision itself, asserted directly so a reviewer can see the exact
+    /// string the classifier probes — and that every non-qualifier byte,
+    /// including a following sentence, survives.
+    #[test]
+    fn the_excision_removes_only_the_qualifier() {
+        assert_eq!(
+            super::excise_selection_qualifier("choose 2, 3, or 4 at random."),
+            Some("choose 2, 3, or 4.".to_string())
+        );
+        assert_eq!(
+            super::excise_selection_qualifier(
+                "choose a basic land type at random. ~ has landwalk of the chosen type."
+            ),
+            Some("choose a basic land type. ~ has landwalk of the chosen type.".to_string())
+        );
+        assert_eq!(super::excise_selection_qualifier("choose a color."), None);
     }
 }

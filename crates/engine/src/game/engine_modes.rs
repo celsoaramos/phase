@@ -1,12 +1,12 @@
 use crate::types::events::GameEvent;
-use crate::types::game_state::{GameState, PendingCast, WaitingFor};
-use crate::types::identifiers::{CardId, ObjectId};
+use crate::types::game_state::{ActivationResidual, GameState, PendingCast, WaitingFor};
+use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::mana::ManaCost;
 
 use super::ability_utils::{
-    ability_target_legality_needs_chosen_x, assign_targets_in_chain,
-    auto_select_targets_for_ability, begin_target_selection_for_ability, build_chained_resolved,
-    build_target_slots_labelled, cap_distribution_target_slots, random_select_targets_for_ability,
+    assign_selected_slots_in_chain, auto_select_targets_for_ability,
+    begin_target_selection_for_ability, build_chained_resolved, build_target_slots_labelled,
+    cap_distribution_target_slots, live_modal_history_source, random_select_targets_for_ability,
     record_modal_mode_choices, selected_mode_labels, target_constraints_from_modal,
     validate_modal_indices,
 };
@@ -29,6 +29,7 @@ pub(super) fn handle_ability_mode_choice(
         is_activated,
         ability_index,
         ability_cost,
+        activation_cost_snapshot,
         unavailable_modes,
     } = waiting_for
     else {
@@ -38,14 +39,43 @@ pub(super) fn handle_ability_mode_choice(
     };
 
     validate_modal_indices(&modal, &indices, &unavailable_modes)?;
+    // CR 602.2b: an activated ability's mode prompt always names the printed
+    // ability it is activating.
+    let activated_ability_index = match (is_activated, ability_index) {
+        (true, Some(index)) => Some(index),
+        (true, None) => {
+            return Err(EngineError::InvalidAction(
+                "an activated mode choice must name its ability index".to_string(),
+            ));
+        }
+        (false, _) => None,
+    };
 
-    record_modal_mode_choices(state, source_id, &modal, &indices);
+    // CR 603.3c + CR 700.2b: a modal triggered ability answered with zero modes
+    // ("choose up to one" / "choose any number") is removed from the stack. It
+    // is never finalized as a no-op entry, and no mode usage is recorded.
+    if activated_ability_index.is_none() && indices.is_empty() {
+        let produced = remove_modal_trigger_with_no_mode(state, player, events);
+        return Ok(triggers::finish_trigger_construction_action(
+            state, events, produced,
+        ));
+    }
+
+    // CR 400.7 + CR 700.2: record against the same incarnation the prompt's
+    // `unavailable_modes` was computed from — the live source for an activated
+    // ability (CR 602.2b), the trigger's captured source for a triggered one
+    // (CR 603.10a).
+    let history_source = match activated_ability_index {
+        Some(_) => live_modal_history_source(state, source_id),
+        None => pending_trigger_modal_history_source(state)?,
+    };
+    record_modal_mode_choices(state, history_source, &modal, &indices);
 
     let mut resolved =
         build_chained_resolved(&mode_abilities, indices.as_slice(), source_id, player)?;
     resolved.selected_mode_labels = selected_mode_labels(&modal.mode_descriptions, &indices);
 
-    let waiting_for = if is_activated {
+    let waiting_for = if let Some(ability_index) = activated_ability_index {
         handle_activated_mode_choice(
             state,
             ActivatedModeChoice {
@@ -54,6 +84,7 @@ pub(super) fn handle_ability_mode_choice(
                 resolved,
                 ability_index,
                 ability_cost,
+                activation_cost_snapshot,
                 modal,
                 mode_abilities,
                 indices,
@@ -86,12 +117,40 @@ pub(super) fn handle_ability_mode_choice(
     Ok(waiting_for)
 }
 
+/// CR 400.7 + CR 603.10a: the modal history key of the trigger whose modes are
+/// being chosen. Its absence means the mode prompt has no trigger behind it.
+fn pending_trigger_modal_history_source(
+    state: &GameState,
+) -> Result<ObjectIncarnationRef, EngineError> {
+    state
+        .pending_trigger
+        .as_ref()
+        .map(|trigger| trigger.modal_history_source(state))
+        .ok_or_else(|| EngineError::InvalidAction("No pending trigger".to_string()))
+}
+
+/// CR 603.3c + CR 700.2b: "If no mode is chosen, the ability is removed from
+/// the stack." Drops the push-first in-construction entry through the single
+/// mid-construction removal authority, then announces any sibling triggers
+/// deferred behind it (CR 603.3b), exactly as a completed construction does.
+fn remove_modal_trigger_with_no_mode(
+    state: &mut GameState,
+    player: crate::types::player::PlayerId,
+    events: &mut Vec<GameEvent>,
+) -> WaitingFor {
+    super::engine::drop_mid_construction_pending_trigger(state);
+    triggers::drain_deferred_triggers_after_trigger_construction(state, events)
+        .unwrap_or(WaitingFor::Priority { player })
+}
+
 struct ActivatedModeChoice {
     player: crate::types::player::PlayerId,
     source_id: ObjectId,
     resolved: crate::types::ability::ResolvedAbility,
-    ability_index: Option<usize>,
+    ability_index: usize,
     ability_cost: Option<crate::types::ability::AbilityCost>,
+    /// CR 601.2f + CR 602.2b: the activation's cost-modifier carrier.
+    activation_cost_snapshot: Option<Box<crate::types::casting_costs::ActivationCostSnapshot>>,
     modal: crate::types::ability::ModalChoice,
     /// CR 700.2: the card's mode definitions and the chosen indices, carried so
     /// per-slot mode labels can be built at the SAME post-flush point as slots
@@ -109,40 +168,57 @@ fn handle_activated_mode_choice(
     let ActivatedModeChoice {
         player,
         source_id,
-        resolved,
+        mut resolved,
         ability_index,
         ability_cost,
+        activation_cost_snapshot,
         modal,
         mode_abilities,
         indices,
     } = choice;
+    // CR 602.2 + CR 601.2c (capture A, modal): the chosen modes' chain is built
+    // here, after the announcement returned for the mode choice, so its journal
+    // facts are captured now, before any cost is paid. Target settlement adds
+    // the committed targets. CR 700.2a: modes are chosen as part of
+    // activating; no game action can intervene while `AbilityModeChoice` is
+    // pending, so this is still the announcement layout (CR 602.2a: provenance
+    // too).
+    casting::record_activation_announcement(state, player, source_id, ability_index, &mut resolved);
 
     let target_constraints = target_constraints_from_modal(&modal);
 
     // CR 602.2b + CR 601.2b/c: Activating an ability follows the spell
-    // announcement steps. If an activated modal ability's target legality depends
-    // on an {X} activation cost, choose X after modes and before targets, then
-    // resume through the same deferred target-selection path modal spells use so
-    // per-mode labels and X-dependent legality stay in sync. CR 601.2d: a chosen
-    // mode that divides an X-dependent pool is likewise X-bounded (issue #2856).
+    // announcement steps, and CR 601.2b announces a mana `{X}` together with the
+    // modes — before targets are chosen (CR 601.2c) and before any cost is paid
+    // (CR 601.2h). So once modes are chosen, a mana-`{X}` activation announces X
+    // next, then resumes through the same deferred target-selection path modal
+    // spells use, so per-mode labels and X-dependent legality stay in sync (an
+    // empty slot set continues straight to payment). CR 601.2d: a chosen mode
+    // that divides an X-dependent pool is likewise X-bounded (issue #2856). This
+    // mirrors the non-modal X detour in `activate_with_cost_carrier`, including
+    // its outstanding-residual marker.
     let mode_distribute = indices
         .iter()
         .find_map(|&i| mode_abilities.get(i).and_then(|m| m.distribute.clone()));
-    if ability_target_legality_needs_chosen_x(&resolved, mode_distribute.as_ref()) {
-        if let Some(cost) = ability_cost.as_ref() {
-            if let Some((mana_cost, remaining)) = casting_costs::extract_x_mana_cost(cost) {
-                let mut pending_x = PendingCast::new(source_id, CardId(0), resolved, mana_cost);
-                pending_x.activation_cost = remaining;
-                pending_x.activation_ability_index = ability_index;
-                pending_x.target_constraints = target_constraints;
-                pending_x.distribute = mode_distribute.clone();
-                pending_x.deferred_target_selection = true;
-                let mut chosen_modes = indices.clone();
-                chosen_modes.sort_unstable();
-                pending_x.chosen_modes = chosen_modes;
-                state.pending_cast = Some(Box::new(pending_x));
-                return casting_costs::enter_payment_step(state, player, None, events);
-            }
+    if let Some(cost) = ability_cost.as_ref() {
+        if let Some((mana_cost, remaining)) = casting_costs::extract_x_mana_cost(cost) {
+            let mut pending_x = PendingCast::for_activation(
+                source_id,
+                resolved,
+                mana_cost,
+                ability_index,
+                activation_cost_snapshot.clone(),
+            );
+            pending_x.activation_cost = remaining;
+            pending_x.target_constraints = target_constraints;
+            pending_x.distribute = mode_distribute.clone();
+            pending_x.deferred_target_selection = true;
+            pending_x.activation_residual = ActivationResidual::XMana;
+            let mut chosen_modes = indices.clone();
+            chosen_modes.sort_unstable();
+            pending_x.chosen_modes = chosen_modes;
+            state.pending_cast = Some(Box::new(pending_x));
+            return casting_costs::enter_payment_step(state, player, None, events);
         }
     }
 
@@ -153,14 +229,14 @@ fn handle_activated_mode_choice(
             // X announcement path as non-modal activated abilities, then resumes
             // through deferred target selection with the chosen modes preserved.
             let (mana_cost, remaining) = casting::split_alt_cost_components(cost);
-            let mut pending_x = PendingCast::new(
+            let mut pending_x = PendingCast::for_activation(
                 source_id,
-                CardId(0),
                 resolved,
                 mana_cost.unwrap_or(ManaCost::NoCost),
+                ability_index,
+                activation_cost_snapshot.clone(),
             );
             pending_x.activation_cost = remaining;
-            pending_x.activation_ability_index = ability_index;
             pending_x.target_constraints = target_constraints;
             pending_x.distribute = mode_distribute.clone();
             pending_x.deferred_target_selection = true;
@@ -214,19 +290,27 @@ fn handle_activated_mode_choice(
 
         if let Some(targets) = resolved_targets {
             let mut resolved = resolved;
-            assign_targets_in_chain(state, &mut resolved, &targets)?;
+            assign_selected_slots_in_chain(state, &mut resolved, &targets)?;
             // CR 602.2b + CR 601.2c: automatic target assignment is still a
             // declaration before activation costs are paid.
             casting::emit_targeting_events(
                 state,
-                &super::ability_utils::flatten_targets_in_chain(&resolved),
+                &super::ability_utils::declared_targets_in_chain(&resolved),
                 source_id,
                 player,
+                Some(crate::types::events::Targeter::Ability(
+                    crate::types::ability::StackAbilityKind::Activated,
+                )),
                 events,
             );
-            let mut pending = PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+            let mut pending = PendingCast::for_activation(
+                source_id,
+                resolved,
+                ManaCost::NoCost,
+                ability_index,
+                activation_cost_snapshot.clone(),
+            );
             pending.activation_cost = ability_cost.clone();
-            pending.activation_ability_index = ability_index;
             pending.target_constraints = target_constraints;
             pending.distribute = mode_distribute;
             pending.begin_activation_trigger_collection();
@@ -234,9 +318,14 @@ fn handle_activated_mode_choice(
                 state, player, pending, events,
             )
         } else {
-            let mut pending = PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+            let mut pending = PendingCast::for_activation(
+                source_id,
+                resolved,
+                ManaCost::NoCost,
+                ability_index,
+                activation_cost_snapshot.clone(),
+            );
             pending.activation_cost = ability_cost;
-            pending.activation_ability_index = ability_index;
             pending.target_constraints = target_constraints;
             pending.distribute = mode_distribute;
             super::casting_targets::begin_activated_target_selection(
@@ -248,12 +337,26 @@ fn handle_activated_mode_choice(
             )
         }
     } else {
-        let mut pending = PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+        let mut pending = PendingCast::for_activation(
+            source_id,
+            resolved,
+            ManaCost::NoCost,
+            ability_index,
+            activation_cost_snapshot.clone(),
+        );
         pending.activation_cost = ability_cost;
-        pending.activation_ability_index = ability_index;
         pending.target_constraints = target_constraints;
         pending.distribute = mode_distribute;
-        casting_costs::finish_activated_ability_at_payment_boundary(state, player, pending, events)
+        // CR 601.2f + CR 602.2b: the chosen modes declare no target, so no target
+        // settlement will follow. A lock the announcement deferred (because another
+        // mode could target) runs here instead, where the modes are known.
+        casting::settle_activation_cost(
+            state,
+            player,
+            pending,
+            crate::types::casting_costs::SettledTail::Boundary,
+            events,
+        )
     }
 }
 
@@ -280,8 +383,9 @@ struct TriggeredModeChoice {
 /// `dispatch_pending_trigger_context`): `state.pending_trigger` is set and its
 /// stack entry is already pushed and tracked by `state.pending_trigger_entry`.
 ///
-/// Returns `Ok(None)` when no mode can be chosen (CR 603.3c) so the caller drops
-/// the trigger exactly as the all-modes-unavailable branch does.
+/// Returns `Ok(None)` when no mode is chosen, whether none can be or an "up to"
+/// draw chose zero (CR 603.3c); the caller drops the pushed entry through
+/// `drop_mid_construction_pending_trigger`.
 pub(super) fn resolve_random_modal_trigger(
     state: &mut GameState,
     player: crate::types::player::PlayerId,
@@ -291,24 +395,24 @@ pub(super) fn resolve_random_modal_trigger(
     unavailable_modes: &[usize],
     events: &mut Vec<GameEvent>,
 ) -> Result<Option<WaitingFor>, EngineError> {
+    // CR 603.3c + CR 700.2b: no mode can be chosen, or an "up to" draw chose
+    // none. Either way the ability is removed from the stack; the caller drops
+    // the pushed entry through `drop_mid_construction_pending_trigger`.
     let Some(indices) =
         super::ability_utils::random_select_modal_indices(state, &modal, unavailable_modes)
+            .filter(|indices| !indices.is_empty())
     else {
-        // CR 603.3c: No legal mode — drop the trigger. The interactive branches
-        // already removed the in-flight stack entry before this point, so just
-        // clear the cursor here.
-        super::stack::pop_uncommitted_pending_trigger_entry(
-            state,
-            super::lifecycle::DelayedTerminalDisposition::NoLegalChoice,
-        );
-        state.pending_trigger = None;
-        state.pending_trigger_firing = None;
         return Ok(None);
     };
 
     // CR 700.2: Track per-turn/per-game mode usage exactly as the interactive
     // path does, then build the chained resolved ability for the drawn modes.
-    record_modal_mode_choices(state, source_id, &modal, &indices);
+    record_modal_mode_choices(
+        state,
+        pending_trigger_modal_history_source(state)?,
+        &modal,
+        &indices,
+    );
     let mut resolved =
         build_chained_resolved(&mode_abilities, indices.as_slice(), source_id, player)?;
     resolved.selected_mode_labels = selected_mode_labels(&modal.mode_descriptions, &indices);
@@ -328,6 +432,77 @@ pub(super) fn resolve_random_modal_trigger(
     Ok(Some(waiting_for))
 }
 
+/// CR 603.3c: choosing a modal trigger's modes is part of putting that one
+/// ability on the stack, so the chosen modes keep every stamp the trigger
+/// received when it triggered and was pushed.
+fn carry_trigger_provenance(
+    pending: &crate::types::ability::ResolvedAbility,
+    chosen: &mut crate::types::ability::ResolvedAbility,
+) {
+    if let Some(source) = &pending.trigger_source {
+        chosen.set_trigger_source_recursive(source.clone());
+    }
+    if pending.source_incarnation.is_some() {
+        chosen.set_source_incarnation_recursive(pending.source_incarnation);
+    }
+    if let Some(player) = pending.original_controller {
+        chosen.set_original_controller_recursive(player);
+    }
+    if let Some(definition_ref) = &pending.trigger_definition_ref {
+        chosen.set_trigger_definition_ref_recursive(definition_ref.clone());
+    }
+    if let Some(origin) = &pending.may_trigger_origin {
+        chosen.set_may_trigger_origin_recursive(origin.clone());
+    }
+    if let Some(player) = pending.scoped_player {
+        chosen.set_scoped_player_recursive(player);
+    }
+    if let Some(x) = pending.chosen_x {
+        chosen.set_chosen_x_recursive(x);
+    }
+    if let Some(snapshot) = &pending.cost_paid_object {
+        chosen.set_cost_paid_object_recursive(snapshot.clone());
+    }
+    if chosen.unless_pay.is_none() {
+        chosen.unless_pay.clone_from(&pending.unless_pay);
+    }
+    let context = &pending.context;
+    if context.source_transformation_count.is_some() {
+        chosen.set_source_transformation_count_recursive(context.source_transformation_count);
+    }
+    if context.source_ability_provenance.is_some() {
+        chosen.set_source_ability_provenance_recursive(context.source_ability_provenance);
+    }
+    if let Some(event) = &context.creation_lookback_event {
+        chosen.set_creation_lookback_event_recursive(event);
+    }
+    for &event in &context.duration_events {
+        chosen.record_duration_event_recursive(event);
+    }
+    // The trigger build stamps the source's cast facts on the root only.
+    chosen.context.cast_from_zone = chosen.context.cast_from_zone.or(context.cast_from_zone);
+    if !context.kickers_paid.is_empty() {
+        chosen
+            .context
+            .kickers_paid
+            .clone_from(&context.kickers_paid);
+    }
+    if !context.additional_cost_payments.is_empty() {
+        chosen
+            .context
+            .additional_cost_payments
+            .clone_from(&context.additional_cost_payments);
+    }
+    chosen.context.additional_cost_payment_count = context.additional_cost_payment_count;
+    chosen.context.additional_cost_paid |= context.additional_cost_paid;
+    chosen.bind_force_block_source_recursive(pending.source_incarnation.map(|incarnation| {
+        crate::types::identifiers::ObjectIncarnationRef {
+            object_id: pending.source_id,
+            incarnation,
+        }
+    }));
+}
+
 fn handle_triggered_mode_choice(
     state: &mut GameState,
     choice: TriggeredModeChoice,
@@ -336,7 +511,7 @@ fn handle_triggered_mode_choice(
     let TriggeredModeChoice {
         player,
         source_id,
-        resolved,
+        mut resolved,
         modal,
         mode_abilities,
         indices,
@@ -346,6 +521,13 @@ fn handle_triggered_mode_choice(
         .pending_trigger
         .take()
         .ok_or_else(|| EngineError::InvalidAction("No pending trigger".to_string()))?;
+    // The stack entry holds the push-time stamps the pending carrier lacks.
+    let pending = state
+        .pending_trigger_entry
+        .and_then(|id| state.stack.iter().rev().find(|entry| entry.id == id))
+        .and_then(|entry| entry.ability())
+        .unwrap_or(trigger.ability.as_ref());
+    carry_trigger_provenance(pending, &mut resolved);
     // CR 603.2 + CR 109.4: Re-establish the trigger event context for
     // the duration of mode-target computation. The modal was paused for mode
     // choice (`trigger_dispatch`) AFTER restoring the context to its pre-dispatch
@@ -384,6 +566,10 @@ fn handle_triggered_mode_choice(
     };
     let target_constraints = target_constraints_from_modal(&modal);
 
+    let mut resolved = resolved;
+    // CR 603.3c + CR 603.3d: the chosen modes declare only the targets chosen
+    // for them.
+    resolved.start_target_record_recursive();
     trigger.ability = Box::new(resolved);
     trigger.target_constraints = target_constraints.clone();
     trigger.modal = None;
@@ -439,7 +625,7 @@ fn handle_triggered_mode_choice(
             // optimized, which is why the mechanical `(*b).clone()` rewrite was
             // reverted at this call site.
             let mut resolved = trigger.ability.clone();
-            assign_targets_in_chain(state, &mut resolved, &targets)?;
+            assign_selected_slots_in_chain(state, &mut resolved, &targets)?;
             // CR 113.2c + CR 603.2 + CR 603.3b: `finalize_trigger_target_selection`
             // already drains the deferred-trigger queue and surfaces the next
             // WaitingFor if a sibling trigger needs input; use that result
