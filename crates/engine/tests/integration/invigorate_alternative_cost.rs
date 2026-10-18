@@ -290,7 +290,7 @@ fn v5_declining_pays_printed_cost_without_life_gain() {
     assert_eq!(power(&runner, bear), Some(6));
 }
 
-/// V6 — CR 118.9 + CR 601.3d: without a Forest the alternative cost is not
+/// V6 — CR 118.9 + CR 601.2b: without a Forest the alternative cost is not
 /// offered. Paired positive with a Forest in the same test.
 #[test]
 fn v6_no_forest_not_offered_forest_offered() {

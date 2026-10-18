@@ -2405,7 +2405,7 @@ Trample";
         );
     }
 
-    /// CR 118.9 + CR 601.3d: an unrecognized leading-if predicate refuses the
+    /// CR 118.9 + CR 601.2b: an unrecognized leading-if predicate refuses the
     /// swapped-order option (reach-guard: the unconditioned sibling above parses).
     #[test]
     fn alt_cost_swapped_clause_order_unrecognized_leading_if_refused() {

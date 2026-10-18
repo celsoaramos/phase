@@ -44908,7 +44908,8 @@ mod tests {
     }
 
     /// W1 — CR 702.174a: a Gift prompt serializes exactly as before the `purpose`
-    /// field existed (no `purpose` key), so no protocol bump is needed.
+    /// field existed (no `purpose` key). The protocol bump versions the new
+    /// EffectCost purpose, which an older reader would show as a gift.
     #[test]
     fn choose_gift_recipient_gift_purpose_wire_shape_unchanged() {
         let json = serde_json::to_value(cast_opponent_prompt(CastOpponentChoicePurpose::Gift))
