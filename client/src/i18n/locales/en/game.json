@@ -106,6 +106,24 @@
     "grant": "Approve",
     "decline": "Keep priority"
   },
+  "sandboxLifeCorrection": {
+    "open": "Life correction",
+    "title": "Sandbox life correction",
+    "description": "Use the normal hand and stack controls to cast and resolve a creature. This panel submits the sandbox SetLife action through the existing game adapter.",
+    "scopeNote": "This corrects life through the engine's player edit path; it is not damage or a card effect. Hidden-hand reveal, semantic discard, and pre-agreed pre-cast Undo are outside this slice.",
+    "target": "Player",
+    "player": "{{name}} (Player {{seat}})",
+    "you": "You",
+    "opponent": "Opponent",
+    "currentLife": "Current life total",
+    "newLife": "New life total",
+    "submit": "Apply correction",
+    "submitting": "Correction submitted; closing this panel will not cancel it.",
+    "applied": "Current committed life for {{player}}: {{life}}.",
+    "notApplied": "The engine did not confirm this correction. Check the current snapshot before trying again.",
+    "failed": "The correction could not be submitted.",
+    "stale": "The game changed while editing. Close and reopen this panel to start from the current snapshot."
+  },
   "debugCreate": {
     "copies": "Copies",
     "asToken": "Create as token",
@@ -601,9 +619,6 @@
     "pendingCheaper": "Next spell costs {{amount}} less",
     "companion": "Companion",
     "unboundedTooltip": "Unbounded {{resource}} (∞)",
-    "unboundedScheduledTooltip": "Unbounded {{resource}} (∞) — collapse pending; a finite amount will be chosen",
-    "unboundedScheduledYouTooltip": "Unbounded {{resource}} (∞) — collapse pending; you'll name the count",
-    "unboundedScheduledGlyph": "∞→N",
     "unboundedConditionalTooltip": "Unbounded {{resource}} (∞) — collapse pending; this may stay unbounded",
     "unboundedConditionalYouTooltip": "Unbounded {{resource}} (∞) — collapse pending; this may stay unbounded, and you'll name the count if it doesn't",
     "unboundedMixedTooltip": "Unbounded {{resource}} (∞) — part of this group has a pending collapse; part remains unbounded",
@@ -686,6 +701,7 @@
     "libraryCount_one": "Library ({{count}} card)",
     "libraryCount_other": "Library ({{count}} cards)",
     "playFromTop": "Play {{name}} from top of library",
+    "activateFromTop": "Activate {{name}} from top of library",
     "topOfLibrary": "top of library",
     "indicatorOpponentPrefix": "Opp ",
     "graveyardLower": "graveyard",
@@ -693,6 +709,7 @@
     "zoneTitle": "{{zone}} ({{count}})",
     "noCardsIn": "No cards in {{zone}}",
     "castFromZone": "Cast from {{zone}}: {{name}}",
+    "activateFromZone": "Activate from {{zone}}: {{name}}",
     "viewCount": "View {{count}}",
     "castableCount": "{{zone}} — {{count}} castable"
   },
@@ -824,7 +841,16 @@
     "defendingPlayerTrample": "Defending Player (Trample)",
     "pwControllerTrample": "PW Controller (Trample Over PW)"
   },
+  "cardTextReference": {
+    "title": "Printed card text (reference)",
+    "hint": "Full printed card text. It may differ from current Oracle text or this ability.",
+    "originalAbility": "Original ability text"
+  },
   "stack": {
+    "activatedAbility": "Activated ability",
+    "activatedAbilityNumber": "Activated ability {{number}}",
+    "triggeredAbility": "Triggered ability",
+    "readAbility": "Read ability and printed card text",
     "title": "Stack",
     "collapsePanel": "Collapse stack panel",
     "expandPanel": "Expand stack panel",
@@ -878,8 +904,10 @@
     "chooseNewTarget": "Choose the spell's new target",
     "chooseNewTargetForSpell": "Choose a new target for {{spell}}",
     "chooseCreatureToExplore": "Choose which creature explores next",
+    "chooseCreatureToEquip": "Choose a creature to equip",
     "chooseCreatureTokenToPopulate": "Choose a creature token to populate",
     "chooseReturnAsAuraTarget": "Choose a permanent to enchant",
+    "chooseTokenHost": "Choose a host for the token",
     "tapUntappedCreatures_one": "Tap {{count}} untapped creature",
     "tapUntappedCreatures_other": "Tap {{count}} untapped creatures",
     "sacrificeExact_one": "Sacrifice {{count}} permanent",
@@ -921,6 +949,7 @@
     "confirmSacrifice": "Sacrifice ({{selected}}/{{count}})",
     "skipSacrifice": "Skip Sacrifice",
     "keepCurrentTargets": "Keep Current Targets",
+    "keepCurrentTarget": "Keep This Target",
     "skip": "Skip",
     "opponentChoice": "(opponent's choice)"
   },
@@ -2430,7 +2459,8 @@
     "confirm": "Confirm",
     "badgeNewTarget": "New target",
     "slotLabel": "Target {{index}}: {{current}} → {{chosen}}",
-    "unselected": "unchanged"
+    "unselected": "unchanged",
+    "keep": "Keep"
   },
   "separatePiles": {
     "chooserName": "Player {{number}}",
@@ -2654,5 +2684,34 @@
     "reveal_one": "Reveal {{count}} card",
     "reveal_other": "Reveal {{count}} cards",
     "decline": "Don't reveal"
+  },
+  "physicalContest": {
+    "title": {
+      "staring": "Staring Contest",
+      "breathHolding": "Breath-Holding Contest"
+    },
+    "versus": "{{first}} vs. {{second}}",
+    "instructions": "Keep clicking, tapping, or pressing Space for as long as you can. The first player to stop for {{seconds}} seconds loses.",
+    "status": {
+      "pending": "Waiting for the contest to begin…",
+      "preparing": "Get ready…",
+      "go": "GO! Keep clicking!",
+      "paused": "Contest paused while a player reconnects…",
+      "spectating": "Watching the contest…",
+      "resolving": "Deciding the result…"
+    },
+    "button": {
+      "wait": "Wait for GO…",
+      "active": "Keep clicking!"
+    },
+    "you": "You",
+    "clicks": "{{name}}: {{count}}",
+    "result": {
+      "won": "You won the contest!",
+      "lost": "You lost the contest.",
+      "winner": "{{name}} won the contest.",
+      "tie": "It's a tie — nothing happens.",
+      "cancelled": "The contest was cancelled — nothing happens."
+    }
   }
 }
