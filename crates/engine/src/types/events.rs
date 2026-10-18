@@ -754,6 +754,9 @@ impl EventObjectSnapshot {
 
             // ---- embedded exact source relations ----
             FilterProp::SaddledSource | FilterProp::ConvokedSource => Supported,
+            // CR 702.122c: the crew ledger is keyed by the subject's own
+            // incarnation, which the snapshot carries (look-back arm in filter.rs).
+            FilterProp::CrewedThisTurn { .. } => Supported,
 
             // ---- embedded per-turn history ----
             FilterProp::WasDealtDamageThisTurn
@@ -1943,6 +1946,20 @@ pub enum GameEvent {
         player_id: PlayerId,
         amount_spent: u32,
         new_cumulative: u32,
+    },
+    /// Eye to Eye / Mouth to Mouth: the real-time contest between `participants`
+    /// (controller first) has begun. See `types::contest`.
+    PhysicalContestStarted {
+        kind: crate::types::contest::ContestKind,
+        participants: [PlayerId; 2],
+    },
+    /// The contest reached a terminal state and its result was applied to the
+    /// game exactly once. `result` distinguishes a decided win, a tie, and a
+    /// technical cancellation.
+    PhysicalContestResolved {
+        kind: crate::types::contest::ContestKind,
+        participants: [PlayerId; 2],
+        result: crate::types::contest::ContestResult,
     },
     /// CR 701.30: A clash occurred between two players.
     Clash {

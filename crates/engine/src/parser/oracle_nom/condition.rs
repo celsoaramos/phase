@@ -22,6 +22,7 @@ use super::primitives::{
 };
 use super::quantity as nom_quantity;
 use super::target as nom_target;
+use super::target::{controller_phrase_among, ControllerPhrase};
 use crate::parser::oracle_target::{
     cast_capable_zones_except, parse_shared_quality, parse_type_phrase_folding, parse_zone_suffix,
     parse_zone_word, peek_zone_boundary, superlative_property_filter_prop,
@@ -255,6 +256,12 @@ fn parse_condition_connector(input: &str) -> OracleResult<'_, ConditionConnectiv
 fn parse_single_inner_condition(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((
         parse_you_attacked_with_total_power_this_combat,
+        // CR 500.8 + CR 506.1 + CR 109.5 + CR 608.2c: the first-combat-phase
+        // occurrence gate, scope-composed (non-possessive "the turn" vs
+        // possessive "your turn"). The single shared recognizer for this
+        // game-state condition; the effect parser lowers its typed result via
+        // `static_condition_to_ability_condition`.
+        parse_first_combat_phase_of_turn,
         // CR 601.2h + CR 608.2c: whole-phrase "it wasn't cast or no mana was spent
         // to cast <self>" gate. MUST precede the event-history arm's
         // `parse_was_cast_condition`, which would otherwise claim the bare "it
@@ -267,6 +274,34 @@ fn parse_single_inner_condition(input: &str) -> OracleResult<'_, StaticCondition
         parse_resolution_context_conditions,
     ))
     .parse(input)
+}
+
+/// CR 500.8 + CR 506.1 + CR 109.5 + CR 608.2c: the first-combat-phase
+/// occurrence gate, composed per axis — the common phrase is parsed once and
+/// the scope alternates between the non-possessive "the turn" and the
+/// possessive "your turn" (CR 109.5: "your" = the ability's controller, so the
+/// possessive form composes `And([DuringYourTurn, FirstCombatPhaseOfTurn])`).
+/// Shared by the effect path (bridged to `AbilityCondition`) and the
+/// trigger/static paths (via `parse_inner_condition`).
+fn parse_first_combat_phase_of_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, possessive) = preceded(
+        (parse_it_is, tag(" the first combat phase of ")),
+        alt((value(false, tag("the turn")), value(true, tag("your turn")))),
+    )
+    .parse(input)?;
+    Ok((
+        rest,
+        if possessive {
+            StaticCondition::And {
+                conditions: vec![
+                    StaticCondition::DuringYourTurn,
+                    StaticCondition::FirstCombatPhaseOfTurn,
+                ],
+            }
+        } else {
+            StaticCondition::FirstCombatPhaseOfTurn
+        },
+    ))
 }
 
 /// CR 508.1a + CR 603.4: "you attacked with creatures with total power N or
@@ -1091,11 +1126,12 @@ fn parse_source_was_dealt_damage_this_turn(input: &str) -> OracleResult<'_, Stat
     ))
     .parse(input)?;
     // Accept both passive-voice tense forms: "was dealt" and "has been dealt".
-    let (rest, _) = alt((
-        tag(" was dealt damage this turn"),
-        tag(" has been dealt damage this turn"),
-    ))
-    .parse(rest)?;
+    let (rest, _) = alt((tag(" was dealt "), tag(" has been dealt "))).parse(rest)?;
+    // CR 120.2a / CR 120.2b: the shared damage-class axis — delegated to
+    // `parse_damage_kind_qualifier`, the authority this module's
+    // qualifier-bearing damage-history surfaces use to name their damage class.
+    let (rest, damage_kind) = parse_damage_kind_qualifier(rest)?;
+    let (rest, _) = tag("damage this turn").parse(rest)?;
     Ok((
         rest,
         make_quantity_ge(
@@ -1104,7 +1140,7 @@ fn parse_source_was_dealt_damage_this_turn(input: &str) -> OracleResult<'_, Stat
                 target: Box::new(target),
                 aggregate: AggregateFunction::Sum,
                 group_by: None,
-                damage_kind: DamageKindFilter::Any,
+                damage_kind,
 
                 channel: DamageChannel::Total,
             },
@@ -1719,6 +1755,14 @@ fn parse_player_state_conditions(input: &str) -> OracleResult<'_, StaticConditio
                 ],
             }
         }),
+        // Digital-only Alchemy (no CR entry): "if you have a boon"
+        // (Underbridge Warlock). Only the controller subject is printed.
+        value(
+            StaticCondition::HasBoon {
+                player: PlayerScope::Controller,
+            },
+            tag("you have a boon"),
+        ),
         // CR 726.3: Initiative status
         value(
             StaticCondition::IsInitiative,
@@ -3083,25 +3127,46 @@ fn parse_this_type_entered_this_turn(input: &str) -> OracleResult<'_, StaticCond
 /// continuations such as "Then if ~ has power 7 or greater, …" (Cloud,
 /// Ex-SOLDIER). Without it, those clauses silently swallow the condition and
 /// the gated sub-ability fires unconditionally.
+///
+/// Strict comparatives against a fixed threshold compose through the same
+/// arm: "its power is greater than N" / "less than N" (Dragonborn
+/// Immolator's dies trigger: "if its power is greater than 0"). The
+/// comparative head is disjoint from the threshold head ("exactly"/number),
+/// and the comparative requires a number after it, so relative-comparison
+/// phrases ("greater than each other creature's power", "less than ~'s
+/// power") still fall through to their own arms and every previously
+/// supported parse is unchanged.
 pub(crate) fn parse_source_power_toughness_condition(
     input: &str,
 ) -> OracleResult<'_, StaticCondition> {
     let (rest, qty) = alt((parse_possessive_property, parse_subject_has_property)).parse(input)?;
-    // CR 208.1: "exactly N" → EQ (Amalia Benavides Aguirre: "if its power is
-    // exactly 20"). The "exactly " prefix is consumed before the number, mirroring
-    // the proven "exactly N" → EQ leaf in `parse_hand_size_predicate`; otherwise
-    // the standard "N or less" / "N or greater" thresholds select LE / GE.
-    let (rest, exactly) = opt(tag("exactly ")).parse(rest)?;
-    let (rest, n) = parse_number(rest)?;
-    let (rest, comparator) = if exactly.is_some() {
-        (rest, Comparator::EQ)
-    } else {
-        alt((
-            value(Comparator::LE, tag(" or less")),
-            value(Comparator::GE, tag(" or greater")),
-        ))
-        .parse(rest)?
-    };
+    let (rest, (comparator, n)) = alt((
+        map(preceded(tag("greater than "), parse_number), |n| {
+            (Comparator::GT, n)
+        }),
+        map(preceded(tag("less than "), parse_number), |n| {
+            (Comparator::LT, n)
+        }),
+        // CR 208.1: "exactly N" → EQ (Amalia Benavides Aguirre: "if its power is
+        // exactly 20"). The "exactly " prefix is consumed before the number, mirroring
+        // the proven "exactly N" → EQ leaf in `parse_hand_size_predicate`; otherwise
+        // the standard "N or less" / "N or greater" thresholds select LE / GE.
+        |rest| {
+            let (rest, exactly) = opt(tag("exactly ")).parse(rest)?;
+            let (rest, n) = parse_number(rest)?;
+            let (rest, comparator) = if exactly.is_some() {
+                (rest, Comparator::EQ)
+            } else {
+                alt((
+                    value(Comparator::LE, tag(" or less")),
+                    value(Comparator::GE, tag(" or greater")),
+                ))
+                .parse(rest)?
+            };
+            Ok((rest, (comparator, n)))
+        },
+    ))
+    .parse(rest)?;
     Ok((
         rest,
         StaticCondition::QuantityComparison {
@@ -4307,7 +4372,11 @@ fn parse_they_hand_size_exact_disjunction(input: &str) -> OracleResult<'_, Stati
 }
 
 fn parse_they_control_count_ge(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = tag("they control ").parse(input)?;
+    let (rest, _) = terminated(
+        controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]),
+        tag(" "),
+    )
+    .parse(input)?;
     let (rest, n) = parse_ge_threshold(rest)?;
     let type_text = rest.trim_end_matches('.');
     let (filter, remainder) = parse_type_phrase_folding(type_text);
@@ -10248,7 +10317,11 @@ fn parse_there_exists_condition(input: &str) -> OracleResult<'_, StaticCondition
 /// source controller's. `ControllerRef::ScopedPlayer` binds to the event player
 /// at both detection and resolution (`resolve_quantity_for_trigger_check`).
 fn parse_that_player_controls_more_comparison(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = tag("that player controls more ").parse(input)?;
+    let (rest, _) = (
+        controller_phrase_among(&[ControllerPhrase::THAT_PLAYER_CONTROLS]),
+        tag(" more "),
+    )
+        .parse(input)?;
     let (rest, type_text) = take_until::<_, _, OracleError<'_>>(" than you").parse(rest)?;
     let (rest, _) = tag(" than you").parse(rest)?;
 
@@ -10783,7 +10856,9 @@ fn parse_unless_pay_condition(input: &str) -> OracleResult<'_, StaticCondition> 
     let (rest, scaling) = opt(value(
         UnlessPayScaling::PerAffectedCreature,
         (
-            tag(" for each creature they control that"),
+            tag(" for each creature "),
+            controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]),
+            tag(" that"),
             alt((recognize(parse_apostrophe_s), tag(" is"))),
             tag(" blocking it"),
         ),
@@ -12042,10 +12117,114 @@ mod tests {
     use super::*;
     use crate::types::ability::{
         CardTypeSetSource, ControllerRef, CountScope, PtStat, PtValueScope, RoundingMode,
-        TargetFilter, TriggerCondition, TypeFilter, TypedFilter, ZoneRef,
+        TargetFilter, TriggerCondition, TypeFilter, TypedFilter, UnlessPayScaling, ZoneRef,
     };
     use crate::types::card_type::Supertype;
     use crate::types::mana::{ManaColor, ManaCost};
+
+    /// The "they control" sites decline every other controller phrase.
+    const NOT_THEY_CONTROL: [&str; 4] = [
+        "you control",
+        "that player controls",
+        "controlled by that player",
+        "the chosen player controls",
+    ];
+
+    #[test]
+    fn they_control_count_ge_marker() {
+        let (rest, condition) =
+            parse_they_control_count_ge("they control three or more creatures").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            condition,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::creature()
+                                .controller(ControllerRef::ScopedPlayer)
+                                .properties(vec![FilterProp::InZone {
+                                    zone: Zone::Battlefield,
+                                }])
+                        ),
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            }
+        );
+        for declined in NOT_THEY_CONTROL {
+            assert!(
+                parse_they_control_count_ge(&format!("{declined} three or more creatures"))
+                    .is_err(),
+                "{declined:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn that_player_controls_more_marker() {
+        let (rest, condition) = parse_that_player_controls_more_comparison(
+            "that player controls more creatures than you",
+        )
+        .unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter },
+                },
+            comparator: Comparator::GT,
+            ..
+        } = condition
+        else {
+            panic!("comparison: {condition:?}");
+        };
+        assert_eq!(
+            filter,
+            TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::ScopedPlayer))
+        );
+        for declined in [
+            "they control",
+            "you control",
+            "controlled by that player",
+            "the chosen player controls",
+        ] {
+            assert!(
+                parse_that_player_controls_more_comparison(&format!(
+                    "{declined} more creatures than you"
+                ))
+                .is_err(),
+                "{declined:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unless_pay_scaling_marker() {
+        let parse = |controller: &str| {
+            let text = format!("you pay {{1}} for each creature {controller} that's blocking it");
+            let (rest, condition) = parse_unless_pay_condition(&text).unwrap();
+            let StaticCondition::UnlessPay { scaling, .. } = condition else {
+                panic!("unless pay: {condition:?}");
+            };
+            (rest.to_string(), scaling)
+        };
+        assert_eq!(
+            parse("they control"),
+            (String::new(), UnlessPayScaling::PerAffectedCreature)
+        );
+        for declined in NOT_THEY_CONTROL {
+            assert_eq!(
+                parse(declined),
+                (
+                    format!(" for each creature {declined} that's blocking it"),
+                    UnlessPayScaling::Flat
+                ),
+                "{declined:?}"
+            );
+        }
+    }
 
     /// CR 603.4 + CR 102.1: "a player has more `<property>` than each other
     /// player" via the public `parse_inner_condition` seam — the exact shape,
@@ -13888,6 +14067,37 @@ mod tests {
     /// or more [type]` count authority is parameterized on the controller-scope
     /// axis. Both surface forms flow through `parse_inner_condition` and produce
     /// the same `ObjectCount >= N` shape, differing only in the injected
+    /// CR 500.8 + CR 506.1 + CR 109.5 + CR 608.2c: the first-combat-phase
+    /// occurrence gate is recognized by the SHARED authority, scope-composed
+    /// per axis — the possessive "your turn" form adds `DuringYourTurn`
+    /// (CR 109.5) while the non-possessive "the turn" form stays a single leaf.
+    #[test]
+    fn parse_inner_condition_first_combat_phase_scope_axis() {
+        let (rest, condition) = parse_inner_condition("it's the first combat phase of the turn")
+            .expect("the non-possessive form must parse in the shared authority");
+        assert_eq!(rest, "");
+        assert_eq!(condition, StaticCondition::FirstCombatPhaseOfTurn);
+
+        let (rest, condition) = parse_inner_condition("it's the first combat phase of your turn")
+            .expect("the possessive form must parse in the shared authority");
+        assert_eq!(rest, "");
+        assert_eq!(
+            condition,
+            StaticCondition::And {
+                conditions: vec![
+                    StaticCondition::DuringYourTurn,
+                    StaticCondition::FirstCombatPhaseOfTurn,
+                ],
+            }
+        );
+
+        // Review control: the "it is" expansion is the same condition.
+        let (rest, condition) = parse_inner_condition("it is the first combat phase of the turn")
+            .expect("the 'it is' form must parse in the shared authority");
+        assert_eq!(rest, "");
+        assert_eq!(condition, StaticCondition::FirstCombatPhaseOfTurn);
+    }
+
     /// `ControllerRef`. Self form ("you control three or more creatures") pins
     /// `You`; opponent form (Lashwhip Predator: "your opponents control three or
     /// more creatures") pins `Opponent`.
@@ -21312,6 +21522,180 @@ mod tests {
         }
     }
 
+    /// CR 120.2b + CR 602.5: Grim Repriser's verbatim gate — "an opponent has
+    /// been dealt noncombat damage this turn". The "has been dealt" tense plus
+    /// the `noncombat` qualifier must compose to `NoncombatOnly` at threshold 1.
+    #[test]
+    fn test_opponent_has_been_dealt_noncombat_damage_this_turn() {
+        let (rest, c) =
+            parse_inner_condition("an opponent has been dealt noncombat damage this turn").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::DamageDealtThisTurn {
+                                source,
+                                target,
+                                aggregate: AggregateFunction::Sum,
+                                group_by: None,
+                                damage_kind: DamageKindFilter::NoncombatOnly,
+
+                                channel: DamageChannel::Total,
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            } => {
+                assert_eq!(*source, TargetFilter::Any);
+                assert_player_recipient(&target, ControllerRef::Opponent);
+            }
+            other => panic!("expected opponent noncombat-damage gate quantity, got {other:?}"),
+        }
+    }
+
+    /// The unqualified sibling stays `Any`: "an opponent was dealt damage this
+    /// turn" (Skarrgan Pit-Skulk's Bloodthirst gate) must not collapse to a
+    /// damage class now that the qualifier threads through this arm.
+    #[test]
+    fn test_opponent_was_dealt_damage_this_turn_stays_any() {
+        let (rest, c) = parse_inner_condition("an opponent was dealt damage this turn").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::DamageDealtThisTurn {
+                                source,
+                                target,
+                                aggregate: AggregateFunction::Sum,
+                                group_by: None,
+                                damage_kind: DamageKindFilter::Any,
+
+                                channel: DamageChannel::Total,
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            } => {
+                assert_eq!(*source, TargetFilter::Any);
+                assert_player_recipient(&target, ControllerRef::Opponent);
+            }
+            other => panic!("expected opponent any-damage gate quantity, got {other:?}"),
+        }
+    }
+
+    /// Hostile sibling for the axis: "combat" names `CombatOnly`, never
+    /// `NoncombatOnly` or the empty-tag `Any`.
+    #[test]
+    fn test_opponent_was_dealt_combat_damage_this_turn() {
+        let (rest, c) =
+            parse_inner_condition("an opponent was dealt combat damage this turn").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::DamageDealtThisTurn {
+                                source,
+                                target,
+                                aggregate: AggregateFunction::Sum,
+                                group_by: None,
+                                damage_kind: DamageKindFilter::CombatOnly,
+
+                                channel: DamageChannel::Total,
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            } => {
+                assert_eq!(*source, TargetFilter::Any);
+                assert_player_recipient(&target, ControllerRef::Opponent);
+            }
+            other => panic!("expected opponent combat-damage gate quantity, got {other:?}"),
+        }
+    }
+
+    /// CR 120.2b: the self subject composes with the qualifier too — "~ has
+    /// been dealt noncombat damage this turn" is `SelfRef` + `NoncombatOnly`.
+    #[test]
+    fn test_self_has_been_dealt_noncombat_damage_this_turn() {
+        let (rest, c) =
+            parse_inner_condition("~ has been dealt noncombat damage this turn").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::DamageDealtThisTurn {
+                                source,
+                                target,
+                                aggregate: AggregateFunction::Sum,
+                                group_by: None,
+                                damage_kind: DamageKindFilter::NoncombatOnly,
+
+                                channel: DamageChannel::Total,
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            } => {
+                assert_eq!(*source, TargetFilter::Any);
+                assert_eq!(*target, TargetFilter::SelfRef);
+            }
+            other => panic!("expected self noncombat-damage gate quantity, got {other:?}"),
+        }
+    }
+
+    /// Ordering tripwire: the quantified form still takes the threshold arm
+    /// (`Max` over `Some(DamageGroupKey::Target)`, GE 4), never this arm's
+    /// `Sum`/`None` threshold-1 shape.
+    #[test]
+    fn test_opponent_damage_threshold_orders_before_bare_arm() {
+        let (rest, c) =
+            parse_inner_condition("an opponent was dealt 4 or more noncombat damage this turn")
+                .unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::DamageDealtThisTurn {
+                                source,
+                                target,
+                                aggregate: AggregateFunction::Max,
+                                group_by: Some(DamageGroupKey::Target),
+                                damage_kind: DamageKindFilter::NoncombatOnly,
+
+                                channel: DamageChannel::Total,
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 4 },
+            } => {
+                assert_eq!(*source, TargetFilter::Any);
+                assert_player_recipient(&target, ControllerRef::Opponent);
+            }
+            other => panic!("expected opponent noncombat-damage threshold quantity, got {other:?}"),
+        }
+    }
+
+    /// The arm stops exactly at the condition end: trailing text is left
+    /// unconsumed rather than swallowed.
+    #[test]
+    fn test_opponent_noncombat_damage_gate_rejects_trailing_junk() {
+        let (rest, _) = parse_inner_condition(
+            "an opponent has been dealt noncombat damage this turn, draw a card",
+        )
+        .unwrap();
+        assert_eq!(rest, ", draw a card");
+    }
+
     /// CR 120.1 + CR 603.4: "~ dealt damage to another creature this turn" — the
     /// dealing-direction *creature* target (Wolverine, Best There Is). "another"
     /// excludes the source (FilterProp::Another); no "combat" -> DamageKindFilter::Any.
@@ -24128,6 +24512,57 @@ mod tests {
         }
     }
 
+    /// CR 208.1: strict comparatives against a fixed threshold — "its power
+    /// is greater than 0" (Dragonborn Immolator's dies trigger) and the
+    /// symmetric "less than N". The comparative head requires a number, so
+    /// the relative-comparison phrases above still route to their own arms.
+    #[test]
+    fn parse_inner_condition_source_power_strict_comparative_fixed_threshold() {
+        let (rest, c) = parse_inner_condition("its power is greater than 0.").unwrap();
+        assert_eq!(rest, ".");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs,
+                comparator,
+                rhs,
+            } => {
+                assert_eq!(comparator, Comparator::GT);
+                assert_eq!(
+                    lhs,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::Power {
+                            scope: ObjectScope::Source,
+                        },
+                    }
+                );
+                assert_eq!(rhs, QuantityExpr::Fixed { value: 0 });
+            }
+            other => panic!("expected QuantityComparison, got {other:?}"),
+        }
+
+        let (rest, c) = parse_inner_condition("its toughness is less than 4.").unwrap();
+        assert_eq!(rest, ".");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs,
+                comparator,
+                rhs,
+            } => {
+                assert_eq!(comparator, Comparator::LT);
+                assert_eq!(
+                    lhs,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::Toughness {
+                            scope: ObjectScope::Source,
+                        },
+                    }
+                );
+                assert_eq!(rhs, QuantityExpr::Fixed { value: 4 });
+            }
+            other => panic!("expected QuantityComparison, got {other:?}"),
+        }
+    }
+
     /// "greater than or equal to" variant: comparator should be GE, aggregate Max.
     #[test]
     fn parse_inner_condition_superlative_each_other_ge() {
@@ -25326,6 +25761,10 @@ mod tests {
             ),
             ("it's your turn", "it\u{2019}s your turn"),
             ("it's not your turn", "it\u{2019}s not your turn"),
+            (
+                "it's the first combat phase of the turn",
+                "it\u{2019}s the first combat phase of the turn",
+            ),
             (
                 "~ hasn't dealt damage yet",
                 "~ hasn\u{2019}t dealt damage yet",
