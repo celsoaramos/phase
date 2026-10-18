@@ -14933,13 +14933,16 @@ fn try_parse_event(
         // CR 508.3d: "Whenever [a player] attacks" triggers fire once per attack declaration,
         // not once per attacker. This applies to "opponent attacks you" patterns (e.g., Lulu,
         // Cunning Rhetoric) where the subject is an opponent and the target is "you".
+        // The subject must be the opponent PLAYER: "a creature an opponent
+        // controls attacks you" is a per-creature Attacks trigger (CR 508.3a).
         let is_opponent_attacks_you =
             matches!(
                 subject,
                 TargetFilter::Typed(TypedFilter {
                     controller: Some(ControllerRef::Opponent),
+                    type_filters,
                     ..
-                })
+                }) if type_filters.is_empty()
             ) && matches!(
                 attack_target_filter,
                 Some(AttackTargetFilter::PlayerOrPlaneswalker) | Some(AttackTargetFilter::Player)
