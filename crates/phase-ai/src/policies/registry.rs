@@ -184,6 +184,10 @@ pub enum PolicyId {
     /// CR 106.4: a ritual's mana empties at end of step/phase — don't cast one
     /// when nothing in reach can spend it in this window.
     RitualSink,
+    /// CR 509.1a + CR 602.2: hold a creature's durable `{T}` ability (Steel
+    /// Overseer class) until the opponent's combat is over, so the creature
+    /// stays available to block.
+    CreatureTapPatience,
 }
 
 /// Coarse routing kind for a candidate decision. Each policy declares which
@@ -451,6 +455,7 @@ impl Default for PolicyRegistry {
             Box::new(GraveyardAuthorityPolicy),
             Box::new(super::pile_partition::PilePartitionPolicy),
             Box::new(super::ritual_sink::RitualSinkPolicy),
+            Box::new(super::creature_tap_patience::CreatureTapPatiencePolicy),
         ];
         Self::from_policies(policies)
     }

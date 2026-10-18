@@ -1246,6 +1246,25 @@ fn target_choice_penalty(ctx: &PolicyContext<'_>, target: &TargetRef) -> f64 {
         }
     }
 
+    // CR 701.26a/b: "tap or untap target creature" (Sewer-veillance Cam) only
+    // changes something through the branch that FLIPS the target's state.
+    // An opponent's creature that is already tapped can only be untapped,
+    // which helps its controller; an untapped creature of the AI's can only
+    // be tapped, which costs the AI. Either way the effect is spent on nothing
+    // the AI wants — reported 2026-10-18: the AI aimed the Cam at an
+    // opponent's creature still tapped from attacking, next to that
+    // opponent's untapped vigilant creature.
+    if is_tap_or_untap_choice(&effects) {
+        if let Some(object) = ctx.state.objects.get(object_id) {
+            let opponents =
+                engine::game::players::is_opponent(ctx.state, ctx.ai_player, object.controller);
+            let own = object.controller == ctx.ai_player;
+            if (opponents && object.tapped) || (own && !object.tapped) {
+                return -8.0;
+            }
+        }
+    }
+
     let harmful = effects
         .iter()
         .any(|effect| matches!(effect_polarity(effect), EffectPolarity::Harmful));
@@ -1257,6 +1276,31 @@ fn target_choice_penalty(ctx: &PolicyContext<'_>, target: &TargetRef) -> f64 {
     } else {
         0.0
     }
+}
+
+/// The parsed shape of "tap or untap target <object>": a `ChooseOneOf` whose
+/// two branches tap and untap the parent target (see
+/// `try_parse_tap_or_untap_choice` in the engine parser).
+fn is_tap_or_untap_choice(effects: &[&Effect]) -> bool {
+    use engine::types::ability::{EffectScope, TapStateChange};
+    let branch_is = |branch: &AbilityDefinition, wanted: TapStateChange| {
+        matches!(
+            &*branch.effect,
+            Effect::SetTapState {
+                target: TargetFilter::ParentTarget,
+                scope: EffectScope::Single,
+                state,
+            } if *state == wanted
+        )
+    };
+    effects.iter().any(|effect| match effect {
+        Effect::ChooseOneOf { branches, .. } => {
+            branches.len() == 2
+                && branches.iter().any(|b| branch_is(b, TapStateChange::Tap))
+                && branches.iter().any(|b| branch_is(b, TapStateChange::Untap))
+        }
+        _ => false,
+    })
 }
 
 fn is_redundant_creature_only_removal(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> bool {
