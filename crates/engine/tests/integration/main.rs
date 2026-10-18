@@ -1795,6 +1795,7 @@ mod multi_source_each_power_damage;
 mod mycoloth_devour_drain_strand;
 mod nadu_lavaspur_boots_max_times;
 mod najeela_extra_combat_grant_2898;
+mod nasty_end_legendary_sacrifice;
 mod no_top_level_test_binaries;
 mod oblivions_hunger_conditional_draw;
 mod offer_side_auto_payment;

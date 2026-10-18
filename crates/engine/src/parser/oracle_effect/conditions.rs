@@ -8116,7 +8116,21 @@ fn parse_cost_paid_object_predicate(rest: &str) -> Option<CostPaidPredicate> {
     if let Some(prop) = parse_status_property_predicate(rest) {
         return Some(CostPaidPredicate::Property(prop));
     }
+    if let Some(prop) = parse_supertype_property_predicate(rest) {
+        return Some(CostPaidPredicate::Property(prop));
+    }
     parse_article_type_predicate(rest).map(CostPaidPredicate::TypeMatch)
+}
+
+/// CR 205.4a: A bare supertype predicate ("the sacrificed creature was
+/// legendary" — Nasty End) as a `FilterProp::HasSupertype`, read against the
+/// cost-paid object's LKI supertypes.
+fn parse_supertype_property_predicate(input: &str) -> Option<FilterProp> {
+    let trimmed = input.trim().trim_end_matches('.').trim();
+    let (rest, value) = parse_supertype_word(trimmed).ok()?;
+    rest.trim()
+        .is_empty()
+        .then_some(FilterProp::HasSupertype { value })
 }
 
 /// CR 701.60b: Parse a status-property predicate as a `FilterProp`. Currently

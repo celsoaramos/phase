@@ -24765,6 +24765,62 @@ fn instead_condition_recognizes_sacrificed_creature_was_a_subtype() {
     }
 }
 
+/// CR 205.4a + CR 608.2c: Nasty End — a bare supertype predicate on the
+/// cost-paid object ("the sacrificed creature was legendary") lowers to
+/// `CostPaidObjectMatchesFilter { HasSupertype(Legendary) }` under
+/// `ConditionInstead`, swapping the two-card draw for three.
+#[test]
+fn instead_condition_recognizes_sacrificed_creature_was_legendary() {
+    use crate::types::card_type::Supertype;
+    let ability = parse_effect_chain(
+        "Draw two cards. If the sacrificed creature was legendary, draw three cards instead.",
+        AbilityKind::Spell,
+    );
+    assert!(
+        matches!(
+            &*ability.effect,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 2 },
+                ..
+            }
+        ),
+        "base effect must stay the two-card draw, got {:?}",
+        ability.effect
+    );
+    let sub = ability
+        .sub_ability
+        .as_ref()
+        .expect("expected instead sub_ability");
+    let Some(AbilityCondition::ConditionInstead { inner }) = sub.condition.as_ref() else {
+        panic!("expected ConditionInstead, got {:?}", sub.condition);
+    };
+    let AbilityCondition::CostPaidObjectMatchesFilter {
+        filter: TargetFilter::Typed(typed),
+    } = inner.as_ref()
+    else {
+        panic!("expected CostPaidObjectMatchesFilter, got {inner:?}");
+    };
+    assert!(typed.type_filters.contains(&TypeFilter::Creature));
+    assert!(
+        typed.properties.contains(&FilterProp::HasSupertype {
+            value: Supertype::Legendary
+        }),
+        "properties must include HasSupertype(Legendary), got {:?}",
+        typed.properties
+    );
+    assert!(
+        matches!(
+            &*sub.effect,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 3 },
+                ..
+            }
+        ),
+        "override must draw three, got {:?}",
+        sub.effect
+    );
+}
+
 /// CR 117.1 + CR 400.7j + CR 608.2k + CR 614.1a: Witch's Oven class —
 /// the "sacrificed creature" cost-paid object is checked against its LKI
 /// toughness to replace the token quantity. This is a property predicate on
