@@ -2816,7 +2816,15 @@ fn parse_subject_application_for(
                 is_optional: false,
             });
         }
-        return subject_filter_application(filter, true);
+        // CR 608.2d: "target player/opponent may <verb>" — the targeted player
+        // performs the action and announces the choice. The announcer is stamped
+        // at assembly (`DeclaredPlayer` of this clause's own declaration).
+        let mut application = subject_filter_application(filter, true)?;
+        application.is_optional = all_consuming(tag::<_, _, OracleError<'_>>("may"))
+            .parse(rest.trim())
+            .is_ok()
+            && application.affected.denotes_player_target();
+        return Some(application);
     }
     if tag::<_, _, OracleError<'_>>("up to ")
         .parse(lower.as_str())

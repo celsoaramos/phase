@@ -69,7 +69,7 @@
 use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case, take_until};
-use nom::combinator::{map, opt, value};
+use nom::combinator::{map, not, opt, value};
 use nom::sequence::{delimited, terminated};
 use nom::Parser;
 
@@ -383,9 +383,14 @@ fn try_peel_opponent_may_prefix(
                 (None, Some(PlayerFilter::TriggeringPlayer)),
                 tag("the first player may "),
             ),
+            // CR 115.1 + CR 608.2d: "target opponent may draw …" names ONE
+            // targeted opponent who both acts and announces; it stays on the
+            // subject path (`parse_subject_application`) so the target slot
+            // survives. The causative/choice forms ("may have you draw", "may
+            // choose …") keep the may-actor scope peel.
             value(
                 (None, Some(PlayerFilter::Opponent)),
-                tag("target opponent may "),
+                terminated(tag("target opponent may "), not(tag("draw "))),
             ),
             value(
                 (None, Some(PlayerFilter::DefendingPlayer)),

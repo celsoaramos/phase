@@ -1646,6 +1646,31 @@ fn bind_chosen_number_anaphor(def: &mut AbilityDefinition, prior: &[AbilityDefin
     }
 }
 
+/// CR 115.1 + CR 608.2d: "target player/opponent may <verb>" — the clause
+/// declares its own player target and that player announces the choice. The
+/// effect's player slot is an announced TARGET (`Player` / `Typed`), which
+/// `subject_anchored_optional_actor` refuses because the same shape also comes
+/// from the controller-held "you may have target player …" (Jace's Erasure); the
+/// clause's own subject wording is the provenance that separates the two.
+fn targeted_player_may_actor(
+    def: &AbilityDefinition,
+    clause_ir: &ClauseIr,
+) -> Option<TargetFilter> {
+    let group = def.declares_chosen_group?;
+    let fragment = clause_ir.source.fragment()?.to_lowercase();
+    preceded(
+        multispace0::<_, OracleError<'_>>,
+        (
+            tag("target "),
+            alt((tag("opponent "), tag("player "))),
+            tag("may "),
+        ),
+    )
+    .parse(fragment.as_str())
+    .ok()?;
+    Some(TargetFilter::DeclaredPlayer { group })
+}
+
 /// CR 608.2d + CR 603.7b/d/e: WHEN a stamped announcer anaphor will be resolved.
 ///
 /// CR 608.2c binds the clause's anaphor by the rules of English; CR 608.2d then
@@ -3251,7 +3276,8 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
             // so precedence belongs at the writer, not at the classifier.
             if def.optional_for.is_none() && def.optional_player.is_none() {
                 def.optional_player =
-                    subject_anchored_optional_actor(&def, ActorBindingWindow::ThisResolution);
+                    subject_anchored_optional_actor(&def, ActorBindingWindow::ThisResolution)
+                        .or_else(|| targeted_player_may_actor(&def, clause_ir));
             }
         }
         if matches!(&clause_ir.parsed.effect, Effect::SearchOutsideGame { .. }) {

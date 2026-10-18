@@ -1477,6 +1477,7 @@ mod target_instance_identity_9280;
 mod target_player_zone_count_slot_6856;
 mod targeted_exchange_preview_budget;
 mod targeted_player_mass_library_shuffle;
+mod tataru_taru_target_opponent_may_draw;
 mod tchaka_venerable_king;
 mod teamwork_aggregate_legal_actions;
 mod teamwork_origin_composition;

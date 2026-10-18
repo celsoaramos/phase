@@ -3186,6 +3186,37 @@ fn starts_each_player_predicate_clause_lower(s: &str) -> OracleResult<'_, ()> {
     .parse(rest)
 }
 
+/// CR 115.1 + CR 601.2c + CR 608.2c: a "target player"/"target opponent"
+/// conjunct joined by a bare " and " opens its OWN player target and is a fresh
+/// clause start when a player-action verb (or the "may" modal, CR 608.2d)
+/// follows the subject (Tataru Taru: "you draw a card and target opponent may
+/// draw a card"; Mindculling: "... and target opponent discards two cards").
+/// A bare noun-phrase continuation ("... to target creature and target player")
+/// has no verb and is left un-split. Player sibling of
+/// `starts_each_player_predicate_clause_lower`; `gains`/`loses` already split
+/// through `starts_target_continuous_clause_lower`.
+fn starts_target_player_predicate_clause_lower(s: &str) -> OracleResult<'_, ()> {
+    let (rest, _) = (tag("target "), alt((tag("opponent "), tag("player ")))).parse(s)?;
+    value(
+        (),
+        alt((
+            tag("may "),
+            tag("draws "),
+            tag("discards "),
+            tag("mills "),
+            tag("sacrifices "),
+            tag("exiles "),
+            tag("creates "),
+            tag("reveals "),
+            tag("shuffles "),
+            tag("puts "),
+            tag("searches "),
+            tag("returns "),
+        )),
+    )
+    .parse(rest)
+}
+
 /// CR 608.2c + CR 122.1: "remove <quantity> <type> counter[s] [from it]" as a
 /// bare-`" and "` conjunct is an independent imperative instruction, not a
 /// noun-phrase continuation of the prior conjunct. Amy Pond: "choose a suspended
@@ -3745,6 +3776,9 @@ fn starts_bare_and_clause_lower(s: &str) -> bool {
     // `starts_target_continuous_clause_lower`) so the `alt(...)` cluster stays
     // under nom's 21-arm limit.
     .or(value((), starts_each_player_predicate_clause_lower))
+    // CR 115.1 + CR 601.2c: a fresh "target player/opponent <verb>" or
+    // "target player/opponent may <verb>" conjunct (Tataru Taru, Mindculling).
+    .or(value((), starts_target_player_predicate_clause_lower))
     // CR 608.2c + CR 122.1: a bare "remove <quantity> <type> counter[s] …"
     // conjunct is an independent counter-removal instruction (Amy Pond). Trailing
     // `.or()` arm (mirroring `starts_target_continuous_clause_lower`) so the

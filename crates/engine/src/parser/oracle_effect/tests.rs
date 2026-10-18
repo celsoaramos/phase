@@ -45041,6 +45041,78 @@ fn inject_subject_target_copy_token_owner() {
     }
 }
 
+/// CR 115.1 + CR 608.2d: Tataru Taru — "you draw a card and target opponent
+/// may draw a card". The bare-"and" conjunct opens its own player target; the
+/// optional draw targets that opponent and that opponent announces the may
+/// (`optional_player` = the clause's own declared player), with no per-opponent
+/// `player_scope` fan-out.
+#[test]
+fn compound_target_opponent_may_draw_keeps_target_and_announcer() {
+    let chain = parse_effect_chain(
+        "you draw a card and target opponent may draw a card",
+        AbilityKind::Spell,
+    );
+    assert!(
+        matches!(
+            &*chain.effect,
+            Effect::Draw {
+                target: TargetFilter::Controller,
+                ..
+            }
+        ),
+        "head is the controller's draw, got {:?}",
+        chain.effect
+    );
+    let sub = chain.sub_ability.as_ref().expect("opponent conjunct");
+    let Effect::Draw { target, count } = &*sub.effect else {
+        panic!("expected the opponent's Draw, got {:?}", sub.effect);
+    };
+    assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
+    assert!(
+        target.denotes_player_target(),
+        "the draw keeps its announced player target, got {target:?}"
+    );
+    assert!(sub.optional, "the opponent's draw is optional");
+    assert_eq!(sub.player_scope, None, "no per-opponent fan-out");
+    let group = sub
+        .declares_chosen_group
+        .expect("the conjunct declares its player target");
+    assert_eq!(
+        sub.optional_player,
+        Some(TargetFilter::DeclaredPlayer { group }),
+        "CR 608.2d: the targeted opponent announces the may"
+    );
+}
+
+/// CR 115.1: other targeted-player verbs split off a bare " and " too
+/// (Mindculling), while a bare noun-phrase continuation does not.
+#[test]
+fn compound_target_opponent_verb_conjunct_splits() {
+    let chain = parse_effect_chain(
+        "you draw two cards and target opponent discards two cards",
+        AbilityKind::Spell,
+    );
+    let sub = chain.sub_ability.as_ref().expect("discard conjunct");
+    let Effect::Discard { target, .. } = &*sub.effect else {
+        panic!("expected Discard, got {:?}", sub.effect);
+    };
+    assert!(target.denotes_player_target(), "got {target:?}");
+    assert!(!sub.optional);
+
+    let damage = parse_effect_chain(
+        "~ deals 2 damage to target creature and target player",
+        AbilityKind::Spell,
+    );
+    assert!(
+        damage.sub_ability.is_none()
+            || !matches!(
+                &*damage.sub_ability.as_ref().unwrap().effect,
+                Effect::Unimplemented { .. }
+            ),
+        "a noun-phrase continuation stays one damage clause, got {damage:?}"
+    );
+}
+
 /// CR 115.1 + CR 701.21a: Edict subjects retain their player-target
 /// restriction. Diabolic Edict can target any player, while Cruel Edict can
 /// target only an opponent.
