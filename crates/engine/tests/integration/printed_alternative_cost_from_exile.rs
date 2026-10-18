@@ -203,7 +203,7 @@ fn fireblast_exiled_by_impulse_draw_offers_the_mountain_sacrifice() {
     let state = runner.state();
     assert_eq!(state.objects[&fireblast].zone, Zone::Exile);
     assert_eq!(state.objects[&filler].zone, Zone::Exile);
-    assert!(state.players[0].mana_pool.mana.is_empty());
+    assert!(state.players[0].mana_pool.is_empty());
 
     assert!(
         can_cast_object_now(runner.state(), P0, fireblast),
@@ -240,7 +240,7 @@ fn declining_the_alternative_cost_from_exile_pays_the_printed_mana_cost() {
     assert_eq!(runner.state().stack.len(), 1);
     assert_eq!(mountains_on_battlefield(&runner, P0), 2);
     assert!(
-        runner.state().players[0].mana_pool.mana.is_empty(),
+        runner.state().players[0].mana_pool.is_empty(),
         "the printed {{4}}{{R}}{{R}} was paid"
     );
 }
@@ -281,7 +281,7 @@ fn one_mountain_does_not_make_the_exiled_fireblast_castable() {
             ..
         }) if *id == fireblast
     ));
-    assert!(state.players[0].mana_pool.mana.is_empty());
+    assert!(state.players[0].mana_pool.is_empty());
     assert_eq!(mountains_on_battlefield(&runner, P0), 1);
 }
 
@@ -488,7 +488,7 @@ fn force_of_will_without_a_blue_pitch_card_keeps_the_ordinary_cast() {
         commit.state().stack.back().map(|entry| entry.id),
         Some(force)
     );
-    assert!(commit.state().players[0].mana_pool.mana.is_empty());
+    assert!(commit.state().players[0].mana_pool.is_empty());
 }
 
 /// CR 118.9a: a cast authorized "without paying its mana cost" already uses an
@@ -643,7 +643,7 @@ fn late_preview_only_uses_the_printed_option_for_normal_casts() {
     cast(&mut runner, fireblast, None);
     assert!(runner.state().objects[&fireblast].face_down);
     assert_eq!(runner.state().objects[&fireblast].zone, Zone::Stack);
-    assert!(runner.state().players[0].mana_pool.mana.is_empty());
+    assert!(runner.state().players[0].mana_pool.is_empty());
 
     let (mut runner, fireblast, mountains) = face_down_fireblast_board(2, 2);
     assert!(can_cast_object_now(runner.state(), P0, fireblast));
@@ -724,5 +724,5 @@ fn a_cost_rider_grant_keeps_the_printed_alternative_cost_unoffered() {
         Some(fireblast)
     );
     assert_eq!(mountains_on_battlefield(&runner, P0), 2);
-    assert!(runner.state().players[0].mana_pool.mana.is_empty());
+    assert!(runner.state().players[0].mana_pool.is_empty());
 }
