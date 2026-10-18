@@ -221,6 +221,7 @@
     "branch": "card/repeated-payment-frame-deadlock"
   },
   {
-    "branch": "ai/prospective-payment-budget"
+    "branch": "ai/prospective-payment-budget-mf",
+    "pr": 10074
   }
 ]
