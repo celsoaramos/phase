@@ -2,10 +2,10 @@
 //! Engine-authored presentation projections over `GameState`.
 //!
 //! These "derived views" are computed just-in-time at serialization
-//! boundaries (the WASM getter, the server-core broadcast) and sent to
-//! clients alongside the raw state. Display consumers (React components)
-//! consume the pre-grouped shape directly and never compute game logic
-//! themselves — per CLAUDE.md's "engine owns all logic" invariant.
+//! boundaries and sent to clients alongside the viewer-filtered state.
+//! Display consumers (React components) consume the pre-grouped shape
+//! directly and never compute game logic themselves — per CLAUDE.md's
+//! "engine owns all logic" invariant.
 //!
 //! Contrast with `crates/engine/src/game/derived.rs`, which contains
 //! engine-internal state derivation (summoning sickness, commander damage
@@ -13,10 +13,12 @@
 //! that composes those helpers into a client-ready shape.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::num::NonZeroUsize;
 
 use crate::analysis::resource::ResourceAxis;
-use crate::game::ability_utils::declared_targets_in_chain;
+use crate::game::ability_utils::{declared_targets_in_chain, flatten_targets_in_chain};
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::game_object::{AttachTarget, DisplaySource};
 use crate::game::stack::{
@@ -93,6 +95,10 @@ pub struct StackEntryDisplay {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_image_ref: Option<TokenImageRef>,
     pub kind_label: String,
+    /// The typed template behind `kind_label` for activated and triggered
+    /// ability entries (`StackAbilityKindView`); `None` for every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ability_kind: Option<StackAbilityKindView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ability_description: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -116,6 +122,40 @@ pub struct StackEntryDisplay {
     /// renders one engine-provided value and never picks between two.
     #[serde(default)]
     pub controller: PlayerId,
+}
+
+/// Presentation-only discriminant for the ability template `kind_label` names,
+/// published beside it so a localized display layer formats the label from
+/// typed data instead of parsing the English string.
+///
+/// This mirrors the label `stack_entry_detail` chooses, not a rules
+/// classification: keyword-action entries (Equip, Crew, …) are labelled by
+/// their keyword and carry no value here, and nothing in game logic may read
+/// it. `StackAbilityKind` in `types::ability` is the rules-filter axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum StackAbilityKindView {
+    /// `number` is the 1-based printed position from
+    /// `ResolvedAbility::ability_index`; absent when the ability carries none.
+    Activated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        number: Option<NonZeroUsize>,
+    },
+    Triggered,
+}
+
+impl StackAbilityKindView {
+    /// The single authority for the English ability label, so `kind_label`
+    /// and this value can never disagree.
+    fn english_label(self) -> String {
+        match self {
+            Self::Activated {
+                number: Some(number),
+            } => format!("Activated ability {number}"),
+            Self::Activated { number: None } => "Activated ability".to_string(),
+            Self::Triggered => "Triggered ability".to_string(),
+        }
+    }
 }
 
 /// A single player-affecting condition the HUD surfaces as a status icon.
@@ -761,11 +801,11 @@ pub struct DerivedViews {
     pub auras_attached_to_player: BTreeMap<PlayerId, Vec<ObjectId>>,
 
     /// CR 702.188a + 604.1: web-slinging alt-cost the VIEWING player may pay for each
-    /// qualifying card in their OWN hand (incl. statically-granted web-slinging). Keyed by
-    /// hand ObjectId. Populated ONLY for the `viewer` passed to derive_views and ONLY from
-    /// that viewer's hand — never another player's — so it cannot leak which opponent/AI
-    /// cards qualify, even on the unfiltered get_game_state() path. Empty when no viewer,
-    /// no granting static, or no qualifying card.
+    /// qualifying card in their OWN hand. Keyed by hand ObjectId. Populated ONLY for
+    /// the `viewer` passed to derive_views and ONLY from that viewer's hand — never
+    /// another player's — so it cannot leak which opponent/AI cards qualify, even
+    /// when derive_views is handed an unfiltered state. Empty when no viewer, no
+    /// granting static, or no qualifying card.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub web_slinging_costs: HashMap<ObjectId, ManaCost>,
 
@@ -943,17 +983,14 @@ pub struct DerivedViews {
     pub counter_display: HashMap<ObjectId, ObjectCounterDisplay>,
 }
 
-/// Serialize-only wrapper: the WASM getter passes `&GameState` by reference
-/// to avoid an O(n) clone of `state.objects` and other owned collections
-/// (GameState is not rpds-backed at the top level). The wire shape is
+/// Serialize-only wrapper. The wire shape is
 /// `{ state: <GameState>, derived: <DerivedViews> }`.
 #[derive(Debug)]
 pub struct ClientGameStateRef<'a> {
-    pub state: &'a GameState,
-    pub derived: DerivedViews,
-    display_visible_object_ids: Option<BTreeSet<ObjectId>>,
-    viewer: Option<PlayerId>,
-    already_filtered: bool,
+    /// Owned when [`Self::wrap`] computed the projection, borrowed when a
+    /// [`Self::wrap_filtered`] caller supplied it.
+    state: Cow<'a, GameState>,
+    derived: DerivedViews,
 }
 
 impl Serialize for ClientGameStateRef<'_> {
@@ -967,13 +1004,7 @@ impl Serialize for ClientGameStateRef<'_> {
             derived: &'a DerivedViews,
         }
 
-        let state = client_state_wire_value(
-            self.state,
-            self.display_visible_object_ids.as_ref(),
-            self.viewer,
-            self.already_filtered,
-        )
-        .map_err(serde::ser::Error::custom)?;
+        let state = client_state_wire_value(&self.state).map_err(serde::ser::Error::custom)?;
         ClientGameStateEnvelope {
             state: &state,
             derived: &self.derived,
@@ -986,25 +1017,8 @@ impl Serialize for ClientGameStateRef<'_> {
 /// persistence schema of [`GameState`]. Delayed-trigger receipts and their
 /// allocators authorize replay/transition handling; clients receive neither
 /// those private capabilities nor the resolved journal that contains them.
-fn client_state_wire_value(
-    state: &GameState,
-    display_visible_object_ids: Option<&BTreeSet<ObjectId>>,
-    viewer: Option<PlayerId>,
-    already_filtered: bool,
-) -> serde_json::Result<serde_json::Value> {
-    // CR 601.2h + CR 608.2c: direct client snapshots must pass through the
-    // same identity/knowledge redaction as the filtered-viewer path. An
-    // unscoped wire has no authenticated actor, so it must keep the canonical
-    // base and never materialize a staged shadow; wrap_filtered has already
-    // performed the viewer projection.
-    let payment_projected = match (viewer, already_filtered) {
-        (Some(viewer), false) => crate::game::visibility::filter_state_for_viewer(state, viewer),
-        (Some(_), true) => state.clone(),
-        (None, false) => crate::game::visibility::filter_state_for_unseated_viewer(state),
-        (None, true) => state.clone(),
-    };
-    let projected_state =
-        crate::game::visibility::project_paid_cast_cleanup_authority(&payment_projected);
+fn client_state_wire_value(state: &GameState) -> serde_json::Result<serde_json::Value> {
+    let projected_state = crate::game::visibility::project_paid_cast_cleanup_authority(state);
     let mut value = serde_json::to_value(&projected_state)?;
     let Some(root) = value.as_object_mut() else {
         return Ok(value);
@@ -1017,30 +1031,6 @@ fn client_state_wire_value(
     // mutable redaction lists or from private execution carriers.
     root.insert("wire_projection".to_string(), serde_json::Value::Bool(true));
 
-    if let Some(display_visible_object_ids) = display_visible_object_ids {
-        if let Some(objects) = root
-            .get_mut("objects")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            for object in objects.values_mut() {
-                if let Some(object) = object.as_object_mut() {
-                    object.remove("display_visible_to_viewer");
-                }
-            }
-            for object_id in display_visible_object_ids {
-                if let Some(object) = objects
-                    .get_mut(&object_id.0.to_string())
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    object.insert(
-                        "display_visible_to_viewer".to_string(),
-                        serde_json::Value::Bool(true),
-                    );
-                }
-            }
-        }
-    }
-
     root.remove("next_delayed_trigger_token");
     root.remove("next_delayed_trigger_instance");
     root.remove("next_resolution_cast_offer_id");
@@ -1049,9 +1039,8 @@ fn client_state_wire_value(
     root.remove("resolving_trigger_firing");
     root.remove("resolved_rules_journal");
     root.remove("stack_resolution_session");
-    // CR 605.4a + CR 117.3c: Defense in depth for direct `ClientGameStateRef`
-    // callers that did not first run `visibility::filter_state_for_viewer`.
-    // Both are trusted persistence authorities, never client schema.
+    // CR 605.4a + CR 117.3c: Defense in depth. Both are trusted persistence
+    // authorities, never client schema.
     root.remove("pending_triggered_mana_resume");
     root.remove("pending_trigger_construction_priority_recipient");
     // Same defense in depth for the original Cube multiset: undealt entries and
@@ -1097,25 +1086,15 @@ impl<'a> ClientGameStateRef<'a> {
     /// Viewer-filtered paths must use [`Self::wrap_filtered`] so redaction cannot
     /// erase an authoritative decision projection.
     pub fn wrap(state: &'a GameState, viewer: Option<PlayerId>) -> Self {
-        let filtered_state = match viewer {
+        // CR 601.2h + CR 608.2c: direct client snapshots must pass through the
+        // same identity/knowledge redaction as the filtered-viewer path. An
+        // unscoped wire has no authenticated actor, so it must keep the canonical
+        // base and never materialize a staged shadow.
+        let projection = match viewer {
             Some(viewer) => crate::game::visibility::filter_state_for_viewer(state, viewer),
             None => crate::game::visibility::filter_state_for_unseated_viewer(state),
         };
-        let display_visible_object_ids = Some(
-            filtered_state
-                .objects
-                .iter()
-                .filter_map(|(id, object)| object.display_visible_to_viewer.then_some(*id))
-                .collect(),
-        );
-        let derived = derive_filtered_views(state, &filtered_state, viewer);
-        Self {
-            state,
-            derived,
-            display_visible_object_ids,
-            viewer,
-            already_filtered: false,
-        }
+        Self::from_projection(state, Cow::Owned(projection), viewer)
     }
 
     /// Wrap a viewer-filtered state while deriving rules-authoritative fields
@@ -1126,13 +1105,24 @@ impl<'a> ClientGameStateRef<'a> {
         filtered_state: &'a GameState,
         viewer: Option<PlayerId>,
     ) -> Self {
+        Self::from_projection(authoritative_state, Cow::Borrowed(filtered_state), viewer)
+    }
+
+    fn from_projection(
+        authoritative_state: &GameState,
+        projection: Cow<'a, GameState>,
+        viewer: Option<PlayerId>,
+    ) -> Self {
+        let derived = derive_filtered_views(authoritative_state, &projection, viewer);
         Self {
-            state: filtered_state,
-            derived: derive_filtered_views(authoritative_state, filtered_state, viewer),
-            display_visible_object_ids: None,
-            viewer,
-            already_filtered: true,
+            state: projection,
+            derived,
         }
+    }
+
+    /// The state the envelope's `state` half is serialized from.
+    pub fn state(&self) -> &GameState {
+        &self.state
     }
 }
 
@@ -2690,36 +2680,49 @@ fn stack_entry_details(state: &GameState) -> HashMap<ObjectId, StackEntryDisplay
 fn stack_entry_detail(state: &GameState, entry: &StackEntry) -> StackEntryDisplay {
     let source_name = stack_source_name(state, entry);
     let effective_ability = effective_stack_ability(state, entry);
-    let (kind_label, ability_description) = match &entry.kind {
+    let (kind_label, ability_kind, ability_description) = match &entry.kind {
         StackEntryKind::Spell { ability, .. } => (
             "Spell".to_string(),
+            None,
             ability
                 .as_ref()
                 .and_then(|ability| ability.description.clone()),
         ),
-        StackEntryKind::ActivatedAbility { ability, .. } => (
-            ability
-                .ability_index
-                .map(|idx| format!("Activated ability {}", idx + 1))
-                .unwrap_or_else(|| "Activated ability".to_string()),
-            ability.description.clone(),
-        ),
+        StackEntryKind::ActivatedAbility { ability, .. } => {
+            let kind = StackAbilityKindView::Activated {
+                number: ability
+                    .ability_index
+                    .map(|idx| NonZeroUsize::MIN.saturating_add(idx)),
+            };
+            (
+                kind.english_label(),
+                Some(kind),
+                ability.description.clone(),
+            )
+        }
         StackEntryKind::TriggeredAbility {
             ability,
             description,
             ..
-        } => (
-            "Triggered ability".to_string(),
-            description.clone().or_else(|| ability.description.clone()),
-        ),
-        StackEntryKind::KeywordAction { action } => (keyword_action_label(action), None),
-        StackEntryKind::CombatDamage { sub_step, .. } => (combat_damage_label(*sub_step), None),
+        } => {
+            let kind = StackAbilityKindView::Triggered;
+            (
+                kind.english_label(),
+                Some(kind),
+                description.clone().or_else(|| ability.description.clone()),
+            )
+        }
+        StackEntryKind::KeywordAction { action } => (keyword_action_label(action), None, None),
+        StackEntryKind::CombatDamage { sub_step, .. } => {
+            (combat_damage_label(*sub_step), None, None)
+        }
     };
 
     StackEntryDisplay {
         source_name,
         token_image_ref: stack_source_token_image_ref(state, entry),
         kind_label,
+        ability_kind,
         ability_description,
         selected_mode_labels: effective_ability
             .ability
@@ -2811,7 +2814,15 @@ fn stack_entry_targets(state: &GameState, entry: &StackEntry) -> Vec<StackTarget
         StackEntryKind::KeywordAction { action } => keyword_action_targets(action),
         _ => effective_stack_ability(state, entry)
             .ability
-            .map(declared_targets_in_chain)
+            .map(|ability| {
+                let declared = declared_targets_in_chain(ability);
+                // An entry that declared no target shows what it holds.
+                if declared.is_empty() {
+                    flatten_targets_in_chain(ability)
+                } else {
+                    declared
+                }
+            })
             .unwrap_or_default(),
     };
     targets
@@ -3063,8 +3074,8 @@ mod tests {
     use crate::game::triggers::{PendingTrigger, PendingTriggerContext};
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        DelayedTriggerCondition, Duration, Effect, EffectKind, ModalChoice, ResolvedAbility,
-        RestrictionExpiry, StaticCondition, TargetFilter, TargetRef,
+        DelayedTriggerCondition, DelayedTriggerKind, Duration, Effect, EffectKind, ModalChoice,
+        ResolvedAbility, RestrictionExpiry, StaticCondition, TargetFilter, TargetRef,
     };
     use crate::types::card_type::CoreType;
     use crate::types::format::FormatConfig;
@@ -5168,6 +5179,228 @@ mod tests {
         );
     }
 
+    /// `stack_entry_detail` publishes the typed template behind `kind_label`
+    /// for ability entries, numbered exactly as the label is, and nothing for
+    /// spells or keyword actions. The numbered entry is stamped by the real
+    /// activation path (`GameAction::ActivateAbility`).
+    #[test]
+    fn stack_entry_details_publish_structured_ability_kind_beside_kind_label() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::types::actions::GameAction;
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let source = scenario
+            .add_creature_from_oracle(
+                P0,
+                "Twin Pumper",
+                2,
+                2,
+                "{0}: This creature gets +1/+1 until end of turn.\n{0}: This creature gets +0/+1 until end of turn.",
+            )
+            .id();
+        let mut runner = scenario.build();
+        let second = runner.state().objects[&source]
+            .abilities
+            .iter()
+            .enumerate()
+            .filter(|(_, ability)| ability.cost.is_some())
+            .nth(1)
+            .map(|(index, _)| index)
+            .expect("the fixture has two activated abilities");
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: second,
+            })
+            .expect("activate the second ability");
+
+        let activated = runner
+            .state()
+            .stack
+            .back()
+            .expect("the activation is on the stack")
+            .clone();
+        let StackEntryKind::ActivatedAbility { ability, .. } = &activated.kind else {
+            panic!("the top stack entry is the activated ability");
+        };
+        assert_eq!(
+            ability.ability_index,
+            Some(second),
+            "the activation path stamps the printed ability index"
+        );
+
+        let state = runner.state_mut();
+        let inert = |source: ObjectId| {
+            ResolvedAbility::new(
+                Effect::unimplemented("inert", "inert fixture effect"),
+                Vec::new(),
+                source,
+                PlayerId(0),
+            )
+        };
+        let trigger = create_object(
+            state,
+            CardId(91),
+            PlayerId(0),
+            "Trigger".to_string(),
+            Zone::Stack,
+        );
+        state.stack.push_back(StackEntry {
+            id: trigger,
+            source_id: source,
+            controller: PlayerId(0),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: source,
+                ability: Box::new(inert(source)),
+                condition: None,
+                trigger_event: None,
+                description: None,
+                source_name: "Twin Pumper".to_string(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        });
+        let unnumbered = create_object(
+            state,
+            CardId(92),
+            PlayerId(0),
+            "Unnumbered".to_string(),
+            Zone::Stack,
+        );
+        state.stack.push_back(StackEntry {
+            id: unnumbered,
+            source_id: source,
+            controller: PlayerId(0),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: source,
+                ability: Box::new(inert(source)),
+            },
+        });
+        let spell = create_object(
+            state,
+            CardId(93),
+            PlayerId(0),
+            "Spell".to_string(),
+            Zone::Stack,
+        );
+        state.stack.push_back(StackEntry {
+            id: spell,
+            source_id: spell,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(93),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+        let equipment = create_object(
+            state,
+            CardId(94),
+            PlayerId(0),
+            "Equipment".to_string(),
+            Zone::Battlefield,
+        );
+        let equip = create_object(
+            state,
+            CardId(95),
+            PlayerId(0),
+            "Equip".to_string(),
+            Zone::Stack,
+        );
+        state.stack.push_back(StackEntry {
+            id: equip,
+            source_id: equipment,
+            controller: PlayerId(0),
+            kind: StackEntryKind::KeywordAction {
+                action: KeywordAction::Equip {
+                    equipment_id: equipment,
+                    target_creature_id: source,
+                },
+            },
+        });
+
+        let views = derive_views(runner.state(), Some(P0));
+        let details = &views.stack_entry_details;
+
+        let numbered = &details[&activated.id];
+        assert_eq!(
+            numbered.ability_kind,
+            Some(StackAbilityKindView::Activated {
+                number: NonZeroUsize::new(second + 1),
+            }),
+            "the numbered activated entry carries its 1-based printed position"
+        );
+        assert_eq!(
+            numbered.kind_label,
+            format!("Activated ability {}", second + 1)
+        );
+
+        assert_eq!(
+            details[&trigger].ability_kind,
+            Some(StackAbilityKindView::Triggered)
+        );
+        assert_eq!(details[&trigger].kind_label, "Triggered ability");
+
+        assert_eq!(
+            details[&unnumbered].ability_kind,
+            Some(StackAbilityKindView::Activated { number: None }),
+            "an activated ability with no printed index stays unnumbered"
+        );
+        assert_eq!(details[&unnumbered].kind_label, "Activated ability");
+
+        assert_eq!(details[&spell].kind_label, "Spell");
+        assert_eq!(details[&spell].ability_kind, None);
+        assert_eq!(details[&equip].kind_label, "Equip");
+        assert_eq!(
+            details[&equip].ability_kind, None,
+            "keyword actions are labelled by their keyword, not an ability template"
+        );
+
+        for detail in details.values() {
+            if let Some(kind) = detail.ability_kind {
+                assert_eq!(
+                    kind.english_label(),
+                    detail.kind_label,
+                    "kind_label is derived from the typed ability kind"
+                );
+            }
+        }
+
+        let wire = serde_json::to_value(ClientGameStateRef::wrap(runner.state(), Some(P0)))
+            .expect("serialize client game state");
+        let wire_details = &wire["derived"]["stack_entry_details"];
+        assert_eq!(
+            wire_details[activated.id.0.to_string()]["ability_kind"],
+            serde_json::json!({"type": "Activated", "data": {"number": second + 1}}),
+        );
+        assert_eq!(
+            wire_details[unnumbered.0.to_string()]["ability_kind"],
+            serde_json::json!({"type": "Activated", "data": {}}),
+        );
+        assert_eq!(
+            wire_details[trigger.0.to_string()]["ability_kind"],
+            serde_json::json!({"type": "Triggered"}),
+        );
+        let spell_wire = wire_details[spell.0.to_string()]
+            .as_object()
+            .expect("the spell has a stack detail");
+        assert_eq!(spell_wire["kind_label"], "Spell");
+        assert!(
+            !spell_wire.contains_key("ability_kind"),
+            "entries without an ability template omit the key"
+        );
+
+        let decoded: DerivedViews =
+            serde_json::from_value(wire["derived"].clone()).expect("decode derived views");
+        assert_eq!(
+            decoded.stack_entry_details[&activated.id].ability_kind, numbered.ability_kind,
+            "the structured kind round-trips through the client wire"
+        );
+    }
+
     #[test]
     fn pending_modal_spell_details_survive_filtering_and_client_wire_round_trip() {
         let mut state = GameState::new_two_player(42);
@@ -5256,6 +5489,7 @@ mod tests {
             source_name: "Spell".to_string(),
             token_image_ref: None,
             kind_label: "Spell".to_string(),
+            ability_kind: None,
             ability_description: None,
             selected_mode_labels: Vec::new(),
             is_pending: false,
@@ -5270,11 +5504,16 @@ mod tests {
             !empty_json.contains("selected_mode_labels") && !empty_json.contains("is_pending"),
             "empty additions must preserve the legacy wire shape",
         );
+        assert!(
+            !empty_json.contains("ability_kind"),
+            "an entry without an ability template must not emit `ability_kind`",
+        );
         let legacy: StackEntryDisplay =
             serde_json::from_str(r#"{"source_name":"Spell","kind_label":"Spell"}"#)
                 .expect("legacy display payload deserializes");
         assert!(legacy.selected_mode_labels.is_empty());
         assert!(!legacy.is_pending);
+        assert!(legacy.ability_kind.is_none());
 
         let mut selected = empty;
         selected.selected_mode_labels = vec!["Choose this mode.".to_string()];
@@ -5480,6 +5719,7 @@ mod tests {
             controller: PlayerId(0),
             source_id: source,
             one_shot: true,
+            kind: DelayedTriggerKind::Ordinary,
             provenance: crate::types::identifiers::DelayedInstallIdentity::ReceiptEligible(
                 provenance,
             ),
@@ -5664,6 +5904,7 @@ mod tests {
                 hit_card,
                 mana_spend_permission: None,
                 graveyard_replacement: None,
+                enters_with_modifications: Default::default(),
                 cast_transformed: false,
                 additional_cost: None,
                 cleanup: ResolutionCastCleanup {
@@ -5834,7 +6075,7 @@ mod tests {
             source_id: None,
             graveyard_replacement: None,
             enters_with_counter: None,
-            enters_with_modifications: Vec::new(),
+            enters_with_modifications: Default::default(),
             mana_spend_permission: None,
             cast_cost_modifier: None,
         }];
@@ -5903,6 +6144,16 @@ mod tests {
                         Some(owner),
                     ))
                     .expect("viewer continuation wire serializes"),
+                ),
+                (
+                    // `wrap_filtered` takes any `&GameState`; this entry hands it the unprojected one.
+                    "unprojected wrap_filtered",
+                    serde_json::to_value(ClientGameStateRef::wrap_filtered(
+                        &stage_state,
+                        &stage_state,
+                        Some(owner),
+                    ))
+                    .expect("unprojected wrap_filtered wire serializes"),
                 ),
             ] {
                 let client_state = &projection["state"];
@@ -6210,8 +6461,8 @@ mod tests {
 
     /// CR 702.188a + CR 604.1: web-slinging costs are VIEWER-scoped. P0 controls
     /// the grantor; both P0 and P1 hold a qualifying spell. `derive_views` for P0
-    /// must surface ONLY P0's card (never P1's, even though the grant is symmetric
-    /// in the abstract) so the unfiltered path can't leak opponent hand contents.
+    /// must surface ONLY P0's card (never P1's) so `derive_views` over an
+    /// unfiltered state can't leak opponent hand contents.
     /// `derive_views(_, None)` must surface nothing.
     #[test]
     fn web_slinging_costs_are_viewer_scoped_and_leak_proof() {
@@ -6376,6 +6627,7 @@ mod tests {
                     single_use: false,
                     cast_cost_modifier: None,
                     alt_ability_cost: None,
+                    without_paying_mana_cost: false,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 });
         }
@@ -7969,9 +8221,8 @@ mod tests {
         );
     }
 
-    /// CR 605.4a + CR 117.3c (plan Step 6, boundary 2): `client_state_wire_value`
-    /// is the defence-in-depth boundary for direct `ClientGameStateRef::wrap`
-    /// callers that never ran `visibility::filter_state_for_viewer`.
+    /// CR 605.4a + CR 117.3c: `client_state_wire_value` is a defence-in-depth
+    /// boundary.
     ///
     /// All four projections — direct `wrap` for the prompt owner and for an
     /// opponent, and `wrap_filtered` over both filtered states — must omit both
@@ -8100,12 +8351,8 @@ mod tests {
         );
     }
 
-    /// `ClientGameStateRef::wrap` serializes the state it is handed, filtered
-    /// or not, so a direct caller that never ran `filter_state_for_viewer` must
-    /// still not ship the original Cube multiset to a client.
-    ///
-    /// REVERT-PROBE: drop `root.remove("booster_pack_pool")` from
-    /// `client_state_wire_value` and both envelopes carry the key and sentinel.
+    /// A `ClientGameStateRef::wrap` envelope must not ship the original Cube
+    /// multiset to a client.
     #[test]
     fn client_wire_omits_the_original_cube_booster_pool() {
         const SENTINEL: &str = "Undealt cube wire sentinel";
@@ -8121,10 +8368,6 @@ mod tests {
             "test precondition: trusted persistence keeps the source under its snake-case key"
         );
 
-        // Both iterations guard `root.remove`: `wrap` serializes the state it
-        // was handed and uses its `filter_state_for_viewer` copy only for
-        // display ids. Server frames (`filter_state_for_player`) and
-        // `wrap_filtered` callers are redacted independently by visibility.rs.
         for viewer in [None, Some(PlayerId(1))] {
             let projection = serde_json::to_value(ClientGameStateRef::wrap(&state, viewer))
                 .expect("client envelope serializes");

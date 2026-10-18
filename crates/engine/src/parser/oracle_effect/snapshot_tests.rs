@@ -660,8 +660,12 @@ fn return_target_and_same_name_from_your_graveyard_carries_zone_and_mass_tail() 
         .contains(&FilterProp::SameNameAsParentTarget));
 }
 
+/// Shilgengar, Sire of Famine. The count position's equal-to chain reads "its
+/// toughness" as the anaphoric object, which the runtime binds to the
+/// sacrificed Angel (CR 608.2k; `count_slot_fail_closed_runtime.rs`
+/// `shilgengar_angel_instead_creates_toughness_bloods`).
 #[test]
-fn cost_paid_object_instead_clause_uses_cost_paid_toughness() {
+fn cost_paid_object_instead_clause_reads_its_toughness_anaphorically() {
     let def = parse_effect_chain(
             "Create a Blood token. If you sacrificed an Angel this way, create a number of Blood tokens equal to its toughness instead.",
             AbilityKind::Activated,
@@ -693,7 +697,7 @@ fn cost_paid_object_instead_clause_uses_cost_paid_toughness() {
         Effect::Token {
             count: QuantityExpr::Ref {
                 qty: QuantityRef::Toughness {
-                    scope: ObjectScope::CostPaidObject
+                    scope: ObjectScope::Anaphoric
                 }
             },
             ..
@@ -1703,6 +1707,19 @@ fn scoped_player_search_then_shuffles_keeps_the_scoped_player() {
         }
     )));
     assert_eq!(chain_shuffle_target(execute), &TargetFilter::ScopedPlayer);
+
+    // CR 101.2 + CR 121.3 + CR 119.7: both halves of "can't draw cards or gain life".
+    use crate::types::statics::{ProhibitionScope, StaticMode};
+    let modes: Vec<_> = parsed.statics.iter().map(|s| &s.mode).collect();
+    assert_eq!(
+        modes,
+        vec![
+            &StaticMode::CantDraw {
+                who: ProhibitionScope::AllPlayers
+            },
+            &StaticMode::CantGainLife,
+        ]
+    );
 }
 
 fn declared() -> TargetFilter {

@@ -76,6 +76,7 @@ pub(crate) fn complete_discard_to_graveyard(
         face_down_in_exile: crate::types::ability::ExileConcealment::Public,
         chain_referent: crate::types::zones::ChainReferentIntent::Silent,
         enter_as_copy: None,
+        enter_with_choices: None,
         discard_frame,
         performed_by: None,
         applied,
@@ -380,8 +381,9 @@ pub fn resolve(
     // an unrelated card whenever hand size happened to equal the discard
     // count. The one bit those four PLAYER-scoped shapes never carry, and
     // that Thoughtseize's empty-reveal case DOES, is a
-    // `parent_target_missing_reason` of `RevealHandChoice` — stamped ONLY by
-    // `apply_parent_chain_context` immediately after a `RevealHand`
+    // `parent_target_missing_reason` of `RevealHandChoice` — stamped at a
+    // parent->child hand-off (see `ResolvedAbility::parent_target_missing_reason`)
+    // immediately after a `RevealHand`
     // reveal-choice whose eligible set was empty (see
     // `GameState::last_parent_target_missing_reason`). So: enter the specific-
     // targets loop (a no-op when `specific_targets` is empty, which IS the
