@@ -179,9 +179,6 @@
     "branch": "card/non-outlaw-negation"
   },
   {
-    "branch": "card/scoped-player-search"
-  },
-  {
     "branch": "card/top-library-multi-permission"
   },
   {
@@ -216,5 +213,14 @@
   },
   {
     "branch": "ai/conditional-destroy-gate"
+  },
+  {
+    "branch": "card/next-cast-copy-it-triggering-spell"
+  },
+  {
+    "branch": "card/repeated-payment-frame-deadlock"
+  },
+  {
+    "branch": "ai/prospective-payment-budget"
   }
 ]
