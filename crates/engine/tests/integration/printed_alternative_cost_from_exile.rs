@@ -154,7 +154,7 @@ fn free_cast_from_exile_does_not_also_offer_the_printed_alternative_cost() {
             graveyard_replacement: None,
             mana_spend_permission: None,
             enters_with_counter: None,
-            enters_with_modifications: Vec::new(),
+            enters_with_modifications: Default::default(),
             cast_cost_modifier: None,
         });
 
