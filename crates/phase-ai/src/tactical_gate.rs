@@ -31,6 +31,7 @@ use engine::game::quantity::{
     static_definition_is_cast_stable_for_pre_cast, trigger_definition_is_cast_stable_for_pre_cast,
     try_resolve_quantity_in_source_context,
 };
+use engine::game::stack::stack_object_controller;
 use engine::game::targeting::find_legal_targets;
 use engine::game::triggers::{
     synthetic_keyword_spell_cast_trigger_applies, trigger_definition_functions_in_zone,
@@ -1279,12 +1280,10 @@ fn counter_reaches_nothing_foreign(ctx: &PolicyContext<'_>) -> bool {
         return false;
     }
     let ai = ctx.ai_player;
-    if ctx
-        .state
-        .stack
-        .iter()
-        .all(|entry| entry.controller == ai && matches!(entry.kind, StackEntryKind::Spell { .. }))
-    {
+    if ctx.state.stack.iter().all(|entry| {
+        stack_object_controller(ctx.state, entry) == ai
+            && matches!(entry.kind, StackEntryKind::Spell { .. })
+    }) {
         return true;
     }
     // CR 107.3a + CR 601.2b + CR 601.2c + CR 602.2b: X is announced before
@@ -1706,10 +1705,14 @@ fn is_pure_counter_payload(effects: &[&Effect]) -> bool {
 }
 
 /// Whether `id` is a spell on the stack controlled by `ai_player`.
+///
+/// CR 112.2 + CR 613.1b: the caster controls a spell only by default; a
+/// control-changing effect (Commandeer) moves it while the `StackEntry` keeps
+/// the original caster, so ownership reads the live stack-object controller.
 fn is_own_stack_spell(state: &GameState, ai_player: PlayerId, id: ObjectId) -> bool {
     state.stack.iter().any(|entry| {
         entry.id == id
-            && entry.controller == ai_player
+            && stack_object_controller(state, entry) == ai_player
             && matches!(entry.kind, StackEntryKind::Spell { .. })
     })
 }
@@ -7885,6 +7888,152 @@ mod tests {
 
     fn casts(action: &GameAction, spell: ObjectId) -> bool {
         matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == spell)
+    }
+
+    const COMMANDEER_ORACLE: &str = "You may exile two blue cards from your hand rather than pay this spell's mana cost.\nGain control of target noncreature spell. You may choose new targets for it. (If that spell is an artifact, enchantment, or planeswalker, the permanent enters under your control.)";
+    const DIVINATION_ORACLE: &str = "Draw two cards.";
+    const OPT_ORACLE: &str =
+        "Scry 1. (Look at the top card of your library. You may put that card on the bottom.)\nDraw a card.";
+
+    /// Resolve Commandeer on the stack's top spell through the reducer, keep
+    /// its targets, and assert the stolen spell's entry still records
+    /// `caster` while the live object is controlled by `new_controller`.
+    fn resolve_commandeer(
+        runner: &mut GameRunner,
+        stolen: ObjectId,
+        caster: PlayerId,
+        new_controller: PlayerId,
+    ) {
+        runner.resolve_top();
+        while matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { .. }
+        ) {
+            runner
+                .act(GameAction::DecideOptionalEffect { accept: false })
+                .expect("keep the targets");
+        }
+        let state = runner.state();
+        let entry = state
+            .stack
+            .iter()
+            .find(|entry| entry.id == stolen)
+            .expect("reach guard: the stolen spell is still on the stack");
+        assert_eq!(
+            (entry.controller, state.objects[&stolen].controller),
+            (caster, new_controller),
+            "reach guard: the entry records the caster, the live object the new controller"
+        );
+        assert_eq!(state.stack.len(), 1, "reach guard: Commandeer has resolved");
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::Priority { player: P0 }
+        ));
+    }
+
+    /// CR 112.2 + CR 613.1b: P0 casts Divination and P1 Commandeers it. The
+    /// spell is now P1's, so P0's Spell Pierce has a useful opponent-controlled
+    /// victim: the root and the target choice both stay available.
+    #[test]
+    fn counter_keeps_a_spell_the_ai_cast_but_an_opponent_now_controls() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let divination = scenario
+            .add_spell_to_hand_from_oracle(P0, "Divination", false, DIVINATION_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                generic: 2,
+                shards: vec![ManaCostShard::Blue],
+            })
+            .id();
+        let pierce = scenario
+            .add_spell_to_hand_from_oracle(P0, "Spell Pierce", true, SPELL_PIERCE_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::Blue],
+            })
+            .id();
+        let commandeer = scenario
+            .add_spell_to_hand_from_oracle(P1, "Commandeer", true, COMMANDEER_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                generic: 5,
+                shards: vec![ManaCostShard::Blue, ManaCostShard::Blue],
+            })
+            .id();
+        scenario.with_mana_pool(P0, pooled_mana(ManaType::Blue, 4));
+        scenario.with_mana_pool(P1, pooled_mana(ManaType::Blue, 7));
+        let mut runner = scenario.build();
+        runner.cast(divination).commit();
+        runner.act(GameAction::PassPriority).expect("P0 passes");
+        runner.cast(commandeer).target_object(divination).commit();
+        resolve_commandeer(&mut runner, divination, P0, P1);
+        let state = runner.state();
+
+        assert!(!is_own_stack_spell(state, P0, divination));
+        assert_counter_in_pools(state, pierce, None, GateDecision::Allow);
+        assert_ne!(
+            counter_target_verdict(
+                state,
+                plain_counter(None),
+                vec![TargetRef::Object(divination)],
+                divination
+            ),
+            GateDecision::Reject,
+            "countering the spell an opponent now controls is a useful target"
+        );
+    }
+
+    /// CR 112.2 + CR 613.1b: P1 casts Opt and P0 Commandeers it. The spell is
+    /// now P0's own, so Spell Pierce's only legal target would counter the
+    /// AI's own spell: the gate, scoring, both chooser routes and the target
+    /// choice all exclude it.
+    #[test]
+    fn counter_rejects_a_spell_an_opponent_cast_but_the_ai_now_controls() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let opt = scenario
+            .add_spell_to_hand_from_oracle(P1, "Opt", true, OPT_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::Blue],
+            })
+            .id();
+        let commandeer = scenario
+            .add_spell_to_hand_from_oracle(P0, "Commandeer", true, COMMANDEER_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                generic: 5,
+                shards: vec![ManaCostShard::Blue, ManaCostShard::Blue],
+            })
+            .id();
+        let pierce = scenario
+            .add_spell_to_hand_from_oracle(P0, "Spell Pierce", true, SPELL_PIERCE_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::Blue],
+            })
+            .id();
+        scenario.with_mana_pool(P0, pooled_mana(ManaType::Blue, 8));
+        scenario.with_mana_pool(P1, pooled_mana(ManaType::Blue, 1));
+        let mut runner = scenario.build();
+        runner.act(GameAction::PassPriority).expect("P0 passes");
+        runner.cast(opt).commit();
+        runner.act(GameAction::PassPriority).expect("P1 passes");
+        runner.cast(commandeer).target_object(opt).commit();
+        resolve_commandeer(&mut runner, opt, P1, P0);
+        let state = runner.state();
+
+        assert!(is_own_stack_spell(state, P0, opt));
+        let root = assert_counter_in_pools(state, pierce, None, GateDecision::Reject);
+        assert_counter_never_chosen(state, &root.action);
+        assert_eq!(
+            counter_target_verdict(
+                state,
+                plain_counter(None),
+                vec![TargetRef::Object(opt)],
+                opt
+            ),
+            GateDecision::Reject,
+            "the spell the AI now controls is its own counter target"
+        );
     }
 
     const SPELL_BLAST_ORACLE: &str = "Counter target spell with mana value X. (For example, if that spell's mana cost is {3}{U}{U}, X is 5.)";
