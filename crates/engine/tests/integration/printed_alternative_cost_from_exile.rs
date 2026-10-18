@@ -260,6 +260,28 @@ fn one_mountain_does_not_make_the_exiled_fireblast_castable() {
         .iter()
         .any(|permission| matches!(permission, CastingPermission::PlayFromExile { .. })));
     assert!(!can_cast_object_now(runner.state(), P0, fireblast));
+
+    let pool = &mut runner.state_mut().players[0].mana_pool;
+    for unit in red_mana(6) {
+        pool.add(unit);
+    }
+    assert!(can_cast_object_now(runner.state(), P0, fireblast));
+    cast(&mut runner, fireblast, None);
+
+    let state = runner.state();
+    assert!(matches!(
+        state.stack.back(),
+        Some(StackEntry {
+            id,
+            kind: StackEntryKind::Spell {
+                casting_variant: CastingVariant::Normal,
+                ..
+            },
+            ..
+        }) if *id == fireblast
+    ));
+    assert!(state.players[0].mana_pool.mana.is_empty());
+    assert_eq!(mountains_on_battlefield(&runner, P0), 1);
 }
 
 /// CR 601.2a + CR 112.2: the caster of an impulse cast — the spell's controller,
