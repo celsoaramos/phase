@@ -133,9 +133,10 @@ type SerializedCost = {
  * Display-only formatting of an engine `EffectCost` (precedent: `formatFilteredCard`).
  * The engine is the authority on what the cost is; this only renders the one
  * recipient shape it pays at cast time — "have an opponent gain N life"
- * (Invigorate). Every other effect-cost keeps the generic label.
+ * (Invigorate). Every other effect-cost has no rendering here (null), so
+ * `formatCost` keeps its generic "Activate" label and keyword detail shows nothing.
  */
-function formatEffectCost(effect: SerializedCost["effect"]): string {
+function formatEffectCost(effect: SerializedCost["effect"]): string | null {
   const player = effect?.player;
   if (
     effect?.type === "GainLife" &&
@@ -148,7 +149,7 @@ function formatEffectCost(effect: SerializedCost["effect"]): string {
       amount: formatQuantity(effect.amount, 1),
     });
   }
-  return "Activate";
+  return null;
 }
 
 function formatTypeFilter(filter: unknown): string {
