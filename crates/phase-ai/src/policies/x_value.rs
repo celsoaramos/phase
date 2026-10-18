@@ -39,6 +39,23 @@ use super::x_reference::{effect_references_x, spell_object_references_x};
 pub struct XValuePolicy;
 
 impl XValuePolicy {
+    /// X=0 candidate while a positive X is affordable, on a payoff that reads X.
+    fn zero_wastes_payoff(&self, ctx: &PolicyContext<'_>) -> bool {
+        match (&ctx.decision.waiting_for, &ctx.candidate.action) {
+            (
+                WaitingFor::ChooseXValue {
+                    max, pending_cast, ..
+                },
+                GameAction::ChooseX { value: 0 },
+            ) => {
+                *max > 0
+                    && (ability_references_x(&pending_cast.ability)
+                        || spell_object_references_x(ctx.state, pending_cast.object_id))
+            }
+            _ => false,
+        }
+    }
+
     pub fn score(&self, ctx: &PolicyContext<'_>) -> f64 {
         let (max, ability, object_id, candidate_x) =
             match (&ctx.decision.waiting_for, &ctx.candidate.action) {
@@ -85,6 +102,13 @@ impl TacticalPolicy for XValuePolicy {
     }
 
     fn verdict(&self, ctx: &PolicyContext<'_>) -> PolicyVerdict {
+        // The cast is already committed when X is chosen (CR 601.2b), so X=0 on
+        // an X-scaled payoff throws the card away. The +1 ramp alone enters ×0.1
+        // under search and lost to evaluation noise: VeryHard announced X=0 on
+        // Torment of Hailfire with X=2 affordable.
+        if self.zero_wastes_payoff(ctx) {
+            return PolicyVerdict::reject(PolicyReason::new("x_value_zero_wastes_cast"));
+        }
         PolicyVerdict::Score {
             delta: self.score(ctx),
             reason: PolicyReason::new("x_value_score"),
@@ -276,6 +300,82 @@ mod tests {
             cast_facts: None,
             search_depth: crate::policies::context::SearchDepth::Root,
         }
+    }
+
+    fn torment_pending_cast() -> PendingCast {
+        let mut ability = ResolvedAbility::new(
+            AbilityEffect::LoseLife {
+                amount: QuantityExpr::Fixed { value: 3 },
+                target: None,
+            },
+            Vec::new(),
+            ObjectId(43),
+            PlayerId(0),
+        );
+        ability.repeat_for = Some(x_quantity());
+        PendingCast::new(
+            ObjectId(43),
+            CardId(43),
+            ability,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::X, ManaCostShard::Black, ManaCostShard::Black],
+                generic: 0,
+            },
+        )
+    }
+
+    fn choose_x_verdict(pending: PendingCast, max: u32, value: u32) -> PolicyVerdict {
+        let state = make_state();
+        let config = crate::config::AiConfig::default();
+        let ai_context = crate::context::AiContext::empty(&config.weights);
+        let decision = AiDecisionContext {
+            waiting_for: WaitingFor::ChooseXValue {
+                player: PlayerId(0),
+                min: 0,
+                max,
+                pending_cast: Box::new(pending),
+                convoke_mode: None,
+                x_cost_previews: vec![],
+            },
+            candidates: Vec::new(),
+        };
+        let candidate = CandidateAction {
+            action: GameAction::ChooseX { value },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Selection),
+        };
+        XValuePolicy.verdict(&make_ctx(
+            &state,
+            &decision,
+            &candidate,
+            &config,
+            &ai_context,
+        ))
+    }
+
+    #[test]
+    fn zero_x_rejected_when_a_positive_x_is_affordable() {
+        // Torment of Hailfire with X=2 affordable: X=0 throws the card away.
+        assert!(matches!(
+            choose_x_verdict(torment_pending_cast(), 2, 0),
+            PolicyVerdict::Reject { .. }
+        ));
+        assert!(matches!(
+            choose_x_verdict(torment_pending_cast(), 2, 2),
+            PolicyVerdict::Score { .. }
+        ));
+        // Fireball's X is the damage amount: same rule.
+        assert!(matches!(
+            choose_x_verdict(fireball_pending_cast(), 1, 0),
+            PolicyVerdict::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn zero_x_kept_when_nothing_else_is_affordable() {
+        assert!(!matches!(
+            choose_x_verdict(torment_pending_cast(), 0, 0),
+            PolicyVerdict::Reject { .. }
+        ));
     }
 
     #[test]
