@@ -238,5 +238,8 @@
   },
   {
     "branch": "ai/tap-ability-timing"
+  },
+  {
+    "branch": "card/crew-saddle-triggering-source"
   }
 ]
