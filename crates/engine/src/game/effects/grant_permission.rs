@@ -63,10 +63,8 @@ pub(crate) fn resolve_grantee(
 
 /// Grant a CastingPermission to the target object (CR 604.6).
 ///
-/// Implements static abilities that modify where/how a card can be cast, such as
-/// "You may cast this card from exile" (CR 604.6: static abilities that apply while
-/// a card is in a zone you could cast it from). Building block for Airbending,
-/// Foretell, Suspend, and similar "cast from exile" mechanics.
+/// Implements permissions that modify where/how a card can be cast. Building block
+/// for Airbending, Foretell, Suspend, and similar "cast from exile" mechanics.
 pub fn resolve(
     state: &mut GameState,
     ability: &ResolvedAbility,
@@ -87,7 +85,9 @@ pub fn resolve(
     // chained grants don't inherit parent targets via
     // `effects::mod.rs::resolve_ability_chain`.
     let (target_ids, tracked_set_group): (Vec<_>, Option<TrackedSetId>) = match target_filter {
-        TargetFilter::SelfRef => (vec![ability.source_id], None),
+        // CR 400.7: Plot's cost exiles the card before the incarnation is
+        // captured, so the exiled card is still the current source here.
+        TargetFilter::SelfRef => (ability.self_ref_binding(state).into_iter().collect(), None),
         // CR 608.2c: The `TrackedSetId(0)` sentinel binds to the highest tracked
         // set id — the set the immediately preceding effect in this chain
         // published. Empty sets are *not* skipped: an empty current set means
@@ -134,7 +134,7 @@ pub fn resolve(
             // that carry explicit object targets (plotted / PlayFromExile) are
             // unaffected.
             if ids.is_empty() {
-                (vec![ability.source_id], None)
+                (ability.self_ref_binding(state).into_iter().collect(), None)
             } else {
                 (ids, None)
             }
@@ -150,7 +150,9 @@ pub fn resolve(
                 .collect(),
             None,
         ),
-        TargetFilter::Any | TargetFilter::None => (vec![ability.source_id], None),
+        TargetFilter::Any | TargetFilter::None => {
+            (ability.self_ref_binding(state).into_iter().collect(), None)
+        }
         other => {
             let ctx = crate::game::filter::FilterContext::from_ability(ability);
             (
@@ -417,6 +419,7 @@ mod tests {
                     single_use: false,
                     cast_cost_modifier: None,
                     alt_ability_cost: None,
+                    without_paying_mana_cost: false,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     invalidation: None,
                 },
@@ -483,6 +486,7 @@ mod tests {
             single_use: false,
             cast_cost_modifier: None,
             alt_ability_cost: None,
+            without_paying_mana_cost: false,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: Some(PlayPermissionInvalidation::UntilNextGrantFromSameSource),
         };
@@ -566,6 +570,7 @@ mod tests {
                     single_use: true,
                     cast_cost_modifier: None,
                     alt_ability_cost: None,
+                    without_paying_mana_cost: false,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     invalidation: None,
                 },
@@ -792,6 +797,7 @@ mod tests {
                     single_use: false,
                     cast_cost_modifier: None,
                     alt_ability_cost: None,
+                    without_paying_mana_cost: false,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     invalidation: None,
                 },
@@ -852,6 +858,7 @@ mod tests {
                     single_use: false,
                     cast_cost_modifier: None,
                     alt_ability_cost: None,
+                    without_paying_mana_cost: false,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     invalidation: None,
                 },
@@ -925,6 +932,7 @@ mod tests {
                     single_use: false,
                     cast_cost_modifier: None,
                     alt_ability_cost: None,
+                    without_paying_mana_cost: false,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     invalidation: None,
                 },
@@ -1010,6 +1018,7 @@ mod tests {
             single_use: false,
             cast_cost_modifier: None,
             alt_ability_cost: None,
+            without_paying_mana_cost: false,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: None,
         };
@@ -1091,6 +1100,7 @@ mod tests {
             single_use: false,
             cast_cost_modifier: None,
             alt_ability_cost: None,
+            without_paying_mana_cost: false,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: None,
         };
@@ -1158,6 +1168,7 @@ mod tests {
             single_use: false,
             cast_cost_modifier: None,
             alt_ability_cost: None,
+            without_paying_mana_cost: false,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: None,
         }];
@@ -1198,6 +1209,7 @@ mod tests {
                     single_use: false,
                     cast_cost_modifier: None,
                     alt_ability_cost: None,
+                    without_paying_mana_cost: false,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     invalidation: None,
                 },
@@ -1271,6 +1283,7 @@ mod tests {
                 single_use: false,
                 cast_cost_modifier: None,
                 alt_ability_cost: None,
+                without_paying_mana_cost: false,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 invalidation: None,
             }];
@@ -1317,6 +1330,7 @@ mod tests {
                 single_use: false,
                 cast_cost_modifier: None,
                 alt_ability_cost: None,
+                without_paying_mana_cost: false,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 invalidation: None,
             }];
@@ -1378,6 +1392,7 @@ mod tests {
                     single_use: false,
                     cast_cost_modifier: None,
                     alt_ability_cost: None,
+                    without_paying_mana_cost: false,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     invalidation: None,
                 },

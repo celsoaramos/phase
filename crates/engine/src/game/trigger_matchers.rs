@@ -894,6 +894,7 @@ pub(super) fn target_filter_matches_object(
         | TargetFilter::ExiledCardByIndex { .. }
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::DeclaredPlayer { .. }
         | TargetFilter::ParentTargetController
         | TargetFilter::ParentTargetOwner
         | TargetFilter::SourceChosenPlayer
@@ -1158,6 +1159,8 @@ fn count_matching_trigger_event_subjects(
         | GameEvent::PlayerCounterChanged { .. }
         | GameEvent::ManaExpended { .. }
         | GameEvent::Clash { .. }
+        | GameEvent::PhysicalContestStarted { .. }
+        | GameEvent::PhysicalContestResolved { .. }
         | GameEvent::VoteCast { .. }
         | GameEvent::VoteResolved { .. }
         | GameEvent::PowerToughnessChanged { .. }
@@ -1871,6 +1874,23 @@ pub(super) fn match_spell_cast(
             return false;
         }
     }
+    // CR 115.9a / CR 115.9c: a single target, counted as the requirement says.
+    if let Some(count) = trigger
+        .valid_card
+        .as_ref()
+        .and_then(super::filter::single_target_count)
+    {
+        let targets = state
+            .stack
+            .iter()
+            .find(|e| e.id == *object_id)
+            .and_then(|e| e.ability())
+            .map(super::ability_utils::declared_targets_in_chain)
+            .unwrap_or_default();
+        if !count.admits(&targets) {
+            return false;
+        }
+    }
     // CR 115.9b: Check "that targets [X]" constraint (.any() semantics).
     if let Some(targets_filter) = trigger
         .valid_card
@@ -1926,7 +1946,6 @@ pub(super) fn matching_attack_events(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> Vec<GameEvent> {
-    let source_id = source_event_subject_id(source_context);
     if let GameEvent::AttackersDeclared {
         attacker_ids,
         defending_player,
@@ -1993,22 +2012,7 @@ pub(super) fn matching_attack_events(
         }
 
         // Find which attacker(s) satisfy the creature / attacking-player filter.
-        let attacker_matches = |id: &ObjectId| -> bool {
-            if trigger.valid_card.is_some() {
-                valid_card_matches(trigger, state, *id, source_context)
-            } else if trigger.valid_source.is_some() {
-                valid_source_matches(trigger, state, *id, source_context)
-            } else if trigger.valid_target.is_some() {
-                // CR 508.3b: "Whenever [player] is attacked" — no attacker
-                // filter, any creature attacking that player satisfies the
-                // trigger. The defending-player restriction is enforced by
-                // `attack_target_matches` below.
-                true
-            } else {
-                *id == source_id
-            }
-        };
-
+        //
         // CR 508.3b: "Whenever [player] is attacked" triggers once per
         // attacked player, not once per attacking creature. Deduplicate when
         // the trigger has valid_target set but no valid_card/valid_source
@@ -2021,7 +2025,7 @@ pub(super) fn matching_attack_events(
         attacker_ids
             .iter()
             .filter_map(|id| {
-                if !attacker_matches(id) {
+                if !attack_declaration_attacker_matches(trigger, state, *id, source_context) {
                     return None;
                 }
                 let target = attacks
@@ -2057,6 +2061,105 @@ pub(super) fn matching_attack_events(
     } else {
         Vec::new()
     }
+}
+
+/// CR 508.1 + CR 508.3b + CR 508.3d: whether one declared attacker satisfies
+/// the trigger's attacker-side filter. A `valid_target`-only trigger
+/// ("Whenever [player] is attacked") filters on the ATTACK TARGET instead, so
+/// every declared attacker matches here and `attack_target_matches` supplies
+/// the restriction.
+fn attack_declaration_attacker_matches(
+    trigger: &TriggerDefinition,
+    state: &GameState,
+    id: ObjectId,
+    source_context: &TriggerSourceContext,
+) -> bool {
+    if trigger.valid_card.is_some() {
+        valid_card_matches(trigger, state, id, source_context)
+    } else if trigger.valid_source.is_some() {
+        valid_source_matches(trigger, state, id, source_context)
+    } else if trigger.valid_target.is_some() {
+        true
+    } else {
+        id == source_event_subject_id(source_context)
+    }
+}
+
+/// CR 508.3d + CR 508.5a: expand one `AttackersDeclared` event into one
+/// narrowed context per ATTACKED player, each carrying that player's complete
+/// matching attacker set — the antecedent of the followed clause's "those
+/// creatures" and the referent of "defending player" / "that player"
+/// ("Whenever one or more creatures attack one of your opponents, if any of
+/// those creatures have power or toughness equal to the chosen number, Squall
+/// deals damage equal to its power to defending player."). Wizards' Neyali,
+/// the Plumecrest release note states the same occurrence grammar for
+/// "attack <player>" ("triggers for each player you are attacking with one or
+/// more tokens"): the attacked player is the grouping axis, so one declaration
+/// against two opponents is TWO occurrences, each with its own attacker set —
+/// never one combined set answered by the first defender. An attacked player
+/// with no matching attacker produces no group. The player-subject branch of
+/// [`matching_attack_events`] already narrows one context per attacked player
+/// (the subject there is the attacking player), so it is reused as-is.
+pub(super) fn matching_attack_events_by_defending_player(
+    event: &GameEvent,
+    trigger: &TriggerDefinition,
+    source_context: &TriggerSourceContext,
+    state: &GameState,
+) -> Vec<GameEvent> {
+    let GameEvent::AttackersDeclared {
+        attacker_ids,
+        defending_player,
+        attacks,
+        ..
+    } = event
+    else {
+        return Vec::new();
+    };
+    if trigger
+        .valid_source
+        .as_ref()
+        .is_some_and(|filter| filter.is_player_scope())
+    {
+        return matching_attack_events(event, trigger, source_context, state);
+    }
+    let mut groups: Vec<(PlayerId, Vec<(ObjectId, crate::game::combat::AttackTarget)>)> =
+        Vec::new();
+    for id in attacker_ids {
+        if !attack_declaration_attacker_matches(trigger, state, *id, source_context) {
+            continue;
+        }
+        let target = attacks
+            .iter()
+            .find_map(|(attacker_id, target)| (*attacker_id == *id).then_some(*target))
+            .unwrap_or(crate::game::combat::AttackTarget::Player(*defending_player));
+        if !attack_target_matches(trigger, state, target, *defending_player, source_context) {
+            continue;
+        }
+        let event_defending_player =
+            crate::game::combat::defending_player_for_target_or(state, target, *defending_player);
+        match groups
+            .iter_mut()
+            .find(|(player, _)| *player == event_defending_player)
+        {
+            Some((_, members)) => members.push((*id, target)),
+            None => groups.push((event_defending_player, vec![(*id, target)])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(event_defending_player, members)| {
+            let attacker_ids: Vec<ObjectId> = members.iter().map(|(id, _)| *id).collect();
+            GameEvent::AttackersDeclared {
+                declaration_records: super::triggers::declaration_records_for_attackers(
+                    event,
+                    &attacker_ids,
+                ),
+                attacker_ids,
+                defending_player: event_defending_player,
+                attacks: members,
+            }
+        })
+        .collect()
 }
 
 fn attack_target_matches(
@@ -5562,13 +5665,14 @@ fn stack_entry_targets_only(
     let Some(ability) = entry.ability() else {
         return false;
     };
+    let targets = super::ability_utils::declared_targets_in_chain(ability);
     // A spell with no targets doesn't "target only X" — it doesn't target at all.
-    if ability.targets.is_empty() {
+    if targets.is_empty() {
         return false;
     }
     let source_controller = Some(source_context.source_read(state).controller());
     let ctx = super::filter::FilterContext::from_trigger_source(source_context);
-    ability.targets.iter().all(|t| match t {
+    targets.iter().all(|t| match t {
         TargetRef::Object(id) => super::filter::matches_target_filter(state, *id, constraint, &ctx),
         TargetRef::Player(pid) => super::filter::player_matches_target_filter_in_state(
             state,
@@ -5595,12 +5699,13 @@ fn stack_entry_targets_any(
     let Some(ability) = entry.ability() else {
         return false;
     };
-    if ability.targets.is_empty() {
+    let targets = super::ability_utils::declared_targets_in_chain(ability);
+    if targets.is_empty() {
         return false;
     }
     let source_controller = Some(source_context.source_read(state).controller());
     let ctx = super::filter::FilterContext::from_trigger_source(source_context);
-    ability.targets.iter().any(|t| match t {
+    targets.iter().any(|t| match t {
         TargetRef::Object(id) => super::filter::matches_target_filter(state, *id, constraint, &ctx),
         TargetRef::Player(pid) => super::filter::player_matches_target_filter_in_state(
             state,
@@ -7584,6 +7689,7 @@ mod tests {
                 kind: crate::types::events::ActivatedAbilityKind::Normal,
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
+                stack_entry: None,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7597,6 +7703,7 @@ mod tests {
                 kind: crate::types::events::ActivatedAbilityKind::Normal,
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
+                stack_entry: None,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7637,6 +7744,7 @@ mod tests {
                 kind: crate::types::events::ActivatedAbilityKind::Normal,
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
+                stack_entry: None,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7650,6 +7758,7 @@ mod tests {
                 kind: crate::types::events::ActivatedAbilityKind::Normal,
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
+                stack_entry: None,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7692,6 +7801,7 @@ mod tests {
                     crate::types::events::ActivationTriggerState::CollectedAtActivation {
                         observers,
                     },
+                stack_entry: None,
             };
             assert!(!match_ability_activated(
                 &collected, &trigger, &context, &state
@@ -7788,6 +7898,7 @@ mod tests {
                 kind: crate::types::events::ActivatedAbilityKind::Loyalty,
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
+                stack_entry: None,
             },
             &trigger,
             &test_trigger_source_context(&state, regulator),
@@ -7819,6 +7930,7 @@ mod tests {
                 kind: crate::types::events::ActivatedAbilityKind::Loyalty,
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
+                stack_entry: None,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7831,6 +7943,7 @@ mod tests {
                 kind: crate::types::events::ActivatedAbilityKind::Normal,
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
+                stack_entry: None,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7862,6 +7975,7 @@ mod tests {
                 kind: crate::types::events::ActivatedAbilityKind::Loyalty,
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
+                stack_entry: None,
             },
             &trigger,
             &test_trigger_source_context(&state, regulator),
@@ -7895,6 +8009,7 @@ mod tests {
                 kind: crate::types::events::ActivatedAbilityKind::Normal,
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
+                stack_entry: None,
             },
             &trigger,
             &test_trigger_source_context(&state, regulator),
@@ -7929,6 +8044,7 @@ mod tests {
                 kind: crate::types::events::ActivatedAbilityKind::Loyalty,
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
+                stack_entry: None,
             },
             &trigger,
             &test_trigger_source_context(&state, regulator),
@@ -7978,6 +8094,7 @@ mod tests {
                     kind: crate::types::events::ActivatedAbilityKind::Loyalty,
                     departed_source_lki: None,
                     trigger_state: crate::types::events::ActivationTriggerState::Pending,
+                    stack_entry: None,
                 };
                 assert_eq!(
                     match_loyalty_ability_activated(&event, &trigger, &context, state),
@@ -8064,6 +8181,7 @@ mod tests {
                 kind: crate::types::events::ActivatedAbilityKind::Loyalty,
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
+                stack_entry: None,
             };
             let matches = |state: &GameState, player, source| {
                 match_loyalty_ability_activated(
@@ -8777,6 +8895,10 @@ mod tests {
                 core_types: vec![CoreType::Artifact],
                 controller: PlayerId(0),
                 owner: PlayerId(0),
+                arrival: crate::types::game_state::ArrivalIdentity {
+                    owner: PlayerId(0),
+                    controller: PlayerId(0),
+                },
                 is_token: false,
                 ..ZoneChangeRecord::test_minimal(
                     nontoken_artifact,
@@ -8802,6 +8924,10 @@ mod tests {
                 core_types: vec![CoreType::Artifact],
                 controller: PlayerId(0),
                 owner: PlayerId(0),
+                arrival: crate::types::game_state::ArrivalIdentity {
+                    owner: PlayerId(0),
+                    controller: PlayerId(0),
+                },
                 is_token: true,
                 ..ZoneChangeRecord::test_minimal(munitions, None, Zone::Battlefield)
             }),
@@ -9360,6 +9486,10 @@ mod tests {
             record: Box::new(ZoneChangeRecord {
                 controller: PlayerId(0),
                 owner: PlayerId(0),
+                arrival: crate::types::game_state::ArrivalIdentity {
+                    owner: PlayerId(0),
+                    controller: PlayerId(0),
+                },
                 ..ZoneChangeRecord::test_minimal(own_card, Some(Zone::Graveyard), Zone::Battlefield)
             }),
         };
@@ -9378,6 +9508,10 @@ mod tests {
             record: Box::new(ZoneChangeRecord {
                 controller: PlayerId(1),
                 owner: PlayerId(1),
+                arrival: crate::types::game_state::ArrivalIdentity {
+                    owner: PlayerId(1),
+                    controller: PlayerId(1),
+                },
                 ..ZoneChangeRecord::test_minimal(
                     opponent_card,
                     Some(Zone::Graveyard),
@@ -9404,6 +9538,10 @@ mod tests {
                 core_types: vec![CoreType::Creature],
                 controller: PlayerId(1),
                 owner: PlayerId(1),
+                arrival: crate::types::game_state::ArrivalIdentity {
+                    owner: PlayerId(1),
+                    controller: PlayerId(1),
+                },
                 ..ZoneChangeRecord::test_minimal(
                     opponent_creature,
                     Some(Zone::Battlefield),
@@ -17205,6 +17343,10 @@ mod tests {
                 core_types: vec![CoreType::Creature],
                 controller: PlayerId(0),
                 owner: PlayerId(0),
+                arrival: crate::types::game_state::ArrivalIdentity {
+                    owner: PlayerId(0),
+                    controller: PlayerId(0),
+                },
                 ..ZoneChangeRecord::test_minimal(source, Some(Zone::Battlefield), Zone::Graveyard)
             }),
         };
@@ -17229,6 +17371,10 @@ mod tests {
                 core_types: vec![CoreType::Creature],
                 controller: PlayerId(0),
                 owner: PlayerId(0),
+                arrival: crate::types::game_state::ArrivalIdentity {
+                    owner: PlayerId(0),
+                    controller: PlayerId(0),
+                },
                 ..ZoneChangeRecord::test_minimal(own_milled, Some(Zone::Library), Zone::Graveyard)
             }),
         };
@@ -17254,6 +17400,10 @@ mod tests {
                 core_types: vec![CoreType::Creature],
                 controller: PlayerId(1),
                 owner: PlayerId(1),
+                arrival: crate::types::game_state::ArrivalIdentity {
+                    owner: PlayerId(1),
+                    controller: PlayerId(1),
+                },
                 ..ZoneChangeRecord::test_minimal(
                     opp_dying,
                     Some(Zone::Battlefield),
@@ -17282,6 +17432,10 @@ mod tests {
                 core_types: vec![CoreType::Creature],
                 controller: PlayerId(1),
                 owner: PlayerId(1),
+                arrival: crate::types::game_state::ArrivalIdentity {
+                    owner: PlayerId(1),
+                    controller: PlayerId(1),
+                },
                 ..ZoneChangeRecord::test_minimal(opp_milled, Some(Zone::Library), Zone::Graveyard)
             }),
         };
@@ -17562,6 +17716,10 @@ mod tests {
                 core_types: vec![CoreType::Creature],
                 controller: PlayerId(0),
                 owner: PlayerId(0),
+                arrival: crate::types::game_state::ArrivalIdentity {
+                    owner: PlayerId(0),
+                    controller: PlayerId(0),
+                },
                 ..ZoneChangeRecord::test_minimal(source, Some(Zone::Battlefield), Zone::Graveyard)
             }),
         };
@@ -17585,6 +17743,10 @@ mod tests {
                 core_types: vec![CoreType::Creature],
                 controller: PlayerId(1),
                 owner: PlayerId(1),
+                arrival: crate::types::game_state::ArrivalIdentity {
+                    owner: PlayerId(1),
+                    controller: PlayerId(1),
+                },
                 ..ZoneChangeRecord::test_minimal(opp_milled, Some(Zone::Library), Zone::Graveyard)
             }),
         };
@@ -18751,6 +18913,10 @@ mod tests {
             record: Box::new(ZoneChangeRecord {
                 core_types: vec![CoreType::Creature],
                 owner: pile_owner,
+                arrival: crate::types::game_state::ArrivalIdentity {
+                    owner: pile_owner,
+                    controller: reanimator,
+                },
                 controller: reanimator,
                 ..ZoneChangeRecord::test_minimal(entrant, Some(Zone::Graveyard), Zone::Battlefield)
             }),

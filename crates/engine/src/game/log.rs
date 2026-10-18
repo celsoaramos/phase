@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::game::combat::AttackTarget;
 use crate::game::planechase::PlanarDieFace;
 use crate::types::ability::{AbilityTag, TargetRef};
+use crate::types::contest::{ContestKind, ContestOutcome, ContestResult};
 use crate::types::events::{GameEvent, PlayerActionKind};
 use crate::types::game_state::{GameState, StackObjectClass, ZoneChangeRecord};
 use crate::types::identifiers::ObjectId;
@@ -524,6 +525,8 @@ fn importance(event: &GameEvent) -> LogImportance {
         | GameEvent::PlayerPerformedAction { .. }
         | GameEvent::Specialized { .. }
         | GameEvent::Clash { .. }
+        | GameEvent::PhysicalContestStarted { .. }
+        | GameEvent::PhysicalContestResolved { .. }
         | GameEvent::VoteCast { .. }
         | GameEvent::VoteResolved { .. } => LogImportance::Detail,
     }
@@ -576,6 +579,8 @@ fn tone(event: &GameEvent) -> LogTone {
         | GameEvent::Earthbend { .. }
         | GameEvent::Waterbend { .. }
         | GameEvent::Clash { .. }
+        | GameEvent::PhysicalContestStarted { .. }
+        | GameEvent::PhysicalContestResolved { .. }
         | GameEvent::VoteCast { .. }
         | GameEvent::VoteResolved { .. } => LogTone::Informational,
         // CR 701.17a + CR 701.17c: never narrated, because the paired `ZoneChanged`
@@ -1067,6 +1072,8 @@ fn categorize(event: &GameEvent) -> LogCategory {
         | GameEvent::ContraptionCranked { .. }
         | GameEvent::Specialized { .. }
         | GameEvent::Clash { .. }
+        | GameEvent::PhysicalContestStarted { .. }
+        | GameEvent::PhysicalContestResolved { .. }
         | GameEvent::VoteCast { .. }
         | GameEvent::VoteResolved { .. }
         | GameEvent::XValueChosen { .. } => LogCategory::Special,
@@ -2237,6 +2244,24 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             text(&sprocket.to_string()),
         ],
         GameEvent::Clash { .. } => vec![text("Clash")],
+        GameEvent::PhysicalContestStarted { kind, participants } => vec![
+            player_seg(state, participants[0]),
+            text(" and "),
+            player_seg(state, participants[1]),
+            text(match kind {
+                ContestKind::Staring => " begin a staring contest",
+                ContestKind::BreathHolding => " begin a breath-holding contest",
+            }),
+        ],
+        GameEvent::PhysicalContestResolved { result, .. } => match result {
+            ContestResult::Outcome(ContestOutcome::Decided { winner, .. }) => {
+                vec![player_seg(state, *winner), text(" wins the contest")]
+            }
+            ContestResult::Outcome(ContestOutcome::Tie) => {
+                vec![text("The contest ends in a tie; nothing happens")]
+            }
+            ContestResult::Cancelled(_) => vec![text("The contest was cancelled; nothing happens")],
+        },
         GameEvent::VoteCast { voter, choice, .. } => {
             vec![player_seg(state, *voter), text(" voted "), text(choice)]
         }
@@ -2656,6 +2681,7 @@ mod tests {
         let mut record = ZoneChangeRecord::test_minimal(foretold, Some(Zone::Hand), Zone::Exile);
         record.name = "Secret Foretell".to_string();
         record.owner = PlayerId(1);
+        record.arrival.owner = PlayerId(1);
         let entries = resolve_log_entries(
             &[
                 GameEvent::ZoneChanged {
@@ -3486,6 +3512,7 @@ mod tests {
         let mut record =
             crate::types::game_state::ZoneChangeRecord::test_minimal(object_id, Some(from), to);
         record.owner = owner;
+        record.arrival.owner = owner;
         record.turn_zone_change_index = turn_zone_change_index;
         GameEvent::ZoneChanged {
             object_id,
@@ -3920,6 +3947,7 @@ mod tests {
             kind: Default::default(),
             departed_source_lki: None,
             trigger_state: crate::types::events::ActivationTriggerState::Pending,
+            stack_entry: None,
         };
         let keyword = |source_id| GameEvent::KeywordAbilityActivated {
             ability_tag: AbilityTag::Equip,
@@ -3942,6 +3970,7 @@ mod tests {
             kind: crate::types::events::ActivatedAbilityKind::Mana,
             departed_source_lki: None,
             trigger_state: crate::types::events::ActivationTriggerState::Pending,
+            stack_entry: None,
         };
         assert_eq!(lines(&[mana]), 0);
     }

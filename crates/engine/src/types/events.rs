@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::counter::CounterType;
+use crate::types::ability::AttachmentReferent;
 
 use super::ability::{
     AbilityTag, AttachmentKind, CostPaidObjectSnapshot, EffectKind, FilterProp, TargetFilter,
@@ -633,6 +634,7 @@ impl EventObjectSnapshot {
             | TargetFilter::TriggeringSource
             | TargetFilter::EventTarget
             | TargetFilter::ParentTargetSlot { .. }
+            | TargetFilter::DeclaredPlayer { .. }
             | TargetFilter::OriginalSource
             | TargetFilter::PostReplacementDamageTarget
             // CR 615.5 + CR 615: object/compound referents never reachable from
@@ -752,6 +754,9 @@ impl EventObjectSnapshot {
 
             // ---- embedded exact source relations ----
             FilterProp::SaddledSource | FilterProp::ConvokedSource => Supported,
+            // CR 702.122c: the crew ledger is keyed by the subject's own
+            // incarnation, which the snapshot carries (look-back arm in filter.rs).
+            FilterProp::CrewedThisTurn { .. } => Supported,
 
             // ---- embedded per-turn history ----
             FilterProp::WasDealtDamageThisTurn
@@ -788,7 +793,10 @@ impl EventObjectSnapshot {
             FilterProp::HasSingleTarget
             | FilterProp::Targets { .. }
             | FilterProp::TargetsOnly { .. }
-            | FilterProp::Modal => PermanentDomainFalse,
+            | FilterProp::Modal
+            // CR 722.3d: a prepare spell is a Stack-zone object by definition, so a
+            // permanent subject is a decided false, not a gap.
+            | FilterProp::PrepareSpell => PermanentDomainFalse,
 
             // ---- unsupported: needs a live candidate lookup or an unmodeled field ----
             // Not reachable from the subject grammar today. Reaching one fails the gate,
@@ -818,9 +826,10 @@ impl EventObjectSnapshot {
             // CR 607.2a: This compares against an object linked in the live
             // exile-link side table, which event snapshots deliberately omit.
             | FilterProp::SameNameAsExiledBySource
-            | FilterProp::AttachedToSource
-            | FilterProp::AttachedToRecipient
-            | FilterProp::AttachedToPlayer { .. }
+            | FilterProp::AttachedTo { to: AttachmentReferent::Source }
+            | FilterProp::AttachedTo { to: AttachmentReferent::Recipient }
+            | FilterProp::AttachedTo { to: AttachmentReferent::Player { .. } }
+            | FilterProp::AttachedTo { to: AttachmentReferent::DeclaredTarget { .. } }
             | FilterProp::Unpaired
             | FilterProp::OtherThanTriggerObject
             | FilterProp::MostPrevalentCreatureTypeIn { .. }
@@ -1004,6 +1013,13 @@ pub enum GameEvent {
         /// Omitted on the wire when `Pending`.
         #[serde(default, skip_serializing_if = "ActivationTriggerState::is_pending")]
         trigger_state: ActivationTriggerState,
+        /// CR 602.2a + CR 113.7a: the stack object this activation created — the
+        /// ability "that ability" / "it" names for a trigger on this event, never
+        /// another object of the same source. `None` when the activation used no
+        /// stack (a mana-ability activation, CR 605.3b) and for an event decoded from
+        /// a state predating the field. Omitted on the wire when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stack_entry: Option<ObjectId>,
     },
     /// CR 603.6a: Enters-the-battlefield and zone-change triggers fire on this
     /// event. `from` is `None` when an object is created directly in a zone
@@ -1931,6 +1947,20 @@ pub enum GameEvent {
         amount_spent: u32,
         new_cumulative: u32,
     },
+    /// Eye to Eye / Mouth to Mouth: the real-time contest between `participants`
+    /// (controller first) has begun. See `types::contest`.
+    PhysicalContestStarted {
+        kind: crate::types::contest::ContestKind,
+        participants: [PlayerId; 2],
+    },
+    /// The contest reached a terminal state and its result was applied to the
+    /// game exactly once. `result` distinguishes a decided win, a tie, and a
+    /// technical cancellation.
+    PhysicalContestResolved {
+        kind: crate::types::contest::ContestKind,
+        participants: [PlayerId; 2],
+        result: crate::types::contest::ContestResult,
+    },
     /// CR 701.30: A clash occurred between two players.
     Clash {
         controller: PlayerId,
@@ -2087,6 +2117,7 @@ mod tests {
                 kind,
                 departed_source_lki,
                 trigger_state,
+                stack_entry,
                 ..
             } => {
                 assert_eq!(kind, ActivatedAbilityKind::Normal);
@@ -2098,6 +2129,10 @@ mod tests {
                     trigger_state,
                     ActivationTriggerState::Pending,
                     "a legacy event is observed by ordinary collection"
+                );
+                assert_eq!(
+                    stack_entry, None,
+                    "a legacy event predating the field names no stack entry"
                 );
             }
             other => panic!("expected AbilityActivated, got {other:?}"),
@@ -2118,6 +2153,7 @@ mod tests {
                 kind,
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
+                stack_entry: None,
             };
             let json = serde_json::to_value(&event).unwrap();
             let back: GameEvent = serde_json::from_value(json).unwrap();
@@ -2126,6 +2162,31 @@ mod tests {
                 other => panic!("expected AbilityActivated, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn ability_activated_stack_entry_round_trips_and_defaults_to_none() {
+        // CR 602.2a: the stack object a stack-using activation created survives
+        // serialization, and a mana activation's absent entry is omitted.
+        let event = |stack_entry| GameEvent::AbilityActivated {
+            player_id: PlayerId(1),
+            source_id: ObjectId(9),
+            kind: ActivatedAbilityKind::Normal,
+            departed_source_lki: None,
+            trigger_state: ActivationTriggerState::Pending,
+            stack_entry,
+        };
+        let named = event(Some(ObjectId(42)));
+        let json = serde_json::to_value(&named).unwrap();
+        assert_eq!(json["data"]["stack_entry"], 42);
+        let back: GameEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(back, named);
+
+        let json = serde_json::to_value(event(None)).unwrap();
+        assert!(
+            json["data"].get("stack_entry").is_none(),
+            "an activation that used no stack omits the key"
+        );
     }
 
     #[test]
@@ -2300,6 +2361,14 @@ mod tests {
             properties: vec![FilterProp::HasSingleTarget],
         });
         assert_eq!(classify(&stack_prop), PermanentDomainFalse);
+
+        // CR 722.3d: a prepare spell is only ever a Stack-zone object.
+        let prepare_spell = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Creature],
+            controller: None,
+            properties: vec![FilterProp::PrepareSpell],
+        });
+        assert_eq!(classify(&prepare_spell), PermanentDomainFalse);
     }
 
     /// A shape that needs a live candidate lookup is `Unsupported` — the signal that the
