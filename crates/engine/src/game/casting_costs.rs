@@ -943,6 +943,29 @@ pub(crate) fn payable_spell_alternative_cost_details(
     object_id: ObjectId,
 ) -> Option<PayableSpellAlternativeCost> {
     let obj = state.objects.get(&object_id)?;
+    let casting_permission_index = match state
+        .pending_cast
+        .as_ref()
+        .filter(|pending| pending.object_id == object_id)
+    {
+        Some(pending) => pending.casting_permission_index,
+        None => super::casting::selected_object_cast_permission_index(state, obj, player, None),
+    };
+    payable_spell_alternative_cost_details_at_index(
+        state,
+        player,
+        object_id,
+        casting_permission_index,
+    )
+}
+
+pub(super) fn payable_spell_alternative_cost_details_at_index(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    casting_permission_index: Option<CastingPermissionIndex>,
+) -> Option<PayableSpellAlternativeCost> {
+    let obj = state.objects.get(&object_id)?;
     // CR 601.2a: the offer is scoped by the cast's ORIGIN zone (the object may
     // already sit on the stack when a pending cast re-asks).
     let origin_zone = super::casting::spell_cast_origin_zone(state, obj);
@@ -960,7 +983,12 @@ pub(crate) fn payable_spell_alternative_cost_details(
     // (Stolen Strategy exiles an opponent's card) — so this route is keyed on
     // the grant, not on the exiled card's `obj.controller` (its owner, CR 108.4a).
     let impulse_exile_cast = origin_zone == Zone::Exile
-        && super::casting::exile_cast_pays_printed_mana_cost(obj, player);
+        && super::casting::exile_cast_pays_printed_mana_cost(
+            state,
+            obj,
+            player,
+            casting_permission_index,
+        );
     let own_card = obj.controller == player;
     if !own_card && !impulse_exile_cast {
         return None;
@@ -8186,7 +8214,14 @@ fn check_additional_cost_or_pay_with_kept_cost(
             .and_then(|permission| {
                 payable_spell_alternative_cost_for_timing(state, player, object_id, permission)
             })
-            .or_else(|| payable_spell_alternative_cost_details(state, player, object_id));
+            .or_else(|| {
+                payable_spell_alternative_cost_details_at_index(
+                    state,
+                    player,
+                    object_id,
+                    casting_permission_index,
+                )
+            });
         if let Some(alt_cost) = alt_cost {
             // CR 118.9 + CR 601.2b: carry the once-per-turn grant source (As
             // Foretold) across the choice round-trip so its per-turn slot is
