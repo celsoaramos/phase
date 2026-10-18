@@ -2672,12 +2672,16 @@ pub(super) fn exile_cast_pays_printed_mana_cost(
         return false;
     }
     match &obj.casting_permissions[index.0] {
-        CastingPermission::PlayFromExile {
-            alt_ability_cost: None,
+        // CR 118.9a: only a paid, rider-free impulse grant leaves the mana cost
+        // in place (`is_normal_cost_authority_for_rider`); a "without paying its
+        // mana cost" grant (Fire Lord Ozai) or an alt-ability rider is already
+        // the cast's one alternative cost. CR 601.2f: a cost-rider grant stays
+        // unoffered, since its composition with a non-mana alternative cost is
+        // not modelled.
+        permission @ CastingPermission::PlayFromExile {
             cast_cost_modifier: None,
-            provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
             ..
-        } => true,
+        } => permission.is_normal_cost_authority_for_rider(),
         CastingPermission::PlayFromExile { .. }
         | CastingPermission::AdventureCreature
         | CastingPermission::ExileWithAltCost { .. }
@@ -34104,6 +34108,7 @@ mod selected_impulse_authority_tests {
             single_use: false,
             cast_cost_modifier: None,
             alt_ability_cost: None,
+            without_paying_mana_cost: false,
             land_enter_tapped: EtbTapState::Unspecified,
         };
         let mut used = live.clone();
@@ -34119,6 +34124,16 @@ mod selected_impulse_authority_tests {
         let mut filtered = live.clone();
         if let CastingPermission::PlayFromExile { card_filter, .. } = &mut filtered {
             *card_filter = Some(TargetFilter::SpecificObject { id: other });
+        }
+        // CR 118.9a: a "without paying its mana cost" grant (Fire Lord Ozai) is
+        // already the cast's one alternative cost.
+        let mut free = live.clone();
+        if let CastingPermission::PlayFromExile {
+            without_paying_mana_cost,
+            ..
+        } = &mut free
+        {
+            *without_paying_mana_cost = true;
         }
         runner
             .state_mut()
@@ -34142,9 +34157,10 @@ mod selected_impulse_authority_tests {
                     graveyard_replacement: None,
                     mana_spend_permission: None,
                     enters_with_counter: None,
-                    enters_with_modifications: Vec::new(),
+                    enters_with_modifications: Default::default(),
                     cast_cost_modifier: None,
                 },
+                free,
             ]);
         runner.state_mut().exile_play_permissions_used.insert(card);
         let state = runner.state();
@@ -34172,6 +34188,12 @@ mod selected_impulse_authority_tests {
             obj,
             P0,
             Some(CastingPermissionIndex(3)),
+        ));
+        assert!(!exile_cast_pays_printed_mana_cost(
+            state,
+            obj,
+            P0,
+            Some(CastingPermissionIndex(4)),
         ));
         assert!(!exile_cast_pays_printed_mana_cost(state, obj, P0, None));
     }
