@@ -404,3 +404,118 @@ fn ripples_of_undeath_decline_optional_keeps_milled_cards_in_graveyard() {
         "3 milled cards must remain in graveyard when payment declined"
     );
 }
+
+/// CR 608.2c + CR 701.13a: accepting and paying "{1} and 3 life" must let the
+/// controller put one of THE MILLED cards into their hand. The composite
+/// payment is staged as its own depth-0 replay (`payment_transaction`), which
+/// used to reset the chain's tracked set and publish an empty one in its place:
+/// "those cards" then named nothing, no card was offered, and the 3 life were
+/// paid for nothing (MagicFinder field report, 2026-10-19).
+fn accept_and_pay_puts_a_milled_card_into_hand(tap_a_land: bool) {
+    let Some(db) = load_db() else {
+        return;
+    };
+
+    let mut scenario = GameScenario::new();
+    let _ripples = scenario.add_real_card(P0, "Ripples of Undeath", Zone::Battlefield, db);
+    if tap_a_land {
+        scenario.add_basic_land(P0, engine::types::mana::ManaColor::Black);
+    }
+    let mut runner = scenario.build();
+    engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+
+    runner.state_mut().turn_number = 2;
+    runner.state_mut().phase = Phase::Untap;
+    runner.state_mut().active_player = P0;
+    runner.state_mut().priority_player = P0;
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+    seed_library(&mut runner, 6);
+
+    let _ = runner.auto_advance_to_main_phase();
+    let hand_before = runner.state().players[0].hand.len();
+    let life_before = runner.state().players[0].life;
+    if !tap_a_land {
+        add_mana(&mut runner, &[ManaType::Colorless]);
+    }
+
+    // Resolve the trigger: Mill 3, then the optional pay prompt.
+    let _ = runner.act(GameAction::PassPriority);
+    let _ = runner.act(GameAction::PassPriority);
+    let milled: Vec<_> = runner.state().players[0]
+        .graveyard
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(
+        milled.len(),
+        3,
+        "Mill 3 must have resolved before the payment prompt"
+    );
+
+    let mut picked = None;
+    for _ in 0..12 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OptionalEffectChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept: true })
+                    .expect("accepting the optional payment should succeed");
+            }
+            WaitingFor::EffectZoneChoice { cards, .. } => {
+                let mut offered = cards.clone();
+                offered.sort();
+                let mut expected = milled.clone();
+                expected.sort();
+                assert_eq!(
+                    offered, expected,
+                    "the choice must offer exactly the milled cards"
+                );
+                picked = Some(cards[0]);
+                runner
+                    .act(GameAction::SelectCards {
+                        cards: vec![cards[0]],
+                    })
+                    .expect("selecting a milled card should succeed");
+            }
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
+            WaitingFor::Priority { .. } => {
+                let _ = runner.act(GameAction::PassPriority);
+            }
+            _ => {
+                // Mana payment for {1} (tap the land): take the engine-issued action.
+                let action = engine::ai_support::candidate_actions(runner.state())
+                    .into_iter()
+                    .next()
+                    .expect("the payment prompt must issue a legal action")
+                    .action;
+                runner.act(action).expect("paying {1} should succeed");
+            }
+        }
+    }
+
+    let picked = picked.expect("paying must offer a card from among the milled cards");
+    assert_eq!(
+        runner.state().players[0].life,
+        life_before - 3,
+        "3 life paid"
+    );
+    assert!(
+        runner.state().players[0].hand.contains(&picked),
+        "the chosen milled card must be in hand"
+    );
+    assert_eq!(runner.state().players[0].hand.len(), hand_before + 1);
+    assert_eq!(
+        runner.state().players[0].graveyard.len(),
+        2,
+        "the other two milled cards stay"
+    );
+}
+
+#[test]
+fn ripples_of_undeath_accept_paid_from_pool_puts_milled_card_into_hand() {
+    accept_and_pay_puts_a_milled_card_into_hand(false);
+}
+
+#[test]
+fn ripples_of_undeath_accept_paid_by_tapping_a_land_puts_milled_card_into_hand() {
+    accept_and_pay_puts_a_milled_card_into_hand(true);
+}

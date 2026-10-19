@@ -57,6 +57,33 @@ fn restore_trigger_context(state: &mut GameState, context: Option<&ResolvingTrig
     state.die_result_this_resolution = context.die_result;
 }
 
+/// CR 608.2c: the payment root is replayed on a shadow as its own depth-0
+/// chain, and a depth-0 entry starts a fresh resolution scope — it clears the
+/// chain-local tracked set. The payment is still one instruction of the SAME
+/// resolution, so when it published no objects of its own (mana, life, energy),
+/// the population named before it ("those cards") stays the chain's. Ripples of
+/// Undeath: "mill three cards. Then you may pay {1} and 3 life. If you do, put a
+/// card from among those cards into your hand" — the payment's empty publish
+/// replaced the milled cards and the hand move found nothing. A payment that
+/// did publish (a sacrifice) keeps its own set.
+fn keep_chain_population(
+    shadow: &mut GameState,
+    before: Option<crate::types::identifiers::TrackedSetId>,
+) {
+    let Some(before) = before else {
+        return;
+    };
+    let published_nothing = shadow.chain_tracked_set_id.is_none_or(|id| {
+        shadow
+            .tracked_object_sets
+            .get(&id)
+            .is_none_or(|members| members.is_empty())
+    });
+    if published_nothing {
+        shadow.chain_tracked_set_id = Some(before);
+    }
+}
+
 fn returned_to_base_waiting(
     state: &GameState,
     base_waiting_for: &crate::types::game_state::WaitingFor,
@@ -98,6 +125,7 @@ pub(crate) fn begin(
     let payment_root = payment_only_root(ability);
     effects::resolve_ability_chain(&mut shadow, &payment_root, &mut buffered_events, 0)?;
     restore_trigger_context(&mut shadow, resolving_trigger_context.as_ref());
+    keep_chain_population(&mut shadow, base.chain_tracked_set_id);
     shadow.payment_transaction_replay = false;
 
     // A failed composite owns no partial payment and produces no payment events.
@@ -197,6 +225,7 @@ fn replay(
 
     shadow.payment_transaction_replay = false;
 
+    keep_chain_population(&mut shadow, state.chain_tracked_set_id);
     if returned_to_base_waiting(&shadow, &transaction.base_waiting_for) {
         Ok(ReplayOutcome::Completed {
             shadow,
