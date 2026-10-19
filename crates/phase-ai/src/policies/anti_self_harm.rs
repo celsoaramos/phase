@@ -184,8 +184,19 @@ fn reject_reason(ctx: &PolicyContext<'_>) -> Option<PolicyReason> {
 /// receive any of its upside. A soft no-target penalty still lets softmax spend
 /// a card to enhance an opponent's creature, which is never a useful line when
 /// the spell supplies no separate damage, removal, or AI-directed resource.
+///
+/// Only what the spell does AS IT RESOLVES counts (CR 608.2): a permanent spell
+/// resolves into the permanent itself (CR 608.3), and its activated abilities —
+/// firebreathing, equip, "{W}: target creature gains …" — are not spent by the
+/// cast. Reading them here vetoed every creature with a self-pump while the AI
+/// had no creature on the battlefield, so it never cast one and the board stayed
+/// empty for good (MagicFinder field report 2026-10-19: a Kaalia deck holding
+/// creatures for twenty turns with ten lands untapped).
 fn beneficial_creature_spell_has_no_friendly_recipient(ctx: &PolicyContext<'_>) -> bool {
-    let effects = ctx.effects();
+    let effects: Vec<&Effect> = action_ability_definitions(ctx)
+        .into_iter()
+        .flat_map(collect_definition_effects)
+        .collect();
     let has_beneficial_creature_effect = effects.iter().any(|effect| {
         matches!(effect_polarity(effect), EffectPolarity::Beneficial) && targets_creatures(effect)
     });
@@ -3417,6 +3428,62 @@ mod tests {
                 .map(|(_, verdict)| verdict),
             Some(PolicyVerdict::Score { .. })
         ));
+    }
+
+    /// MagicFinder field report 2026-10-19: with no creature of its own the AI
+    /// never cast a creature that carries a self-pump ("{R}: +1/+0"), because
+    /// the activated ability was read as the spell's own effect.
+    #[test]
+    fn creature_with_self_pump_ability_is_not_a_creature_benefit_spell() {
+        let mut state = make_state();
+        state.phase = Phase::PreCombatMain;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        add_creature(&mut state, PlayerId(1), "Opponent Creature", 2, 2);
+
+        let dragon_id = create_object(
+            &mut state,
+            CardId(90_019),
+            PlayerId(0),
+            "Shivan Dragon".to_string(),
+            Zone::Hand,
+        );
+        let dragon = state.objects.get_mut(&dragon_id).unwrap();
+        dragon.card_types.core_types.push(CoreType::Creature);
+        dragon.power = Some(5);
+        dragon.toughness = Some(5);
+        dragon.mana_cost = ManaCost::zero();
+        *Arc::make_mut(&mut dragon.abilities) = parsed_abilities(
+            "Shivan Dragon",
+            "Flying\n{R}: Shivan Dragon gets +1/+0 until end of turn.",
+            &["Flying"],
+            &["Creature"],
+        );
+        assert!(
+            dragon
+                .abilities
+                .iter()
+                .any(|a| a.kind != AbilityKind::Spell),
+            "the fixture must carry the activated self-pump"
+        );
+
+        let candidate = engine::ai_support::candidate_actions(&state)
+            .into_iter()
+            .find(|candidate| {
+                matches!(candidate.action, GameAction::CastSpell { object_id, .. } if object_id == dragon_id)
+            })
+            .expect("the engine must offer the creature cast");
+        let verdicts = shared_registry_verdicts_for(&state, &candidate);
+        assert!(
+            !verdicts
+                .iter()
+                .any(|(id, verdict)| *id == PolicyId::AntiSelfHarm
+                    && matches!(verdict, PolicyVerdict::Reject { .. })),
+            "casting a creature must not be vetoed for its own activated pump: {verdicts:?}"
+        );
     }
 
     #[test]
