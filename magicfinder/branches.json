@@ -241,5 +241,8 @@
   },
   {
     "branch": "card/crew-saddle-triggering-source"
+  },
+  {
+    "branch": "card/ripples-payment-keeps-milled-set"
   }
 ]
