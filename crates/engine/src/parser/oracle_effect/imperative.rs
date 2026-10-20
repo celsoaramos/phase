@@ -11527,6 +11527,42 @@ pub(super) fn parse_counter_ast(text: &str, lower: &str) -> Option<ZoneCounterIm
         });
     }
 
+    // CR 701.6 + CR 201.2: "Counter all spells with those names" (Grimoire
+    // Thief) — the names are the cards the preceding instruction just turned
+    // face up / revealed (`state.last_revealed_ids`, the `LastRevealed`
+    // anaphor). Without this arm the name clause was dropped and EVERY spell on
+    // the stack was countered.
+    if mass_consumed {
+        let named_spells: nom::IResult<&str, (), OracleError<'_>> = (
+            alt((tag("spells"), tag("spell"))),
+            tag(" with "),
+            alt((tag("those names"), tag("that name"))),
+            opt(tag(".")),
+            nom::combinator::eof,
+        )
+            .map(|_| ())
+            .parse(rest.trim_end());
+        if named_spells.is_ok() {
+            return Some(ZoneCounterImperativeAst::Counter {
+                target: TargetFilter::And {
+                    filters: vec![
+                        TargetFilter::StackSpell,
+                        TargetFilter::Typed(TypedFilter::new(TypeFilter::Any).properties(vec![
+                            FilterProp::SharesQuality {
+                                quality: crate::types::ability::SharedQuality::Name,
+                                reference: Some(Box::new(TargetFilter::LastRevealed)),
+                                relation: crate::types::ability::SharedQualityRelation::Shares,
+                            },
+                        ])),
+                    ],
+                },
+                source_rider: None,
+                unless_pay: None,
+                all: true,
+            });
+        }
+    }
+
     // CR 701.6a + CR 115.1: "Counter target <stack-object phrase>" where the
     // phrase is a multi-way disjunction of spells and/or activated/triggered
     // abilities — e.g. Louisoix's Sacrifice's "activated ability, triggered

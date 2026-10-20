@@ -1026,7 +1026,17 @@ pub(crate) fn identity_projection_for_viewer(
                             state, obj, pl.id,
                         )
                 });
-                !(foretell_ok || hideaway_lookable_by_viewer || play_from_exile_lookable)
+                // CR 406.3: "You may look at cards exiled with ~" (Grimoire
+                // Thief) — the source's static lets its controller look.
+                let exiled_with_source_lookable = viewer_may_look_at_exiled_with_source(
+                    state,
+                    *obj_id,
+                    &can_view_private_for_player,
+                );
+                !(foretell_ok
+                    || hideaway_lookable_by_viewer
+                    || play_from_exile_lookable
+                    || exiled_with_source_lookable)
             })
         })
         .collect();
@@ -3558,7 +3568,37 @@ fn face_down_exile_visible_to_viewer(
     can_view_private_for_player: &impl Fn(PlayerId) -> bool,
 ) -> bool {
     let foretell_ok = obj.foretold && can_view_private_for_player(obj.owner);
-    foretell_ok || look_link_lets_view(state, object_id, can_view_private_for_player)
+    foretell_ok
+        || look_link_lets_view(state, object_id, can_view_private_for_player)
+        || viewer_may_look_at_exiled_with_source(state, object_id, can_view_private_for_player)
+}
+
+/// CR 406.3: "You may look at cards exiled with ~" (Grimoire Thief, Bane Alley
+/// Broker) — a `MayLookAtFaceDown` static on the battlefield whose subject is
+/// exactly the source's exiled cards (`TargetFilter::ExiledBySource`) lets its
+/// controller look at those face-down exiles. Only that subject reaches the
+/// exile zone: the face-down-permanent permissions (Found Footage) keep their
+/// battlefield scope.
+fn viewer_may_look_at_exiled_with_source(
+    state: &GameState,
+    object_id: ObjectId,
+    can_view_private_for_player: &impl Fn(PlayerId) -> bool,
+) -> bool {
+    use crate::types::ability::TargetFilter;
+    use crate::types::statics::{StaticMode, StaticModeKind};
+    if !super::functioning_abilities::static_kind_present(state, StaticModeKind::MayLookAtFaceDown)
+    {
+        return false;
+    }
+    super::functioning_abilities::battlefield_active_statics(state).any(|(source, def)| {
+        matches!(def.mode, StaticMode::MayLookAtFaceDown)
+            && matches!(def.affected, Some(TargetFilter::ExiledBySource))
+            && can_view_private_for_player(source.controller)
+            && state
+                .exile_links
+                .iter()
+                .any(|link| link.source_id == source.id && link.exiled_id == object_id)
+    })
 }
 
 /// CR 406.3 + CR 702.75a: a look link lets the viewer look at face-down exiled
