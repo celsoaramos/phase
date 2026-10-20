@@ -1654,29 +1654,21 @@ fn apply_action_boundary_core(
     // `false` when nothing was parked or an earlier convergence point already consumed it
     // (`Option::take_if`).
     let scan_from = result.events.len();
-    if effects::token::realize_settled_token_battlefield_entry(state, &mut result.events) {
-        let wf = match engine_priority::run_post_action_pipeline_from(
-            state,
-            &mut result.events,
-            scan_from,
-            &result.waiting_for,
-            false,
-            false,
-        ) {
-            Ok(wf) => wf,
-            Err(err) => {
-                *state = boundary_snapshot;
-                return Err(err);
-            }
-        };
-        // The pipeline's terminal return hands back `flush_pending_priority_intercepts(..)` WITHOUT
-        // writing `state.waiting_for`, and the drain can raise `OrderTriggers` (CR 603.3b; measured
-        // on the Fanatic route). BOTH writes are load-bearing: `finish_action_boundary` copies
-        // `result.waiting_for` INTO the state at `sync_waiting_for`, and
-        // `apply_interaction_pre_reconciliation_for_life_safety` returns `raw.result` without ever
-        // calling `finish_action_boundary`.
-        state.waiting_for = wf.clone();
-        result.waiting_for = wf;
+    let realized_token_entry =
+        effects::token::realize_settled_token_battlefield_entry(state, &mut result.events);
+    // CR 608.2c + CR 608.2n: the same convergence for a resolution this action
+    // completed on a route that never reached the pipeline (a spell cast during
+    // a resolution, CR 608.2g, finishes its announcement here): the resolving
+    // instant or sorcery still owes its final part — leaving the stack — and the
+    // pipeline's top runs it (`run_spell_final_part_if_due`) and collects its
+    // triggers. A token realization and an owed final part on the same action
+    // share one pass.
+    let owed_spell_final_part_is_due = owed_spell_final_part_is_due(state, &result);
+    if realized_token_entry || owed_spell_final_part_is_due {
+        if let Err(err) = run_boundary_convergence_pipeline(state, &mut result, scan_from) {
+            *state = boundary_snapshot;
+            return Err(err);
+        }
     }
     // CR 603.2 + CR 603.3: events this action emitted while the announcement
     // stays paused are staged into its carrier; a spell's carrier returns to
@@ -1699,6 +1691,87 @@ fn apply_action_boundary_core(
         preserve_interaction,
         lifecycle,
     })
+}
+
+/// CR 608.2c + CR 608.2n: whether the action's result leaves a Priority window
+/// in which the resolving instant or sorcery owes its final part and every
+/// instruction has been followed. The handler's result already names the
+/// Priority window; the state's copy is only synchronized at
+/// `finish_action_boundary`, and the final-part authority reads it, so it is
+/// synchronized first.
+fn owed_spell_final_part_is_due(state: &mut GameState, result: &ActionResult) -> bool {
+    let owes_spell_final_part = matches!(result.waiting_for, WaitingFor::Priority { .. })
+        && super::stack::resolving_spell_owes_final_part(state);
+    if owes_spell_final_part {
+        sync_waiting_for(state, &result.waiting_for);
+    }
+    owes_spell_final_part && resolution_instructions_are_done(state)
+}
+
+/// The action boundary's convergence pass: the ordinary post-action pipeline,
+/// scanning only `result.events[scan_from..]`, whose top runs an owed final
+/// part (`run_spell_final_part_if_due`) and whose drain puts the batch on the
+/// stack. The caller restores its own snapshot on `Err`.
+fn run_boundary_convergence_pipeline(
+    state: &mut GameState,
+    result: &mut ActionResult,
+    scan_from: usize,
+) -> Result<(), EngineError> {
+    let wf = engine_priority::run_post_action_pipeline_from(
+        state,
+        &mut result.events,
+        scan_from,
+        &result.waiting_for,
+        false,
+        false,
+    )?;
+    // The pipeline's terminal return hands back `flush_pending_priority_intercepts(..)` WITHOUT
+    // writing `state.waiting_for`, and the drain can raise `OrderTriggers` (CR 603.3b; measured
+    // on the Fanatic route). BOTH writes are load-bearing: `finish_action_boundary` copies
+    // `result.waiting_for` INTO the state at `sync_waiting_for`, and
+    // `apply_interaction_pre_reconciliation_for_life_safety` returns `raw.result` without ever
+    // calling `finish_action_boundary`.
+    state.waiting_for = wf.clone();
+    result.waiting_for = wf;
+    Ok(())
+}
+
+/// CR 608.2c + CR 608.2n: an action whose result completed a paused instant
+/// or sorcery's instructions on a route that reached no pipeline — a handler
+/// that returned its result directly, or an elimination by the CR 704.5a net
+/// that canonically declined the departed player's pending choice (CR 800.4a +
+/// CR 608.2m) — still owes the spell's final part. Run the pipeline from
+/// `scan_from`: its top runs that part (`run_spell_final_part_if_due`) and its
+/// drain puts the batch on the stack before the action returns.
+fn converge_owed_spell_final_part(
+    state: &mut GameState,
+    result: &mut ActionResult,
+    scan_from: usize,
+) -> Result<bool, EngineError> {
+    if !owed_spell_final_part_is_due(state, result) {
+        return Ok(false);
+    }
+    run_boundary_convergence_pipeline(state, result, scan_from)?;
+    Ok(true)
+}
+
+/// CR 704.5a + CR 800.4a: the player-loss net, then the convergence of a
+/// resolution the net's elimination completed. `reconcile` is the net each
+/// side of the convergence runs: the full [`reconcile_terminal_result`], or,
+/// after an auto-pass drive that did not advance, only its terminal half
+/// ([`reconcile_terminal_sba`]) so the loop shortcut is evaluated once per
+/// priority frame (CR 732.2a).
+fn reconcile_terminal_result_completing_resolution(
+    state: &mut GameState,
+    result: &mut ActionResult,
+    reconcile: fn(&mut GameState, &mut ActionResult),
+) -> Result<(), EngineError> {
+    reconcile(state, result);
+    let scan_from = result.events.len();
+    if converge_owed_spell_final_part(state, result, scan_from)? {
+        reconcile(state, result);
+    }
+    Ok(())
 }
 
 /// CR 117.3b + CR 608.2c + CR 614.12a + CR 614.13a: A completed Devour entry
@@ -1893,6 +1966,13 @@ fn recover_ownerless_post_replacement_completion_at_priority_boundary(
         || state.pending_cast.is_some()
         || state.pending_resolution_completion.is_some()
         || state.resolving_stack_entry.is_none()
+        // CR 608.2n: a carrier still owing its spell's final part is live work
+        // for the ordinary drain, not a stale rest.
+        || super::stack::resolving_spell_owes_final_part(state)
+        // CR 608.2n: an instant or sorcery still on the stack has not made its
+        // move to the graveyard; settling its carrier would strand it in the
+        // stack zone, so the shape is not a stale rest.
+        || super::stack::resolving_instant_or_sorcery_on_stack(state).is_some()
     {
         return false;
     }
@@ -1921,6 +2001,13 @@ fn is_orphaned_devour_completion_at_priority_boundary(state: &GameState) -> bool
         && state
             .active_post_replacement_drains()
             .is_some_and(crate::types::game_state::PostReplacementDrainStack::is_empty)
+        // CR 608.2n: a carrier still owing its spell's final part is live work
+        // for the final part's authority, not a terminal rest.
+        && !super::stack::resolving_spell_owes_final_part(state)
+        // CR 608.2n: an instant or sorcery still on the stack has not made its
+        // move to the graveyard; settling its carrier would strand it in the
+        // stack zone, so the frame is not a terminal rest.
+        && super::stack::resolving_instant_or_sorcery_on_stack(state).is_none()
 }
 
 fn is_orphaned_spell_resolution_at_priority_boundary(state: &GameState) -> bool {
@@ -1941,6 +2028,13 @@ fn is_orphaned_spell_resolution_at_priority_boundary(state: &GameState) -> bool 
                 ..
             }) if *id == pending.object_id
         )
+        // CR 608.2n: a carrier still owing its spell's final part is live work
+        // for the final part's authority, not a terminal rest.
+        && !super::stack::resolving_spell_owes_final_part(state)
+        // CR 608.2n: an instant or sorcery still on the stack has not made its
+        // move to the graveyard; settling its carrier would strand it in the
+        // stack zone, so the frame is not a terminal rest.
+        && super::stack::resolving_instant_or_sorcery_on_stack(state).is_none()
 }
 
 /// Finalize a checked persisted restore after its runtime-only data is present.
@@ -2081,7 +2175,15 @@ fn finish_action_boundary_with_lifecycle(
         preserve_interaction,
         lifecycle,
     } = raw;
-    reconcile_terminal_result(state, &mut result);
+    if let Err(err) = reconcile_terminal_result_completing_resolution(
+        state,
+        &mut result,
+        reconcile_terminal_result,
+    ) {
+        lifecycle.discard();
+        *state = boundary_snapshot;
+        return Err(err);
+    }
     bump_state_revision(state);
     sync_waiting_for(state, &result.waiting_for);
     // A reversed activation (CR 602.2b + CR 601.2h) already had its pre-action
@@ -2100,10 +2202,17 @@ fn finish_action_boundary_with_lifecycle(
     } else {
         run_auto_pass_loop(state, &mut result)
     };
-    if auto_pass_advanced {
-        reconcile_terminal_result(state, &mut result);
+    // CR 732.2a: a drive that did not advance re-runs only the terminal half.
+    let reconcile: fn(&mut GameState, &mut ActionResult) = if auto_pass_advanced {
+        reconcile_terminal_result
     } else {
-        reconcile_terminal_sba(state, &mut result);
+        reconcile_terminal_sba
+    };
+    if let Err(err) = reconcile_terminal_result_completing_resolution(state, &mut result, reconcile)
+    {
+        lifecycle.discard();
+        *state = boundary_snapshot;
+        return Err(err);
     }
     if matches!(result.waiting_for, WaitingFor::GameOver { .. }) {
         take_and_restore_stack_resolution_session(state);
@@ -2775,9 +2884,9 @@ pub enum BoundedOfferRefusal {
     /// (6) A per-iteration choice the cycle opens is not specified by a published slot.
     UnspecifiedChoiceWindow,
     /// (7) `elimination_cascade` measured no CR 704 threshold at all and no cleanup bound, or
-    /// measured one under which no repetition is legal. Both grounds refuse here, because both
-    /// leave this producer with nothing to state: its whole claim is a threshold it measured
-    /// inside the loop.
+    /// measured one under which the proposer survives no repetition. Both grounds refuse here,
+    /// because both leave this producer with nothing to state: its whole claim is a threshold it
+    /// measured inside the loop.
     NoNarrowedLegalCount,
 }
 
@@ -3085,9 +3194,18 @@ fn certified_bounded_cycle_offer<'a>(
         // disjunct instead of discarding it. Semantics are byte-for-byte the `||` it
         // replaces: the equality arm is still evaluated first and `_pinned` still runs only
         // when it fails. The two disjuncts are mutually exclusive — equality compares the
-        // stack exactly (constant depth) while cover's item (2) forces strictly growing depth
-        // — so "which disjunct" is a total function with no both-matched case.
-        let cert = if crate::analysis::resource::loop_states_equal_modulo_resources(prior, state) {
+        // stack exactly but for the published answers (constant depth) while cover's item (2)
+        // forces strictly growing depth — so "which disjunct" is a total function with no
+        // both-matched case. Equality leaves the published answers out because they are the
+        // declaration's per-repetition choices, not part of what repeats (CR 732.2a), which is
+        // what lets the minimal period certify under an alternating answer history.
+        let cert = if crate::analysis::resource::loop_states_equal_modulo_published_answers(
+            prior,
+            ring_live[idx],
+            state,
+            proposer,
+            &slots,
+        ) {
             Some(PeriodCertification::BoardEqualOnly)
         } else if crate::analysis::resource::loop_states_cover_modulo_growth_pinned(
             prior,
@@ -3418,21 +3536,21 @@ fn bounded_offer_tail(
     // so the bound cannot be divided by anything other than what the certificate states.
     periodic.seat_life_charge = frame_wise.seat_life_charges(&charged);
     // (7b) THE DECLARATION, BEFORE THE SCHEMA. The cascade below is DECLARATION-RELATIVE, so the
-    // pins have to exist before there is a count to publish. `pin_journalled_declaration` reads
-    // the journal alone and stamps nothing, which is exactly what makes taking it here
-    // non-circular: the publisher's own count is stamped onto it at step (10), after this
-    // producer has decided what that count is.
-    let pins = pin_journalled_declaration(state, proposer, &points);
+    // pins have to exist before there is a count to publish. `pin_journalled_declaration` pins
+    // each charged slot to its observed aim and every other point from the journal, and stamps
+    // nothing, which is exactly what makes taking it here non-circular: the declaration's own
+    // count is stamped onto it at step (10), after this producer has decided what that count is.
+    let pins = pin_journalled_declaration(state, proposer, &points, &charged);
 
     // (7c) THE CASCADE, TAKEN TWICE — once under the offer's OWN declaration and once under a
     // WITNESS, because CR 732.2a's two questions are not one question.
     //
-    // The SUGGESTION must be a count the offer's own published declaration can drive: the declare
-    // handler resolves `template: None` to exactly that declaration, and the AI's own candidate
-    // carries it, so publishing a suggestion it cannot drive would have the engine refuse its own
-    // offer. The CEILING answers CR 732.2a's "may be legally taken", which quantifies
-    // EXISTENTIALLY — what SOME legal declaration may specify. Those are different numbers and
-    // the schema carries two fields for them.
+    // The OWN count is what the offer's published declaration (the observation) drives, and it
+    // is stamped onto that declaration. The SUGGESTION is a count its suggested declaration
+    // drives (the count roles are stated on `ShortcutDecisionSchema::suggested_declaration`).
+    // The CEILING answers CR 732.2a's "may be legally taken", which quantifies EXISTENTIALLY —
+    // what SOME legal declaration may specify. Those are different numbers and the schema
+    // carries separate fields for them.
     //
     // The charge is `PeriodicDelta::declared_seat_life_charges`' and NOT the published divisor.
     // The divisor charges every reachable seat its full magnitude in every repetition, so a
@@ -3448,20 +3566,20 @@ fn bounded_offer_tail(
     // ONE conjunct at ONE site, over the reduction's own answer: the ABSENCE means no living seat
     // is consumed, so this producer measured nothing and belongs to another seam. A cascade
     // publishes `0` only when a turn-cycle period's cleanup bound allows no repetition
-    // (CR 514.1), and the `count >= 1` filter below refuses that offer. This is also what makes
-    // `schema.is_bounded()` true BY CONSTRUCTION for every offer this function mints. NO UPPER
-    // END: a threshold above the engine's repetition budget is still a measured threshold, and the
-    // budget is the schema constructor's to apply.
+    // (CR 514.1), and the survived-count refusal in step (9) refuses that offer. This is also
+    // what makes `schema.is_bounded()` true BY CONSTRUCTION for every offer this function mints.
+    // NO UPPER END: a threshold above the engine's repetition budget is still a measured
+    // threshold, and the budget is the schema constructor's to apply.
     //
     // BOTH cascades below are read at `ChargeBound::Ceiling`, which is the question this seam
     // asks: what SOME conforming declaration may take from a seat. An over-charge there only
     // LOWERS a published count, which is the direction a ceiling must fail in.
     //
-    // And both with no announced lead, where the consumption seam reads each charged slot's lead
-    // off the board the drive starts from. The own declaration pins one aim at every index, where
-    // a lead changes nothing; the witness read without one reaches each later segment no later
-    // than a drive does, so its crossings land no later than a drive's and the ceiling it backs is
-    // no higher.
+    // And both with this board's own lead, the same one the declare and consumption seams read:
+    // the trigger on top of the stack resolves the target it latched at the first repetition
+    // (CR 603.3d + CR 601.2c), which under an alternating answer history is not the observed aim.
+    let leading = leading_announcement_aims(state, proposer);
+    let lead = crate::analysis::resource::AnnouncedLead::LeadingRepetition(&leading);
     let own = periodic
         .elimination_cascade(
             state,
@@ -3470,35 +3588,37 @@ fn bounded_offer_tail(
             pins.as_ref(),
             &points,
             crate::analysis::resource::ChargeBound::Ceiling,
-            crate::analysis::resource::AnnouncedLead::None,
+            lead,
         )
         .map(|cascade| truncate_to_declared_seats(cascade, pins.as_ref(), state))
-        .filter(|cascade| cascade.count >= 1)
         .ok_or(BoundedOfferRefusal::NoNarrowedLegalCount)?;
     // The witness needs a published declaration to re-aim and a charged slot to re-aim; without
-    // either it is `None` and the ceiling degenerates to the suggestion — today's shape.
-    let witness_bound = pins
+    // either it is `None` and the ceiling degenerates to the own count.
+    let witness = pins
         .as_ref()
-        .and_then(|observed| periodic.piecewise_witness(state, proposer, observed, &points))
-        .and_then(|witness| {
-            periodic.elimination_cascade(
-                state,
-                proposer,
-                Some(&witness),
-                pins.as_ref(),
-                &points,
-                crate::analysis::resource::ChargeBound::Ceiling,
-                crate::analysis::resource::AnnouncedLead::None,
-            )
-        })
-        .map_or(0, |cascade| cascade.count);
+        .and_then(|observed| periodic.piecewise_witness(state, proposer, observed, &points, lead));
+    let witness_cascade = witness.as_ref().and_then(|witness| {
+        periodic.elimination_cascade(
+            state,
+            proposer,
+            Some(witness),
+            pins.as_ref(),
+            &points,
+            crate::analysis::resource::ChargeBound::Ceiling,
+            lead,
+        )
+    });
+    let witness_bound = witness_cascade.as_ref().map_or(
+        0,
+        crate::analysis::resource::EliminationCascade::capacity_count,
+    );
     // THE LARGER OF THE TWO, and that is not an optimisation. `handle_declare_shortcut` refuses
     // any `Fixed(n)` above `deliverable_capacity`, so a ceiling below the suggestion would have it
     // refuse the offer's own suggestion; and nothing about the witness's greedy aim guarantees its
     // count exceeds the own-declaration count. Both members are legal declarations, so the max
     // keeps "the ceiling is what SOME legal declaration may specify" true and keeps
     // `deliverable_capacity >= iteration_count` true by construction rather than by luck.
-    let measured_bound = own.count.max(witness_bound);
+    let measured_bound = own.capacity_count().max(witness_bound);
 
     // (8) The certificate, with the two fields the bounded class states differently from
     // Path A's spelled out at the site rather than mutated after the fact.
@@ -3526,22 +3646,32 @@ fn bounded_offer_tail(
     // hands the constructor `Some(..)` and `schema.is_bounded()` is true by construction for every
     // offer it mints.
     //
-    // `Fixed(own.count)` is the SUGGESTION — the count the offer's own published declaration
-    // drives. `Some(measured_bound)` is the CEILING the declare handler enforces, which rejects
-    // any `Fixed(n)` above it and rejects `UntilLethal` outright, both already shipped. Either
-    // number handed here may EXCEED the engine's repetition budget, since nothing above clamps
-    // them; the constructor is the single site that applies that budget, and it narrows the
-    // suggestion to the capacity it derives, so `deliverable_capacity >= iteration_count` survives
-    // the clamp. The points go in as the frame source built them: the ring's from its certified
-    // touch, the replay's from the choices its confirmed cycle recorded.
-    let schema = build_shortcut_schema(
+    // `Fixed(measured_bound)` is handed in as the SUGGESTION and step (11) sets the published one.
+    // The ceiling still counts a witness the proposer does not survive, since
+    // `deliverable_capacity = max(own, witness_bound)`.
+    // `Some(measured_bound)` is the CEILING the declare handler enforces, which rejects any
+    // `Fixed(n)` above it and rejects `UntilLethal` outright, both already shipped. Either number
+    // handed here may EXCEED the engine's repetition budget, since nothing above clamps them; the
+    // constructor is the single site that applies that budget, and it narrows the suggestion to
+    // the capacity it derives, so `deliverable_capacity >= iteration_count` survives the clamp.
+    // Every published count is `EliminationCascade::survived_count`'s, clamped to that capacity.
+    // The points go in as the frame source built them: the ring's from its certified touch, the
+    // replay's from the choices its confirmed cycle recorded.
+    let mut schema = build_shortcut_schema(
         points,
-        IterationCount::Fixed(own.count),
+        IterationCount::Fixed(measured_bound),
         Some(measured_bound),
     );
-    // (10) The DECLARATION the engine can already specify for this offer, read out of the same
-    // journal step (7b) read and now STAMPED with the published suggestion and VALIDATED against
-    // the schema that publishes it. Taken again here rather than carried from (7b) because
+    let own_survived = own.survived_count(proposer, schema.deliverable_capacity);
+    // CR 704.5a / CR 704.5b / CR 704.5c + CR 732.2a: no offer when the proposer survives no
+    // repetition of its own declaration, the count that declaration would be stamped at.
+    if own_survived == 0 {
+        return Err(BoundedOfferRefusal::NoNarrowedLegalCount);
+    }
+    let own_count = IterationCount::Fixed(own_survived);
+    // (10) The DECLARATION the engine can already specify for this offer, pinned as step (7b)
+    // pinned it and now STAMPED with its own count and VALIDATED at that count against the
+    // schema that publishes it. Taken again here rather than carried from (7b) because
     // publication is the half that needs a schema, and the journal read is deterministic: this
     // returns `Some` over exactly the pins (7b) charged, or `None` where the publisher's own gate
     // refuses them — the latent arm this function's doc already scopes.
@@ -3551,7 +3681,64 @@ fn bounded_offer_tail(
         &schema,
         certificate.per_cycle.as_ref(),
         recorded,
+        &charged,
+        &own_count,
     );
+    // (11) The SUGGESTION: the witness at the most repetitions the proposer survives, within the
+    // capacity, cut to the segments that count reaches, stamped and validated at that count, and
+    // published only where it drives further than the declaration's own count and conforms there.
+    let suggested_count = witness_cascade.as_ref().map_or(0, |cascade| {
+        cascade.survived_count(proposer, schema.deliverable_capacity)
+    });
+    let suggested = IterationCount::Fixed(suggested_count);
+    let suggestion = witness
+        .filter(|_| suggested_count > own_survived)
+        .zip(declaration.as_ref())
+        .and_then(|(mut witness, published)| {
+            witness.cut_schedules_at(&suggested);
+            witness.replay = crate::analysis::decision_template::ReplayMode::Scheduled {
+                count: suggested.clone(),
+            };
+            crate::analysis::decision_template::declaration_conforms(
+                &schema,
+                &witness,
+                shortcut_validated_range(&suggested, Some(&witness)),
+                crate::analysis::decision_template::AimContext {
+                    proposer,
+                    per_cycle: certificate.per_cycle.as_ref(),
+                    published: Some(published),
+                },
+                recorded,
+                state,
+            )
+            .then_some(witness)
+        });
+    match suggestion {
+        Some(witness) => {
+            schema.iteration_count = suggested;
+            schema.suggested_declaration = Some(witness);
+        }
+        None => schema.iteration_count = own_count,
+    }
+    // The interaction layer reads no `GameState`, so the lead it splits a preview by is
+    // snapshotted here, on the published points only.
+    schema.leading_aims = leading
+        .iter()
+        .filter_map(|decision| {
+            use crate::analysis::decision_template::{ConcreteDecision, ConcreteTarget};
+            let ConcreteDecision::Targets { slot, targets } = decision else {
+                return None;
+            };
+            let [ConcreteTarget::Player(seat)] = targets.as_slice() else {
+                return None;
+            };
+            schema
+                .points
+                .iter()
+                .any(|point| point.slot == *slot)
+                .then(|| (slot.clone(), *seat))
+        })
+        .collect();
     Ok((certificate, schema, declaration))
 }
 
@@ -3561,7 +3748,7 @@ fn bounded_offer_tail(
 /// `build_bounded_declaration` pins a single-seat ranking. Once that seat departs the pin no longer
 /// names a living seat, `PeriodicDelta::declared_seat_life_charges` reads it as unknown and
 /// fail-closed ("both lands and leaves"), and an unguarded cascade would keep charging every other
-/// seat the reserved dip and publish a SUGGESTION that declaration cannot drive.
+/// seat the reserved dip and publish an own count that declaration cannot drive.
 ///
 /// INCLUSIVE, and that is a decision rather than an off-by-one: the entry meeting the pins is the
 /// one the pinned seat departs on, which the declaration DOES drive. Dropping it publishes the
@@ -3605,15 +3792,10 @@ fn truncate_to_declared_seats(
         }
         })
     };
-    let Some(cut) = cascade.entries.iter().position(names_a_seat_of) else {
-        return cascade;
-    };
-    let mut entries = cascade.entries;
-    entries.truncate(cut + 1);
-    let count = entries
-        .last()
-        .map_or(cascade.count, |entry| entry.repetition);
-    crate::analysis::resource::EliminationCascade { count, entries }
+    match cascade.entries.iter().position(names_a_seat_of) {
+        Some(cut) => cascade.truncated_through(cut),
+        None => cascade,
+    }
 }
 
 /// CR 732.2a: the declaration THIS offer can already state, derived from what the proposer
@@ -3639,21 +3821,23 @@ fn truncate_to_declared_seats(
 /// # PUBLISHED IS VALIDATED — `is_some()` means "the declare handler will take this"
 ///
 /// `ai_support::candidates` gates its `DeclareShortcut` candidate on `declaration.is_some()`
-/// and hands this very template to `handle_declare_shortcut`, which validates it. So the
+/// and, where the offer publishes no suggested declaration, hands this very template to
+/// `handle_declare_shortcut`, which validates it. So the
 /// publisher must not be able to emit anything that handler would refuse: step (5) runs the
 /// SHARED [`crate::analysis::decision_template::declaration_conforms`] — the same coverage +
 /// value-legality predicate that handler and the human ingress run — rather than a third
 /// derivation of `required` alongside theirs.
 ///
-/// The range is `shortcut_validated_range(&schema.iteration_count, ..)`, i.e. this offer's own
-/// SUGGESTION. Since the suggestion and the ceiling became separate fields that is NOT the widest
-/// count a declarer may name — `deliverable_capacity` is, and it can be larger. `validate_pins`
-/// re-checks `0..range`, so passing here implies passing at every shorter `Fixed(n)`; what makes
-/// the narrower range sound above the suggestion is that `handle_declare_shortcut` re-validates
-/// through the same authority at the count actually named.
+/// The range is `shortcut_validated_range(own_count, ..)`, i.e. this declaration's OWN count,
+/// which bounds every count it drives; `iteration_count` belongs to the suggestion (see
+/// `ShortcutDecisionSchema::suggested_declaration`). That is NOT the widest count a declarer may
+/// name — `deliverable_capacity` is, and it can be larger. `validate_pins` re-checks `0..range`,
+/// so passing here implies passing at every shorter `Fixed(n)`; what makes the narrower range
+/// sound above it is that `handle_declare_shortcut` re-validates through the same authority at
+/// the count actually named.
 ///
-/// The published declaration satisfies the AIM conjunct at the published count BY CONSTRUCTION:
-/// `truncate_to_declared_seats` cuts the suggestion at the repetition this declaration's own aim
+/// The published declaration satisfies the AIM conjunct at its own count BY CONSTRUCTION:
+/// `truncate_to_declared_seats` cuts the own count at the repetition this declaration's own aim
 /// departs on, so no repetition inside it aims past a crossing. That is a statement about this
 /// declaration at this count, and about no other declaration at the same count.
 ///
@@ -3685,24 +3869,27 @@ fn build_bounded_declaration(
     schema: &crate::analysis::decision_template::ShortcutDecisionSchema,
     per_cycle: Option<&crate::analysis::resource::PeriodSignature>,
     recorded: Option<&[crate::analysis::decision_template::PinnedDecision]>,
+    observed_aims: &[crate::analysis::resource::SlotCharge],
+    own_count: &crate::analysis::decision_template::IterationCount,
 ) -> Option<crate::analysis::decision_template::DecisionTemplate> {
     use crate::analysis::decision_template::ReplayMode;
-    let mut template = pin_journalled_declaration(state, proposer, &schema.points)?;
-    // (4) The published SUGGESTION is stamped here, by the step that knows it, rather than inside
-    // the pinning authority above: the count is the producer's answer and the pins are the
-    // journal's, and nothing reads this copy (see `analysis::decision_template::resolve`'s doc).
+    let mut template = pin_journalled_declaration(state, proposer, &schema.points, observed_aims)?;
+    // (4) The declaration's OWN count is stamped here, by the step that knows it, rather than
+    // inside the pinning authority above: the count is the producer's answer and the pins are the
+    // observation's, and nothing reads this copy (see `analysis::decision_template::resolve`'s
+    // doc).
     template.replay = ReplayMode::Scheduled {
-        count: schema.iteration_count.clone(),
+        count: own_count.clone(),
     };
     // (5) VALIDATE BEFORE PUBLISHING — the same authority `handle_declare_shortcut` accepts
     // under. See this function's "Published is validated" doc section for why the range is the
-    // schema's OWN count and why this is not a third derivation.
+    // declaration's OWN count and why this is not a third derivation.
     // `published` is the template under validation: at this seam the declaration the offer is
     // about to publish and the declaration the aim walk measures against ARE the same one.
     crate::analysis::decision_template::declaration_conforms(
         schema,
         &template,
-        shortcut_validated_range(&schema.iteration_count, Some(&template)),
+        shortcut_validated_range(own_count, Some(&template)),
         crate::analysis::decision_template::AimContext {
             proposer,
             per_cycle,
@@ -3714,13 +3901,16 @@ fn build_bounded_declaration(
     .then_some(template)
 }
 
-/// CR 732.2a: the PINS the offer's own declaration carries — the proposer's answer at each
-/// published point, read out of the same journal the detection window populated, and nothing
-/// else.
+/// CR 732.2a: the PINS the offer's own declaration carries — at a charged slot, the seat its
+/// announcement that resolved in the certified window aimed at (`SlotCharge::aimed_at`, the aim
+/// whose loss the period measured; `None` there withdraws the whole template), and at every other
+/// published point the proposer's answer, read out of the same journal the detection window
+/// populated.
 ///
 /// Split from the publish gate above because the two halves are settled by different things. The
-/// pins are settled by the published `points` alone; the count stamped onto the template is the
-/// producer's own published suggestion, which is not a fact about what the proposer answered.
+/// pins are settled by the published `points` and the observation alone; the count stamped onto
+/// the template is the declaration's own count, which is not a fact about what the proposer
+/// answered.
 /// Keeping them apart is what lets a caller take the declaration BEFORE a schema exists to stamp
 /// from, with no second declaration authority and no circularity.
 ///
@@ -3731,6 +3921,7 @@ fn pin_journalled_declaration(
     state: &GameState,
     proposer: PlayerId,
     points: &[crate::analysis::decision_template::DecisionPoint],
+    observed_aims: &[crate::analysis::resource::SlotCharge],
 ) -> Option<crate::analysis::decision_template::DecisionTemplate> {
     use crate::analysis::decision_template::{
         DecisionGroupKey, DecisionKind, DecisionPointKind, DecisionTemplate, LoopAnswer,
@@ -3742,10 +3933,26 @@ fn pin_journalled_declaration(
     }
     let mut decisions = Vec::with_capacity(points.len());
     for point in points {
-        // (2) The journal read, under the PROPOSER's own key — the same key
-        // `record_trigger_target_answer` and the `DecideOptionalEffect` arm write under.
-        let LoopAnswer::Uniform(value) = state.loop_answer(&point.slot, proposer)? else {
-            return None;
+        // (2) A charged slot's observed aim, else the journal read, under the PROPOSER's own key —
+        // the same key `record_trigger_target_answer` and the `DecideOptionalEffect` arm write
+        // under.
+        let observed = observed_aims
+            .iter()
+            .find(|charge| charge.slot == point.slot)
+            .map(|charge| {
+                charge.aimed_at.and_then(|seat| {
+                    announced_target_pins(state, &[TargetRef::Player(seat)])
+                        .map(LoopAnswerValue::Targets)
+                })
+            });
+        let value = match observed {
+            Some(value) => value?,
+            None => {
+                let LoopAnswer::Uniform(value) = state.loop_answer(&point.slot, proposer)? else {
+                    return None;
+                };
+                value
+            }
         };
         // (3) The wildcard-free (kind, value) match.
         decisions.push(match (&point.kind, value) {
@@ -3783,7 +3990,7 @@ fn pin_journalled_declaration(
         });
     }
     // (4) The template. `ReplayMode::Static` is the UNSTAMPED shape: the driving count comes off
-    // `GameAction::DeclareShortcut`, and the publisher above stamps the offer's own suggestion
+    // `GameAction::DeclareShortcut`, and the publisher above stamps the declaration's own count
     // onto this copy, which nothing reads.
     Some(DecisionTemplate {
         owner: proposer,
@@ -4175,6 +4382,39 @@ pub(crate) fn entry_publishes_pin_slots(
         may: announced.may,
         legal_targets,
     })
+}
+
+/// CR 603.3d + CR 601.2c: the targets the TOP stack entry latched when it was put there, if it
+/// announces a target slot — the aim that slot resolves at a drive's first repetition
+/// ([`crate::analysis::resource::AnnouncedLead`]). The single lead authority the offer, declare
+/// and consumption seams read off the board each asks about, through the same acceptance
+/// authority ([`entry_announces`]) the charged slots are minted by.
+///
+/// Only the top entry: it resolves next (CR 405.5 + CR 608.1), and every announcement it causes
+/// goes above anything buried beneath it (CR 405.2), so a buried entry never resolves first.
+pub(crate) fn leading_announcement_aims(
+    state: &GameState,
+    proposer: PlayerId,
+) -> Vec<crate::analysis::decision_template::ConcreteDecision> {
+    use crate::analysis::decision_template::{ConcreteDecision, ConcreteTarget};
+    state
+        .stack
+        .back()
+        .and_then(|entry| {
+            let slot = entry_announces(state, entry, proposer)?.target?.slot;
+            let targets = entry
+                .ability()?
+                .targets
+                .iter()
+                .map(|t| match t {
+                    TargetRef::Player(p) => ConcreteTarget::Player(*p),
+                    TargetRef::Object(o) => ConcreteTarget::Object(*o),
+                })
+                .collect();
+            Some(ConcreteDecision::Targets { slot, targets })
+        })
+        .into_iter()
+        .collect()
 }
 
 /// CR 601.2c + CR 603.5 (reached for a triggered ability via CR 603.3d): what ONE stack
@@ -4651,16 +4891,20 @@ pub(crate) fn bounded_cycle_pin_slots_for_window(
 ///
 /// # THE OBSERVED AIM, and when it is withdrawn
 ///
-/// Beside the reach, each charge carries the seat the window observed the announcement NAME
-/// ([`crate::analysis::resource::SlotCharge::aimed_at`], CR 601.2c reached for a triggered
-/// ability via CR 603.3d), read from the announcing entry's own `ability().targets`. It is
-/// `Some(seat)` only when that slice is exactly one `TargetRef::Player` whose seat lies in
-/// THAT frame's projected reach; every other shape — no target, an object target, several
-/// targets, or a seat the frame's own legality authority excludes — yields `None`.
+/// Beside the reach, each charge carries the seat whose loss the period measured
+/// ([`crate::analysis::resource::SlotCharge::aimed_at`]): the target of the slot's announcement
+/// that RESOLVED inside the window ([`crate::analysis::resource::PeriodTouch::resolved`],
+/// CR 608.1, CR 608.2 + CR 119.3), read from that entry's own `ability().targets`. It is NOT
+/// read off the announcements made in the window: under an alternating answer history the
+/// announcement in flight at the window's end names a different seat from the one whose loss
+/// the window measured. It is `Some(seat)` only when that slice is exactly one
+/// `TargetRef::Player` whose seat lies in the charge's reach; every other shape — no target, an
+/// object target, several targets, or a seat outside the reach — yields `None`, and so does a
+/// slot with no resolved announcement in the window, which measured no loss.
 ///
-/// WITHDRAWAL, not first-wins: on a repeated slot the reach unions, and the aim is set to
-/// `None` the moment a later frame's aim differs from the one recorded. "Agree or nothing" is
-/// the fail-closed direction, because an aim can only ever REDUCE a charge.
+/// WITHDRAWAL, not first-wins: the aim is set to `None` the moment a later resolved
+/// announcement of the same slot names a different seat. "Agree or nothing" is the fail-closed
+/// direction, because an aim can only ever REDUCE a charge.
 ///
 /// # THE UPSTREAM INVARIANT the reach-scoped operator depends on
 ///
@@ -4729,34 +4973,48 @@ pub(crate) fn bounded_cycle_charged_targets_for_window(
             .collect();
         reaches.sort_unstable();
         reaches.dedup();
-        // CR 601.2c (reached for a triggered ability via CR 603.3d): the seat this frame's
-        // announcement actually NAMED, read from the announcing entry rather than re-derived.
-        // The catch-all arm is the fail-CLOSED one: a shape this reader does not understand —
-        // and a seat outside the frame's own legal set, which is no attribution at all — is
-        // `None` rather than a guess.
-        let aimed_at = match entry.ability().map(|ability| ability.targets.as_slice()) {
-            Some([TargetRef::Player(seat)]) if reaches.contains(seat) => Some(*seat),
-            _ => None,
-        };
-        // UNION the reach, WITHDRAW a disagreeing aim. `position` (not `iter_mut().find`) so
-        // the immutable probe's borrow ends before the `None` arm pushes.
+        // UNION the reach. `position` (not `iter_mut().find`) so the immutable probe's borrow
+        // ends before the `None` arm pushes.
         match charged.iter().position(|charge| charge.slot == target.slot) {
             Some(i) => {
                 let seats = &mut charged[i].reaches;
                 seats.extend(reaches);
                 seats.sort_unstable();
                 seats.dedup();
-                if charged[i].aimed_at != aimed_at {
-                    charged[i].aimed_at = None;
-                }
             }
             None => charged.push(SlotCharge {
                 slot: target.slot,
                 magnitude,
                 reaches,
-                aimed_at,
+                aimed_at: None,
             }),
         }
+    }
+    // CR 608.1 + CR 608.2 + CR 119.3: the aim is read off the announcements that RESOLVED in the
+    // window, agree-or-nothing; a slot none of whose announcements resolved measured no loss.
+    for charge in &mut charged {
+        let mut aim: Option<Option<PlayerId>> = None;
+        for (frame, entry) in &touch.resolved {
+            let Some(target) = entry_announces(frame, entry, proposer).and_then(|a| a.target)
+            else {
+                continue;
+            };
+            if target.slot != charge.slot {
+                continue;
+            }
+            // The catch-all arm is the fail-CLOSED one: a shape this reader does not understand,
+            // or a seat outside the charge's reach, is no attribution at all.
+            let seen = match entry.ability().map(|ability| ability.targets.as_slice()) {
+                Some([TargetRef::Player(seat)]) if charge.reaches.contains(seat) => Some(*seat),
+                _ => None,
+            };
+            aim = Some(match aim {
+                None => seen,
+                Some(prev) if prev == seen => prev,
+                Some(_) => None,
+            });
+        }
+        charge.aimed_at = aim.flatten();
     }
     charged
 }
@@ -4807,6 +5065,8 @@ fn build_shortcut_schema(
         })
         .sum();
     ShortcutDecisionSchema {
+        suggested_declaration: None,
+        leading_aims: Vec::new(),
         iteration_count,
         measured_repetition_bound,
         deliverable_capacity,
@@ -4945,8 +5205,8 @@ fn shortcut_consumption_bound(
     // `consumption_seat_life_charges` keeps its job wherever the divisor is what is wanted.
     let template = proposal.template.as_ref();
     // CR 732.2a: the declaration the offer PUBLISHED stands in the charge authority's `observed`
-    // role — the aim the reserved charge subtracted, and the one a leading charged slot resolves —
-    // while `template` stands in the declaration role. Passed as it stands: both reads below answer
+    // role — the aim the reserved charge subtracted — while `template` stands in the declaration
+    // role. Passed as it stands: both reads below answer
     // an absent one on their refusing side, and standing `template` in for it would put one
     // declaration back into both roles.
     let published = proposal.published_declaration.as_ref();
@@ -4960,21 +5220,10 @@ fn shortcut_consumption_bound(
     // CR 601.2c + CR 603.3d: a charged slot leads only where its trigger was put on the stack, its
     // target chosen, before the shortcut was proposed. The drive answers a target prompt raised
     // inside cycle `i` with the declaration at index `i`, so a slot announced on this pre-drive
-    // stack resolves the published aim at the first repetition, and a slot announced inside the
-    // drive resolves the declaration from it. Which slots lead is read off this board, through
-    // the acceptance authority the charged slots were minted by, over the announcements
-    // `certified_period_touch` seeds from this stack when there is no window.
-    let touch = crate::analysis::resource::certified_period_touch(
-        &[],
-        state,
-        crate::analysis::resource::PeriodCertification::ResourceSignatureOnly,
-    );
-    let announced: Vec<crate::analysis::decision_template::DecisionSlot> = touch
-        .announced
-        .iter()
-        .filter_map(|(frame, entry)| entry_announces(frame, entry, proposal.proposer)?.target)
-        .map(|target| target.slot)
-        .collect();
+    // stack resolves the target its trigger latched at the first repetition, and a slot
+    // announced inside the drive resolves the declaration from it. Which slots lead, and on what,
+    // is read off this board by `leading_announcement_aims`.
+    let announced = leading_announcement_aims(state, proposal.proposer);
     let lead = crate::analysis::resource::AnnouncedLead::LeadingRepetition(&announced);
     // The DRIVABILITY question, so the charge stream is read at `ChargeBound::Ceiling`:
     // `shortcut_count_is_drivable` refuses every count above what this re-derives, and an
@@ -5014,7 +5263,7 @@ fn shortcut_consumption_bound(
                 .collect()
         });
     ConsumptionDerivation::Measured(ConsumptionBound {
-        ceiling: ceiling.count,
+        ceiling: ceiling.capacity_count(),
         entries,
     })
 }
@@ -5393,6 +5642,7 @@ fn apply_until_lethal_shortcut(
                         .per_cycle
                         .as_ref()
                         .map(crate::analysis::resource::PeriodSignature::frames_per_period),
+                    DepartureStop::EndsRepetition,
                 ) {
                     CycleOutcome::Recurred { state: s, .. } => running = *s,
                     CycleOutcome::CrossLethal {
@@ -5614,7 +5864,8 @@ fn shortcut_drive_period(
 /// that has not bounded it must not call this — an unchecked `Fixed(4e9)` becomes a
 /// four-billion-iteration validation loop. `handle_declare_shortcut` discharges it by running
 /// the `MAX_SHORTCUT_CYCLES` / `deliverable_capacity` match above its pin-validation block;
-/// `build_bounded_declaration` by passing the schema's own `iteration_count`; the interaction
+/// `build_bounded_declaration` and `bounded_offer_tail`'s suggestion check by passing a survived
+/// count clamped to `deliverable_capacity`; the interaction
 /// decoder by the count-spec projection, which computes
 /// `max = schema.deliverable_capacity.min(MAX_SHORTCUT_CYCLES)` and admits only that window.
 ///
@@ -5649,7 +5900,8 @@ enum CycleOutcome {
         winner: Option<PlayerId>,
         events: Vec<GameEvent>,
     },
-    /// CR 800.4a: a seat LEFT THE GAME mid-drive while the game continued ⇒ `state` is the
+    /// CR 800.4a: a seat LEFT THE GAME mid-drive while the game continued, and the caller asked a
+    /// departure to end the repetition ([`DepartureStop::EndsRepetition`]) ⇒ `state` is the
     /// board at the first priority window after the removal, `events` its accumulated events.
     ///
     /// Named for the departure and not for a loss condition: CR 704.3 + CR 117.5 run the
@@ -5664,6 +5916,19 @@ enum CycleOutcome {
     },
     /// Runaway beat cap, an unpinned prompt, or an engine error ⇒ abort to manual play.
     Abort,
+}
+
+/// CR 800.4 + CR 732.2c: whether a seat leaving the game inside a driven repetition ends that repetition.
+/// A player leaving does not end the game while two or more remain, so a departure inside a
+/// repetition the declared count is followed by is not an ending point: that repetition runs to
+/// its own boundary, and the next starts in phase with the period the count was derived from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepartureStop {
+    /// The departure is the drive's ending point ([`CycleOutcome::SeatLeft`]): an unsigned
+    /// drive, a declared count's final repetition, or a drive to lethal.
+    EndsRepetition,
+    /// The repetition runs to its own boundary and its departure is judged where it recurs.
+    CompletesRepetition,
 }
 
 /// CR 800.4a: how many seats are still in the game. A COUNT, not a set — the drive's
@@ -5743,6 +6008,7 @@ fn drive_one_shortcut_cycle(
     iteration: crate::analysis::decision_template::IterationIndex,
     cycle_beat_cap: usize,
     frames_per_period: Option<u32>,
+    departure: DepartureStop,
 ) -> CycleOutcome {
     let mut work = committed.clone();
     priority::reset_priority(&mut work);
@@ -5784,7 +6050,8 @@ fn drive_one_shortcut_cycle(
             // this return is the first priority window AT OR AFTER the sweep that removed the
             // seat — an ending point reached rather than manufactured.
             //
-            // AHEAD OF BOTH `Priority` arms, and the reason is TOTALITY, not preference. A
+            // Under `DepartureStop::EndsRepetition` this arm sits AHEAD OF BOTH `Priority` arms,
+            // and the reason is TOTALITY, not preference. A
             // removal can be first observed at either beat kind, and both occur. Placed after
             // the active-player settle arm, a removal observed at the active player's own beat
             // would instead be handed to that arm, which re-runs its recurrence check on a
@@ -5796,10 +6063,17 @@ fn drive_one_shortcut_cycle(
             // priority. A departure first observed at a non-priority prompt is answered from
             // the pins as usual and classified at the next priority beat, which is the first
             // LEGAL ending point at or after the removal.
+            //
+            // Under `CompletesRepetition` the departure is not an ending point: this arm stands
+            // aside, the repetition runs to its own boundary in the arms below, and the caller's
+            // `Recurred` arm judges the departure against its predicted cascade and the period
+            // over the seats still in the game.
             Ok(PriorityPassPipelineOutcome {
                 waiting_for: WaitingFor::Priority { .. },
                 ..
-            }) if seats_in_game(&work) < seats_at_entry => {
+            }) if departure == DepartureStop::EndsRepetition
+                && seats_in_game(&work) < seats_at_entry =>
+            {
                 ev.append(&mut beat_events);
                 return CycleOutcome::SeatLeft {
                     state: Box::new(work),
@@ -6505,6 +6779,13 @@ fn materialize_fixed_shortcut(
             i,
             cycle_beat_cap,
             per_cycle.map(crate::analysis::resource::PeriodSignature::frames_per_period),
+            // CR 800.4 + CR 732.2c: a signed drive's non-final repetition completes past a departure, so
+            // every later repetition stays in phase with the period the count was derived from.
+            if per_cycle.is_none() || i + 1 == n {
+                DepartureStop::EndsRepetition
+            } else {
+                DepartureStop::CompletesRepetition
+            },
         ) {
             CycleOutcome::Recurred {
                 state: s,
@@ -6563,7 +6844,11 @@ fn materialize_fixed_shortcut(
                         .map(|p| p.id)
                         .collect();
                     if !pd.conforms_in(
-                        &crate::analysis::resource::ResourceVector::period(&committed, &s),
+                        &crate::analysis::resource::ResourceVector::period_among(
+                            &committed,
+                            &s,
+                            |seat| still_in_game.contains(&seat),
+                        ),
                         pins,
                         &still_in_game,
                     ) {
@@ -6649,6 +6934,11 @@ fn materialize_fixed_shortcut(
             // read. Deliberately NOT the last committed board — a headroom already spent by
             // earlier cycles would relieve to a REMAINING-cycles figure, while the conjunct
             // below compares against the drive's ABSOLUTE index.
+            //
+            // Reached only where the drive asked a departure to end the repetition: an unsigned
+            // drive, or the declared count's FINAL repetition. A departure inside an earlier
+            // repetition of a signed drive completes that repetition (`DepartureStop`) and is
+            // discriminated in the `Recurred` arm above.
             //
             // NO CONFORMANCE CHECK HERE, and that is the decision rather than an omission.
             // `PeriodicDelta::conforms` protects the REMAINING repetitions of a bound derived
@@ -8052,9 +8342,13 @@ fn handle_declare_shortcut(
         | crate::analysis::decision_template::IterationCount::UntilLethal => {}
     }
     // A `template: None` declaration is not "no pins" — it is "no OVERRIDE of the pins this
-    // offer already published". Resolve it against the offer's own engine-issued declaration so
-    // the manual ingress and `ai_support::candidates` (which reads the identical field) declare
-    // the SAME proposal against the SAME offer. Until this line existed the engine published a
+    // offer already published". Resolve it against the offer's SUGGESTION
+    // (`ShortcutDecisionSchema::suggestion`: the suggested declaration, else the published one) so
+    // the manual ingress and `ai_support::candidates` (which reads the identical accessor) declare
+    // the SAME proposal against the SAME offer. A restored save's suggestion is a client ingress
+    // like its declaration, so it passes the same owner firewall and `declaration_conforms`
+    // below. `proposal.published_declaration` stays the published declaration, the observation
+    // the charge model reads. Until this line existed the engine published a
     // declaration on the offer and then discarded it here, so the AI — which sends
     // `Some(declaration)` — was accepted while the browser, which sends `None`, was refused on
     // one and the same offer. No rules citation is minted here: the block immediately below
@@ -8085,7 +8379,7 @@ fn handle_declare_shortcut(
     // even with a non-empty schema, both non-bounded mints hard-code `declaration: None`, and a
     // restored save may carry `None`. Pinned by
     // `a_template_free_declaration_is_admitted_only_by_the_proposers_own_period`.
-    let template = template.or_else(|| offer.declaration.cloned());
+    let template = template.or_else(|| offer.schema.suggestion(offer.declaration).cloned());
     // CR 732.2a + CR 603.5: the declared template's `owner` is CLIENT-SUPPLIED — the
     // `GameAction::DeclareShortcut { template }` payload arrives here verbatim — and it is
     // the comparand `inject_pinned_answer` uses to decide WHOSE CR 603.5 choice a pin may
@@ -8185,6 +8479,7 @@ fn handle_declare_shortcut(
         // Bound here, while the offer carrying it is still in scope: the answer journal it was
         // pinned from does not survive to the consumption seam that reads it.
         published_declaration: offer.declaration.cloned(),
+        leading_aims: offer.schema.leading_aims.clone(),
         road: offer.road,
         period: offer.period.clone(),
     };
@@ -8852,14 +9147,6 @@ pub(super) fn resume_pending_continuation_if_priority(
             }
         }
     }
-    // CR 608.2n + CR 608.2g: a spell held on the stack by its own free-cast
-    // window is put into its zone as the final part of its resolution, now
-    // that the window and everything parked behind it are done.
-    if matches!(state.waiting_for, WaitingFor::Priority { .. })
-        && resolution_instructions_are_done(state)
-    {
-        super::stack::deliver_deferred_spell(state, events);
-    }
     settle_resolving_stack_entry_after_continuation_resume(state);
     Ok(())
 }
@@ -8882,10 +9169,19 @@ pub(super) fn settle_resolving_stack_entry_after_continuation_resume(state: &mut
 /// stack object. Unlike the priority-boundary wrapper above, this is called at
 /// the exact completion point when the prompt has already replaced Priority.
 pub(super) fn settle_resolving_stack_entry_before_trigger_selection(state: &mut GameState) {
+    // CR 608.2n: a carrier that owes its spell's final part is refused here
+    // (`resolving_stack_entry_can_settle`); `run_spell_final_part_if_due` runs it.
     if !resolving_stack_entry_can_settle(state) {
         return;
     }
     settle_finished_resolving_stack_entry(state);
+}
+
+/// CR 608.2n: an instant or sorcery whose final part is still owed is still
+/// resolving; its carrier may settle only after `run_spell_final_part_if_due`,
+/// which owns the event stream, has run that part.
+fn resolving_stack_entry_can_settle(state: &GameState) -> bool {
+    resolution_instructions_are_done(state) && !super::stack::resolving_spell_owes_final_part(state)
 }
 
 /// CR 608.2c + CR 608.2m: An object that has left the stack keeps resolving
@@ -8900,15 +9196,6 @@ pub(super) fn settle_resolving_stack_entry_before_trigger_selection(state: &mut 
 /// exists to clear it. Carrier/firing parity is a separate question, answered
 /// by `resolving_carrier_parity_is_coherent` and reported on the settle path
 /// rather than gating it.
-fn resolving_stack_entry_can_settle(state: &GameState) -> bool {
-    resolution_instructions_are_done(state) && state.deferred_spell_delivery.is_none()
-}
-
-/// CR 608.2c + CR 608.2n: whether the carrier's resolution has followed all of
-/// its instructions. Its carrier still may not settle while a spell paused on
-/// its own free-cast window owes its final move (`deferred_spell_delivery`):
-/// only a site that can deliver that move (`stack::deliver_deferred_spell`,
-/// which needs the event stream) may do so first.
 pub(super) fn resolution_instructions_are_done(state: &GameState) -> bool {
     state.resolving_stack_entry.is_some()
         && state.active_ability_continuation().is_none()
@@ -8967,6 +9254,54 @@ fn settle_finished_resolving_stack_entry(state: &mut GameState) {
     );
     // CR 400.7j: resolution-scoped self-move state ends with its carrier.
     state.resolution_source_relatch = None;
+}
+
+/// CR 608.2c + CR 608.2n: the single authority that completes an instant or
+/// sorcery whose instructions paused. It acts only at a priority boundary,
+/// only while the carrier owes its final part, and only once every
+/// instruction has been followed.
+///
+/// It runs the hooks, destination, move and report
+/// (`stack::finish_deferred_spell_resolution`), then retires the carrier. A
+/// final part that parks a question of its own (CR 616.1, CR 702.99a) clears
+/// the marker, and the carrier then settles through the ordinary wrapper.
+///
+/// CR 603.2 + CR 603.3 + CR 603.3b: the final part's events trigger now and
+/// wait in `deferred_triggers` for the resolution's batch. They are claimed
+/// for the ordinary collector, so a scan of the same buffer does not collect
+/// them twice; CR 603.7 delayed collectors still see them.
+///
+/// Returns whether a final part ran.
+pub(super) fn run_spell_final_part_if_due(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> bool {
+    if !matches!(state.waiting_for, WaitingFor::Priority { .. })
+        || !super::stack::resolving_spell_owes_final_part(state)
+        || !resolution_instructions_are_done(state)
+    {
+        return false;
+    }
+    let final_part_start = events.len();
+    match super::stack::finish_deferred_spell_resolution(state, events) {
+        super::stack::DeferredFinalPart::Parked => {}
+        super::stack::DeferredFinalPart::Completed | super::stack::DeferredFinalPart::NotOwed => {
+            super::stack::finish_resolving_stack_entry(
+                state,
+                super::lifecycle::DelayedTerminalDisposition::Resolved,
+            );
+            // CR 400.7j: resolution-scoped self-move state ends with its carrier.
+            state.resolution_source_relatch = None;
+        }
+    }
+    let final_part_events: Vec<GameEvent> = events[final_part_start..]
+        .iter()
+        .filter(|event| !matches!(event, GameEvent::PhaseChanged { .. }))
+        .cloned()
+        .collect();
+    triggers::collect_triggers_into_deferred(state, &final_part_events);
+    triggers::claim_events_for_ordinary_collection(state, events, final_part_start);
+    true
 }
 
 /// CR 118.3b + CR 119.4 + CR 616.1: Resume the exact outer cost action after
@@ -9234,6 +9569,7 @@ fn pass_priority_once_with_pipeline(
     // submitter (the controller), which would mis-count consecutive passes and
     // soft-lock the game.
     let current_seat = turn_control::priority_seat(state);
+    let final_part_owed_before_pass = super::stack::resolving_spell_owes_final_part(state);
     let priority_outcome = priority::handle_priority_pass_with_limit(
         current_seat,
         state,
@@ -9290,13 +9626,23 @@ fn pass_priority_once_with_pipeline(
     let skip_triggers =
         stack_was_empty && !state.stack.is_empty() && state.phase == Phase::CombatDamage;
 
-    let mut wf = match engine_priority::run_post_action_pipeline(
-        state,
-        events,
-        &state.waiting_for.clone(),
-        skip_triggers,
-        false,
-    ) {
+    // CR 608.2n + CR 117.5: if `resolve_top`'s net ran a final part in this
+    // pass, the resolution is over, so its batch goes on the stack above any
+    // spell still below it before another object begins resolving.
+    let final_part_ran_in_pass =
+        final_part_owed_before_pass && !super::stack::resolving_spell_owes_final_part(state);
+    let pass_wf = state.waiting_for.clone();
+    let pipeline = if final_part_ran_in_pass {
+        engine_priority::run_post_action_pipeline_after_spell_final_part(
+            state,
+            events,
+            &pass_wf,
+            skip_triggers,
+        )
+    } else {
+        engine_priority::run_post_action_pipeline(state, events, &pass_wf, skip_triggers, false)
+    };
+    let mut wf = match pipeline {
         Ok(waiting_for) => waiting_for,
         Err(error) => {
             if let Some(snapshot) = boundary_snapshot.as_ref() {
@@ -9529,13 +9875,31 @@ pub(crate) fn resume_stack_resolution_session_runner(state: &mut GameState) -> A
     let journal_start = state.resolved_rules_journal.entries().len();
     let mut result = ActionResult::applied(Vec::new(), state.waiting_for.clone());
 
-    reconcile_terminal_result(state, &mut result);
+    // This seam has no error channel: a failed convergence restores the
+    // seam's entry state and reports it unchanged. The owed carrier is then
+    // still found by `stack::resolve_top`'s net at the next pass.
+    if reconcile_terminal_result_completing_resolution(
+        state,
+        &mut result,
+        reconcile_terminal_result,
+    )
+    .is_err()
+    {
+        *state = boundary_snapshot;
+        return ActionResult::applied(Vec::new(), state.waiting_for.clone());
+    }
     bump_state_revision(state);
     sync_waiting_for(state, &result.waiting_for);
-    if run_auto_pass_loop(state, &mut result) {
-        reconcile_terminal_result(state, &mut result);
+    // CR 732.2a: a drive that did not advance re-runs only the terminal half.
+    let reconcile: fn(&mut GameState, &mut ActionResult) = if run_auto_pass_loop(state, &mut result)
+    {
+        reconcile_terminal_result
     } else {
-        reconcile_terminal_sba(state, &mut result);
+        reconcile_terminal_sba
+    };
+    if reconcile_terminal_result_completing_resolution(state, &mut result, reconcile).is_err() {
+        *state = boundary_snapshot;
+        return ActionResult::applied(Vec::new(), state.waiting_for.clone());
     }
     if matches!(result.waiting_for, WaitingFor::GameOver { .. }) {
         take_and_restore_stack_resolution_session(state);
@@ -10107,11 +10471,29 @@ pub(crate) fn resume_auto_pass_after_resolve_all(
     // sides of the internal auto-pass drive. The resume seam bypasses
     // `finish_action_boundary`, so without this a loss created by its final
     // resolution could remain at Priority instead of becoming GameOver.
-    reconcile_terminal_result(state, &mut result);
-    if run_auto_pass_loop(state, &mut result) {
-        reconcile_terminal_result(state, &mut result);
+    // This seam has no error channel: a failed convergence restores the
+    // seam's entry state and leaves `batch` untouched. The owed carrier is then
+    // still found by `stack::resolve_top`'s net at the next pass.
+    if reconcile_terminal_result_completing_resolution(
+        state,
+        &mut result,
+        reconcile_terminal_result,
+    )
+    .is_err()
+    {
+        *state = before;
+        return;
+    }
+    // CR 732.2a: a drive that did not advance re-runs only the terminal half.
+    let reconcile: fn(&mut GameState, &mut ActionResult) = if run_auto_pass_loop(state, &mut result)
+    {
+        reconcile_terminal_result
     } else {
-        reconcile_terminal_sba(state, &mut result);
+        reconcile_terminal_sba
+    };
+    if reconcile_terminal_result_completing_resolution(state, &mut result, reconcile).is_err() {
+        *state = before;
+        return;
     }
 
     let log_entries = super::log::resolve_log_entries(&result.events, &before, state);
@@ -11372,10 +11754,23 @@ pub(super) fn settle_deferred_phase_transition(
     // CR 608.2g + CR 502.4: retire a completed resolution-cast marker and its
     // carrier, as the pipeline's settlement step would, but leave the triggers
     // it parked held for the next time a player would receive priority.
-    engine_priority::settle_pending_resolution_completion(state);
+    engine_priority::settle_pending_resolution_completion(state, events);
+    // CR 608.2n: a completed resolution's final part runs here, and its
+    // triggers are collected with the batch. At the cleanup step, the retry
+    // below reaches `execute_cleanup`, whose tail puts that batch on the stack
+    // and gives the active player priority before the turn can end
+    // (CR 514.3a). At an untap step's turn-ending leave they are held for the
+    // next time a player receives priority (CR 502.4).
+    run_spell_final_part_if_due(state, events);
     // CR 608.2c: a carrier whose resolution has finished settles before the
     // transition is retried.
     settle_resolving_stack_entry_after_continuation_resume(state);
+    // CR 608.2n + CR 616.1: the settling spell's final part may itself have
+    // asked a question; that prompt, not the provisional window, now owns the
+    // waiting state.
+    if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+        return state.waiting_for.clone();
+    }
     if state.stack.is_empty() && !turns::phase_transition_requires_settlement(state) {
         // CR 514.1 + CR 514.2: a transition deferred as the cleanup step began
         // came before the step's actions, so the interpreter resumes the step.
@@ -15488,6 +15883,12 @@ fn apply_non_priority_pass_action(
         // battlefield-permanent selection. Publish a fresh tracked set so the
         // downstream `PayCost { ScaledMana }` and the `IfYouDo`/`Untap` tail
         // resolve against exactly this selection, then resume the chain.
+        //
+        // CR 115.10a + CR 608.2d: the same prompt also carries a described
+        // damage recipient ("a creature or player", no "target") — see
+        // `effects::deal_damage::parked_recipient_pool`. That pick is bound to
+        // the parked damage instruction instead of being published, and may be a
+        // player.
         (
             WaitingFor::ChooseObjectsSelection {
                 player,
@@ -15510,41 +15911,63 @@ fn apply_non_priority_pass_action(
                     max.map_or(String::new(), |maximum| format!(" and at most {maximum}"))
                 )));
             }
-            // Validate all selected targets are distinct objects in the eligible set.
-            let mut selected_objects = HashSet::with_capacity(selected_count);
+            // The prompt belongs to a parked described damage instruction only when
+            // the active continuation is that instruction, still holding exactly
+            // the pool this prompt offers. A tracked-set producer's prompt never
+            // matches: its parked continuation is some other instruction, even one
+            // whose own candidate set would be identical.
+            let recipient_pool = state
+                .active_ability_continuation()
+                .and_then(|continuation| {
+                    effects::deal_damage::parked_recipient_pool(&continuation.chain)
+                })
+                .filter(|pool| *pool == eligible_set);
+            // Validate all selected targets are distinct members of the eligible set;
+            // a player is a legal pick only for a damage recipient.
+            let mut selected: HashSet<TargetRef> = HashSet::with_capacity(selected_count);
             for t in &targets {
                 if !eligible_set.contains(t) {
                     return Err(EngineError::InvalidAction(
                         "Selected target not eligible for object selection".to_string(),
                     ));
                 }
-                let TargetRef::Object(id) = t else {
+                if recipient_pool.is_none() && matches!(t, TargetRef::Player(_)) {
                     return Err(EngineError::InvalidAction(
                         "Object selection accepts battlefield objects only".to_string(),
                     ));
-                };
-                if !selected_objects.insert(*id) {
+                }
+                if !selected.insert(t.clone()) {
                     return Err(EngineError::InvalidAction(
                         "Duplicate object in object selection".to_string(),
                     ));
                 }
             }
-            let ids: Vec<ObjectId> = targets
-                .iter()
-                .map(|target| match target {
-                    TargetRef::Object(id) => *id,
-                    TargetRef::Player(_) => unreachable!("validated as objects above"),
-                })
-                .collect();
-            // CR 608.2c: Always allocate a fresh tracked set — a player-chosen
-            // "those creatures" set is a new resolution scope. An empty
-            // selection yields an empty fresh set (size 0).
-            effects::publish_fresh_tracked_set(state, ids);
-            events.push(GameEvent::EffectResolved {
-                kind: crate::types::ability::EffectKind::ChooseObjectsIntoTrackedSet,
-                source_id: ObjectId(0), // Source not tracked through choice state
-                subject: None,
-            });
+            if recipient_pool.is_some() {
+                // CR 608.2d: the pick is chosen while the instruction is applied, so
+                // it is bound unpinned (never announced as a target) as the parked
+                // damage node's recipient. Nothing is published: this is not a
+                // tracked-set selection.
+                if let Some(frame) = state.active_ability_continuation_frame_mut() {
+                    frame.pending.chain.set_unpinned_targets(targets);
+                }
+            } else {
+                let ids: Vec<ObjectId> = targets
+                    .iter()
+                    .map(|target| match target {
+                        TargetRef::Object(id) => *id,
+                        TargetRef::Player(_) => unreachable!("validated as objects above"),
+                    })
+                    .collect();
+                // CR 608.2c: Always allocate a fresh tracked set — a player-chosen
+                // "those creatures" set is a new resolution scope. An empty
+                // selection yields an empty fresh set (size 0).
+                effects::publish_fresh_tracked_set(state, ids);
+                events.push(GameEvent::EffectResolved {
+                    kind: crate::types::ability::EffectKind::ChooseObjectsIntoTrackedSet,
+                    source_id: ObjectId(0), // Source not tracked through choice state
+                    subject: None,
+                });
+            }
             state.waiting_for = WaitingFor::Priority { player: p };
             state.priority_player = p;
             // CR 608.2: restore the triggering event so the stashed
@@ -20283,8 +20706,16 @@ mod bounded_declaration_tests {
                 "reach-guard: the CR 603.5 answer must be journalled before the consumer runs"
             );
 
-            let declaration = build_bounded_declaration(&state, PROPOSER, &schema, None, None)
-                .expect("both published points are answered, so the declaration is complete");
+            let declaration = build_bounded_declaration(
+                &state,
+                PROPOSER,
+                &schema,
+                None,
+                None,
+                &[],
+                &schema.iteration_count,
+            )
+            .expect("both published points are answered, so the declaration is complete");
             assert_eq!(
                 declaration.decisions[0],
                 PinnedDecision::MayChoice {
@@ -20374,7 +20805,16 @@ mod bounded_declaration_tests {
             LoopAnswer::Uniform(LoopAnswerValue::Targets(vec![TargetPin::Player(AIMED)])),
         );
         assert!(
-            build_bounded_declaration(&control, PROPOSER, &control_schema, None, None).is_some(),
+            build_bounded_declaration(
+                &control,
+                PROPOSER,
+                &control_schema,
+                None,
+                None,
+                &[],
+                &control_schema.iteration_count
+            )
+            .is_some(),
             "CONTROL: a fully-answered two-kind schema DOES publish a declaration — without this \
              a consumer that refused everything would pass all four cases below"
         );
@@ -20421,7 +20861,16 @@ mod bounded_declaration_tests {
             );
 
             assert!(
-                build_bounded_declaration(&state, PROPOSER, &schema, None, None).is_none(),
+                build_bounded_declaration(
+                    &state,
+                    PROPOSER,
+                    &schema,
+                    None,
+                    None,
+                    &[],
+                    &schema.iteration_count
+                )
+                .is_none(),
                 "CR 732.2a: {kind:?} has no `LoopAnswerValue` shape, so the declaration must \
                  refuse rather than pin a guess or silently drop the point"
             );
@@ -20464,7 +20913,16 @@ mod bounded_declaration_tests {
             "reach-guard: the journal is NON-empty, so the refusal below is the point set's"
         );
         assert!(
-            build_bounded_declaration(&state, PROPOSER, &empty, None, None).is_none(),
+            build_bounded_declaration(
+                &state,
+                PROPOSER,
+                &empty,
+                None,
+                None,
+                &[],
+                &empty.iteration_count
+            )
+            .is_none(),
             "CR 732.2a: an offer that publishes no choice states no declaration"
         );
     }
@@ -20611,7 +21069,16 @@ mod bounded_declaration_tests {
 
             // ── HALF 2: the PUBLISHER's verdict must be the same one ──
             assert_eq!(
-                build_bounded_declaration(&state, PROPOSER, &schema, None, None).is_some(),
+                build_bounded_declaration(
+                    &state,
+                    PROPOSER,
+                    &schema,
+                    None,
+                    None,
+                    &[],
+                    &schema.iteration_count
+                )
+                .is_some(),
                 handler_accepts,
                 "[{label}] CR 732.2a: `declaration.is_some()` is read as 'the declare handler \
                  will accept this'. A template the handler refuses must NOT be published, and a \
@@ -20653,7 +21120,16 @@ mod bounded_declaration_tests {
             ]
         };
         let published = |recorded: Option<&[PinnedDecision]>| {
-            build_bounded_declaration(&state, PROPOSER, &schema, None, recorded).is_some()
+            build_bounded_declaration(
+                &state,
+                PROPOSER,
+                &schema,
+                None,
+                recorded,
+                &[],
+                &schema.iteration_count,
+            )
+            .is_some()
         };
         assert!(
             published(None),
@@ -20969,8 +21445,15 @@ mod stage2_injector_tests {
 
         // `None`: this row is about the injector arm on a board-recurring targeted loop, so
         // it drives under the same no-signature delimiter every pre-bounded offer uses.
-        let outcome =
-            drive_one_shortcut_cycle(&committed, &boundary, Some(&template), 0, cap, None);
+        let outcome = drive_one_shortcut_cycle(
+            &committed,
+            &boundary,
+            Some(&template),
+            0,
+            cap,
+            None,
+            DepartureStop::EndsRepetition,
+        );
         let CycleOutcome::SeatLeft { state, .. } = outcome else {
             panic!(
                 "CR 800.4a: a staggered wipe stops at the FIRST removal, not at the second; \
@@ -21035,8 +21518,15 @@ mod stage2_injector_tests {
         let (committed, boundary, template, cap) = two_drainer_rig();
 
         // (a) REACH-GUARD: the drive really does remove a seat on this rig.
-        let outcome =
-            drive_one_shortcut_cycle(&committed, &boundary, Some(&template), 0, cap, None);
+        let outcome = drive_one_shortcut_cycle(
+            &committed,
+            &boundary,
+            Some(&template),
+            0,
+            cap,
+            None,
+            DepartureStop::EndsRepetition,
+        );
         let CycleOutcome::SeatLeft { state: driven, .. } = outcome else {
             panic!("reach-guard: this rig's drive must remove a seat, or (b) proves nothing");
         };
@@ -21063,6 +21553,7 @@ mod stage2_injector_tests {
             per_cycle: None,
             shortened_by: None,
             published_declaration: None,
+            leading_aims: Vec::new(),
             road: crate::analysis::loop_check::OfferRoad::Ring,
             period: Default::default(),
         };
@@ -21154,9 +21645,15 @@ mod stage2_injector_tests {
         );
 
         // (b) REACH-GUARD: cycle 0 still removes a seat, with survivors.
-        let CycleOutcome::SeatLeft { state: driven, .. } =
-            drive_one_shortcut_cycle(&committed, &boundary, Some(&sched), 0, cap, None)
-        else {
+        let CycleOutcome::SeatLeft { state: driven, .. } = drive_one_shortcut_cycle(
+            &committed,
+            &boundary,
+            Some(&sched),
+            0,
+            cap,
+            None,
+            DepartureStop::EndsRepetition,
+        ) else {
             panic!("reach-guard: the respelled pins must drive the sibling row's removal")
         };
         let gone: Vec<PlayerId> = driven
@@ -21180,7 +21677,15 @@ mod stage2_injector_tests {
 
         // (c) THE DISCRIMINATOR: the cycle the fallback gives up WOULD have crowned. Without
         //     this leg, (d) is satisfied by any drive that merely stops.
-        let follow = drive_one_shortcut_cycle(&driven, &boundary, Some(&sched), 1, cap, None);
+        let follow = drive_one_shortcut_cycle(
+            &driven,
+            &boundary,
+            Some(&sched),
+            1,
+            cap,
+            None,
+            DepartureStop::EndsRepetition,
+        );
         assert!(
             matches!(follow, CycleOutcome::CrossLethal { winner: Some(w), .. } if w == P0),
             "reach-guard: driving on past the removal reaches the crown that (d) says this \
@@ -21200,6 +21705,7 @@ mod stage2_injector_tests {
             per_cycle: None,
             shortened_by: None,
             published_declaration: None,
+            leading_aims: Vec::new(),
             road: crate::analysis::loop_check::OfferRoad::Ring,
             period: Default::default(),
         };
@@ -22841,7 +23347,7 @@ mod stage2_injector_tests {
 
         assert_eq!(
             producers.len() + readers.len() + in_test,
-            53,
+            54,
             "CR 603.5 prompt census drifted. A new PRODUCER must have its recipient bound \
              somewhere — the mint's conjunct (a) covers exactly ONE of them. A new READER is \
              the benign case (U4's own consumption arm was one).\n\
@@ -22849,9 +23355,9 @@ mod stage2_injector_tests {
         );
         assert_eq!(
             (producers.len(), readers.len(), in_test),
-            (4, 11, 38),
+            (4, 11, 39),
             "the partition, not just the total: four PRODUCTION producers, eleven PRODUCTION \
-             readers (including the two new optional-subject projection reads), and 38 \
+             readers (including the two new optional-subject projection reads), and 39 \
              `#[cfg(test)]` lines.\nproducers={producers:#?}\n\
              readers={readers:#?}"
         );
@@ -25057,7 +25563,7 @@ mod bounded_offer_conjunct_tests {
 
     /// STEP (7) `NoNarrowedLegalCount`, the MEASURED-ZERO ground. `elimination_bounds` returning
     /// 0 states that TWO OR MORE seats cross on the first iteration, so no repetition is legal at
-    /// all, and the gate's `count >= 1` conjunct refuses it rather than minting a `Fixed(0)` offer
+    /// all, and the gate refuses its survived count of 0 rather than minting a `Fixed(0)` offer
     /// whose acceptance would commit nothing while spending the CR 732.2b window.
     ///
     /// A board where a SINGLE seat has zero headroom is a different answer: the bound reaches
@@ -25078,8 +25584,8 @@ mod bounded_offer_conjunct_tests {
     /// function is called directly, in the `analysis::resource` battery: its case (g) is the
     /// single zero-headroom seat publishing `1`, and its two-tied-seats arm is the `0`.
     ///
-    /// REVERT-PROBE: delete the relief's `+ 1` ⇒ ⓑ's board publishes `0`, the gate's
-    /// `count >= 1` conjunct refuses it, and ⓑ FAILS while ⓐ stays green.
+    /// REVERT-PROBE: delete the relief's `+ 1` ⇒ ⓑ's board survives `0`, the gate refuses it,
+    /// and ⓑ FAILS while ⓐ stays green.
     #[test]
     fn a_bound_of_zero_mints_no_bounded_offer() {
         // ⓐ POSITIVE CONTROL: a full library certifies and narrows to a legal count.
@@ -26742,6 +27248,77 @@ mod resolving_carrier_settle_tests {
             1,
             "the settled continuation must cross exactly one turn boundary"
         );
+    }
+
+    /// CR 608.2n + CR 514.3a: a sorcery whose paused instructions are done
+    /// still owes its final part when a transition deferred at the cleanup
+    /// step is settled. The final part runs there and its own move triggers
+    /// ("Whenever a card is put into your graveyard from anywhere"); the retry
+    /// reaches the cleanup step's actions, whose tail puts that trigger on the
+    /// stack and gives the active player priority, so the turn does not end.
+    #[test]
+    fn a_deferred_cleanup_transition_puts_the_final_parts_trigger_on_the_stack_before_the_turn_ends(
+    ) {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::game::zones::move_to_zone;
+        use crate::types::game_state::{CastingVariant, OwedSpellFinalPart};
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::End);
+        let archivist = scenario
+            .add_enchantment_from_oracle(
+                P0,
+                "Graveyard Archivist",
+                "Whenever a card is put into your graveyard from anywhere, you gain 1 life.",
+            )
+            .id();
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(P0, "Plain Draw", false, "Draw a card.")
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        move_to_zone(state, spell, Zone::Stack, &mut Vec::new());
+        state.phase = Phase::Cleanup;
+        state.active_player = P0;
+        state.resolving_stack_entry = Some(StackEntry {
+            id: spell,
+            source_id: spell,
+            controller: P0,
+            kind: StackEntryKind::Spell {
+                card_id: CardId(spell.0),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+        state.resolving_spell_final_part = Some(OwedSpellFinalPart { spell });
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+        let starting_turn = state.turn_number;
+
+        let mut events = Vec::new();
+        let waiting_for = super::settle_deferred_phase_transition(state, &mut events);
+
+        // Reach guard: the final part ran.
+        assert_eq!(state.objects[&spell].zone, Zone::Graveyard);
+        assert!(state.resolving_stack_entry.is_none());
+        assert!(state.resolving_spell_final_part.is_none());
+
+        assert_eq!(waiting_for, WaitingFor::Priority { player: P0 });
+        assert_eq!(state.phase, Phase::Cleanup);
+        assert_eq!(state.turn_number, starting_turn, "the turn does not end");
+        assert_eq!(
+            state
+                .stack
+                .iter()
+                .filter(
+                    |entry| matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
+                        && entry.source_id == archivist
+                )
+                .count(),
+            1,
+            "the final part's trigger is on the stack"
+        );
+        assert!(state.deferred_triggers.is_empty());
     }
 }
 

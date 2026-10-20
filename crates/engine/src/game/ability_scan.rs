@@ -1076,6 +1076,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
         Effect::EndTheTurn => Axes::NONE,
         Effect::EndCombatPhase => Axes::NONE,
         Effect::Vote { .. } => Axes::CONSERVATIVE,
+        Effect::ExileTopCardContest { .. } => Axes::CONSERVATIVE,
         Effect::SeparateIntoPiles { .. } => Axes::CONSERVATIVE,
         Effect::SwitchPT { target } => {
             let mut acc = Axes::NONE;
@@ -4818,6 +4819,12 @@ fn scan_static_condition(x: &StaticCondition, mode: ScanMode) -> Axes {
         StaticCondition::SourceIsFaceUp => Axes::NONE,
         StaticCondition::AdditionalCostPaid => Axes::NONE,
         StaticCondition::CastingAsVariant { variant: _ } => Axes::NONE,
+        StaticCondition::FirstCombatPhaseOfTurn => Axes {
+            event: false,
+            sibling: false,
+            projected: true,
+            history: HistoryReads::NONE,
+        },
         StaticCondition::None => Axes::NONE,
     }
 }
@@ -7048,6 +7055,7 @@ fn effect_target_ctx(e: &Effect, mode: ScanMode) -> FilterReadContext {
         | Effect::EndCombatPhase
         | Effect::Vote { .. }
         | Effect::SeparateIntoPiles { .. }
+        | Effect::ExileTopCardContest { .. }
         | Effect::SwitchPT { .. }
         | Effect::CopySpell { .. }
         | Effect::EpicCopy { .. }
@@ -7471,6 +7479,7 @@ fn effect_census_role(e: &Effect) -> CensusRole {
         | Effect::EndCombatPhase
         | Effect::Vote { .. }
         | Effect::SeparateIntoPiles { .. }
+        | Effect::ExileTopCardContest { .. }
         | Effect::SwitchPT { .. }
         | Effect::CopySpell { .. }
         | Effect::EpicCopy { .. }
@@ -7627,6 +7636,7 @@ mod tests {
         ZoneChoiceCandidateSource, ZoneChoiceChooser, ZoneOwner,
     };
     use crate::types::counter::CounterType;
+    use crate::types::events::ActivatedAbilityKind;
     use crate::types::identifiers::{ExtraPhaseId, ObjectId};
     use crate::types::keywords::CostBearingKeywordKind;
     use crate::types::mana::{ManaColor, ManaCost};
@@ -11247,9 +11257,15 @@ mod tests {
             ContinuousModification::GrantAllActivatedAbilitiesOf {
                 source: TargetFilter::Any,
                 cap: None,
+                kind: None,
             },
             ContinuousModification::GrantAllTriggeredAbilitiesOf {
                 source: TargetFilter::Any,
+            },
+            ContinuousModification::GrantAllActivatedAbilitiesOf {
+                source: TargetFilter::Any,
+                cap: None,
+                kind: Some(ActivatedAbilityKind::Loyalty),
             },
             ContinuousModification::RetainPrintedTriggerFromSource {
                 source_trigger_index: 0,
@@ -11273,8 +11289,8 @@ mod tests {
         ];
         assert_eq!(
             survivors.len(),
-            10,
-            "scope guard covers 10 of the arm's 11 members; CopyValues is the \
+            11,
+            "scope guard covers 11 of the arm's 12 members; CopyValues is the \
              documented omission"
         );
         for m in &survivors {

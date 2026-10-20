@@ -31481,7 +31481,7 @@ fn census_variant_names(body: &str) -> Vec<String> {
 /// it.
 #[test]
 fn render_net_effect_carrier_census() {
-    const EFFECT_VARIANT_PIN: usize = 237;
+    const EFFECT_VARIANT_PIN: usize = 238;
     /// `(enum header, pinned variant count, the ONE variant the net destructures)`.
     const PAYLOAD_ENUM_PINS: &[(&str, usize, &str)] = &[
         ("pub enum CastingPermission {", 8, "ExileWithAltCost"),
@@ -31504,6 +31504,7 @@ fn render_net_effect_carrier_census() {
         "CreatePlaneswalkReplacement",
         "EachPlayerCopyChosen",
         "ExileResolvingSpellInsteadOfGraveyard",
+        "ExileTopCardContest",
         "FlipCoin",
         "FlipCoinUntilLose",
         "FlipCoins",
@@ -31748,7 +31749,10 @@ fn render_net_reaches_every_nested_description_carrier() {
     parsed
         .abilities
         .push(carrier(Effect::AddPendingEntersModifications {
-            modifications: vec![granted("add_pending_enters")],
+            rider: crate::types::ability::PendingEntersModifications {
+                modifications: vec![granted("add_pending_enters")],
+                cast_filter: None,
+            },
         }));
     tags.push("add_pending_enters");
 
@@ -31935,7 +31939,10 @@ fn render_net_reaches_every_nested_description_carrier() {
                 duration: None,
                 graveyard_replacement: None,
                 enters_with_counter: None,
-                enters_with_modifications: vec![granted("grant_casting_permission")],
+                enters_with_modifications: crate::types::ability::PendingEntersModifications {
+                    modifications: vec![granted("grant_casting_permission")],
+                    cast_filter: None,
+                },
                 mana_spend_permission: None,
                 cast_cost_modifier: None,
             },
@@ -31992,6 +31999,11 @@ fn render_net_reaches_every_nested_description_carrier() {
         unchosen_pile_effect: Some(Box::new(ability("piles_unchosen"))),
     }));
     tags.extend(["piles_chosen", "piles_unchosen"]);
+
+    parsed.abilities.push(carrier(Effect::ExileTopCardContest {
+        winner_effect: Box::new(ability("contest_winner")),
+    }));
+    tags.push("contest_winner");
 
     let mut token_static = static_def("token_static");
     token_static.modifications.push(granted("token_static_mod"));
@@ -32151,7 +32163,10 @@ fn guard_walk_reaches_every_continuous_modification_carrier() {
         (
             "AddPendingEntersModifications.modifications",
             Effect::AddPendingEntersModifications {
-                modifications: vec![marked()],
+                rider: crate::types::ability::PendingEntersModifications {
+                    modifications: vec![marked()],
+                    cast_filter: None,
+                },
             },
         ),
         (
@@ -32179,7 +32194,10 @@ fn guard_walk_reaches_every_continuous_modification_carrier() {
                     duration: None,
                     graveyard_replacement: None,
                     enters_with_counter: None,
-                    enters_with_modifications: vec![marked()],
+                    enters_with_modifications: crate::types::ability::PendingEntersModifications {
+                        modifications: vec![marked()],
+                        cast_filter: None,
+                    },
                     mana_spend_permission: None,
                     cast_cost_modifier: None,
                 },
@@ -34126,6 +34144,82 @@ fn static_shaped_as_enters_lines_are_one_enters_with_clause_gap() {
         );
         assert!(parse_as_enters_one_shot_replacement(AS_ENTERS_LOSE_TWO, name).is_some());
     }
+}
+
+/// CR 614.1c + CR 608.2c: Power Level Analyzer's as-enters choice line carries
+/// a source enters-with sentence (and an "instead" override) beside the choice.
+/// One replacement cannot carry them all, so the whole line is one
+/// `enters_with_clause` gap — never a `Choose` replacement that drops the
+/// counters (issue #9993). Oracle text verbatim (Scryfall / AtomicCards).
+#[test]
+fn as_enters_choose_line_with_source_enters_with_sentence_is_one_enters_with_clause_gap() {
+    use crate::game::coverage::{card_face_gaps, card_face_has_unimplemented_parts};
+    use crate::types::card::CardFace;
+
+    const NAME: &str = "Power Level Analyzer";
+    const ORACLE: &str = "As Power Level Analyzer enters the battlefield, you and target opponent each secretly choose a number between 1 and 10, then reveal. Power Level Analyzer enters with a number of +1/+1 counters equal to the distance between the two numbers. If both players chose the same number, put seven +1/+1 counters on Power Level Analyzer instead.";
+    const NORMALIZED: &str = "As ~ enters the battlefield, you and target opponent each secretly choose a number between 1 and 10, then reveal. ~ enters with a number of +1/+1 counters equal to the distance between the two numbers. If both players chose the same number, put seven +1/+1 counters on ~ instead.";
+    const FIRST_SENTENCE: &str = "As Power Level Analyzer enters the battlefield, you and target opponent each secretly choose a number between 1 and 10, then reveal.";
+
+    let parsed = parse(ORACLE, NAME, &[], &["Artifact", "Creature"], &["Construct"]);
+    // (1) Negative, revert-failing: no replacement carries part of the line.
+    assert!(parsed.replacements.is_empty(), "{:?}", parsed.replacements);
+    // (2) Positive: the whole line is exactly one enters_with_clause gap.
+    assert_eq!(parsed.abilities.len(), 1, "{:?}", parsed.abilities);
+    assert!(
+        matches!(
+            &*parsed.abilities[0].effect,
+            Effect::Unimplemented { name, description: Some(text) }
+                if name == "enters_with_clause" && text == NORMALIZED
+        ),
+        "the whole line is the gap, got {:?}",
+        parsed.abilities
+    );
+    assert!(parsed.triggers.is_empty(), "{:?}", parsed.triggers);
+    assert!(parsed.statics.is_empty(), "{:?}", parsed.statics);
+    // (3) Coverage honesty: the card face reports the AST gap.
+    let face = CardFace {
+        name: NAME.to_string(),
+        abilities: parsed.abilities.clone(),
+        triggers: parsed.triggers.clone(),
+        static_abilities: parsed.statics.clone(),
+        replacements: parsed.replacements.clone(),
+        ..CardFace::default()
+    };
+    assert!(card_face_has_unimplemented_parts(&face));
+    assert!(
+        card_face_gaps(&face)
+            .iter()
+            .any(|g| g == "Effect:enters_with_clause"),
+        "{:?}",
+        card_face_gaps(&face)
+    );
+    // Reach guards for (1): the gap authority owns the line, and the
+    // as-enters choose arm is live — it still claims the choice sentence alone,
+    // so (1) is not satisfied by a broken arm.
+    assert_eq!(
+        enters_with_fails_closed(ORACLE, NAME),
+        Some(EntersWithGap::Clause)
+    );
+    let choice = parse_replacement_line(FIRST_SENTENCE, NAME)
+        .expect("the choice sentence alone is still an as-enters choose replacement");
+    assert_eq!(choice.event, ReplacementEvent::Moved);
+    assert!(
+        matches!(
+            &*choice.execute.as_ref().expect("execute").effect,
+            Effect::Choose {
+                choice_type: ChoiceType::NumberRange {
+                    min: 1,
+                    max: Some(10),
+                    ..
+                },
+                persist: true,
+                ..
+            }
+        ),
+        "{:?}",
+        choice.execute
+    );
 }
 
 /// CR 614.1c + CR 608.2c: Gluttonous Hellkite's trigger-prefixed line (the
