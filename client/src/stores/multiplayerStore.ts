@@ -22,10 +22,7 @@ import type {
   TournamentUpdateReply,
 } from "../adapter/types";
 import { AdapterError, AdapterErrorCode, isCustomGameFormat } from "../adapter/types";
-import {
-  isFormatConfigShape,
-  rehydrateExperimentalDungeons,
-} from "../adapter/format-config-shape";
+import { isFormatConfigShape } from "../adapter/format-config-shape";
 import { findSavedCustomFormat } from "../services/customFormats";
 import { AI_DIFFICULTIES } from "../constants/ai";
 import { FORMAT_REGISTRY } from "../data/formatRegistry";
@@ -90,6 +87,7 @@ import {
 // the store's runtime graph, though — the `serverMetrics` import below reaches
 // it anyway (see there).
 import type { DirectorySource } from "../services/serverDirectory";
+import type { PileSource } from "../services/pileSource";
 // A VALUE import, and with it a real runtime edge: `serverMetrics` value-imports
 // `directoryUrl` from `serverDirectory`, which closes back on this store TWICE
 // — directly (`serverDirectory.ts:23` imports `useMultiplayerStore`) and via
@@ -116,7 +114,7 @@ import {
   isOfficialMultiplayerServerUrl,
 } from "../config/multiplayerServer";
 import { saveActiveGame, useGameStore } from "./gameStore";
-import { usePreferencesStore } from "./preferencesStore";
+import { usePreferencesStore, type AiDeckSelection } from "./preferencesStore";
 import {
   canAttemptNativeEngine,
   ensureNativeEngine,
@@ -129,6 +127,7 @@ import {
   type DraftPhase,
 } from "../adapter/server-draft-adapter";
 import type { DraftPlayerView } from "../adapter/draft-adapter";
+import type { CommanderBracketTier } from "../types/bracketEstimate";
 import type {
   DeckChoice,
   PlayerSlot,
@@ -176,6 +175,7 @@ function asDeckPayload(deck: HostingDeck): {
   commander: string[];
   planar_deck: string[];
   scheme_deck: string[];
+  bracket_tier?: CommanderBracketTier;
 } {
   return {
     main_deck: deck.main_deck,
@@ -183,6 +183,7 @@ function asDeckPayload(deck: HostingDeck): {
     commander: deck.commander,
     planar_deck: deck.planar_deck ?? [],
     scheme_deck: deck.scheme_deck ?? [],
+    ...(deck.bracket_tier ? { bracket_tier: deck.bracket_tier } : {}),
   };
 }
 
@@ -191,6 +192,17 @@ function aiSeatDeckChoice(deckName: string | null): DeckChoice {
     return { type: "Random" };
   }
   return { type: "Named", data: deckName };
+}
+
+/** The wire shape of an AI seat for `CreateGameWithSettings`: client-only
+ *  fields such as `deckId` stay off the wire. */
+function aiSeatRequest(seat: AiSeatConfig) {
+  return {
+    seatIndex: seat.seatIndex,
+    difficulty: seat.difficulty,
+    deckName: seat.deckName,
+    ...(seat.deck ? { deck: seat.deck } : {}),
+  };
 }
 
 function effectiveAiSeats(settings: HostingSettings): AiSeatConfig[] {
@@ -1463,6 +1475,11 @@ export interface AiSeatConfig {
   difficulty: string;
   deckName: string | null;
   deck?: DeckChoice;
+  /** The seat's deck selection: an AI deck catalog id, or the Random sentinel
+   *  (which stays Random even after `deck` is resolved). Used by the host form and
+   *  the all-AI local start only; it is never sent on the wire — `deck` carries
+   *  the concrete decklist. */
+  deckId?: AiDeckSelection;
 }
 
 export interface HostingDeck {
@@ -1471,6 +1488,8 @@ export interface HostingDeck {
   commander: string[];
   planar_deck?: string[];
   scheme_deck?: string[];
+  /** Declared Commander bracket tier; omitted decks default to Core on the engine. */
+  bracket_tier?: CommanderBracketTier;
 }
 
 /** Persisted snapshot of the host-setup form so the lobby remembers the
@@ -1523,6 +1542,8 @@ export interface HostingSettings {
   /** Pre-minted `[A-Z0-9]{6}` game code from a Discord link. Absent → the
    *  broker/server mints one. */
   requestedCode?: string;
+  /** The host's pile for a `HostPile` format; absent = the default pile. */
+  pile?: PileSource;
 }
 
 /** Snapshot of the host's session config, captured at startHosting time.
@@ -2351,12 +2372,10 @@ function normalizeCustomHostConfig(
   if (typeof savedCustomFormatId !== "string") return null;
   if (!findSavedCustomFormat(savedCustomFormatId)) return null;
 
-  // Configs persisted before the experimental-dungeons axis existed lack the
-  // flag; the engine defaults it to false, so rehydrate it here — before the
-  // shape guard — rather than discarding the whole remembered setup.
-  // Non-boolean values reset to the default too: a capability flag must never
-  // rehydrate as truthy from corrupt data.
-  const storedFormatConfig = rehydrateExperimentalDungeons(persisted.formatConfig);
+  // The shape guard names required fields but never rejects unknown ones,
+  // so configs persisted when the removed experimental-dungeons flag still
+  // existed keep validating with the stale key ignored.
+  const storedFormatConfig = persisted.formatConfig;
   if (!isFormatConfigShape(storedFormatConfig)) return null;
   // The blob must describe the format it is filed under. `isFormatConfigShape`
   // already ties `format` to `custom_rules.id`; this ties both to the key the
@@ -2407,10 +2426,6 @@ function normalizeBuiltInHostConfig(
     allow_debug_actions: typeof storedFormatConfig.allow_debug_actions === "boolean"
       ? storedFormatConfig.allow_debug_actions
       : defaults.allow_debug_actions,
-    allow_experimental_dungeons:
-      typeof storedFormatConfig.allow_experimental_dungeons === "boolean"
-        ? storedFormatConfig.allow_experimental_dungeons
-        : defaults.allow_experimental_dungeons,
   };
   return finalizeRememberedHostConfig(persisted, format, formatConfig, null);
 }
@@ -2450,6 +2465,7 @@ function finalizeRememberedHostConfig(
         )
         || typeof seat.difficulty !== "string"
         || (typeof seat.deckName !== "string" && seat.deckName !== null)
+        || (seat.deckId !== undefined && typeof seat.deckId !== "string")
       ) {
         continue;
       }
@@ -2457,6 +2473,7 @@ function finalizeRememberedHostConfig(
         seatIndex: seat.seatIndex,
         difficulty: seat.difficulty,
         deckName: seat.deckName,
+        ...(seat.deckId !== undefined ? { deckId: seat.deckId } : {}),
       });
     }
   }
@@ -3168,7 +3185,7 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
                 loop_detection: settings.loopDetection,
               },
               format_config: settings.formatConfig,
-              ai_seats: aiSeats,
+              ai_seats: aiSeats.map(aiSeatRequest),
               room_name: settings.roomName,
               start_when_full: settings.startWhenFull,
               ranked: settings.ranked,
@@ -4274,7 +4291,7 @@ useMultiplayerStore.subscribe((state, prev) => {
 });
 
 export function getPlayerDisplayName(playerId: number, myId?: number): string {
-  if (playerId === myId) return "You";
+  if (playerId === myId) return i18n.t("game:player.you");
   return getOpponentDisplayName(playerId);
 }
 
@@ -4282,5 +4299,5 @@ export function getOpponentDisplayName(playerId: number): string {
   const state = useMultiplayerStore.getState();
   const name = state.playerNames.get(playerId);
   if (name) return name;
-  return `Opp ${playerId + 1}`;
+  return i18n.t("game:player.opponent", { seat: playerId + 1 });
 }
