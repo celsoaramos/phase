@@ -879,7 +879,6 @@ describe("multiplayerStore", () => {
       sideboard_policy: { type: "Limited", data: 15 },
       default_deck_copy_limit: { type: "UpTo", data: 4 },
       allow_debug_actions: false,
-      allow_experimental_dungeons: false,
       custom_rules: {
         id: 0,
         structural: {
@@ -964,21 +963,43 @@ describe("multiplayerStore", () => {
     ]);
   });
 
-  it("rehydrates a legacy custom config missing the experimental-dungeons flag", () => {
+  it("round-trips a remembered AI seat's deckId and rejects a non-string one", () => {
     seedSavedCustomFormat("saved-1");
-    // Persisted before the axis existed: every field but the new flag.
-    const { allow_experimental_dungeons: _dropped, ...legacyConfig } =
-      customFormatConfigFixture();
+
+    const normalized = normalizeRememberedHostConfig(
+      persistedCustomHostConfig({
+        aiSeats: [
+          { seatIndex: 1, difficulty: "Hard", deckName: null, deckId: "Precon Deck" },
+          { seatIndex: 2, difficulty: "Easy", deckName: null, deckId: "Random" },
+          { seatIndex: 3, difficulty: "Easy", deckName: null, deckId: 7 },
+        ],
+      }),
+    );
+
+    expect(normalized?.aiSeats).toEqual([
+      { seatIndex: 1, difficulty: "Hard", deckName: null, deckId: "Precon Deck" },
+      { seatIndex: 2, difficulty: "Easy", deckName: null, deckId: "Random" },
+    ]);
+  });
+
+  it("keeps a remembered custom config carrying the removed experimental-dungeons key", () => {
+    seedSavedCustomFormat("saved-1");
+    // Persisted before the flag was removed: every field plus the stale key.
+    const legacyConfig = {
+      ...customFormatConfigFixture(),
+      allow_experimental_dungeons: true,
+    };
 
     const normalized = normalizeRememberedHostConfig(
       persistedCustomHostConfig({ formatConfig: legacyConfig }),
     );
 
-    // The setup survives with the engine's default filled in — not discarded.
+    // The setup survives with the stale key ignored — not discarded.
     expect(normalized).not.toBeNull();
     expect(normalized?.format).toBe("Custom:0");
-    expect(normalized?.formatConfig).toEqual(customFormatConfigFixture());
-    expect(normalized?.formatConfig.allow_experimental_dungeons).toBe(false);
+    expect(normalized?.formatConfig).toEqual(
+      expect.objectContaining(customFormatConfigFixture()),
+    );
     // ...and the format-independent tail ran, so nothing else was lost either.
     expect(normalized?.playerCount).toBe(3);
     expect(normalized?.isPublic).toBe(false);
@@ -1208,6 +1229,73 @@ describe("multiplayerStore", () => {
       data: { ai_seats: unknown[] };
     };
     expect(frame.data.ai_seats).toEqual(aiSeats);
+  });
+
+  it("sends each AI seat's resolved deck but never its client-only deckId", async () => {
+    const deck = { type: "DeckList" as const, data: { main_deck: ["Forest"], sideboard: [], commander: [] } };
+    useMultiplayerStore.getState().startHosting(
+      hostingSettings({
+        aiSeats: [
+          { seatIndex: 1, difficulty: "Hard", deckName: null, deckId: "Precon Deck", deck },
+          { seatIndex: 2, difficulty: "Easy", deckName: null, deckId: "Random" },
+        ],
+      }),
+      {
+        main_deck: ["Forest"],
+        sideboard: [],
+        commander: ["Goreclaw, Terror of Qal Sisma"],
+      },
+      HOST_URL,
+    );
+
+    await waitFor(() => expect(socketMocks.send).toHaveBeenCalled());
+    const frame = JSON.parse(socketMocks.send.mock.calls[0][0] as string) as {
+      data: { ai_seats: unknown[] };
+    };
+    expect(frame.data.ai_seats).toEqual([
+      { seatIndex: 1, difficulty: "Hard", deckName: null, deck },
+      { seatIndex: 2, difficulty: "Easy", deckName: null },
+    ]);
+  });
+
+  it("sends the declared bracket tier on the host deck and each AI seat's deck", async () => {
+    const seatDeck = {
+      type: "DeckList" as const,
+      data: { main_deck: ["Forest"], sideboard: [], commander: [], bracket_tier: "cedh" as const },
+    };
+    useMultiplayerStore.getState().startHosting(
+      hostingSettings({
+        aiSeats: [{ seatIndex: 1, difficulty: "CEDH", deckName: null, deck: seatDeck }],
+      }),
+      { main_deck: ["Forest"], sideboard: [], commander: [], bracket_tier: "cedh" },
+      HOST_URL,
+    );
+
+    await waitFor(() => expect(socketMocks.send).toHaveBeenCalled());
+    const frame = JSON.parse(socketMocks.send.mock.calls[0][0] as string) as {
+      type: string;
+      data: {
+        deck: { bracket_tier?: string };
+        ai_seats: { deck: { data: { bracket_tier?: string } } }[];
+      };
+    };
+    expect(frame.type).toBe("CreateGameWithSettings");
+    expect(frame.data.deck.bracket_tier).toBe("cedh");
+    expect(frame.data.ai_seats[0].deck.data.bracket_tier).toBe("cedh");
+  });
+
+  it("leaves the host deck's bracket tier off the frame when none is declared", async () => {
+    useMultiplayerStore.getState().startHosting(
+      hostingSettings(),
+      { main_deck: ["Forest"], sideboard: [], commander: [] },
+      HOST_URL,
+    );
+
+    await waitFor(() => expect(socketMocks.send).toHaveBeenCalled());
+    const frame = JSON.parse(socketMocks.send.mock.calls[0][0] as string) as {
+      data: { deck: Record<string, unknown> };
+    };
+    expect(frame.data.deck).not.toHaveProperty("bracket_tier");
   });
 
   it("saves server-host metadata with the reconnect token while waiting for players", async () => {
