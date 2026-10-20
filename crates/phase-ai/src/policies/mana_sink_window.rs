@@ -49,11 +49,11 @@ use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use crate::features::DeckFeatures;
 
-pub struct OwnTurnManaSinkPolicy;
+pub struct ManaSinkWindowPolicy;
 
-impl TacticalPolicy for OwnTurnManaSinkPolicy {
+impl TacticalPolicy for ManaSinkWindowPolicy {
     fn id(&self) -> PolicyId {
-        PolicyId::OwnTurnManaSink
+        PolicyId::ManaSinkWindow
     }
 
     fn decision_kinds(&self) -> &'static [DecisionKind] {
@@ -78,17 +78,17 @@ impl TacticalPolicy for OwnTurnManaSinkPolicy {
             ability_index,
         } = &ctx.candidate.action
         else {
-            return neutral("own_turn_mana_sink_na");
+            return neutral("mana_sink_window_na");
         };
         let state = ctx.state;
         let Some(source) = state.objects.get(source_id) else {
-            return neutral("own_turn_mana_sink_na");
+            return neutral("mana_sink_window_na");
         };
         let Some(ability) = source.abilities.get(*ability_index) else {
-            return neutral("own_turn_mana_sink_na");
+            return neutral("mana_sink_window_na");
         };
         if source.controller != ctx.ai_player || !ability_is_deferrable_sink(ability) {
-            return neutral("own_turn_mana_sink_na");
+            return neutral("mana_sink_window_na");
         }
 
         // Only quiet priority windows: with something on the stack the
@@ -96,15 +96,15 @@ impl TacticalPolicy for OwnTurnManaSinkPolicy {
         if !matches!(state.waiting_for, WaitingFor::Priority { player } if player == ctx.ai_player)
             || !state.stack.is_empty()
         {
-            return neutral("own_turn_mana_sink_not_quiet");
+            return neutral("mana_sink_window_not_quiet");
         }
 
         if state.active_player != ctx.ai_player {
-            return neutral("own_turn_mana_sink_free_window");
+            return neutral("mana_sink_window_free_window");
         }
 
         PolicyVerdict::reject(
-            PolicyReason::new("own_turn_mana_sink_hold").with_fact("phase", state.phase as i64),
+            PolicyReason::new("mana_sink_window_hold").with_fact("phase", state.phase as i64),
         )
     }
 }

@@ -164,7 +164,7 @@ pub enum PolicyId {
     /// CR 602.2 + CR 117.3b: hold a mana-costed durable sink (Silverquill
     /// Campus's scry) for the opponent's end step instead of spending the
     /// mana the AI's own turn needs.
-    OwnTurnManaSink,
+    ManaSinkWindow,
     /// CR 601.2f: deploy a "spells you cast cost less" engine before the spells
     /// it discounts.
     CostReduction,
@@ -447,7 +447,7 @@ impl Default for PolicyRegistry {
             Box::new(PayoffPolicy::new(&BLINK_PAYOFF)),
             Box::new(LoopShortcutPolicy),
             Box::new(super::self_bounce_target::SelfBounceTargetPolicy),
-            Box::new(super::own_turn_mana_sink::OwnTurnManaSinkPolicy),
+            Box::new(super::mana_sink_window::ManaSinkWindowPolicy),
             Box::new(super::cost_reduction::CostReductionPolicy),
             Box::new(super::draw_payoff::DrawPayoffPolicy),
             Box::new(super::discard_payoff::DiscardPayoffPolicy),
