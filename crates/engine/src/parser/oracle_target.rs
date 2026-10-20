@@ -8274,6 +8274,33 @@ fn parse_ownership_or_controller_suffix(
         return own_ctrl_offset + (own_ctrl.len() - rest.len());
     }
 
+    // CR 109.4 + CR 115.1: "whose controller controls <object>" / "whose
+    // controller doesn't control <object>" — a CONTROLLER PREDICATE on the
+    // target, the object-axis twin of "each opponent who controls …" (Seasinger:
+    // "target creature whose controller controls an Island"). The predicate body
+    // is the shared `parse_controls_permanent_predicate`; only the subject words
+    // differ. Left unparsed, the clause was dropped and the target lost its
+    // restriction (any creature could be stolen).
+    if let Ok((predicate, _)) = tag::<_, _, OracleError<'_>>("whose controller ").parse(own_ctrl) {
+        let mut predicate_ctx = ParseContext::default();
+        if let Some((comparator, count, filter, rest)) =
+            super::oracle_effect::lower::parse_controls_permanent_predicate(
+                predicate,
+                &mut predicate_ctx,
+            )
+        {
+            properties.push(FilterProp::ControllerMatches {
+                player: Box::new(PlayerFilter::ControlsCount {
+                    relation: PlayerRelation::All,
+                    filter,
+                    comparator,
+                    count: Box::new(count),
+                }),
+            });
+            return own_ctrl_offset + (own_ctrl.len() - rest.len());
+        }
+    }
+
     let (ctrl, ctrl_len) =
         parse_controller_suffix(text, ctx).map_or((None, 0), |(ctrl, len)| (Some(ctrl), len));
     if ctrl.is_some() {

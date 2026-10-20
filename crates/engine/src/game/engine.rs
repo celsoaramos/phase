@@ -19416,14 +19416,20 @@ pub(crate) fn duration_event_matches(
         (DurationEvent::OpponentBecameMonarch, GameEvent::MonarchChanged { player_id }) => {
             super::players::is_opponent(state, controller, *player_id)
         }
+        // CR 611.2b: "for as long as ~ remains tapped" — the source untapped.
+        (DurationEvent::SourceUntapped, GameEvent::PermanentUntapped { object_id }) => {
+            *object_id == source_id
+        }
         _ => false,
     }
 }
 
-/// The CR 610.3 "until" events a held activated or triggered ability can latch.
-const LATCHABLE_DURATION_EVENTS: [DurationEvent; 2] = [
+/// The CR 610.3 "until" events and CR 611.2b "remains tapped" source events a
+/// held activated or triggered ability can latch.
+const LATCHABLE_DURATION_EVENTS: [DurationEvent; 3] = [
     DurationEvent::SourceLeftBattlefield,
     DurationEvent::OpponentBecameMonarch,
+    DurationEvent::SourceUntapped,
 ];
 
 /// CR 610.3a / CR 610.3b: the specified "until" events in `events` that occurred

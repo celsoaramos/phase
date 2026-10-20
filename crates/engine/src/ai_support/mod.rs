@@ -2495,6 +2495,19 @@ pub fn legal_actions_full(state: &GameState) -> LegalActionsFull {
         }
     }
 
+    // CR 502.3: "You may choose not to untap ~" (Seasinger, Vedalken Shackles,
+    // Old Man of the Sea) — declining is the player's choice for each candidate,
+    // and the reducer accepts it (`ChooseUntap { untap: false }`). AI candidate
+    // generation offers only the untap, so the decline is added here, like the
+    // remembered optional choice above; without it the player could only untap
+    // and every "keep it tapped to keep control" line was impossible.
+    if let WaitingFor::UntapChoice { candidates, .. } = &state.waiting_for {
+        actions.extend(candidates.iter().map(|&object_id| GameAction::ChooseUntap {
+            object_id,
+            untap: false,
+        }));
+    }
+
     // Build spell costs map. The frontend display layer needs the
     // engine-effective cost (after Affinity / ReduceCost / commander tax / etc.)
     // for every spell the player owns in a castable zone — not just spells the

@@ -4355,6 +4355,11 @@ pub enum Duration {
 pub enum DurationEvent {
     SourceLeftBattlefield,
     OpponentBecameMonarch,
+    /// CR 611.2b: the source became untapped. Ends a "for as long as ~ remains
+    /// tapped" duration (Seasinger, Old Man of the Sea, Rubinia Soulsinger):
+    /// once the source has untapped it did not remain tapped, even if it is
+    /// tapped again before the ability resolves.
+    SourceUntapped,
 }
 
 impl Duration {
@@ -4371,6 +4376,32 @@ impl Duration {
             | Self::UntilNextStepOf { .. }
             | Self::ForAsLongAs { .. }
             | Self::UntilSourceExilesAnotherCard
+            | Self::UntilEvent { .. }
+            | Self::Permanent => None,
+        }
+    }
+
+    /// CR 611.2b: the source-state event that ends this duration before it can
+    /// begin. "For as long as ~ remains tapped" (the source tapped as the
+    /// activation cost) ends the moment the source untaps — if that happens
+    /// while the ability waits on the stack, the duration ends before the
+    /// effect would begin and the effect does nothing, even when the source
+    /// is tapped again by the time the ability resolves.
+    pub fn source_state_event(&self) -> Option<DurationEvent> {
+        match self {
+            Self::ForAsLongAs { condition } => condition
+                .requires_source_tapped()
+                .then_some(DurationEvent::SourceUntapped),
+            Self::UntilEndOfTurn
+            | Self::UntilEndOfCombat
+            | Self::UntilNextTurnOf { .. }
+            | Self::UntilEndOfNextTurnOf { .. }
+            | Self::UntilHostLeavesPlay
+            | Self::WhileHostOnBattlefield
+            | Self::WhileControllingHost
+            | Self::UntilNextStepOf { .. }
+            | Self::UntilSourceExilesAnotherCard
+            | Self::UntilOpponentBecomesMonarch
             | Self::UntilEvent { .. }
             | Self::Permanent => None,
         }
@@ -13445,6 +13476,20 @@ pub enum StaticCondition {
 }
 
 impl StaticCondition {
+    /// CR 110.5b + CR 611.2b: true when this duration condition requires the
+    /// SOURCE to stay tapped — `SourceIsTapped` itself, or a conjunction that
+    /// contains it ("for as long as you control ~ and ~ remains tapped"). A
+    /// disjunction or negation does not: untapping the source need not end it.
+    pub(crate) fn requires_source_tapped(&self) -> bool {
+        match self {
+            StaticCondition::SourceIsTapped => true,
+            StaticCondition::And { conditions } => conditions
+                .iter()
+                .any(StaticCondition::requires_source_tapped),
+            _ => false,
+        }
+    }
+
     /// Engine limitation, not CR-mandated: the player whose DESIGNATION this
     /// leaf tests, when the leaf is a designation predicate at all.
     ///
@@ -37366,9 +37411,22 @@ impl ResolvedAbility {
         }
     }
 
-    /// Whether this ability chain contains a zone change bounded by `event`.
+    /// CR 610.3 + CR 611.2b: the event that, observed while this node waits on
+    /// the stack, means its duration has already ended — a zone change's "until"
+    /// event (CR 610.3a) or the source untapping under a "remains tapped"
+    /// duration (CR 611.2b).
+    pub(crate) fn latchable_duration_event(&self) -> Option<DurationEvent> {
+        self.bounded_zone_change_event().or_else(|| {
+            self.duration
+                .as_ref()
+                .and_then(Duration::source_state_event)
+        })
+    }
+
+    /// Whether this ability chain contains a node whose duration is bounded by
+    /// `event` (see [`Self::latchable_duration_event`]).
     pub(crate) fn contains_duration_event(&self, event: DurationEvent) -> bool {
-        self.bounded_zone_change_event() == Some(event)
+        self.latchable_duration_event() == Some(event)
             || self
                 .sub_ability
                 .as_ref()
@@ -37380,7 +37438,7 @@ impl ResolvedAbility {
     }
 
     pub(crate) fn record_duration_event_recursive(&mut self, event: DurationEvent) {
-        if self.bounded_zone_change_event() == Some(event)
+        if self.latchable_duration_event() == Some(event)
             && !self.context.duration_events.contains(&event)
         {
             self.context.duration_events.push(event);

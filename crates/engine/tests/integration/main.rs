@@ -1395,6 +1395,7 @@ mod scroll_rack_linked_exile;
 mod scythecat_cub_second_resolution;
 mod search_delivery_observer_dedup;
 mod season_points_budget_modal;
+mod seasinger_remains_tapped;
 mod seasoned_dungeoneer_initiative_room_trigger;
 mod selenia_vigilance_grant;
 mod self_attached_aura_token_host;

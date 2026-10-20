@@ -9212,11 +9212,48 @@ fn resolve_effect_step(
     }
 }
 
+/// CR 611.2b: a "for as long as ~ remains tapped" duration whose source untapped
+/// after the ability was put onto the stack (latched by
+/// `engine::check_exile_returns`) or earlier in this same resolution has
+/// already ended, so the effect it would create never begins and does nothing.
+fn source_state_duration_already_ended(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    events: &[GameEvent],
+) -> bool {
+    let Some(event) = ability
+        .duration
+        .as_ref()
+        .and_then(Duration::source_state_event)
+    else {
+        return false;
+    };
+    ability.context.duration_events.contains(&event)
+        || events.iter().any(|observed| {
+            crate::game::engine::duration_event_matches(
+                state,
+                ability.source_id,
+                None,
+                ability.controller,
+                event,
+                observed,
+            )
+        })
+}
+
 fn resolve_legacy_effect(
     state: &mut GameState,
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<Option<EffectResolutionResult>, EffectError> {
+    if source_state_duration_already_ended(state, ability, events) {
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+            subject: None,
+        });
+        return Ok(None);
+    }
     match &ability.effect {
         Effect::StartYourEngines { .. } => speed_effects::resolve_start(state, ability, events),
         Effect::ChangeSpeed { .. } => speed_effects::resolve_change_speed(state, ability, events),

@@ -6689,6 +6689,21 @@ pub(crate) fn parse_controls_permanent_object<'a>(
     ctx: &mut ParseContext,
 ) -> Option<(Comparator, QuantityExpr, TargetFilter, &'a str)> {
     let lower = rest.to_lowercase();
+    let ((), predicate) = nom_on_lower(rest, &lower, |i| value((), tag("who ")).parse(i))?;
+    parse_controls_permanent_predicate(predicate, ctx)
+}
+
+/// CR 109.4 + CR 109.5: the subject-free body of [`parse_controls_permanent_object`]
+/// — "controls <object>" / "doesn't control <object>" / "controls more <type>
+/// than you" / "controls the most <type>". Each subject ("who " for a player
+/// population, "whose controller " for an object's controller — Seasinger's
+/// "creature whose controller controls an Island") strips its own words and
+/// hands the verb phrase here, so the predicate grammar has one authority.
+pub(crate) fn parse_controls_permanent_predicate<'a>(
+    rest: &'a str,
+    ctx: &mut ParseContext,
+) -> Option<(Comparator, QuantityExpr, TargetFilter, &'a str)> {
+    let lower = rest.to_lowercase();
     // Comparative form tried FIRST: "who controls more <type> than you".
     // Mirrors `oracle_nom::condition::parse_that_player_controls_more_comparison`:
     // consume the verb prefix, then split the original-case remainder on
@@ -6696,7 +6711,6 @@ pub(crate) fn parse_controls_permanent_object<'a>(
     // in original case. `split_once_on_lower` is a structural boundary lookup
     // (permitted), not parsing dispatch.
     if let Some(((), after_verb)) = nom_on_lower(rest, &lower, |i| {
-        let (i, _) = tag("who ").parse(i)?;
         let (i, _) = alt((tag("controls more "), tag("control more "))).parse(i)?;
         Ok((i, ()))
     }) {
@@ -6740,7 +6754,6 @@ pub(crate) fn parse_controls_permanent_object<'a>(
     // everyone, per the Tectonic Hellion "if everyone controls the same number,
     // everyone …" ruling.
     if let Some(((), after_verb)) = nom_on_lower(rest, &lower, |i| {
-        let (i, _) = tag("who ").parse(i)?;
         let (i, _) = alt((tag("controls the most "), tag("control the most "))).parse(i)?;
         Ok((i, ()))
     }) {
@@ -6775,35 +6788,32 @@ pub(crate) fn parse_controls_permanent_object<'a>(
     // is not split. `(GE, Fixed(1))` ≡ old `Controls` (count >= 1);
     // `(EQ, Fixed(0))` ≡ old `ControlsNone` (count == 0).
     let ((comparator, count), after_verb) = nom_on_lower(rest, &lower, |i| {
-        preceded(
-            tag("who "),
-            alt((
-                value(
-                    (Comparator::EQ, QuantityExpr::Fixed { value: 0 }),
-                    tag("doesn't control "),
-                ),
-                value(
-                    (Comparator::EQ, QuantityExpr::Fixed { value: 0 }),
-                    tag("does not control "),
-                ),
-                value(
-                    (Comparator::EQ, QuantityExpr::Fixed { value: 0 }),
-                    tag("don't control "),
-                ),
-                value(
-                    (Comparator::EQ, QuantityExpr::Fixed { value: 0 }),
-                    tag("do not control "),
-                ),
-                value(
-                    (Comparator::GE, QuantityExpr::Fixed { value: 1 }),
-                    tag("controls "),
-                ),
-                value(
-                    (Comparator::GE, QuantityExpr::Fixed { value: 1 }),
-                    tag("control "),
-                ),
-            )),
-        )
+        alt((
+            value(
+                (Comparator::EQ, QuantityExpr::Fixed { value: 0 }),
+                tag("doesn't control "),
+            ),
+            value(
+                (Comparator::EQ, QuantityExpr::Fixed { value: 0 }),
+                tag("does not control "),
+            ),
+            value(
+                (Comparator::EQ, QuantityExpr::Fixed { value: 0 }),
+                tag("don't control "),
+            ),
+            value(
+                (Comparator::EQ, QuantityExpr::Fixed { value: 0 }),
+                tag("do not control "),
+            ),
+            value(
+                (Comparator::GE, QuantityExpr::Fixed { value: 1 }),
+                tag("controls "),
+            ),
+            value(
+                (Comparator::GE, QuantityExpr::Fixed { value: 1 }),
+                tag("control "),
+            ),
+        ))
         .parse(i)
     })?;
     // The object sub-phrase is consumed by the shared type-phrase combinator.
