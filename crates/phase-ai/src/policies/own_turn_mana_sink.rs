@@ -110,7 +110,10 @@ impl TacticalPolicy for OwnTurnManaSinkPolicy {
 }
 
 fn ability_is_deferrable_sink(ability: &AbilityDefinition) -> bool {
-    ability.cost.as_ref().is_some_and(spends_mana_and_maybe_taps)
+    ability
+        .cost
+        .as_ref()
+        .is_some_and(spends_mana_and_maybe_taps)
         && ability.activation_restrictions.is_empty()
         && ability.condition.is_none()
         && ability.ability_tag.is_none()
@@ -144,8 +147,14 @@ fn spends_mana_and_maybe_taps(cost: &AbilityCost) -> bool {
 fn chain_is_deferrable(ability: &AbilityDefinition) -> bool {
     effect_is_deferrable(&ability.effect)
         && ability.duration.is_none()
-        && ability.sub_ability.as_deref().is_none_or(chain_is_deferrable)
-        && ability.else_ability.as_deref().is_none_or(chain_is_deferrable)
+        && ability
+            .sub_ability
+            .as_deref()
+            .is_none_or(chain_is_deferrable)
+        && ability
+            .else_ability
+            .as_deref()
+            .is_none_or(chain_is_deferrable)
 }
 
 /// Effects that give nothing in the AI's own turn that the opponent's end

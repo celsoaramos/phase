@@ -161,6 +161,10 @@ pub enum PolicyId {
     CommanderZoneReturn,
     /// CR 608.2c: "return a land you control" self-bounce target choice.
     SelfBounceTarget,
+    /// CR 602.2 + CR 117.3b: hold a mana-costed durable sink (Silverquill
+    /// Campus's scry) for the opponent's end step instead of spending the
+    /// mana the AI's own turn needs.
+    OwnTurnManaSink,
     /// CR 601.2f: deploy a "spells you cast cost less" engine before the spells
     /// it discounts.
     CostReduction,
@@ -184,10 +188,6 @@ pub enum PolicyId {
     /// CR 106.4: a ritual's mana empties at end of step/phase — don't cast one
     /// when nothing in reach can spend it in this window.
     RitualSink,
-    /// CR 602.2 + CR 117.3b: hold a mana-costed durable sink (Silverquill
-    /// Campus's scry) for the opponent's end step instead of spending the
-    /// mana the AI's own turn needs.
-    OwnTurnManaSink,
 }
 
 /// Coarse routing kind for a candidate decision. Each policy declares which
@@ -447,6 +447,7 @@ impl Default for PolicyRegistry {
             Box::new(PayoffPolicy::new(&BLINK_PAYOFF)),
             Box::new(LoopShortcutPolicy),
             Box::new(super::self_bounce_target::SelfBounceTargetPolicy),
+            Box::new(super::own_turn_mana_sink::OwnTurnManaSinkPolicy),
             Box::new(super::cost_reduction::CostReductionPolicy),
             Box::new(super::draw_payoff::DrawPayoffPolicy),
             Box::new(super::discard_payoff::DiscardPayoffPolicy),
@@ -455,7 +456,6 @@ impl Default for PolicyRegistry {
             Box::new(GraveyardAuthorityPolicy),
             Box::new(super::pile_partition::PilePartitionPolicy),
             Box::new(super::ritual_sink::RitualSinkPolicy),
-            Box::new(super::own_turn_mana_sink::OwnTurnManaSinkPolicy),
         ];
         Self::from_policies(policies)
     }
