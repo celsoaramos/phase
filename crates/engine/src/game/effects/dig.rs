@@ -143,9 +143,36 @@ pub fn resolve(
         .find(|p| p.id == library_owner)
         .ok_or(EffectError::PlayerNotFound)?;
 
-    // CR 609.3: If a library has fewer cards than required, use as many as available.
-    let count = dig_num.min(state.library_of(player.id).len());
-    if count == 0 {
+    let cards: Vec<_> = if dig_source == DigSource::PriorDigRemainder {
+        // CR 701.20e + CR 608.2c: a second selection "from among them" after a
+        // keep-Dig chooses among the looked-at cards that are still in the
+        // library. The parent Dig deferred its rest routing and published that
+        // unkept pile as the chain's tracked set (see
+        // `dig_continuation_needs_full_looked_at_tracked_set`); a card it already
+        // put into a hand is no longer a library member and drops out here.
+        let library = state.library_of(player.id);
+        state
+            .chain_tracked_set_id
+            .and_then(|id| state.tracked_object_sets.get(&id))
+            .map(|members| {
+                members
+                    .iter()
+                    .copied()
+                    .filter(|id| library.contains(id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        // CR 609.3: If a library has fewer cards than required, use as many as available.
+        let count = dig_num.min(state.library_of(player.id).len());
+        state
+            .library_of(player.id)
+            .iter()
+            .take(count)
+            .copied()
+            .collect()
+    };
+    if cards.is_empty() {
         // CR 608.2c: Nothing was looked at — a chained `ParentTarget` consumer
         // ("put up to one of them on top … the rest on the bottom") has no
         // cards to act on and must not fall back to acting on this ability's
@@ -160,12 +187,6 @@ pub fn resolve(
         return Ok(());
     }
 
-    let cards: Vec<_> = state
-        .library_of(player.id)
-        .iter()
-        .take(count)
-        .copied()
-        .collect::<Vec<_>>();
     let raw_keep_count = raw_keep_num.min(cards.len());
 
     // CR 701.20e / CR 701.20a: Pure-peek pattern (keep_count = 0): "look at" /

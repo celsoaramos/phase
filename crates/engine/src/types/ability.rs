@@ -17657,12 +17657,19 @@ impl DigRestSplitScope {
 /// `PriorLook` reads from `GameState::private_look_ids`, which was populated
 /// by a preceding look-only Dig (e.g. the Birthing Ritual pattern: look →
 /// sacrifice → choose from among those cards).
+/// `PriorDigRemainder` reads the cards a preceding keep-Dig left behind in the
+/// library — the unkept pile that Dig published as the chain's tracked set —
+/// for a SECOND selection over the same looked-at cards (Choco, Seeker of
+/// Paradise: "You may put one of them into your hand. Then put any number of
+/// land cards from among them onto the battlefield tapped and the rest into
+/// your graveyard").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DigSource {
     #[default]
     Library,
     PriorLook,
+    PriorDigRemainder,
 }
 
 impl DigSource {

@@ -967,7 +967,9 @@ pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
 /// `PutAtLibraryPosition { TrackedSet }` step before exiling from the same
 /// looked-at pile. Those continuations publish and route via the **unkept**
 /// looked-at cards; generic reveal/keep continuations (Zimone land split)
-/// bind only the kept/revealed subset.
+/// bind only the kept/revealed subset. A second "from among them" selection
+/// (`Dig { source: PriorDigRemainder }` — Choco, Seeker of Paradise) reads the
+/// same unkept pile, so it must still be in the library when that Dig resolves.
 fn dig_continuation_needs_full_looked_at_tracked_set(ability: &ResolvedAbility) -> bool {
     let mut current = Some(ability);
     while let Some(sub) = current {
@@ -975,6 +977,9 @@ fn dig_continuation_needs_full_looked_at_tracked_set(ability: &ResolvedAbility) 
             &sub.effect,
             Effect::PutAtLibraryPosition {
                 target: crate::types::ability::TargetFilter::TrackedSet { .. },
+                ..
+            } | Effect::Dig {
+                source: crate::types::ability::DigSource::PriorDigRemainder,
                 ..
             }
         ) {

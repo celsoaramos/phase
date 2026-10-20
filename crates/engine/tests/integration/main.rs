@@ -163,6 +163,7 @@ mod chandra_revolution_doesnt_untap_slot;
 mod charging_cinderhorn_issue_2868;
 mod chatterstorm_storm;
 mod chittering_rats;
+mod choco_seeker_of_paradise_dig_remainder;
 mod choose_from_zone_exiled_this_way_anaphor;
 mod chosen_color_object_filter;
 mod chosen_color_rechoose_same_source;

@@ -5789,6 +5789,55 @@ pub(super) fn apply_clause_continuation(
             let Some(dig_pos) = dig_pos else {
                 return;
             };
+            // CR 608.2c + CR 701.20e: a SECOND "from among them" selection over
+            // the same looked-at cards (Choco, Seeker of Paradise: "You may put
+            // one of them into your hand. Then put any number of land cards from
+            // among them onto the battlefield tapped and the rest into your
+            // graveyard"). The anchor Dig was already patched by the first
+            // clause into a single keep to hand that said nothing about the rest;
+            // overwriting it here silently dropped the hand step (the last clause
+            // won). Written order is real: keep the first selection, and chain a
+            // `PriorDigRemainder` Dig that chooses among the cards the first one
+            // left in the library and owns the remainder.
+            let second_selection = matches!(
+                &*defs[dig_pos].effect,
+                Effect::Dig {
+                    destination: Some(Zone::Hand),
+                    keep_count: Some(prev_keep),
+                    keep_count_expr: None,
+                    rest_destination: None,
+                    rest_split_top_count: None,
+                    source: DigSource::Library,
+                    ..
+                } if *prev_keep != u32::MAX
+            ) && kept_dest.is_some_and(|zone| zone != Zone::Hand);
+            if second_selection {
+                debug_assert!(
+                    face_down_profile.is_none() && enters_under.is_none(),
+                    "Dig-remainder from-among form does not carry face-down/under-control"
+                );
+                let (keep, keep_expr, up_to) = quantity.to_dig_keep();
+                defs.push(AbilityDefinition::new(
+                    kind,
+                    Effect::Dig {
+                        player: TargetFilter::Controller,
+                        count: QuantityExpr::Fixed { value: 0 },
+                        keep_count: keep,
+                        keep_count_expr: keep_expr,
+                        up_to,
+                        filter: card_filter,
+                        destination: kept_dest,
+                        rest_destination: rest_dest,
+                        rest_split_top_count: rest_split_top.map(|boxed| *boxed),
+                        rest_order: continuation_rest_order,
+                        reveal: reveal_verb,
+                        enter_tapped,
+                        enters_attacking,
+                        source: DigSource::PriorDigRemainder,
+                    },
+                ));
+                return;
+            }
             let previous = &mut defs[dig_pos];
             if let Effect::Dig {
                 keep_count,
@@ -7369,13 +7418,13 @@ pub(super) fn parse_dig_from_among(
     .parse(lower)
     {
         let before_of = before_of.trim();
-        if let Ok((after_put, _)) = alt((
-            tag::<_, _, OracleError<'_>>("you may put "),
-            tag("put "),
-            tag("you may reveal "),
-            tag("reveal "),
-            tag("you may return "),
-            tag("return "),
+        if let Ok((after_put, prefix_optional)) = alt((
+            value(true, tag::<_, _, OracleError<'_>>("you may put ")),
+            value(false, tag("put ")),
+            value(true, tag("you may reveal ")),
+            value(false, tag("reveal ")),
+            value(true, tag("you may return ")),
+            value(false, tag("return ")),
         ))
         .parse(before_of)
         {
@@ -7397,7 +7446,14 @@ pub(super) fn parse_dig_from_among(
                     .map_or(PutCount::up(1), |(_, n)| PutCount::up(n))
             } else if let Some((expr, _)) = parse_count_expr(after_put) {
                 // CR 701.20e: literal → `Fixed`; "X" → `Variable` (dynamic keep).
-                PutCount::Exactly(expr)
+                // CR 608.2d: "you may put one of them …" is the player's option,
+                // so it may keep none — the same `prefix_optional` mapping the
+                // "milled this way" arm above applies.
+                if prefix_optional {
+                    PutCount::Up(expr)
+                } else {
+                    PutCount::Exactly(expr)
+                }
             } else {
                 PutCount::up(1)
             };
