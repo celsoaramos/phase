@@ -247,5 +247,8 @@
   },
   {
     "branch": "card/ripples-payment-keeps-milled-set"
+  },
+  {
+    "branch": "card/mf-relatos-1019"
   }
 ]
