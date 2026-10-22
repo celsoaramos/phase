@@ -10256,6 +10256,7 @@ fn extract_trigger_condition_features(
         | TriggerCondition::DuringPlayersTurn { .. }
         | TriggerCondition::SourceEnteredThisTurn
         | TriggerCondition::SourceAttackedThisCombat
+        | TriggerCondition::SourceAndOthersAttackedThisCombat { .. }
         | TriggerCondition::ChoseOtherRingBearer
         | TriggerCondition::ChoseRingBearer
         | TriggerCondition::EchoDue
