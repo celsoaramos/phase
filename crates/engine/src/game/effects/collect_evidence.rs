@@ -12,11 +12,21 @@ use std::collections::HashSet;
 use super::super::engine::EngineError;
 use super::super::zone_pipeline::{self, ZoneMoveRequest, ZoneMoveResult};
 
+/// CR 701.59a: the cards in `player`'s graveyard that can be exiled as
+/// evidence. CR 601.2a: a spell being cast from the graveyard is on the stack,
+/// so it is never its own evidence.
 fn graveyard_cards(state: &GameState, player: PlayerId) -> Vec<ObjectId> {
     state
         .players
         .get(player.0 as usize)
-        .map(|p| p.graveyard.iter().copied().collect())
+        .map(|p| {
+            state
+                .graveyard_of(p.id)
+                .iter()
+                .copied()
+                .filter(|&id| !super::super::casting::is_spell_being_cast(state, id))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -170,11 +180,7 @@ pub(crate) fn handle_choice(
         }
     }
 
-    let still_legal: Vec<ObjectId> = state
-        .players
-        .get(player.0 as usize)
-        .map(|p| p.graveyard.iter().copied().collect())
-        .unwrap_or_default();
+    let still_legal = graveyard_cards(state, player);
     for id in chosen {
         if !still_legal.contains(id) {
             return Err(EngineError::InvalidAction(
@@ -279,7 +285,7 @@ fn complete_cost_payment(
             // any remaining (non-interactive) cost — collect evidence is a no-op
             // there — and pushes the ability. Detected by the activation index
             // carried on the pending; spell casts (bestow Detective's Phoenix)
-            // have `None` and fall through to `pay_and_push`.
+            // have `None` and fall through to `pay_and_push_with_lock`.
             if pending.activation_ability_index.is_some() {
                 return super::super::casting_costs::finish_activated_ability_at_payment_boundary(
                     state, player, pending, events,
@@ -644,6 +650,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         }
     }
