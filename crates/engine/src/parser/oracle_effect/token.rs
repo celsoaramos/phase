@@ -23,7 +23,7 @@ use crate::types::zones::Zone;
 
 use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_static::{parse_quoted_ability_modifications, parse_static_line_multi};
-use super::super::oracle_target::{parse_target, parse_target_with_ctx};
+use super::super::oracle_target::parse_target_with_ctx;
 use super::super::oracle_util::{
     comma_short_self_name, normalize_card_name_refs, parse_count_expr, parse_count_head,
     parse_count_slot, parse_rounding_suffix_only, rewrite_quantity_expr_rounding,
@@ -47,7 +47,7 @@ pub(crate) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) 
     let lower = text.to_lowercase();
 
     // "create a token that's a copy of {target}"
-    if let Ok((_, (tapped, enters_attacking))) = parse_copy_token_entry_modifiers(&lower) {
+    if let Ok((_, (mut tapped, mut enters_attacking))) = parse_copy_token_entry_modifiers(&lower) {
         let tp = TextPair::new(&text, &lower);
         let after_copy_tp = tp
             .strip_after("copy of ")
@@ -76,7 +76,7 @@ pub(crate) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) 
         let (target_text, extra_keywords, additional_modifications) =
             split_token_except_clause(target_text, ctx);
         let target_lower = target_text.trim().to_lowercase();
-        let (mut target, _) = if parse_cost_paid_object_copy_target(&target_lower) {
+        let (mut target, target_remainder) = if parse_cost_paid_object_copy_target(&target_lower) {
             (TargetFilter::CostPaidObject, "")
         } else {
             parse_target_with_ctx(target_text, ctx)
@@ -110,7 +110,23 @@ pub(crate) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) 
         // instead of fabricating a count.
         let (_, after_create) =
             nom_on_lower(&text, &lower, |i| value((), tag("create ")).parse(i))?;
-        let count = parse_count_slot(after_create, ctx)?.count;
+        let count_slot = parse_count_slot(after_create, ctx)?;
+        let count = count_slot.count;
+        // CR 508.4: A creature put onto the battlefield attacking is attacking
+        // without having attacked. Some copy effects state this entry condition
+        // after the copy target (for example, Flamerush Rider's "...attacking
+        // creature and that's tapped and attacking"). Parse only the target
+        // parser's unconsumed remainder so the target's Attacking restriction
+        // never sets the token's entry flags.
+        if let Some((suffix_tapped, suffix_enters_attacking)) =
+            parse_copy_token_trailing_entry_modifiers(
+                &target_remainder.to_lowercase(),
+                count_slot.where_x.is_some(),
+            )
+        {
+            tapped |= suffix_tapped;
+            enters_attacking |= suffix_enters_attacking;
+        }
         return Some(Effect::CopyTokenOf {
             target,
             // CR 109.4: Default to the controller; a "target [player] creates"
@@ -197,6 +213,52 @@ pub(super) fn parse_copy_token_entry_modifiers(input: &str) -> OracleResult<'_, 
     ))
     .parse(rest)?;
     Ok((rest, flags))
+}
+
+/// Parse an optional entry-state suffix after the copied-object target, such
+/// as `and that's tapped and attacking`. The caller supplies only the
+/// unconsumed target remainder, keeping target restrictions separate from
+/// token-entry instructions.
+fn parse_copy_token_trailing_entry_modifiers(
+    remainder: &str,
+    count_bound_by_where_x: bool,
+) -> Option<(bool, bool)> {
+    fn parse_suffix(input: &str, count_bound_by_where_x: bool) -> OracleResult<'_, (bool, bool)> {
+        let (rest, _) = tag("and ").parse(input)?;
+        let (rest, _) =
+            alt((tag("that's"), tag("that is"), tag("thats"), tag("that are"))).parse(rest)?;
+        let (rest, flags) = alt((
+            // The longer alternative must precede `tapped` so it is not
+            // consumed as a tapped-only suffix.
+            value((true, true), tag(" tapped and attacking")),
+            value((true, false), tag(" tapped")),
+            value((false, true), tag(" attacking")),
+        ))
+        .parse(rest)?;
+        let rest = if count_bound_by_where_x {
+            // CR 107.3c: A following where-X clause defines the token count.
+            // `parse_count_slot` already bound the count from this binder and
+            // parsed its quantity in full, so the clause is consumed whole here
+            // rather than re-validated by a second quantity grammar; without
+            // that binder, arbitrary text after the entry modifier is not an
+            // entry clause.
+            opt(preceded(
+                tag(", where x is "),
+                nom::combinator::rest::<_, OracleError<'_>>,
+            ))
+            .parse(rest)?
+            .0
+        } else {
+            rest
+        };
+        let (rest, _) = opt(alt((tag("."), tag(",")))).parse(rest)?;
+        let (rest, _) = nom::character::complete::multispace0.parse(rest)?;
+        let (rest, _) = eof.parse(rest)?;
+        Ok((rest, flags))
+    }
+    parse_suffix(remainder.trim_start(), count_bound_by_where_x)
+        .ok()
+        .map(|(_, flags)| flags)
 }
 
 fn parse_cost_paid_object_copy_target(lower: &str) -> bool {
@@ -534,7 +596,8 @@ fn parse_token_description_with_context(
     let (text, attach_to) = first_token_attachment_connector(&lower)
         .and_then(|connector| tp.split_around(connector))
         .map_or((text, None), |(before, after)| {
-            let (target, _) = parse_target(after.original);
+            let (target, _) =
+                parse_target_with_ctx(after.original, &mut ctx.clone_player_antecedents());
             (before.original, Some(target))
         });
 
@@ -796,7 +859,10 @@ fn parse_token_description_with_context(
             (Some(bound), _) => Some(bound),
             (None, Some(where_expression)) => Some(
                 super::parse_where_x_quantity_expression(&where_expression).or_else(|| {
-                    crate::parser::oracle_quantity::parse_cda_quantity(&where_expression)
+                    crate::parser::oracle_quantity::parse_cda_quantity_with_context(
+                        &where_expression,
+                        &mut ctx.clone_player_antecedents(),
+                    )
                 })?,
             ),
             (None, None) => None,
@@ -826,7 +892,10 @@ fn parse_token_description_with_context(
             // expression to a typed quantity. If it is not representable the
             // token clause does not lower — a raw-text `PtValue::Variable` is a
             // dead node that silently produces a 0/0 token.
-            let parsed = crate::parser::oracle_quantity::parse_cda_quantity(&pt_expression)?;
+            let parsed = crate::parser::oracle_quantity::parse_cda_quantity_with_context(
+                &pt_expression,
+                &mut ctx.clone_player_antecedents(),
+            )?;
             power = Some(PtValue::Quantity(parsed.clone()));
             toughness = Some(PtValue::Quantity(parsed));
         }
@@ -1733,6 +1802,7 @@ pub(super) fn push_unique_string(values: &mut Vec<String>, value: impl Into<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::oracle_target::parse_target;
     use crate::types::ability::{
         ObjectScope, PlayerFilter, QuantityExpr, QuantityRef, RoundingMode, TypeFilter,
     };
@@ -2193,6 +2263,182 @@ mod tests {
     }
 
     #[test]
+    fn flamerush_rider_copy_target_and_post_target_entry_clause_parse() {
+        // Flamerush Rider: the attacking property on the copied target is a
+        // target restriction; the later "and that's tapped and attacking"
+        // independently controls how the token enters.
+        let target_text = "target attacking creature and that's tapped and attacking.";
+        let (target, remainder) = parse_target(target_text);
+        let TargetFilter::Typed(typed_target) = target else {
+            panic!("expected typed target, got {target:?}");
+        };
+        assert!(typed_target.type_filters.contains(&TypeFilter::Creature));
+        assert!(typed_target
+            .properties
+            .contains(&FilterProp::Attacking { defender: None }));
+        assert_eq!(remainder, " and that's tapped and attacking.");
+
+        let oracle = "Create a token that's a copy of another target attacking creature and that's tapped and attacking.";
+        let effect = try_parse_token(&oracle.to_lowercase(), oracle, &mut ParseContext::default())
+            .expect("Flamerush Rider copy clause must parse");
+        let Effect::CopyTokenOf {
+            target,
+            tapped,
+            enters_attacking,
+            ..
+        } = effect
+        else {
+            panic!("expected CopyTokenOf, got {effect:?}");
+        };
+        let TargetFilter::Typed(typed_target) = target else {
+            panic!("expected typed copy target, got {target:?}");
+        };
+        assert!(typed_target.type_filters.contains(&TypeFilter::Creature));
+        assert!(typed_target
+            .properties
+            .contains(&FilterProp::Attacking { defender: None }));
+        assert!(typed_target.properties.contains(&FilterProp::Another));
+        assert!(tapped, "trailing tapped clause must set tapped=true");
+        assert!(
+            enters_attacking,
+            "trailing attacking clause must set enters_attacking=true"
+        );
+
+        let restricted_target = "Create a token that's a copy of target attacking creature.";
+        let effect = try_parse_token(
+            &restricted_target.to_lowercase(),
+            restricted_target,
+            &mut ParseContext::default(),
+        )
+        .expect("copy of an attacking target must parse");
+        let Effect::CopyTokenOf {
+            target,
+            tapped,
+            enters_attacking,
+            ..
+        } = effect
+        else {
+            panic!("expected CopyTokenOf, got {effect:?}");
+        };
+        assert!(matches!(
+            target,
+            TargetFilter::Typed(ref typed)
+                if typed.properties.contains(&FilterProp::Attacking { defender: None })
+        ));
+        assert!(
+            !tapped,
+            "target's Attacking restriction must not tap the token"
+        );
+        assert!(
+            !enters_attacking,
+            "target's Attacking restriction must not make the token enter attacking"
+        );
+
+        // Exercise the full printed Oracle through trigger parsing too. The
+        // delayed end-of-combat exile must remain linked after the target
+        // suffix is consumed.
+        let full_oracle = "Whenever this creature attacks, create a token that's a copy of another target attacking creature and that's tapped and attacking. Exile the token at end of combat.\nDash {2}{R}{R} (You may cast this spell for its dash cost. If you do, it gains haste, and it's returned from the battlefield to its owner's hand at the beginning of the next end step.)";
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            full_oracle,
+            "Flamerush Rider",
+            &["Dash".to_string()],
+            &["Creature".to_string()],
+            &["Human".to_string(), "Warrior".to_string()],
+        );
+        let attack_trigger = parsed
+            .triggers
+            .iter()
+            .find(|trigger| trigger.mode == crate::types::triggers::TriggerMode::Attacks)
+            .expect("full Flamerush Rider Oracle must parse its attack trigger");
+        let execute = attack_trigger
+            .execute
+            .as_deref()
+            .expect("Flamerush Rider attack trigger execute");
+        let Effect::CopyTokenOf {
+            target: TargetFilter::Typed(target),
+            tapped,
+            enters_attacking,
+            ..
+        } = execute.effect.as_ref()
+        else {
+            panic!("expected full attack trigger to start with CopyTokenOf, got {execute:?}");
+        };
+        assert!(target.type_filters.contains(&TypeFilter::Creature));
+        assert!(target
+            .properties
+            .contains(&FilterProp::Attacking { defender: None }));
+        assert!(target.properties.contains(&FilterProp::Another));
+        assert!(*tapped && *enters_attacking);
+
+        fn find_delayed_exile(
+            definition: &crate::types::ability::AbilityDefinition,
+        ) -> Option<&crate::types::ability::AbilityDefinition> {
+            if matches!(
+                definition.effect.as_ref(),
+                Effect::CreateDelayedTrigger {
+                    condition: crate::types::ability::DelayedTriggerCondition::AtNextPhase {
+                        phase: crate::types::phase::Phase::EndCombat,
+                    },
+                    effect,
+                    ..
+                } if matches!(
+                    effect.effect.as_ref(),
+                    Effect::ChangeZone {
+                        destination: Zone::Exile,
+                        target: TargetFilter::LastCreated,
+                        ..
+                    }
+                )
+            ) {
+                return Some(definition);
+            }
+            definition
+                .sub_ability
+                .as_deref()
+                .and_then(find_delayed_exile)
+                .or_else(|| {
+                    definition
+                        .else_ability
+                        .as_deref()
+                        .and_then(find_delayed_exile)
+                })
+        }
+        assert!(
+            find_delayed_exile(execute).is_some(),
+            "the full attack trigger must retain its end-of-combat exile of the created token"
+        );
+    }
+
+    #[test]
+    fn copy_token_entry_suffix_and_leading_forms_remain_composable() {
+        for (suffix, expected) in [
+            (" and that's tapped and attacking.", (true, true)),
+            (" and that is tapped.", (true, false)),
+            (" and thats attacking,", (false, true)),
+        ] {
+            assert_eq!(
+                parse_copy_token_trailing_entry_modifiers(suffix, false),
+                Some(expected),
+                "copy-token trailing entry suffix: {suffix:?}"
+            );
+        }
+        assert_eq!(
+            parse_copy_token_trailing_entry_modifiers(
+                " and that are tapped and attacking, with flying.",
+                true,
+            ),
+            None,
+            "an unrelated trailing clause must not be accepted as an entry modifier"
+        );
+
+        let (_, (tapped, enters_attacking)) = parse_copy_token_entry_modifiers(
+            "create a tapped and attacking token that's a copy of target creature",
+        )
+        .expect("existing leading copy-token form must stay supported");
+        assert!(tapped && enters_attacking);
+    }
+
+    #[test]
     fn copy_x_tokens_binds_where_clause() {
         // CR 107.3: X bound to a trailing "where X is <quantity>" clause.
         let txt = "Create X tokens that are copies of target creature you control, where X is the number of Clues you control.";
@@ -2216,6 +2462,37 @@ mod tests {
                 .contains(&TypeFilter::Subtype("Clue".to_string())),
             "X must count controlled Clues, got {:?}",
             tf.type_filters
+        );
+    }
+
+    #[test]
+    fn nacatl_war_pride_copy_tokens_bind_count_and_entry_state() {
+        // Nacatl War-Pride's printed token sentence combines a copied-source
+        // anaphor, a trailing entry-state clause, and a where-X count binding.
+        let oracle = "create X tokens that are copies of it and that are tapped and attacking, where X is the number of creatures defending player controls.";
+        let effect = try_parse_token(&oracle.to_lowercase(), oracle, &mut ParseContext::default())
+            .expect("Nacatl War-Pride token sentence must parse");
+        let Effect::CopyTokenOf {
+            count,
+            tapped,
+            enters_attacking,
+            ..
+        } = effect
+        else {
+            panic!("expected CopyTokenOf, got {effect:?}");
+        };
+        assert!(tapped && enters_attacking);
+        assert!(
+            matches!(
+                &count,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(filter),
+                    },
+                } if filter.controller == Some(ControllerRef::DefendingPlayer)
+                    && filter.type_filters.contains(&TypeFilter::Creature)
+            ),
+            "where-X must count creatures defending player controls, got {count:?}"
         );
     }
 
@@ -3983,6 +4260,199 @@ mod kazar_token_landfall_tests {
             !debug.contains("Unimplemented"),
             "Ka-Zar must parse to zero residual Unimplemented, got: {debug}"
         );
+    }
+}
+
+#[cfg(test)]
+mod granted_activated_pump_tests {
+    use super::*;
+    use crate::types::ability::{AbilityCost, AbilityKind, Duration};
+    use crate::types::mana::{ManaCost, ManaCostShard};
+
+    const DRAGON_EGG_TOKEN_CLAUSE: &str = "Create a 2/2 red Dragon creature token with flying and \"{R}: This token gets +1/+0 until end of turn.\"";
+    /// Nesting Dragon's nested single-quoted binding, masked as one span by
+    /// `strip_quoted_segments` (verbatim Oracle text).
+    const NESTING_DRAGON: &str = "Flying\nLandfall — Whenever a land you control enters, create a 0/2 red Dragon Egg creature token with defender and \"When this token dies, create a 2/2 red Dragon creature token with flying and '{R}: This token gets +1/+0 until end of turn.'\"";
+    /// Brood Keeper is the in-corpus control: the same granted ability reaching a
+    /// token through the `It has \"…\"` path, which already carried the guard one
+    /// level down (`parse_quoted_rule_static_modifications`).
+    const BROOD_KEEPER: &str = "Whenever an Aura becomes attached to this creature, create a 2/2 red Dragon creature token with flying. It has \"{R}: This creature gets +1/+0 until end of turn.\"";
+
+    /// CR 602.1 + CR 602.1a + CR 604.1 + CR 611.2a: the token's granted ability is
+    /// an ACTIVATED `{R}` pump +1/+0 on the recipient lasting until end of turn.
+    ///
+    /// Revert-failing at every assertion past the first: before the static-line
+    /// guard, `push_parsed_statics` took the `parse_static_line_multi` early return
+    /// and emitted `Continuous { SelfRef, [AddPower 1, AddToughness 0] }` — no
+    /// granted ability at all, cost and duration dropped outright.
+    ///
+    /// Asserted as a SHAPE, never byte equality: Brood Keeper's wrapper is built by
+    /// the `It has "…"` path and carries a `description`, while Dragon Egg's is built
+    /// by `push_parsed_statics`' fallback (`token.rs:1359-1367`) and carries none.
+    fn assert_granted_red_pump(statics: &[StaticDefinition], token: &str) {
+        assert_eq!(
+            statics.len(),
+            1,
+            "{token}: expected exactly one static definition, got {statics:#?}"
+        );
+        let def = &statics[0];
+        assert_eq!(
+            def.affected,
+            Some(TargetFilter::SelfRef),
+            "{token}: the recipient must be the token itself"
+        );
+        assert_eq!(
+            def.modifications.len(),
+            1,
+            "{token}: a bare AddPower/AddToughness would show up here — got {:#?}",
+            def.modifications
+        );
+        let ContinuousModification::GrantAbility { definition } = &def.modifications[0] else {
+            panic!(
+                "{token}: expected GrantAbility, got {:#?}",
+                def.modifications[0]
+            );
+        };
+        assert_eq!(definition.kind, AbilityKind::Activated, "{token}");
+        assert_eq!(
+            definition.cost,
+            Some(AbilityCost::Mana {
+                cost: ManaCost::Cost {
+                    shards: vec![ManaCostShard::Red],
+                    generic: 0,
+                },
+            }),
+            "{token}: the {{R}} activation cost must be carried, not dropped"
+        );
+        let Effect::Pump {
+            power,
+            toughness,
+            target,
+        } = &*definition.effect
+        else {
+            panic!("{token}: expected Pump, got {:?}", definition.effect);
+        };
+        assert_eq!(
+            (power, toughness),
+            (&PtValue::Fixed(1), &PtValue::Fixed(0)),
+            "{token}: expected +1/+0"
+        );
+        assert_eq!(target, &TargetFilter::SelfRef, "{token}");
+        assert_eq!(
+            definition.duration,
+            Some(Duration::UntilEndOfTurn),
+            "{token}: the duration must be carried, not dropped"
+        );
+    }
+
+    /// Reach guard: the unit parsed through to a real payload instead of tripping
+    /// the `Effect::Unimplemented` short-circuit that would make every absence
+    /// assertion below vacuous.
+    fn assert_no_unimplemented(debugged: &impl std::fmt::Debug, what: &str) {
+        assert!(
+            // allow-noncombinator: test assertion scanning debug output, not parsing dispatch.
+            !format!("{debugged:?}").contains("Unimplemented"),
+            "{what} must have no residual Unimplemented effect"
+        );
+    }
+
+    /// Dragon Egg's token clause at the seam the defect was reached through:
+    /// `try_parse_token` → `push_parsed_statics`.
+    #[test]
+    fn dragon_egg_token_clause_grants_an_activated_pump() {
+        let effect = try_parse_token(
+            &DRAGON_EGG_TOKEN_CLAUSE.to_lowercase(),
+            DRAGON_EGG_TOKEN_CLAUSE,
+            &mut ParseContext::default(),
+        )
+        .expect("Dragon Egg's token clause must parse");
+        assert_no_unimplemented(&effect, "Dragon Egg's token clause");
+        let Effect::Token {
+            static_abilities, ..
+        } = &effect
+        else {
+            panic!("expected Effect::Token, got {effect:?}");
+        };
+        assert_granted_red_pump(static_abilities, "Dragon Egg");
+    }
+
+    /// Nesting Dragon: the same granted ability, one token nesting deeper — the
+    /// Dragon Egg token's dies trigger creates the Dragon token whose quoted grant
+    /// is the defect site.
+    #[test]
+    fn nesting_dragon_inner_token_grants_an_activated_pump() {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            NESTING_DRAGON,
+            "Nesting Dragon",
+            &["Flying".to_string()],
+            &["Creature".to_string()],
+            &[],
+        );
+        let execute = parsed
+            .triggers
+            .first()
+            .expect("Nesting Dragon's Landfall trigger must parse")
+            .execute
+            .as_deref()
+            .expect("Landfall trigger must have an execute chain");
+        let Effect::Token {
+            static_abilities, ..
+        } = &*execute.effect
+        else {
+            panic!("expected the outer Effect::Token, got {:?}", execute.effect);
+        };
+        let inner_trigger = static_abilities
+            .iter()
+            .flat_map(|def| def.modifications.iter())
+            .find_map(|modification| match modification {
+                ContinuousModification::GrantTrigger { trigger } => Some(trigger),
+                _ => None,
+            })
+            .expect("the Dragon Egg token must carry a granted dies trigger");
+        let inner_execute = inner_trigger
+            .execute
+            .as_deref()
+            .expect("the granted dies trigger must have an execute chain");
+        assert_no_unimplemented(inner_execute, "Nesting Dragon's inner trigger");
+        let Effect::Token {
+            static_abilities, ..
+        } = &*inner_execute.effect
+        else {
+            panic!(
+                "expected the inner Effect::Token, got {:?}",
+                inner_execute.effect
+            );
+        };
+        assert_granted_red_pump(static_abilities, "Nesting Dragon's inner Dragon token");
+    }
+
+    /// Brood Keeper parity: a different host path (`It has "…"`) must reach the
+    /// identical shape, so the two are asserted by the same helper rather than by
+    /// two independently drifting expectations.
+    #[test]
+    fn brood_keeper_token_grant_has_the_same_shape() {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            BROOD_KEEPER,
+            "Brood Keeper",
+            &[],
+            &["Creature".to_string()],
+            &[],
+        );
+        let execute = parsed
+            .triggers
+            .first()
+            .expect("Brood Keeper's Aura trigger must parse")
+            .execute
+            .as_deref()
+            .expect("the Aura trigger must have an execute chain");
+        let Effect::Token {
+            static_abilities, ..
+        } = &*execute.effect
+        else {
+            panic!("expected Effect::Token, got {:?}", execute.effect);
+        };
+        assert_no_unimplemented(static_abilities, "Brood Keeper's token");
+        assert_granted_red_pump(static_abilities, "Brood Keeper");
     }
 }
 

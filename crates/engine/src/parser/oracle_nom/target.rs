@@ -6,13 +6,14 @@
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{satisfy, space1};
-use nom::combinator::{all_consuming, eof, map, map_opt, not, opt, peek, success, value};
+use nom::combinator::{all_consuming, eof, map, map_opt, not, opt, peek, success, value, verify};
 use nom::multi::separated_list1;
 use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
+use super::bridge::nom_on_lower;
 use super::error::{oracle_err, OracleError, OracleResult};
-use super::primitives::parse_color;
+use super::primitives::{parse_color, parse_number, scan_preceded};
 use crate::parser::oracle_util::{parse_subtype, GRANTING_SELF_PLACEHOLDER, OUTLAW_SUBTYPES};
 use crate::types::ability::{
     Comparator, ControllerRef, FilterProp, StackAbilityKind, TargetFilter, TypeFilter, TypedFilter,
@@ -429,6 +430,71 @@ pub(crate) fn parse_controller_phrase(input: &str) -> OracleResult<'_, Controlle
     .parse(input)
 }
 
+impl ControllerPhrase {
+    /// "you control".
+    pub(crate) const YOU_CONTROL: Self = Self {
+        subject: ControllerSubject::Direct(ControllerRef::You),
+        form: ControllerForm::Plural,
+        tense: ControllerTense::Present,
+    };
+    /// "they control".
+    pub(crate) const THEY_CONTROL: Self = Self {
+        subject: ControllerSubject::Anaphoric(PlayerAnaphor::They),
+        form: ControllerForm::Plural,
+        tense: ControllerTense::Present,
+    };
+    /// "that player controls".
+    pub(crate) const THAT_PLAYER_CONTROLS: Self = Self {
+        subject: ControllerSubject::Anaphoric(PlayerAnaphor::ThatPlayer),
+        form: ControllerForm::Singular,
+        tense: ControllerTense::Present,
+    };
+    /// "controlled by that player".
+    pub(crate) const CONTROLLED_BY_THAT_PLAYER: Self = Self {
+        subject: ControllerSubject::Anaphoric(PlayerAnaphor::ThatPlayer),
+        form: ControllerForm::Passive,
+        tense: ControllerTense::Present,
+    };
+    /// "the chosen player controls".
+    pub(crate) const THE_CHOSEN_PLAYER_CONTROLS: Self = Self {
+        subject: ControllerSubject::Direct(ControllerRef::SourceChosenPlayer),
+        form: ControllerForm::Singular,
+        tense: ControllerTense::Present,
+    };
+}
+
+/// Recognize-only projection of [`parse_controller_phrase`] for a structural-marker
+/// site: consumes a controller phrase that is one of `admitted` and binds nothing,
+/// because the enclosing construct, not the phrase, fixes whose objects are meant.
+pub(crate) fn controller_phrase_among<'a>(
+    admitted: &'static [ControllerPhrase],
+) -> impl Parser<&'a str, Output = (), Error = OracleError<'a>> {
+    value(
+        (),
+        verify(parse_controller_phrase, move |phrase: &ControllerPhrase| {
+            admitted.contains(phrase)
+        }),
+    )
+}
+
+/// [`controller_phrase_among`] for a structural-marker site that reads
+/// original-case text (a `tag_no_case` construct). The lowercase grammar runs
+/// through the mixed-case bridge [`nom_on_lower`], and the remainder is mapped
+/// back onto the original-case input.
+pub(crate) fn controller_phrase_among_mixed_case<'a>(
+    admitted: &'static [ControllerPhrase],
+) -> impl Parser<&'a str, Output = (), Error = OracleError<'a>> {
+    move |input: &'a str| {
+        // ASCII lowercasing keeps byte offsets aligned with `input`.
+        let lower = input.to_ascii_lowercase();
+        nom_on_lower(input, &lower, |i| {
+            controller_phrase_among(admitted).parse(i)
+        })
+        .map(|((), rest)| (rest, ()))
+        .ok_or_else(|| oracle_err(input))
+    }
+}
+
 /// Parse a present-tense direct controller suffix for a type phrase: "you
 /// control", "an opponent controls", "you don't control", "target player
 /// controls", "defending player controls", ….
@@ -654,6 +720,99 @@ pub fn parse_cost_self_reference(input: &str) -> OracleResult<'_, TargetFilter> 
         value(TargetFilter::SelfRef, tag("cardname")),
     ))
     .parse(input)
+}
+
+/// Grammatical number a hand-destination possessive imposes on the returned
+/// object phrase. "your hand" is number-neutral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnedObjectNumber {
+    Singular,
+    Plural,
+    Unmarked,
+}
+
+/// CR 400.3: an object put into a hand goes to its owner's hand. The owner
+/// possessive forms, each with the grammatical number it marks. Single source
+/// of these literals for costs and zone-change triggers.
+pub fn parse_owner_hand_possessive(input: &str) -> OracleResult<'_, ReturnedObjectNumber> {
+    alt((
+        value(ReturnedObjectNumber::Singular, tag("its owner's hand")),
+        value(ReturnedObjectNumber::Plural, tag("their owner's hand")),
+        value(ReturnedObjectNumber::Plural, tag("their owners' hands")),
+    ))
+    .parse(input)
+}
+
+/// "to <owner possessive>" | "to your hand".
+pub fn parse_return_to_hand_destination(input: &str) -> OracleResult<'_, ReturnedObjectNumber> {
+    preceded(
+        tag("to "),
+        alt((
+            parse_owner_hand_possessive,
+            value(ReturnedObjectNumber::Unmarked, tag("your hand")),
+        )),
+    )
+    .parse(input)
+}
+
+/// A counted return-to-hand object phrase split from its hand destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CountedReturnObject<'a> {
+    /// How many objects the phrase names (an article counts as one).
+    pub count: u32,
+    /// The object phrase with the count token removed.
+    pub object: &'a str,
+    /// Text after the destination, left to the caller.
+    pub trailing: &'a str,
+}
+
+/// CR 601.2h: splits "[count] <object> to <hand destination>…" (the count is
+/// part of the total cost). A plural destination with no count token, or an
+/// object phrase led by a non-count quantity ("X lands …", "any number of …")
+/// on any destination, is declined rather than read as one (an 'up to N'
+/// phrase is not declined here; no printed cost carries one). Lowercase input.
+pub fn split_counted_return_to_hand_object(input: &str) -> Option<CountedReturnObject<'_>> {
+    let (before, number, trailing) = scan_preceded(input, parse_return_to_hand_destination)?;
+    let object = before.trim_end();
+    let (object, count) = opt(terminated(
+        verify(parse_number, |n: &u32| *n >= 1),
+        tag(" "),
+    ))
+    .parse(object)
+    .ok()?;
+    // "one or more …" / "two or fewer …": a count token followed by a range
+    // tail is a quantifier, not the exact count the token alone would read as.
+    if count.is_some() && parse_count_range_tail(object).is_ok() {
+        return None;
+    }
+    // "x …" and "any number of …" are quantities, not a count token; on the
+    // number-neutral "your hand" destination they would otherwise read as one.
+    if count.is_none() && parse_non_count_quantity(object).is_ok() {
+        return None;
+    }
+    let count = match (count, number) {
+        (None, ReturnedObjectNumber::Plural) => return None,
+        (None, ReturnedObjectNumber::Singular | ReturnedObjectNumber::Unmarked) => 1,
+        (Some(n), _) => n,
+    };
+    if object.is_empty() {
+        return None;
+    }
+    Some(CountedReturnObject {
+        count,
+        object,
+        trailing,
+    })
+}
+
+/// A range tail that follows a count token ("or more ", "or fewer ").
+fn parse_count_range_tail(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("or more "), tag("or fewer "))).parse(input)
+}
+
+/// A leading quantity that is not a fixed count ("x ", "any number of ").
+fn parse_non_count_quantity(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("x "), tag("any number of "))).parse(input)
 }
 
 /// Parse "it" as a self-reference, requiring a word boundary after "it"
@@ -1269,6 +1428,71 @@ pub(crate) fn parse_object_exclusion_list(input: &str) -> OracleResult<'_, Vec<O
 mod tests {
     use super::*;
 
+    /// Each constant is the grammar's reading of its phrase, and the
+    /// recognize-only projection admits exactly its slice: a phrase sharing the
+    /// subject in a different form or tense is declined.
+    #[test]
+    fn controller_phrase_constants_and_marker() {
+        for (text, constant) in [
+            ("you control", ControllerPhrase::YOU_CONTROL),
+            ("they control", ControllerPhrase::THEY_CONTROL),
+            (
+                "that player controls",
+                ControllerPhrase::THAT_PLAYER_CONTROLS,
+            ),
+            (
+                "controlled by that player",
+                ControllerPhrase::CONTROLLED_BY_THAT_PLAYER,
+            ),
+            (
+                "the chosen player controls",
+                ControllerPhrase::THE_CHOSEN_PLAYER_CONTROLS,
+            ),
+        ] {
+            assert_eq!(
+                parse_controller_phrase(text).ok(),
+                Some(("", constant)),
+                "{text:?}"
+            );
+        }
+
+        let mut they_control = controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]);
+        assert_eq!(they_control.parse("they control").ok(), Some(("", ())));
+        for declined in [
+            "that player controls",
+            "controlled by that player",
+            "they controlled",
+        ] {
+            assert!(they_control.parse(declined).is_err(), "{declined:?}");
+        }
+    }
+
+    /// The mixed-case projection admits the same phrases as the lowercase one
+    /// in any casing, and returns the remainder in the input's original case.
+    #[test]
+    fn controller_phrase_among_mixed_case_bridges_original_case() {
+        let mut they_control =
+            controller_phrase_among_mixed_case(&[ControllerPhrase::THEY_CONTROL]);
+        for text in [
+            "they control Into",
+            "They Control Into",
+            "THEY CONTROL Into",
+        ] {
+            assert_eq!(
+                they_control.parse(text).ok(),
+                Some((" Into", ())),
+                "{text:?}"
+            );
+        }
+        for declined in [
+            "That Player Controls",
+            "Controlled By That Player",
+            "They Controlled",
+        ] {
+            assert!(they_control.parse(declined).is_err(), "{declined:?}");
+        }
+    }
+
     #[test]
     fn object_exclusion_list_refuses_a_granter_reference() {
         assert!(parse_object_exclusion_list(&format!(
@@ -1281,6 +1505,149 @@ mod tests {
                 .1,
             vec![ObjectExclusion::Source, ObjectExclusion::ChosenObject]
         );
+    }
+
+    #[test]
+    fn return_to_hand_destination_numbers() {
+        assert_eq!(
+            parse_return_to_hand_destination("to its owner's hand"),
+            Ok(("", ReturnedObjectNumber::Singular))
+        );
+        assert_eq!(
+            parse_return_to_hand_destination("to their owner's hand."),
+            Ok((".", ReturnedObjectNumber::Plural))
+        );
+        assert_eq!(
+            parse_return_to_hand_destination("to their owners' hands"),
+            Ok(("", ReturnedObjectNumber::Plural))
+        );
+        assert_eq!(
+            parse_return_to_hand_destination("to your hand"),
+            Ok(("", ReturnedObjectNumber::Unmarked))
+        );
+        assert!(parse_return_to_hand_destination("to a hand").is_err());
+        assert!(parse_return_to_hand_destination("into its owner's hand").is_err());
+    }
+
+    #[test]
+    fn split_counted_return_to_hand_object_agreement() {
+        // Counted plural.
+        assert_eq!(
+            split_counted_return_to_hand_object("two islands you control to their owner's hand."),
+            Some(CountedReturnObject {
+                count: 2,
+                object: "islands you control",
+                trailing: ".",
+            })
+        );
+        // Plural destination without a count token declines (reach guard: the
+        // count-2 positive above uses the same destination).
+        assert_eq!(
+            split_counted_return_to_hand_object("x lands you control to their owner's hand"),
+            None
+        );
+        assert_eq!(
+            split_counted_return_to_hand_object(
+                "any number of lands you control to their owners' hands"
+            ),
+            None
+        );
+        // "your hand" is number-neutral: a non-count quantity declines there
+        // too (reach guard: the same destination with an article parses).
+        assert_eq!(
+            split_counted_return_to_hand_object("a creature card from your graveyard to your hand"),
+            Some(CountedReturnObject {
+                count: 1,
+                object: "creature card from your graveyard",
+                trailing: "",
+            })
+        );
+        assert_eq!(
+            split_counted_return_to_hand_object(
+                "x creature cards from your graveyard to your hand"
+            ),
+            None
+        );
+        assert_eq!(
+            split_counted_return_to_hand_object(
+                "any number of creature cards from your graveyard to your hand"
+            ),
+            None
+        );
+        // Article is a parsed count token.
+        assert_eq!(
+            split_counted_return_to_hand_object("a land you control to their owner's hand"),
+            Some(CountedReturnObject {
+                count: 1,
+                object: "land you control",
+                trailing: "",
+            })
+        );
+        // "another" is not the article "an".
+        assert_eq!(
+            split_counted_return_to_hand_object("another creature you control to its owner's hand"),
+            Some(CountedReturnObject {
+                count: 1,
+                object: "another creature you control",
+                trailing: "",
+            })
+        );
+        // A hyphenated word is not a count.
+        assert_eq!(
+            split_counted_return_to_hand_object("two-headed giant to its owner's hand"),
+            Some(CountedReturnObject {
+                count: 1,
+                object: "two-headed giant",
+                trailing: "",
+            })
+        );
+        // Word boundary: "into" is not "to" (reach guard: "to" matches).
+        assert_eq!(
+            split_counted_return_to_hand_object("card into its owner's hand"),
+            None
+        );
+        assert!(split_counted_return_to_hand_object("card to its owner's hand").is_some());
+        // No destination.
+        assert_eq!(
+            split_counted_return_to_hand_object("two islands you control"),
+            None
+        );
+    }
+
+    #[test]
+    fn split_counted_return_to_hand_object_declines_range_quantifiers() {
+        // Reach guards: the exact counts of the same destinations split.
+        assert_eq!(
+            split_counted_return_to_hand_object("two lands you control to their owner's hand"),
+            Some(CountedReturnObject {
+                count: 2,
+                object: "lands you control",
+                trailing: "",
+            })
+        );
+        assert_eq!(
+            split_counted_return_to_hand_object("a land you control to its owner's hand"),
+            Some(CountedReturnObject {
+                count: 1,
+                object: "land you control",
+                trailing: "",
+            })
+        );
+        for input in [
+            "one or more lands you control to their owner's hand",
+            "two or more lands you control to their owner's hand",
+            "2 or more lands you control to their owner's hand",
+            "one or fewer lands you control to their owner's hand",
+            "three or fewer lands you control to their owner's hand",
+            "one or more lands you control to your hand",
+            "one or more creature cards from your graveyard to your hand",
+        ] {
+            assert_eq!(
+                split_counted_return_to_hand_object(input),
+                None,
+                "{input:?} must decline"
+            );
+        }
     }
 
     #[test]

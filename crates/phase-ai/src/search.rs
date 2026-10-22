@@ -10,23 +10,24 @@ use std::io::BufReader;
 
 use engine::ai_support::{
     build_decision_context, build_decision_context_for_semantic_owner, certify_fetch_then_cast,
-    certify_pact_plan, is_pact_payment_cast, is_targeted_exchange_root, retarget_actions,
-    root_may_yield_adverse_exchange, targeted_exchange_verdict,
+    certify_pact_plan, controls_exact_fetchland, is_pact_payment_cast, is_targeted_exchange_root,
+    retarget_actions, root_may_yield_adverse_exchange, targeted_exchange_verdict,
     validated_candidate_actions_for_semantic_owner, AiDecisionContract, TargetedExchangeVerdict,
 };
 use engine::types::ability::{
-    AbilityDefinition, ContinuousModification, Duration, Effect, ResolvedAbility, StaticDefinition,
-    TargetFilter, TargetRef,
+    AbilityCost, AbilityDefinition, ContinuousModification, Duration, Effect, ResolvedAbility,
+    StaticDefinition, TargetFilter, TargetRef,
 };
 use engine::types::actions::{AlternativeCastDecision, GameAction, MulliganChoice};
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{
     CastOfferKind, CompanionDeclaration, CostResume, DistributionUnit, GameState, ManaChoice,
-    ManaChoiceContext, ManaChoicePrompt, MulliganDecisionPhase, PendingMulliganAction, WaitingFor,
+    ManaChoiceContext, ManaChoicePrompt, MulliganDecisionPhase, PendingMulliganAction,
+    StackEntryKind, WaitingFor,
 };
 use engine::types::identifiers::{ObjectId, ObjectIdentityBinding, ObjectIncarnationRef};
 use engine::types::keywords::Keyword;
-use engine::types::mana::ManaType;
+use engine::types::mana::{ManaCost, ManaType};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::statics::StaticMode;
@@ -43,8 +44,8 @@ use crate::context::AiContext;
 use crate::features::DeckFeatures;
 use crate::plan::{PlanSnapshot, PlanState};
 use crate::planner::{
-    apply_candidate, prepare_payment_candidates, BeamContinuationPlanner, ContinuationPlanner,
-    PlannerServices, PreparedCandidate, RankedCandidate, RungStat, SearchBudget,
+    prepare_payment_candidates, BeamContinuationPlanner, PlannerServices, PreparedCandidate,
+    RankedCandidate, RungStat, SearchBudget,
 };
 use crate::policies::context::{PolicyContext, SearchDepth};
 use crate::policies::copy_value::score_legend_rule_keep;
@@ -288,6 +289,11 @@ pub struct AiDecisionSelection {
     pub receipt: Option<crate::decision_receipt::AiDecisionDiagnosticReceipt>,
 }
 
+/// The one decision routine behind every `choose_action*` entry point: issue
+/// the engine's decision contract for `ai_player`, answer the prompts that need
+/// no search directly, and otherwise score the issued candidates and pick one.
+/// The contract issued here and the outcome of the priority shortcut are handed
+/// to the scorer so it does not derive them a second time for the same state.
 fn choose_action_with_session_inner(
     state: &GameState,
     ai_player: PlayerId,
@@ -416,6 +422,14 @@ fn choose_action_with_session_inner(
         }
     }
 
+    // CR 118.5 + CR 118.12a: acknowledge a free Counter payment to protect
+    // the spell. Other unless effects can make declining strategically useful.
+    if zero_counter_payment_owed_by(state, ai_player) {
+        if let Some(action) = bind_specialist(GameAction::PayUnlessCost { pay: true }) {
+            return direct(Some(action));
+        }
+    }
+
     // CR 608.2c + CR 701.23: SearchChoice picks have their own dedicated
     // beam-bounded scorer in `deterministic_choice`. Routing them through
     // `score_candidates` first would force `validate_candidates` to clone
@@ -501,7 +515,14 @@ fn choose_action_with_session_inner(
         return direct(fallback_action(state, config, &contract).and_then(&bind_specialist));
     }
 
-    if let Some(action) = fast_priority_action(state, ai_player, config, session)
+    let fast_priority = fast_priority_action(state, ai_player, config, session);
+    // Only an absent shortcut is reusable: a present one may be filtered out or
+    // followed by session writes below, so the scorer recomputes it.
+    let priority_shortcut = match &fast_priority {
+        None => RootPriorityShortcut::KnownAbsent,
+        Some(_) => RootPriorityShortcut::Recompute,
+    };
+    if let Some(action) = fast_priority
         .filter(|action| durable_pact_routes || !is_certified_pact_root(state, ai_player, action))
     {
         if durable_pact_routes {
@@ -518,7 +539,16 @@ fn choose_action_with_session_inner(
         }
     }
 
-    let mut scored = score_candidates_with_session(state, ai_player, config, session);
+    let mut scored = score_candidates_for_root(
+        state,
+        ai_player,
+        config,
+        session,
+        RootReuse::FromChooser {
+            contract: &contract,
+            priority_shortcut,
+        },
+    );
     if durable_pact_routes {
         draft_pact_routes_for_scored_actions(state, ai_player, &scored, session);
     } else {
@@ -1193,6 +1223,42 @@ fn issued_selection(contract: &AiDecisionContract) -> Option<GameAction> {
         .map(|(_, action)| action.clone())
 }
 
+/// CR 118.5 + CR 118.12a: a payable zero Mana cost protecting a spell from
+/// Counter uses the specialist. Other heads/costs retain their scored policy.
+///
+/// Paying is forced only when every object the instruction would counter is a
+/// spell the payer controls; a Counter of another player's spell, of an
+/// ability, or of nothing keeps the scored policy. The countered referent is
+/// the engine's own resolver binding.
+fn zero_counter_payment_owed_by(state: &GameState, payer: PlayerId) -> bool {
+    let WaitingFor::UnlessPayment {
+        player,
+        cost: AbilityCost::Mana { cost },
+        pending_effect,
+        trigger_event,
+        ..
+    } = &state.waiting_for
+    else {
+        return false;
+    };
+    if *player != payer || *cost != ManaCost::zero() {
+        return false;
+    }
+    let countered = engine::game::effects::unless_payment_countered_stack_ids(
+        state,
+        pending_effect,
+        trigger_event.as_ref(),
+    );
+    !countered.is_empty()
+        && countered.iter().all(|id| {
+            state.stack.iter().any(|entry| {
+                entry.id == *id
+                    && entry.controller == payer
+                    && matches!(entry.kind, StackEntryKind::Spell { .. })
+            })
+        })
+}
+
 /// Produce a safe action when the AI has no scored candidates.
 /// During combat, submit empty declarations. During active play, pass priority.
 /// Returns None only for terminal states (GameOver) where no action is possible.
@@ -1314,6 +1380,10 @@ pub fn fallback_action(
     let action = match &state.waiting_for {
         // Terminal — no action possible.
         WaitingFor::GameOver { .. } => None,
+
+        // Eye to Eye / Mouth to Mouth: the host drives the contest and AI seats click on the
+        // schedule `contest::AiContestants` plans — there is no `GameAction` to choose.
+        WaitingFor::PhysicalContest { .. } => None,
 
         // A local player explicitly proposed this shortcut. AI seats accept the
         // engine-issued consent so the authoritative Ready consumer can
@@ -1646,8 +1716,11 @@ pub fn fallback_action(
             ..
         } => Some(GameAction::DecideOptionalEffect { accept: false }),
 
-        // Unless payment: decline to pay (let the effect resolve).
-        WaitingFor::UnlessPayment { .. } => Some(GameAction::PayUnlessCost { pay: false }),
+        // Unless payment: pay a zero-Mana Counter cost (CR 118.5);
+        // decline every other unless payment.
+        WaitingFor::UnlessPayment { player, .. } => Some(GameAction::PayUnlessCost {
+            pay: zero_counter_payment_owed_by(state, *player),
+        }),
 
         // Disjunctive activation costs: default to the first payable branch.
         WaitingFor::ActivationCostOneOfChoice {
@@ -1689,6 +1762,14 @@ pub fn fallback_action(
 
         // Ring-bearer with no creatures: skip (empty ChooseTarget).
         WaitingFor::ChooseRingBearer { .. } => Some(GameAction::ChooseTarget { target: None }),
+
+        // Boon token-host choice (Dunbarrow Revivalist): a mandatory
+        // resolution-time pick among stamped entrants. Mid-resolution, so
+        // there is no cast to cancel: answer the first engine-issued
+        // ChooseTarget (the prompt only opens with 2+ legal hosts).
+        WaitingFor::ChooseTokenHost { .. } => {
+            issued(|action| matches!(action, GameAction::ChooseTarget { target: Some(_) }))
+        }
 
         // Distribute with empty targets: empty distribution.
         WaitingFor::DistributeAmong { .. } => Some(GameAction::DistributeAmong {
@@ -2606,22 +2687,78 @@ fn finalize_mean(
 /// `determinization_samples == 0` this is byte-identical to the pre-feature
 /// single search. With `K > 0` it runs the untouched search against K
 /// determinized opponent-hidden-zone samples and means the per-action scores.
+/// Derives everything about the root from `state` itself.
 pub(crate) fn score_candidates_with_session(
     state: &GameState,
     ai_player: PlayerId,
     config: &AiConfig,
     session: &Arc<AiSession>,
 ) -> Vec<(GameAction, f64)> {
+    score_candidates_for_root(state, ai_player, config, session, RootReuse::Fresh)
+}
+
+/// Whether the chooser already knows the priority shortcut is unavailable at
+/// the root it is about to score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootPriorityShortcut {
+    /// `fast_priority_action` was just run on this exact state, player, config
+    /// and session and returned `None`, with nothing executed since. Running it
+    /// again would return `None` again, so the scorer skips it.
+    KnownAbsent,
+    /// Nothing is known (or the shortcut produced an action, after which the
+    /// chooser may have written the session); the scorer runs it itself.
+    Recompute,
+}
+
+/// What the caller of the scorer already derived about the root position.
+#[derive(Debug, Clone, Copy)]
+enum RootReuse<'c> {
+    /// Nothing; the scorer derives the decision contract and the priority
+    /// shortcut from the state it is given.
+    Fresh,
+    /// The chooser's own results. `contract` must have been issued for exactly
+    /// the `state` and `ai_player` the scorer is called with, and
+    /// `priority_shortcut` must describe that same state.
+    FromChooser {
+        /// The decision contract the chooser issued for this state and player.
+        contract: &'c AiDecisionContract,
+        /// What the chooser learned from the priority shortcut.
+        priority_shortcut: RootPriorityShortcut,
+    },
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Times the scorer core derived the root decision contract itself.
+    static ROOT_CONTRACT_ISSUES_IN_CORE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Times the scorer core ran the priority shortcut itself.
+    static ROOT_FAST_PRIORITY_RERUNS_IN_CORE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Times the fetch-then-cast route check computed the validated domain.
+    static FETCH_ROUTE_DOMAIN_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Times Pact drafting computed the validated domain.
+    static PACT_DRAFT_DOMAIN_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`score_candidates_with_session`] with the caller's knowledge of the root.
+/// `root` is forwarded only to the searches that run on `state` itself; every
+/// determinized sample is a different state and is scored `Fresh`.
+fn score_candidates_for_root(
+    state: &GameState,
+    ai_player: PlayerId,
+    config: &AiConfig,
+    session: &Arc<AiSession>,
+    root: RootReuse<'_>,
+) -> Vec<(GameAction, f64)> {
     // Attacker declarations are public-state tactical choices. Running K hidden
     // information samples cannot improve them, but would multiply the bounded
     // multiplayer comparison and make a singleton support drift.
     if matches!(state.waiting_for, WaitingFor::DeclareAttackers { .. }) {
-        return score_candidates_core(state, ai_player, config, session, None);
+        return score_candidates_core_for_root(state, ai_player, config, session, None, root);
     }
     let k = config.search.determinization_samples;
     if k == 0 {
         // Unchanged path: no determinization, no shared-deadline override.
-        return score_candidates_core(state, ai_player, config, session, None);
+        return score_candidates_core_for_root(state, ai_player, config, session, None, root);
     }
 
     // ONE shared wall-clock ceiling across all K sequential samples (bounds
@@ -3105,13 +3242,28 @@ fn inject_prospective_fetch_scores(
 /// Persist only opaque Pact drafts while ranking roots. The certificate is
 /// derived by the engine from the exact delayed-trigger installation receipt;
 /// no sampled state or provenance is retained in phase-AI.
+///
+/// A plan can only be certified for a Pact payment cast, and a scored action
+/// only matches a candidate with the same cast object, so when no scored action
+/// is such a cast there is nothing to certify and the validated domain (one
+/// clone-and-apply per candidate) is not computed. The proposals entry is
+/// written either way.
 fn draft_pact_routes_for_scored_actions(
     state: &GameState,
     ai_player: PlayerId,
     scored: &[(GameAction, f64)],
     session: &Arc<AiSession>,
 ) {
-    let candidates = validated_candidate_actions_for_semantic_owner(state, ai_player);
+    let candidates = if scored
+        .iter()
+        .any(|(action, _)| is_pact_payment_cast(state, action))
+    {
+        #[cfg(test)]
+        PACT_DRAFT_DOMAIN_VALIDATIONS.with(|count| count.set(count.get() + 1));
+        validated_candidate_actions_for_semantic_owner(state, ai_player)
+    } else {
+        Vec::new()
+    };
     let proposals: Vec<_> = scored
         .iter()
         .filter_map(|(action, _)| {
@@ -3161,14 +3313,30 @@ fn remove_certified_pact_roots(
     scored.retain(|(action, _)| !is_certified_pact_root(state, ai_player, action));
 }
 
+/// Whether some validated candidate of `ai_player` is a certified
+/// fetch-then-cast root. A route needs a card to cast and an exact fetchland
+/// the player controls; when either is missing no candidate can be certified,
+/// so the validated domain (one clone-and-apply per candidate) is not computed.
 fn has_certified_fetch_then_cast_route(state: &GameState, ai_player: PlayerId) -> bool {
     let casts = hand_identity_bindings(state, ai_player);
     !casts.is_empty()
-        && validated_candidate_actions_for_semantic_owner(state, ai_player)
+        && controls_exact_fetchland(state, ai_player)
+        && fetch_route_validated_domain(state, ai_player)
             .into_iter()
             .any(|candidate| {
                 certify_fetch_then_cast(state, &candidate, &casts, |_, _| 0.0).is_some()
             })
+}
+
+/// The validated candidate domain the fetch-then-cast route check certifies
+/// over. Split out so tests can witness how often it is computed.
+fn fetch_route_validated_domain(
+    state: &GameState,
+    ai_player: PlayerId,
+) -> Vec<engine::ai_support::CandidateAction> {
+    #[cfg(test)]
+    FETCH_ROUTE_DOMAIN_VALIDATIONS.with(|count| count.set(count.get() + 1));
+    validated_candidate_actions_for_semantic_owner(state, ai_player)
 }
 
 fn hand_identity_bindings(state: &GameState, ai_player: PlayerId) -> Vec<ObjectIdentityBinding> {
@@ -3255,13 +3423,54 @@ fn retain_live_pact_route(state: &GameState, ai_player: PlayerId, session: &Arc<
 /// Core scoring for a single (possibly determinized) state. Byte-identical to
 /// the pre-feature `score_candidates_with_session` except it threads a shared
 /// `deadline_override` into `PlannerServices` — `None` reproduces the old
-/// behavior exactly.
+/// behavior exactly. Derives the root contract and priority shortcut itself.
 fn score_candidates_core(
     state: &GameState,
     ai_player: PlayerId,
     config: &AiConfig,
     session: &Arc<AiSession>,
     deadline_override: Option<engine::util::Deadline>,
+) -> Vec<(GameAction, f64)> {
+    score_candidates_core_for_root(
+        state,
+        ai_player,
+        config,
+        session,
+        deadline_override,
+        RootReuse::Fresh,
+    )
+}
+
+/// The engine-issued candidates for `ai_player` at the root: the chooser's
+/// contract when it supplied one, otherwise a freshly issued one. Both are the
+/// same list, because the owner-scoped decision context is defined as the
+/// contract's candidates.
+fn root_issued_candidates(
+    state: &GameState,
+    ai_player: PlayerId,
+    root: RootReuse<'_>,
+) -> Vec<engine::ai_support::CandidateAction> {
+    match root {
+        RootReuse::Fresh => {
+            #[cfg(test)]
+            ROOT_CONTRACT_ISSUES_IN_CORE.with(|count| count.set(count.get() + 1));
+            build_decision_context_for_semantic_owner(state, ai_player).candidates
+        }
+        RootReuse::FromChooser { contract, .. } => contract.candidates.clone(),
+    }
+}
+
+/// [`score_candidates_core`] with the caller's knowledge of the root. Under
+/// [`RootReuse::FromChooser`] the contract's candidates stand in for a second
+/// contract issue, and a priority shortcut the chooser found absent is not run
+/// again; everything else is identical to the `Fresh` path.
+fn score_candidates_core_for_root(
+    state: &GameState,
+    ai_player: PlayerId,
+    config: &AiConfig,
+    session: &Arc<AiSession>,
+    deadline_override: Option<engine::util::Deadline>,
+    root: RootReuse<'_>,
 ) -> Vec<(GameAction, f64)> {
     // The scored/parallel-worker path bypasses `choose_action_with_session_inner`.
     // Preserve Resolve All's user-proposed shortcut semantics here as well: Grant
@@ -3279,8 +3488,7 @@ fn score_candidates_core(
             ..
         }
     ) {
-        let issued_actions = build_decision_context_for_semantic_owner(state, ai_player)
-            .candidates
+        let issued_actions = root_issued_candidates(state, ai_player, root)
             .into_iter()
             .map(|candidate| candidate.action)
             .collect::<Vec<_>>();
@@ -3291,15 +3499,32 @@ fn score_candidates_core(
     if let Some(action) = evoke_variant_choice(state, ai_player) {
         return vec![(action, 1.0)];
     }
-    if let Some(action) = fast_priority_action(state, ai_player, config, session) {
-        return vec![(action, 1.0)];
+    match root {
+        RootReuse::FromChooser {
+            priority_shortcut: RootPriorityShortcut::KnownAbsent,
+            ..
+        } => {}
+        RootReuse::Fresh
+        | RootReuse::FromChooser {
+            priority_shortcut: RootPriorityShortcut::Recompute,
+            ..
+        } => {
+            #[cfg(test)]
+            ROOT_FAST_PRIORITY_RERUNS_IN_CORE.with(|count| count.set(count.get() + 1));
+            if let Some(action) = fast_priority_action(state, ai_player, config, session) {
+                return vec![(action, 1.0)];
+            }
+        }
     }
 
     // The scored path may be called for a named owner while another owner is
     // also pending. Reuse that owner's exact engine-issued domain throughout;
     // the generic context picks the first pending owner and can make a valid
     // choice disappear at the action boundary.
-    let ctx = build_decision_context_for_semantic_owner(state, ai_player);
+    let ctx = engine::ai_support::AiDecisionContext {
+        waiting_for: state.waiting_for.clone(),
+        candidates: root_issued_candidates(state, ai_player, root),
+    };
     #[cfg(test)]
     let policies = session
         .policy_registry_override
@@ -3467,6 +3692,11 @@ fn score_candidates_core(
 /// PV threading (D2) and the rung witness (D3) are the only additions over the
 /// pre-extraction behavior; both are no-ops for `rung_stats`/ordering when the
 /// beam is a single candidate or the killers are empty.
+///
+/// `state` becomes one tracked search root for the whole call, shared by every
+/// rung, so a rung reuses the root successors and the positions below them
+/// that an earlier rung already simulated. Root successors are keyed by action,
+/// so reordering the beam between rungs cannot misalign them.
 fn run_iterative_deepening(
     state: &GameState,
     mut ranked: Vec<RankedCandidate>,
@@ -3492,6 +3722,7 @@ fn run_iterative_deepening(
         .map(|r| (r.candidate.action.clone(), r.root_score(tactical_weight)))
         .collect();
 
+    let root = services.new_search_root();
     for iter_depth in 0..=ceiling {
         // Guard EVERY rung (incl. rung 0) at entry. Interactive: a pre-expired
         // deadline returns the tactical-only floor with zero applies (==
@@ -3505,7 +3736,7 @@ fn run_iterative_deepening(
         // The deepest rung thus gets the full max_nodes just like origin/main's
         // single pass.
         let mut budget = SearchBudget::with_deadline(config.search.max_nodes, services.deadline);
-        let mut planner = BeamContinuationPlanner {
+        let planner = BeamContinuationPlanner {
             depth: iter_depth,
             rollout_depth: config.search.rollout_depth,
         };
@@ -3520,12 +3751,13 @@ fn run_iterative_deepening(
                 completed = false;
                 break;
             }
-            let score = if let Some(sim) = r
-                .payment_successor
-                .clone()
-                .or_else(|| apply_candidate(state, &r.candidate))
-            {
-                let cont = planner.evaluate_after_action(&sim, services, &mut budget);
+            let score = if let Some((child, sim)) = services.successor_edge(
+                Some(root),
+                state,
+                &r.candidate,
+                r.payment_successor.clone(),
+            ) {
+                let cont = planner.evaluate_after_action_at(child, &sim, services, &mut budget);
                 let continuation = r
                     .continuation_witness
                     .filter(|witness| witness.is_finite())
@@ -4860,6 +5092,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::planner::apply_candidate;
     use crate::policies::mulligan::{registry_keeps, FREE_REVEAL_BOUND};
     use engine::ai_support::{
         ActionMetadata, AiDecisionContext, CandidateAction, CertifiedPactPlan, TacticalClass,
@@ -6528,6 +6761,546 @@ mod tests {
         AiDecisionContract::issue(state, owner)
     }
 
+    /// A mechanism fixture for the Counter specialist's cost/seat boundary.
+    /// The Counter targets a spell on the stack that the payer controls.
+    fn unless_payment_state(
+        cost: AbilityCost,
+        payer: PlayerId,
+        remaining: Vec<PlayerId>,
+    ) -> GameState {
+        unless_payment_state_countering(cost, payer, remaining, Some(payer))
+    }
+
+    /// The same fixture with the countered spell controlled by
+    /// `spell_controller`. `None` is the untargeted Counter, which counters
+    /// nothing.
+    fn unless_payment_state_countering(
+        cost: AbilityCost,
+        payer: PlayerId,
+        remaining: Vec<PlayerId>,
+        spell_controller: Option<PlayerId>,
+    ) -> GameState {
+        let mut state = make_state();
+        let source = ObjectId(900);
+        let targets = spell_controller
+            .map(|controller| {
+                let spell = create_object(
+                    &mut state,
+                    CardId(901),
+                    controller,
+                    "Countered Spell".to_string(),
+                    Zone::Stack,
+                );
+                state.stack.push_back(StackEntry {
+                    id: spell,
+                    source_id: spell,
+                    controller,
+                    kind: StackEntryKind::Spell {
+                        card_id: CardId(901),
+                        ability: None,
+                        casting_variant: engine::types::game_state::CastingVariant::Normal,
+                        actual_mana_spent: 0,
+                    },
+                });
+                vec![TargetRef::Object(spell)]
+            })
+            .unwrap_or_default();
+        let pending_effect = ResolvedAbility::new(
+            Effect::Counter {
+                target: TargetFilter::Any,
+                source_rider: None,
+                countered_spell_zone: None,
+            },
+            targets,
+            source,
+            PlayerId(0),
+        );
+        state.waiting_for = WaitingFor::UnlessPayment {
+            player: payer,
+            cost,
+            pending_effect: Box::new(pending_effect),
+            trigger_event: None,
+            effect_description: None,
+            remaining,
+        };
+        state
+    }
+
+    fn mana_unless_cost(cost: ManaCost) -> AbilityCost {
+        AbilityCost::Mana { cost }
+    }
+
+    const UNLESS_LEVELS: [AiDifficulty; 5] = [
+        AiDifficulty::VeryEasy,
+        AiDifficulty::Easy,
+        AiDifficulty::Medium,
+        AiDifficulty::Hard,
+        AiDifficulty::VeryHard,
+    ];
+
+    /// (pays, declines) over seeds 0..40 for `payer` answering `state`.
+    fn unless_answers(
+        state: &GameState,
+        payer: PlayerId,
+        difficulty: AiDifficulty,
+    ) -> (usize, usize) {
+        let config = create_config(difficulty, Platform::Native);
+        let mut tally = (0, 0);
+        for seed in 0..40u64 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            match choose_action(state, payer, &config, &mut rng) {
+                Some(GameAction::PayUnlessCost { pay: true }) => tally.0 += 1,
+                Some(GameAction::PayUnlessCost { pay: false }) => tally.1 += 1,
+                other => panic!("{difficulty:?} seed {seed}: unexpected answer {other:?}"),
+            }
+        }
+        tally
+    }
+
+    /// CR 118.5: a zero Counter payment is answered `pay: true` at VeryEasy through
+    /// VeryHard and every seed (the engine now asks for it instead of auto-paying). The pre-emption precedes every difficulty-keyed
+    /// branch, so CEDH takes it too.
+    #[test]
+    fn free_unless_payment_is_paid_at_every_difficulty() {
+        let payer = PlayerId(1);
+        for remaining in [vec![], vec![PlayerId(0)]] {
+            let state =
+                unless_payment_state(mana_unless_cost(ManaCost::zero()), payer, remaining.clone());
+            // Reach guard: the prompt is the payer's, and the engine issued both
+            // answers, so the pre-emption chose between two issued actions.
+            assert!(state.waiting_for.acting_players().contains(&payer));
+            let contract = AiDecisionContract::issue(&state, payer);
+            assert!(contract.contains_action(&state, &GameAction::PayUnlessCost { pay: true }));
+            assert!(contract.contains_action(&state, &GameAction::PayUnlessCost { pay: false }));
+            for difficulty in UNLESS_LEVELS {
+                assert_eq!(
+                    unless_answers(&state, payer, difficulty),
+                    (40, 0),
+                    "{difficulty:?}, remaining {remaining:?}"
+                );
+            }
+        }
+    }
+
+    /// The paired control: a real {1} cost keeps the scored path (both answers
+    /// occur at every level), and the zero-cost predicate matches nothing else.
+    #[test]
+    fn real_unless_payment_keeps_the_scored_path() {
+        let payer = PlayerId(1);
+        // The scored-path tally keeps the untargeted Counter, so that board is
+        // unchanged by the spell-protection premise below. The predicate rows
+        // at the end show the cost alone excludes a {1} protecting the payer's
+        // own spell.
+        let one = unless_payment_state_countering(
+            mana_unless_cost(ManaCost::generic(1)),
+            payer,
+            vec![],
+            None,
+        );
+        let zero = unless_payment_state(mana_unless_cost(ManaCost::zero()), payer, vec![]);
+        for difficulty in UNLESS_LEVELS {
+            // Reach guard: the same seeds at {0} protecting the payer's spell
+            // pay 40/40.
+            assert_eq!(unless_answers(&zero, payer, difficulty), (40, 0));
+            let (pays, declines) = unless_answers(&one, payer, difficulty);
+            assert!(
+                pays > 0 && declines > 0,
+                "{difficulty:?}: a {{1}} cost is not pre-empted (pays {pays}, declines {declines})"
+            );
+        }
+        let no_cost = mana_unless_cost(ManaCost::NoCost);
+        let pay_life_zero = AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value: 0 },
+        };
+        let generic_one = mana_unless_cost(ManaCost::generic(1));
+        for cost in [no_cost, pay_life_zero, generic_one] {
+            let state = unless_payment_state(cost.clone(), payer, vec![]);
+            assert!(!zero_counter_payment_owed_by(&state, payer), "{cost:?}");
+        }
+        assert!(zero_counter_payment_owed_by(&zero, payer));
+        assert!(
+            !zero_counter_payment_owed_by(&zero, PlayerId(0)),
+            "the predicate is keyed to the prompted seat"
+        );
+    }
+
+    /// `fallback_action` pays a zero Counter payment and declines a nonzero one.
+    #[test]
+    fn fallback_pays_a_free_unless_payment_and_declines_a_real_one() {
+        let payer = PlayerId(1);
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        for (cost, expected) in [(ManaCost::zero(), true), (ManaCost::generic(1), false)] {
+            let state = unless_payment_state(mana_unless_cost(cost.clone()), payer, vec![]);
+            let contract = test_contract(&state);
+            let answer = fallback_action(&state, &config, &contract);
+            assert_eq!(
+                answer,
+                Some(GameAction::PayUnlessCost { pay: expected }),
+                "{cost:?}"
+            );
+            assert!(contract.contains_action(&state, &answer.expect("answer")));
+        }
+    }
+
+    #[test]
+    fn ai_zero_counter_specialist_and_fallback_are_narrow() {
+        let config = create_config(AiDifficulty::Easy, Platform::Native);
+        for effect in [
+            Effect::DealDamage {
+                amount: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Any,
+                damage_source: None,
+                excess: None,
+            },
+            Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
+            },
+        ] {
+            let mut state = unless_payment_state(mana_unless_cost(ManaCost::zero()), P0, vec![]);
+            if let WaitingFor::UnlessPayment { pending_effect, .. } = &mut state.waiting_for {
+                pending_effect.effect = effect;
+            }
+            let contract = AiDecisionContract::issue(&state, P0);
+            assert!(contract.contains_action(&state, &GameAction::PayUnlessCost { pay: true }));
+            assert!(contract.contains_action(&state, &GameAction::PayUnlessCost { pay: false }));
+            assert!(!zero_counter_payment_owed_by(&state, P0));
+            assert_eq!(
+                fallback_action(&state, &config, &contract),
+                Some(GameAction::PayUnlessCost { pay: false })
+            );
+        }
+
+        // CR 701.6a + CR 118.12a: P0 is polled first, with P1 still to be
+        // asked (the "unless any player pays" shape). Paying {0} protects
+        // P0's own spell, which forces the payment (positive control). Paying
+        // to protect P1's spell, or for a Counter that counters nothing, is not
+        // forced; the ordinary policy answers it.
+        for (spell_controller, forced) in [(Some(P0), true), (Some(P1), false), (None, false)] {
+            let state = unless_payment_state_countering(
+                mana_unless_cost(ManaCost::zero()),
+                P0,
+                vec![P1],
+                spell_controller,
+            );
+            // Reach guard: the payer's prompt issues both answers, and the
+            // countered spell's controller is the only difference.
+            assert!(state.waiting_for.acting_players().contains(&P0));
+            assert_eq!(
+                state
+                    .stack
+                    .iter()
+                    .map(|entry| entry.controller)
+                    .collect::<Vec<_>>(),
+                spell_controller.into_iter().collect::<Vec<_>>()
+            );
+            let contract = AiDecisionContract::issue(&state, P0);
+            assert!(contract.contains_action(&state, &GameAction::PayUnlessCost { pay: true }));
+            assert!(contract.contains_action(&state, &GameAction::PayUnlessCost { pay: false }));
+            assert_eq!(
+                zero_counter_payment_owed_by(&state, P0),
+                forced,
+                "{spell_controller:?}"
+            );
+            assert_eq!(
+                fallback_action(&state, &config, &contract),
+                Some(GameAction::PayUnlessCost { pay: forced }),
+                "{spell_controller:?}"
+            );
+            if forced {
+                assert_eq!(
+                    choose_action(&state, P0, &config, &mut SmallRng::seed_from_u64(9943)),
+                    Some(GameAction::PayUnlessCost { pay: true })
+                );
+            }
+        }
+    }
+
+    /// Printed producer with independent Aura/host/Artist authorities.
+    #[test]
+    fn flux_memnite_zero_payment_keeps_ranked_choice_and_decline_payoff() {
+        use crate::decision_receipt::AiDecisionReceiptStatus;
+        use engine::game::game_object::AttachTarget;
+
+        for pay in [false, true] {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PostCombatMain).with_life(P1, 1);
+            let host = scenario
+                .add_creature(P0, "Memnite", 1, 1)
+                .as_artifact_creature()
+                .with_mana_cost(ManaCost::zero())
+                .id();
+            let artist = scenario.add_creature_from_oracle(P0, "Blood Artist", 0, 1,
+                "Whenever this creature or another creature dies, target player loses 1 life and you gain 1 life.")
+                .with_subtypes(vec!["Vampire"])
+                .with_mana_cost(ManaCost::Cost { shards: vec![ManaCostShard::Black], generic: 1 }).id();
+            let flux = scenario.add_spell_to_hand(P1, "Pendrell Flux", false)
+                .as_enchantment().with_subtypes(vec!["Aura"])
+                .from_oracle_text_with_keywords(&["Enchant"], "Enchant creature\nEnchanted creature has \"At the beginning of your upkeep, sacrifice this creature unless you pay its mana cost.\"")
+                .with_mana_cost(ManaCost::Cost { shards: vec![ManaCostShard::Blue], generic: 1 }).id();
+            let lands = [
+                scenario.add_basic_land(P1, ManaColor::Blue),
+                scenario.add_basic_land(P1, ManaColor::Blue),
+            ];
+            let mut runner = scenario.build();
+            runner.state_mut().active_player = P1;
+            runner.state_mut().priority_player = P1;
+            runner.state_mut().waiting_for = WaitingFor::Priority { player: P1 };
+            // CR 303.4a: MTGJSON's Enchant hint supplies the Aura's target filter.
+            assert_eq!(
+                runner.state().objects[&flux].card_types.core_types,
+                vec![CoreType::Enchantment]
+            );
+            assert!(runner.state().objects[&flux]
+                .keywords
+                .iter()
+                .any(|keyword| matches!(keyword, Keyword::Enchant(_))));
+            let committed = runner.cast(flux).target_object(host).commit();
+            let ability = committed
+                .state()
+                .stack
+                .back()
+                .and_then(|entry| entry.ability())
+                .expect("Flux committed with its Aura target");
+            assert_eq!(
+                engine::game::ability_utils::flatten_targets_in_chain(ability),
+                vec![TargetRef::Object(host)]
+            );
+            let cast = committed.resolve();
+            cast.assert_zone(&[flux, host, artist], Zone::Battlefield);
+            assert_eq!(
+                cast.state().objects[&flux].attached_to,
+                Some(AttachTarget::Object(host))
+            );
+            assert_eq!(cast.state().objects[&flux].controller, P1);
+            assert!(lands.iter().all(|land| cast.state().objects[land].tapped));
+            runner.advance_to_upkeep();
+            runner.resolve_top();
+            match &runner.state().waiting_for {
+                WaitingFor::UnlessPayment {
+                    player,
+                    cost,
+                    pending_effect,
+                    ..
+                } => {
+                    assert_eq!(*player, P0);
+                    assert_eq!(*cost, mana_unless_cost(ManaCost::zero()));
+                    assert_eq!(pending_effect.source_id, host);
+                    assert_eq!(pending_effect.controller, P0);
+                    assert!(matches!(pending_effect.effect, Effect::Sacrifice { .. }));
+                }
+                other => panic!("real granted trigger must prompt: {other:?}"),
+            }
+            assert_eq!(runner.state().objects[&host].zone, Zone::Battlefield);
+            let contract = AiDecisionContract::issue(runner.state(), P0);
+            for pay in [false, true] {
+                assert!(
+                    contract.contains_action(runner.state(), &GameAction::PayUnlessCost { pay })
+                );
+            }
+            let config = create_config(AiDifficulty::Easy, Platform::Native);
+            let session = AiSession::arc_from_game(runner.state());
+            let selection = choose_action_with_session_diagnostic(
+                runner.state(),
+                P0,
+                &config,
+                &mut SmallRng::seed_from_u64(9943),
+                &session,
+            );
+            let receipt = selection.receipt.expect("scored payment receipt");
+            assert_eq!(receipt.status, AiDecisionReceiptStatus::Ranked);
+            assert!(receipt
+                .candidates
+                .iter()
+                .any(|candidate| candidate.action == GameAction::PayUnlessCost { pay: false }));
+            let fallback = fallback_action(runner.state(), &config, &contract).expect("fallback");
+            assert_eq!(fallback, GameAction::PayUnlessCost { pay: false });
+            runner
+                .act(if pay {
+                    GameAction::PayUnlessCost { pay: true }
+                } else {
+                    fallback
+                })
+                .expect("issued answer applies");
+            if pay {
+                assert_eq!(runner.state().objects[&host].zone, Zone::Battlefield);
+                assert_eq!(runner.state().players[0].life, 20);
+                assert_eq!(runner.state().players[1].life, 1);
+                assert!(matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::Priority { .. }
+                ));
+            } else {
+                assert_eq!(runner.state().objects[&host].zone, Zone::Graveyard);
+                assert_eq!(runner.state().objects[&artist].zone, Zone::Battlefield);
+                assert!(matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::TriggerTargetSelection { .. }
+                ));
+                runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Player(P1)),
+                    })
+                    .expect("Artist targets opponent");
+                runner.resolve_top();
+                assert_eq!(runner.state().players[0].life, 21);
+                assert_eq!(runner.state().players[1].life, 0);
+                assert!(matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::GameOver { .. }
+                ));
+            }
+        }
+    }
+
+    /// The seat that owes nothing is left alone.
+    #[test]
+    fn bystander_is_not_asked_to_answer_a_free_unless_payment() {
+        let state = unless_payment_state(mana_unless_cost(ManaCost::zero()), PlayerId(1), vec![]);
+        let config = create_config(AiDifficulty::Medium, Platform::Native);
+        let mut rng = SmallRng::seed_from_u64(0);
+        // Reach guard: the payer is answered for the same state.
+        assert_eq!(
+            choose_action(&state, PlayerId(1), &config, &mut rng),
+            Some(GameAction::PayUnlessCost { pay: true })
+        );
+        assert_eq!(choose_action(&state, PlayerId(0), &config, &mut rng), None);
+    }
+
+    /// End to end with a real engine prompt: P1's Override (verbatim text) with
+    /// no artifacts raises the {0} prompt for the AI seat P0, which pays it.
+    #[test]
+    fn ai_override_zero_payment_still_protects_own_spell() {
+        for artifacts in [0usize, 1] {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain);
+            let bear = scenario
+                .add_creature_to_hand(P0, "Grizzly Bears", 2, 2)
+                .with_subtypes(vec!["Bear"])
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![ManaCostShard::Green],
+                    generic: 1,
+                })
+                .id();
+            scenario.add_basic_land(P0, ManaColor::Green);
+            scenario.add_basic_land(P0, ManaColor::Green);
+            let counter = scenario
+                .add_spell_to_hand_from_oracle(
+                    P1,
+                    "Override",
+                    true,
+                    "Counter target spell unless its controller pays {1} for each artifact you control.",
+                )
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![ManaCostShard::Blue],
+                    generic: 2,
+                })
+                .id();
+            for _ in 0..3 {
+                scenario.add_basic_land(P1, ManaColor::Blue);
+            }
+            for i in 0..artifacts {
+                scenario.add_artifact_from_oracle(P1, &format!("Trinket {i}"), "");
+            }
+            let mut runner = scenario.build();
+            {
+                let state = runner.state_mut();
+                state.turn_number = 3;
+                state.active_player = P0;
+                state.phase = Phase::PreCombatMain;
+                state.waiting_for = WaitingFor::Priority { player: P0 };
+            }
+            runner.cast(bear).commit();
+            let bear_spell = runner.state().stack.back().expect("bear spell").id;
+            engine::game::engine::apply_as_current_for_simulation(
+                runner.state_mut(),
+                GameAction::PassPriority,
+            )
+            .expect("P0 passes");
+            let outcome = runner.cast(counter).target_object(bear_spell).resolve();
+            outcome.assert_zone(&[bear_spell], Zone::Stack);
+            assert!(outcome.state().players[1].mana_pool.is_empty());
+            assert_eq!(
+                outcome
+                    .state()
+                    .objects
+                    .values()
+                    .filter(|o| o.controller == P1 && o.tapped)
+                    .count(),
+                3
+            );
+
+            let config = create_config(AiDifficulty::Easy, Platform::Native);
+            let mut rng = SmallRng::seed_from_u64(7);
+            let answer = choose_action(runner.state(), P0, &config, &mut rng);
+            match (&runner.state().waiting_for, artifacts) {
+                (
+                    WaitingFor::UnlessPayment {
+                        player: P0,
+                        cost: AbilityCost::Mana { cost },
+                        ..
+                    },
+                    0,
+                ) => {
+                    assert_eq!(*cost, ManaCost::zero());
+                    for difficulty in UNLESS_LEVELS {
+                        let config = create_config(difficulty, Platform::Native);
+                        let contract = AiDecisionContract::issue(runner.state(), P0);
+                        let answer = choose_action(
+                            runner.state(),
+                            P0,
+                            &config,
+                            &mut SmallRng::seed_from_u64(9943),
+                        );
+                        assert_eq!(answer, Some(GameAction::PayUnlessCost { pay: true }));
+                        assert!(contract.contains_action(runner.state(), &answer.unwrap()));
+                        assert_eq!(
+                            fallback_action(runner.state(), &config, &contract),
+                            Some(GameAction::PayUnlessCost { pay: true })
+                        );
+                    }
+                    assert_eq!(answer, Some(GameAction::PayUnlessCost { pay: true }));
+                    runner
+                        .act(answer.expect("answer"))
+                        .expect("the AI's answer applies");
+                    assert_eq!(
+                        runner.state().objects[&bear_spell].zone,
+                        Zone::Stack,
+                        "paying the free {{0}} leaves the spell on the stack"
+                    );
+                    runner.resolve_top();
+                    assert_eq!(runner.state().objects[&bear_spell].zone, Zone::Battlefield);
+                }
+                (
+                    WaitingFor::UnlessPayment {
+                        player: P0,
+                        cost: AbilityCost::Mana { cost },
+                        ..
+                    },
+                    1,
+                ) => {
+                    // Reach guard: with one artifact the prompt is a real {1}, not
+                    // pre-empted; the answer is whichever the scored path picked.
+                    assert_eq!(*cost, ManaCost::generic(1));
+                    assert!(matches!(answer, Some(GameAction::PayUnlessCost { .. })));
+                    let selection = choose_action_with_session_diagnostic(
+                        runner.state(),
+                        P0,
+                        &config,
+                        &mut SmallRng::seed_from_u64(7),
+                        &AiSession::arc_from_game(runner.state()),
+                    );
+                    assert_eq!(
+                        selection.receipt.expect("ordinary scored counter").status,
+                        crate::decision_receipt::AiDecisionReceiptStatus::Ranked
+                    );
+                }
+                (other, _) => panic!("artifacts {artifacts}: expected the prompt, got {other:?}"),
+            }
+        }
+    }
+
     fn resolution_choice_source(state: &GameState, object_id: ObjectId) -> NamedChoiceSource {
         let context = engine::game::triggers::trigger_source_context_for_latch(
             state,
@@ -6544,7 +7317,8 @@ mod tests {
             predicted_winner: Some(PlayerId(1)),
             certificate: engine::analysis::loop_check::LoopCertificate {
                 unbounded: vec![],
-                win_kind: engine::analysis::loop_check::WinKind::LethalDamage,
+                win_kind: Some(engine::analysis::loop_check::WinKind::LethalDamage),
+                win_kind_at: None,
                 mandatory: false,
                 residual_board_delta: engine::analysis::resource::BoardDelta::default(),
                 per_cycle: None,
@@ -16538,6 +17312,7 @@ mod tests {
                     chosen_exiled: Vec::new(),
                     chosen_sacrificed_battlefield: Vec::new(),
                     cost_paid_object: None,
+                    cost_removed_counters: None,
                     batch_siblings: Vec::new(),
                 }),
             },
@@ -17105,5 +17880,494 @@ one on the bottom of your library.";
             }
             PolicyVerdict::Reject { .. } => panic!("land destruction must not be gated as a fetch"),
         }
+    }
+
+    // ===== Exact search memoization and root reuse =====
+
+    /// Everything `run_iterative_deepening` exposes about one run: the scored
+    /// list with scores as raw bits, and the search statistics.
+    #[derive(Debug, PartialEq)]
+    struct DeepeningTrace {
+        scored: Vec<(GameAction, u64)>,
+        rung_stats: Vec<crate::planner::RungStat>,
+        beta_cutoffs: u32,
+        killer_orderings: u32,
+        tt_hits: u32,
+    }
+
+    /// Scores as raw bits, so equality means bit-identical floats.
+    fn score_bits(scored: &[(GameAction, f64)]) -> Vec<(GameAction, u64)> {
+        scored
+            .iter()
+            .map(|(action, score)| (action.clone(), score.to_bits()))
+            .collect()
+    }
+
+    /// The Hard measurement config the memo tests search with.
+    fn memo_test_config() -> AiConfig {
+        create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7)
+    }
+
+    /// Run the production root beam and `run_iterative_deepening` on fresh
+    /// services. `capacity` overrides the successor-memo capacity; `Some(0)` is
+    /// the arm in which nothing below the root is ever tracked.
+    fn deepening_run(
+        state: &GameState,
+        policies: &PolicyRegistry,
+        capacity: Option<usize>,
+    ) -> (DeepeningTrace, crate::planner::SearchMemoWitness) {
+        let config = memo_test_config();
+        let mut services = PlannerServices::new_default(PlayerId(0), &config, policies);
+        if let Some(capacity) = capacity {
+            services.successor_state_capacity = capacity;
+        }
+        let ranked = build_root_beam(state, &services);
+        assert!(
+            !ranked.is_empty(),
+            "reach-guard: the root beam is non-empty"
+        );
+        let scored = run_iterative_deepening(state, ranked, 0.1, &config, &mut services);
+        let trace = DeepeningTrace {
+            scored: score_bits(&scored),
+            rung_stats: services.rung_stats.clone(),
+            beta_cutoffs: services.beta_cutoffs,
+            killer_orderings: services.killer_orderings,
+            tt_hits: services.tt_hits,
+        };
+        (trace, services.memo_witness)
+    }
+
+    /// `searchable_state` after its creature spell is cast: a spell on the stack.
+    fn spell_on_stack_state() -> GameState {
+        let state = searchable_state();
+        let (_, cast) = pass_and_first_cast(&state);
+        let after = apply_candidate(&state, &cast).expect("the creature cast applies");
+        assert!(
+            !after.stack.is_empty(),
+            "fixture: the spell is on the stack"
+        );
+        after
+    }
+
+    /// `starvation_state` with creatures on both sides: a combat-relevant board.
+    fn combat_board_state() -> GameState {
+        let mut state = starvation_state();
+        add_creature(&mut state, PlayerId(0), 2, 2);
+        add_creature(&mut state, PlayerId(0), 4, 4);
+        add_creature(&mut state, PlayerId(1), 1, 1);
+        state
+    }
+
+    /// T7: iterative deepening revisits its positions through the successor
+    /// memo, and with capacity 0 it never does.
+    #[test]
+    fn iterative_deepening_reuses_successors_across_rungs() {
+        let state = searchable_state();
+        let policies = PolicyRegistry::shared();
+
+        let (trace, tracked) = deepening_run(&state, policies, None);
+        assert!(
+            trace.rung_stats.len() >= 2,
+            "fixture: at least two rungs ran, so the root is revisited"
+        );
+        assert!(
+            tracked.successor_hits > 0,
+            "a later rung must reuse the successors an earlier rung simulated"
+        );
+        assert!(tracked.peak_successor_edges > 0);
+        assert!(tracked.peak_retained_states > 0);
+        assert!(
+            tracked.peak_retained_states <= tracked.peak_successor_edges,
+            "every retained state belongs to a stored edge"
+        );
+        assert!(
+            tracked.peak_node_contexts <= tracked.peak_retained_states + 1,
+            "one context per retained state plus the root"
+        );
+        println!(
+            "T7 witness: hits={} simulations={} context_hits={} context_builds={} peak_successor_edges={} peak_retained_states={} peak_node_contexts={}",
+            tracked.successor_hits,
+            tracked.successor_simulations,
+            tracked.context_hits,
+            tracked.context_builds,
+            tracked.peak_successor_edges,
+            tracked.peak_retained_states,
+            tracked.peak_node_contexts
+        );
+
+        let (_, untracked) = deepening_run(&state, policies, Some(0));
+        assert_eq!(untracked.successor_hits, 0, "capacity 0 stores no edge");
+        assert_eq!(untracked.peak_successor_edges, 0);
+        assert_eq!(untracked.peak_retained_states, 0);
+        assert!(
+            untracked.peak_node_contexts <= 1,
+            "capacity 0 leaves room for the root's context alone"
+        );
+    }
+
+    /// T8: with the memo in use, the scored list and every search statistic are
+    /// bit-identical to the run in which nothing is tracked. The capacity-0 run
+    /// is first compared with itself, so a fixture that is not reproducible is
+    /// reported as such instead of as a memo difference.
+    #[test]
+    fn memoized_search_is_bit_identical_to_the_untracked_search() {
+        let policies = PolicyRegistry::shared();
+        let fixtures: [(&str, GameState); 3] = [
+            ("spell on stack", spell_on_stack_state()),
+            ("combat board", combat_board_state()),
+            ("forced pass chain", make_state()),
+        ];
+        let mut tracked_hits = 0;
+        for (name, state) in &fixtures {
+            let (control_a, witness_a) = deepening_run(state, policies, Some(0));
+            let (control_b, _) = deepening_run(state, policies, Some(0));
+            assert_eq!(
+                control_a, control_b,
+                "{name}: the control arm is reproducible"
+            );
+            assert_eq!(witness_a.successor_hits, 0, "{name}: capacity 0 never hits");
+            assert_eq!(witness_a.context_hits, 0, "{name}: no tracked position");
+
+            let (tracked, witness) = deepening_run(state, policies, None);
+            assert_eq!(tracked, control_a, "{name}: the memo changed the search");
+            println!(
+                "T8 {name}: hits={} context_hits={} peak_successor_edges={} peak_retained_states={}",
+                witness.successor_hits,
+                witness.context_hits,
+                witness.peak_successor_edges,
+                witness.peak_retained_states
+            );
+            tracked_hits += witness.successor_hits;
+        }
+        assert!(
+            tracked_hits > 0,
+            "reach-guard: the tracked arm used the memo"
+        );
+    }
+
+    /// Reset the root-reuse witnesses of this thread.
+    fn reset_root_witnesses() {
+        ROOT_CONTRACT_ISSUES_IN_CORE.with(|count| count.set(0));
+        ROOT_FAST_PRIORITY_RERUNS_IN_CORE.with(|count| count.set(0));
+    }
+
+    /// `(contract issues, priority-shortcut reruns)` the scorer core performed
+    /// on this thread since the last reset.
+    fn root_witnesses() -> (usize, usize) {
+        (
+            ROOT_CONTRACT_ISSUES_IN_CORE.with(std::cell::Cell::get),
+            ROOT_FAST_PRIORITY_RERUNS_IN_CORE.with(std::cell::Cell::get),
+        )
+    }
+
+    /// The Hard config the root-reuse tests decide with: one search on the real
+    /// state, no determinized samples.
+    fn root_reuse_config() -> AiConfig {
+        let mut config = memo_test_config();
+        config.search.determinization_samples = 0;
+        config
+    }
+
+    /// T13: one chooser decision derives the root contract and the absent
+    /// priority shortcut once; the scorer core repeats neither.
+    #[test]
+    fn chooser_hands_its_root_contract_and_shortcut_to_the_scorer() {
+        let state = searchable_state();
+        let config = root_reuse_config();
+        let session = AiSession::arc_from_game(&state);
+        assert!(
+            fast_priority_action(&state, PlayerId(0), &config, &session).is_none(),
+            "fixture: the priority shortcut is absent, so the decision is scored"
+        );
+
+        reset_root_witnesses();
+        let mut rng = SmallRng::seed_from_u64(11);
+        let chosen = choose_action_with_session(&state, PlayerId(0), &config, &mut rng, &session);
+
+        assert!(chosen.is_some(), "reach-guard: a decision was made");
+        assert_eq!(
+            root_witnesses(),
+            (0, 0),
+            "the scorer must reuse the chooser's contract and shortcut result"
+        );
+    }
+
+    /// T14: every path on which the chooser's knowledge does not apply derives
+    /// the root itself. Reach-guard for the zero counters of the T13 test.
+    #[test]
+    fn root_reuse_falls_open_outside_the_chooser() {
+        let state = searchable_state();
+        let config = root_reuse_config();
+        let session = AiSession::arc_from_game(&state);
+
+        // (a) The public scorer knows nothing about the root.
+        reset_root_witnesses();
+        let direct = score_candidates_with_session(&state, PlayerId(0), &config, &session);
+        assert!(has_cast(&direct), "reach-guard: the root was really scored");
+        let (issues, reruns) = root_witnesses();
+        assert!(issues >= 1 && reruns >= 1, "got ({issues}, {reruns})");
+
+        // (b) Determinized samples are different states: each derives its own.
+        let mut sampled = config.clone();
+        sampled.search.determinization_samples = 2;
+        reset_root_witnesses();
+        let mut rng = SmallRng::seed_from_u64(11);
+        let chosen = choose_action_with_session(&state, PlayerId(0), &sampled, &mut rng, &session);
+        assert!(chosen.is_some());
+        let (issues, reruns) = root_witnesses();
+        assert!(issues >= 2 && reruns >= 2, "got ({issues}, {reruns})");
+
+        // (c) A shortcut the chooser did not find absent is run again.
+        let contract = AiDecisionContract::issue(&state, PlayerId(0));
+        reset_root_witnesses();
+        let recomputed = score_candidates_core_for_root(
+            &state,
+            PlayerId(0),
+            &config,
+            &session,
+            None,
+            RootReuse::FromChooser {
+                contract: &contract,
+                priority_shortcut: RootPriorityShortcut::Recompute,
+            },
+        );
+        assert_eq!(root_witnesses(), (0, 1));
+        assert_eq!(score_bits(&recomputed), score_bits(&direct));
+    }
+
+    /// T15: scoring with the chooser's contract and absent shortcut is
+    /// bit-identical to scoring that derives both, on fixtures where scoring is
+    /// reproducible to begin with.
+    #[test]
+    fn root_reuse_scores_bit_identically_to_a_fresh_root() {
+        let config = root_reuse_config();
+        for (name, state) in [
+            ("searchable", searchable_state()),
+            ("starvation", starvation_state()),
+            ("combat board", combat_board_state()),
+        ] {
+            let score = |root: RootReuse<'_>| {
+                let session = AiSession::arc_from_game(&state);
+                score_bits(&score_candidates_for_root(
+                    &state,
+                    PlayerId(0),
+                    &config,
+                    &session,
+                    root,
+                ))
+            };
+            let fresh = score(RootReuse::Fresh);
+            assert_eq!(fresh, score(RootReuse::Fresh), "{name}: control arm");
+            assert!(
+                fresh.len() >= 2,
+                "{name}: reach-guard, the root is searched"
+            );
+
+            let session = AiSession::arc_from_game(&state);
+            assert!(
+                fast_priority_action(&state, PlayerId(0), &config, &session).is_none(),
+                "{name}: the absent shortcut is what the chooser would report"
+            );
+            let contract = AiDecisionContract::issue(&state, PlayerId(0));
+            reset_root_witnesses();
+            let reused = score(RootReuse::FromChooser {
+                contract: &contract,
+                priority_shortcut: RootPriorityShortcut::KnownAbsent,
+            });
+            assert_eq!(root_witnesses(), (0, 0), "{name}: reach-guard, reuse ran");
+            assert_eq!(reused, fresh, "{name}: root reuse changed a score");
+        }
+    }
+
+    /// T16: Pact drafting computes the validated domain only when a scored
+    /// action is a Pact payment cast, and writes the proposals entry either way.
+    #[test]
+    fn pact_drafting_skips_the_validated_domain_without_a_pact_cast() {
+        let state = searchable_state();
+        let config = root_reuse_config();
+        let session = AiSession::arc_from_game(&state);
+        let scored = score_candidates_with_session(&state, PlayerId(0), &config, &session);
+        assert!(has_cast(&scored), "fixture: a non-Pact cast is scored");
+
+        PACT_DRAFT_DOMAIN_VALIDATIONS.with(|count| count.set(0));
+        draft_pact_routes_for_scored_actions(&state, PlayerId(0), &scored, &session);
+        assert_eq!(
+            PACT_DRAFT_DOMAIN_VALIDATIONS.with(std::cell::Cell::get),
+            0,
+            "no Pact cast is scored, so the domain must not be validated"
+        );
+        assert!(
+            session
+                .pact_proposals
+                .read()
+                .expect("Pact proposal store lock")
+                .get(&PlayerId(0))
+                .is_some_and(Vec::is_empty),
+            "the empty proposals entry is still written"
+        );
+
+        // Positive reach-guard: a scored Pact cast is still drafted.
+        let (runner, pact, _) = pact_route_runner(true, 0);
+        let root = pact_root_candidate(runner.state(), pact);
+        let pact_session = AiSession::arc_from_game(runner.state());
+        PACT_DRAFT_DOMAIN_VALIDATIONS.with(|count| count.set(0));
+        draft_pact_routes_for_scored_actions(
+            runner.state(),
+            P0,
+            &[(root.action.clone(), 0.0)],
+            &pact_session,
+        );
+        assert_eq!(PACT_DRAFT_DOMAIN_VALIDATIONS.with(std::cell::Cell::get), 1);
+        let proposals = pact_session
+            .pact_proposals
+            .read()
+            .expect("Pact proposal store lock");
+        let drafted = proposals.get(&P0).expect("the proposals entry is written");
+        assert_eq!(drafted.len(), 1, "the certified Pact root is proposed");
+        assert_eq!(drafted[0].0, root.action);
+    }
+
+    /// The fetch-then-cast board of the route tests: three Mountains, a castable
+    /// card in hand, fetchable lands in the library, and either Misty Rainforest
+    /// or a fourth Mountain on the battlefield.
+    fn fetch_route_board(fetchland: FetchlandOnBoard) -> GameRunner {
+        let db = shared_integration_card_db();
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let fourth_land = match fetchland {
+            FetchlandOnBoard::MistyRainforest => "Misty Rainforest",
+            FetchlandOnBoard::Absent => "Mountain",
+        };
+        scenario.add_real_card(P0, fourth_land, Zone::Battlefield, db);
+        for _ in 0..3 {
+            scenario.add_real_card(P0, "Mountain", Zone::Battlefield, db);
+        }
+        scenario.add_real_card(P0, "Forest", Zone::Library, db);
+        scenario.add_real_card(P0, "Island", Zone::Library, db);
+        scenario.add_real_card(P0, "Phantom Monster", Zone::Hand, db);
+        for _ in 0..10 {
+            scenario.add_real_card(P1, "Mountain", Zone::Library, db);
+        }
+        let mut runner = scenario.build();
+        rehydrate_game_from_card_db(runner.state_mut(), db);
+        runner
+    }
+
+    /// Whether [`fetch_route_board`] puts a fetchland under the AI's control.
+    #[derive(Clone, Copy)]
+    enum FetchlandOnBoard {
+        MistyRainforest,
+        Absent,
+    }
+
+    /// T17: the fetch-then-cast route check validates the candidate domain only
+    /// when the player controls an exact fetchland.
+    #[test]
+    fn fetch_route_check_skips_the_validated_domain_without_a_fetchland() {
+        let without = fetch_route_board(FetchlandOnBoard::Absent);
+        let state = without.state();
+        assert!(
+            !hand_identity_bindings(state, P0).is_empty(),
+            "fixture: there is a card to cast, so only the fetchland is missing"
+        );
+        assert!(
+            !state.layers_dirty.is_dirty(),
+            "fixture: with a layer flush pending the check falls open"
+        );
+        FETCH_ROUTE_DOMAIN_VALIDATIONS.with(|count| count.set(0));
+        assert!(!has_certified_fetch_then_cast_route(state, P0));
+        assert_eq!(
+            FETCH_ROUTE_DOMAIN_VALIDATIONS.with(std::cell::Cell::get),
+            0,
+            "without a fetchland the domain must not be validated"
+        );
+
+        // Positive reach-guard: with a real fetchland the route is certified
+        // from the validated domain.
+        let with = fetch_route_board(FetchlandOnBoard::MistyRainforest);
+        FETCH_ROUTE_DOMAIN_VALIDATIONS.with(|count| count.set(0));
+        assert!(has_certified_fetch_then_cast_route(with.state(), P0));
+        assert_eq!(FETCH_ROUTE_DOMAIN_VALIDATIONS.with(std::cell::Cell::get), 1);
+    }
+
+    /// A policy that only counts how often it is asked for a verdict.
+    struct VerdictCountingPolicy(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl TacticalPolicy for VerdictCountingPolicy {
+        /// Any stable id; the registry under test holds only this policy.
+        fn id(&self) -> PolicyId {
+            PolicyId::PaymentSelection
+        }
+
+        /// Every decision kind, so each scored candidate reaches `verdict`.
+        fn decision_kinds(&self) -> &'static [DecisionKind] {
+            &[
+                DecisionKind::Mulligan,
+                DecisionKind::PlayLand,
+                DecisionKind::CastSpell,
+                DecisionKind::ActivateAbility,
+                DecisionKind::ActivateManaAbility,
+                DecisionKind::SelectTarget,
+                DecisionKind::DeclareAttackers,
+                DecisionKind::DeclareBlockers,
+                DecisionKind::ManaPayment,
+                DecisionKind::ChooseX,
+            ]
+        }
+
+        /// Always active: the registry skips a policy whose activation is `None`.
+        fn activation(
+            &self,
+            _: &crate::features::DeckFeatures,
+            _: &GameState,
+            _: PlayerId,
+        ) -> Option<f32> {
+            Some(1.0)
+        }
+
+        /// Count the request and stay neutral.
+        fn verdict(&self, _: &PolicyContext<'_>) -> PolicyVerdict {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            PolicyVerdict::neutral(PolicyReason::new("verdict_counting_test"))
+        }
+    }
+
+    /// T20 (hostile): nothing a policy scores is memoized. The policy is asked
+    /// for exactly as many verdicts when positions are revisited through the
+    /// memo as when every position is rebuilt.
+    #[test]
+    fn memoized_search_asks_policies_for_every_verdict() {
+        let state = searchable_state();
+        let counted_run = |capacity: Option<usize>| {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let policies = PolicyRegistry::for_tests(vec![Box::new(VerdictCountingPolicy(
+                Arc::clone(&calls),
+            ))]);
+            let (trace, witness) = deepening_run(&state, &policies, capacity);
+            (
+                calls.load(std::sync::atomic::Ordering::Relaxed),
+                trace,
+                witness,
+            )
+        };
+
+        let (tracked_calls, tracked_trace, tracked) = counted_run(None);
+        let (untracked_calls, untracked_trace, untracked) = counted_run(Some(0));
+        println!(
+            "T20: tracked verdicts={tracked_calls} untracked verdicts={untracked_calls} tracked successor_hits={}",
+            tracked.successor_hits
+        );
+
+        assert!(tracked_calls > 0, "fixture: the policy really is consulted");
+        assert!(
+            tracked.successor_hits > 0,
+            "reach-guard: positions were revisited through the memo"
+        );
+        assert_eq!(untracked.successor_hits, 0);
+        assert_eq!(
+            tracked_calls, untracked_calls,
+            "a revisited position must be scored again, not answered from a memo"
+        );
+        assert_eq!(tracked_trace, untracked_trace);
     }
 }
