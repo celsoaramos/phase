@@ -253,5 +253,8 @@
   },
   {
     "branch": "ai/mana-sink-window"
+  },
+  {
+    "branch": "card/territorial-hellkite-last-combat"
   }
 ]
