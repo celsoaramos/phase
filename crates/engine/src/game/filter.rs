@@ -2613,6 +2613,7 @@ fn filter_prop_grammar_any(
             FilterProp::Targets { filter } | FilterProp::TargetsOnly { filter } => {
                 filter_grammar_any(filter, visit)
             }
+            FilterProp::AttachedToMatching { host } => filter_grammar_any(host, visit),
             FilterProp::Not { prop } => filter_prop_grammar_any(prop, visit),
             FilterProp::AnyOf { props } => props
                 .iter()
