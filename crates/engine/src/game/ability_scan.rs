@@ -1731,9 +1731,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc
         }
         Effect::RollDie { .. } => Axes::CONSERVATIVE,
-        Effect::FlipCoin { .. } => Axes::CONSERVATIVE,
         Effect::FlipCoins { .. } => Axes::CONSERVATIVE,
-        Effect::FlipCoinUntilLose { .. } => Axes::CONSERVATIVE,
         Effect::RingTemptsYou => Axes::NONE,
         Effect::VentureIntoDungeon => Axes::NONE,
         Effect::VentureInto { dungeon: _ } => Axes::NONE,
@@ -3300,6 +3298,10 @@ fn scan_ability_condition(x: &AbilityCondition, mode: ScanMode) -> Axes {
             acc = acc.or(scan_quantity_expr(rhs, mode));
             acc
         }
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => scan_quantity_expr(quantity, mode),
         AbilityCondition::PreviousEffectAmount {
             rhs,
             comparator: _,
@@ -4288,6 +4290,10 @@ fn scan_trigger_condition(x: &TriggerCondition, mode: ScanMode) -> Axes {
             acc = acc.or(scan_quantity_expr(rhs, mode));
             acc
         }
+        TriggerCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => scan_quantity_expr(quantity, mode),
         TriggerCondition::HasMaxSpeed => Axes::NONE,
         // CR 725.1: the monarch predicate itself reads no axis; its subject
         // scope is classified per-axis by the shared `PlayerScope` classifier,
@@ -4664,6 +4670,10 @@ fn scan_static_condition(x: &StaticCondition, mode: ScanMode) -> Axes {
             acc = acc.or(scan_quantity_expr(rhs, mode));
             acc
         }
+        StaticCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => scan_quantity_expr(quantity, mode),
         StaticCondition::HasMaxSpeed => Axes::NONE,
         StaticCondition::SpeedGE { threshold: _ } => Axes::NONE,
         StaticCondition::And { conditions } => {
@@ -5393,7 +5403,7 @@ fn scan_player_scope(x: &PlayerScope) -> Axes {
         }
         PlayerScope::RecipientController => Axes::NONE,
         PlayerScope::DefendingPlayer => Axes::NONE,
-        PlayerScope::ParentObjectTargetController => Axes {
+        PlayerScope::ParentObjectTarget { .. } => Axes {
             event: true,
             sibling: false,
             projected: false,
@@ -7139,9 +7149,7 @@ fn effect_target_ctx(e: &Effect, mode: ScanMode) -> FilterReadContext {
         | Effect::LoseTheGame { .. }
         | Effect::WinTheGame { .. }
         | Effect::RollDie { .. }
-        | Effect::FlipCoin { .. }
         | Effect::FlipCoins { .. }
-        | Effect::FlipCoinUntilLose { .. }
         | Effect::RingTemptsYou
         | Effect::VentureIntoDungeon
         | Effect::VentureInto { .. }
@@ -7555,9 +7563,7 @@ fn effect_census_role(e: &Effect) -> CensusRole {
         | Effect::LoseTheGame { .. }
         | Effect::WinTheGame { .. }
         | Effect::RollDie { .. }
-        | Effect::FlipCoin { .. }
         | Effect::FlipCoins { .. }
-        | Effect::FlipCoinUntilLose { .. }
         | Effect::RingTemptsYou
         | Effect::VentureIntoDungeon
         | Effect::VentureInto { .. }
@@ -7641,6 +7647,7 @@ mod tests {
         ZoneChoiceCandidateSource, ZoneChoiceChooser, ZoneOwner,
     };
     use crate::types::counter::CounterType;
+    use crate::types::events::ActivatedAbilityKind;
     use crate::types::identifiers::{ExtraPhaseId, ObjectId};
     use crate::types::keywords::CostBearingKeywordKind;
     use crate::types::mana::{ManaColor, ManaCost};
@@ -11261,9 +11268,15 @@ mod tests {
             ContinuousModification::GrantAllActivatedAbilitiesOf {
                 source: TargetFilter::Any,
                 cap: None,
+                kind: None,
             },
             ContinuousModification::GrantAllTriggeredAbilitiesOf {
                 source: TargetFilter::Any,
+            },
+            ContinuousModification::GrantAllActivatedAbilitiesOf {
+                source: TargetFilter::Any,
+                cap: None,
+                kind: Some(ActivatedAbilityKind::Loyalty),
             },
             ContinuousModification::RetainPrintedTriggerFromSource {
                 source_trigger_index: 0,
@@ -11287,8 +11300,8 @@ mod tests {
         ];
         assert_eq!(
             survivors.len(),
-            10,
-            "scope guard covers 10 of the arm's 11 members; CopyValues is the \
+            11,
+            "scope guard covers 11 of the arm's 12 members; CopyValues is the \
              documented omission"
         );
         for m in &survivors {
