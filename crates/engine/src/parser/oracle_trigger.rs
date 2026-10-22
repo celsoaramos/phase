@@ -597,6 +597,7 @@ fn rewrite_cost_x_in_condition(cond: &mut crate::types::ability::AbilityConditio
         | AbilityCondition::TargetHasKeywordInstead { .. }
         | AbilityCondition::TargetMatchesFilter { .. }
         | AbilityCondition::HasObjectTarget
+        | AbilityCondition::NoPlayerChosen
         | AbilityCondition::TriggeringSpellTargetsFilter { .. }
         | AbilityCondition::SourceMatchesFilter { .. }
         | AbilityCondition::PostReplacementDamageSourceMatchesFilter { .. }

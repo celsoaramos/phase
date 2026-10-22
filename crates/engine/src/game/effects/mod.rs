@@ -7923,6 +7923,7 @@ fn condition_reads_filter_population(
         | AbilityCondition::CompletedDungeon { .. }
         | AbilityCondition::TargetHasKeywordInstead { .. }
         | AbilityCondition::HasObjectTarget
+        | AbilityCondition::NoPlayerChosen
         | AbilityCondition::IsYourTurn
         | AbilityCondition::WasStartingPlayer { .. }
         | AbilityCondition::SpellCastWithVariantThisTurn { .. }
@@ -10698,6 +10699,7 @@ fn should_resolve_subability_on_optional_decline(ability: &ResolvedAbility) -> b
             // CR 601.2c: a presence guard, not a decline-alternative selector —
             // declining the optional effect does not pick a `HasObjectTarget` branch.
             | AbilityCondition::HasObjectTarget
+            | AbilityCondition::NoPlayerChosen
             | AbilityCondition::TriggeringSpellTargetsFilter { .. }
             | AbilityCondition::SourceMatchesFilter { .. }
             | AbilityCondition::PostReplacementDamageSourceMatchesFilter { .. }
@@ -26358,6 +26360,10 @@ pub(crate) fn evaluate_condition(
             .targets
             .iter()
             .any(|t| matches!(t, TargetRef::Object(_))),
+        // CR 608.2c + CR 608.2d: "If you can't choose an opponent this way" — the
+        // preceding player choice had no legal option, so it appended nobody to
+        // the resolution's `chosen_players`.
+        AbilityCondition::NoPlayerChosen => ability.chosen_players.is_empty(),
         // CR 608.2c: Compound condition — all inner conditions must be true.
         AbilityCondition::And { conditions } => conditions
             .iter()

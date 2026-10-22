@@ -2238,6 +2238,12 @@ fn fmt_player_filter(pf: &PlayerFilter) -> String {
             (AttackSubject::Source, CombatHistoryScope::ThisCombat) => {
                 "each opponent this source attacked this combat"
             }
+            (AttackSubject::You, CombatHistoryScope::LastCombat) => {
+                "each opponent you attacked during your last combat"
+            }
+            (AttackSubject::Source, CombatHistoryScope::LastCombat) => {
+                "each opponent this source attacked during your last combat"
+            }
             (AttackSubject::EventAttackers, _) => "each player those attackers attacked",
         },
         PlayerFilter::OpponentAttackingEnchantedPlayer => {
@@ -4742,6 +4748,7 @@ fn fmt_ability_condition(cond: &AbilityCondition) -> String {
             format!("target has {} (instead)", keyword_label(keyword))
         }
         AbilityCondition::HasObjectTarget => "has an object target".into(),
+        AbilityCondition::NoPlayerChosen => "no player was chosen".into(),
         AbilityCondition::TargetMatchesFilter { filter, .. } => {
             format!("target is {}", fmt_target(filter))
         }
@@ -10184,6 +10191,7 @@ fn extract_ability_condition_features(
         | AbilityCondition::TargetHasKeywordInstead { .. }
         | AbilityCondition::TargetMatchesFilter { .. }
         | AbilityCondition::HasObjectTarget
+        | AbilityCondition::NoPlayerChosen
         | AbilityCondition::TriggeringSpellTargetsFilter { .. }
         | AbilityCondition::SourceMatchesFilter { .. }
         | AbilityCondition::PostReplacementDamageSourceMatchesFilter { .. }
@@ -10501,6 +10509,9 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
         // CR 601.2c + CR 115.1: object-target presence guard — resolved by
         // `evaluate_condition` (effects/mod.rs) against the ability's declared targets.
         AbilityCondition::HasObjectTarget => ("HasObjectTarget", Handled),
+        // CR 608.2c + CR 608.2d: resolved by `evaluate_condition` against the
+        // ability's resolution-scoped `chosen_players`.
+        AbilityCondition::NoPlayerChosen => ("NoPlayerChosen", Handled),
         AbilityCondition::TargetMatchesFilter { .. } => ("TargetMatchesFilter", Handled),
         AbilityCondition::TriggeringSpellTargetsFilter { .. } => {
             ("TriggeringSpellTargetsFilter", Handled)

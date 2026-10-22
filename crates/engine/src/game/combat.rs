@@ -6524,9 +6524,24 @@ pub(super) fn commit_attack_declaration(
     state
         .creatures_attacked_this_turn
         .extend(attacker_ids.iter().copied());
+    // Mirrors the `clear()` of the combat-scoped ledgers above: this
+    // declaration is the whole of this combat's attacks.
+    let combat_player = state.active_player;
+    state
+        .creature_attacked_defenders_recent_combat
+        .remove(&combat_player);
     for (attacker_id, defending_player) in creature_attacked_defenders {
         state
             .creature_attacked_defenders_this_turn
+            .entry(attacker_id)
+            .or_default()
+            .insert(defending_player);
+        // CR 506.1 + CR 508.6: the same fact, kept per combat for "your last
+        // combat" (rotated at the next beginning of combat of this player).
+        state
+            .creature_attacked_defenders_recent_combat
+            .entry(combat_player)
+            .or_default()
             .entry(attacker_id)
             .or_default()
             .insert(defending_player);

@@ -5336,6 +5336,8 @@ history_members! {
         CardsDiscardedThisTurnByPlayer => cards_discarded_this_turn_by_player: true,
         CardsExiledWithSourceThisTurn => cards_exiled_with_source_this_turn: false,
         CreatureAttackedDefendersThisTurn => creature_attacked_defenders_this_turn: false,
+        CreatureAttackedDefendersRecentCombat => creature_attacked_defenders_recent_combat: true,
+        CreatureAttackedDefendersLastCombat => creature_attacked_defenders_last_combat: true,
         CreatureBlockedAttackersThisTurn => creature_blocked_attackers_this_turn: false,
         CreatureTypesDealtCombatDamageThisTurn => creature_types_dealt_combat_damage_this_turn: false,
         CreaturesAttackedThisTurn => creatures_attacked_this_turn: false,

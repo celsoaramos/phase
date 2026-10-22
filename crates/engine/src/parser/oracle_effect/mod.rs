@@ -684,6 +684,7 @@ fn condition_refs_source_object(condition: &AbilityCondition) -> bool {
         | AbilityCondition::TargetHasKeywordInstead { .. }
         | AbilityCondition::TargetMatchesFilter { .. }
         | AbilityCondition::HasObjectTarget
+        | AbilityCondition::NoPlayerChosen
         | AbilityCondition::TriggeringSpellTargetsFilter { .. }
         | AbilityCondition::PostReplacementDamageSourceMatchesFilter { .. }
         | AbilityCondition::ZoneChangeObjectMatchesFilter { .. }
@@ -760,6 +761,7 @@ fn rebind_source_counter_condition(condition: &mut AbilityCondition, to: ObjectS
         | AbilityCondition::TargetHasKeywordInstead { .. }
         | AbilityCondition::TargetMatchesFilter { .. }
         | AbilityCondition::HasObjectTarget
+        | AbilityCondition::NoPlayerChosen
         | AbilityCondition::TriggeringSpellTargetsFilter { .. }
         | AbilityCondition::SourceMatchesFilter { .. }
         | AbilityCondition::PostReplacementDamageSourceMatchesFilter { .. }
@@ -2208,6 +2210,7 @@ fn condition_reads_the_event_subject(condition: &AbilityCondition) -> bool {
         | AbilityCondition::CompletedDungeon { .. }
         | AbilityCondition::TargetHasKeywordInstead { .. }
         | AbilityCondition::HasObjectTarget
+        | AbilityCondition::NoPlayerChosen
         | AbilityCondition::TriggeringSpellTargetsFilter { .. }
         | AbilityCondition::SourceMatchesFilter { .. }
         | AbilityCondition::PostReplacementDamageSourceMatchesFilter { .. }
@@ -9884,6 +9887,30 @@ pub(crate) fn parse_opponent_most_life_restriction(input: &str) -> OracleResult<
     Ok((rest, filter))
 }
 
+/// CR 506.1 + CR 508.6 + CR 608.2d: "that ~ didn't attack during your last
+/// combat" (Territorial Hellkite) — narrows an opponent choice to the opponents
+/// the source creature was NOT declared attacking during its controller's last
+/// combat. The "at random" qualifier may sit before the relative clause; it is
+/// read separately by `scan_at_random`, so it is only skipped here.
+pub(crate) fn parse_opponent_not_attacked_by_source_last_combat(
+    input: &str,
+) -> OracleResult<'_, PlayerFilter> {
+    let (rest, _) = opt(tag(" at random")).parse(input)?;
+    let (rest, _) = tag(" that ").parse(rest)?;
+    let (rest, _) = alt((tag("~"), tag("this creature"), tag("it"))).parse(rest)?;
+    let (rest, _) = alt((tag(" didn't"), tag(" didn\u{2019}t"), tag(" did not"))).parse(rest)?;
+    let (rest, _) = tag(" attack during your last combat").parse(rest)?;
+    Ok((
+        rest,
+        PlayerFilter::AllExcept {
+            exclude: Box::new(PlayerFilter::OpponentAttacked {
+                subject: AttackSubject::Source,
+                scope: CombatHistoryScope::LastCombat,
+            }),
+        },
+    ))
+}
+
 /// CR 102.1 + CR 102.2 + CR 102.3 + CR 119.3 / CR 402.3: the superlative
 /// predicate tail used by both grammatical positions (the effect
 /// subject/target arms below) — "with the most `<property>`" / "who has the
@@ -10408,10 +10435,18 @@ fn try_parse_choose_player_to_verb(
         Some(ChoiceType::NumberRange { .. })
     );
     let after_player = if let ChoiceType::Opponent { restriction, .. } = &mut choice_type {
-        match parse_opponent_most_life_restriction(after_player) {
+        match parse_opponent_most_life_restriction(after_player)
+            .or_else(|_| parse_opponent_not_attacked_by_source_last_combat(after_player))
+        {
             Ok((rest, filter)) => {
                 *restriction = Some(Box::new(filter));
-                rest
+                // "at random" precedes the Hellkite's relative clause and was
+                // consumed with it; keep it for the `scan_at_random` check below.
+                if scan_at_random(after_player).is_some() && scan_at_random(rest).is_none() {
+                    after_player
+                } else {
+                    rest
+                }
             }
             Err(_) => {
                 let chosen_number = has_number_choice

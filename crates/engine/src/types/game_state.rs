@@ -23265,6 +23265,23 @@ declare_game_state! {
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map_of_hash_set")]
     pub creature_attacked_defenders_this_turn: HashMap<ObjectId, HashSet<PlayerId>>,
+    /// CR 506.1 + CR 508.6 + CR 508.1b: keyed by the active player whose combat
+    /// it was, the defending players each creature was declared attacking during
+    /// that player's MOST RECENT combat phase (the one in progress once its
+    /// attackers are declared). Written at declaration; moved to
+    /// `creature_attacked_defenders_last_combat` when that player's next combat
+    /// phase begins. Read by "didn't attack during your last combat"
+    /// (Territorial Hellkite) through `creature_attacked_player_last_combat`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub creature_attacked_defenders_recent_combat:
+        Box<BTreeMap<PlayerId, BTreeMap<ObjectId, BTreeSet<PlayerId>>>>,
+    /// CR 506.1 + CR 508.6: the combat BEFORE `creature_attacked_defenders_recent_combat`
+    /// for the same player — rotated in at the beginning of that player's combat
+    /// phase, so a beginning-of-combat trigger reads the previous combat rather
+    /// than the empty one that is just starting.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub creature_attacked_defenders_last_combat:
+        Box<BTreeMap<PlayerId, BTreeMap<ObjectId, BTreeSet<PlayerId>>>>,
     /// CR 509.1g + CR 400.7 + CR 500.8: The turn-scoped counterpart to
     /// `CombatState::creature_blocked_attackers_this_combat`, accumulated across
     /// every combat phase of the turn — effects can add phases to a turn
@@ -29784,6 +29801,65 @@ impl GameState {
             .is_some_and(|defenders| defenders.contains(&defender))
     }
 
+    /// CR 506.1 + CR 508.6: the per-creature attack ledger of `player`'s LAST
+    /// combat. While one of `player`'s combats is in progress that is the
+    /// combat before it; otherwise it is `player`'s most recent combat.
+    fn last_combat_attack_ledger(
+        &self,
+        player: PlayerId,
+    ) -> Option<&BTreeMap<ObjectId, BTreeSet<PlayerId>>> {
+        let in_own_combat = self.combat.is_some() && self.active_player == player;
+        if in_own_combat {
+            self.creature_attacked_defenders_last_combat.get(&player)
+        } else {
+            self.creature_attacked_defenders_recent_combat.get(&player)
+        }
+    }
+
+    /// CR 506.1 + CR 508.6: True if `attacker` (controlled by `controller`) was
+    /// declared attacking `defender` during `controller`'s last combat.
+    pub fn creature_attacked_player_last_combat(
+        &self,
+        controller: PlayerId,
+        attacker: ObjectId,
+        defender: PlayerId,
+    ) -> bool {
+        self.last_combat_attack_ledger(controller)
+            .and_then(|ledger| ledger.get(&attacker))
+            .is_some_and(|defenders| defenders.contains(&defender))
+    }
+
+    /// CR 506.1 + CR 508.6: True if `attacker_controller` declared one or more
+    /// creatures attacking `defender` during their last combat (CR 508.1: only
+    /// the active player's creatures attack, so the ledger holds only theirs).
+    pub fn player_attacked_player_last_combat(
+        &self,
+        attacker_controller: PlayerId,
+        defender: PlayerId,
+    ) -> bool {
+        self.last_combat_attack_ledger(attacker_controller)
+            .is_some_and(|ledger| {
+                ledger
+                    .values()
+                    .any(|defenders| defenders.contains(&defender))
+            })
+    }
+
+    /// CR 506.1: a combat phase of `player` begins — the ledger of their
+    /// previous combat becomes "last combat" and a fresh one starts.
+    pub(crate) fn rotate_combat_attack_ledger(&mut self, player: PlayerId) {
+        let previous = self
+            .creature_attacked_defenders_recent_combat
+            .remove(&player)
+            .unwrap_or_default();
+        if previous.is_empty() {
+            self.creature_attacked_defenders_last_combat.remove(&player);
+        } else {
+            self.creature_attacked_defenders_last_combat
+                .insert(player, previous);
+        }
+    }
+
     /// CR 508.6: Did `subject` attack player `target` within `scope`? Centralizes
     /// the turn- vs combat-scoped lookup behind `PlayerFilter::OpponentAttacked`.
     pub fn opponent_attacked(
@@ -29807,6 +29883,12 @@ impl GameState {
             }
             (AttackSubject::Source, CombatHistoryScope::ThisCombat) => {
                 self.creature_attacked_player_this_combat(source_id, target)
+            }
+            (AttackSubject::You, CombatHistoryScope::LastCombat) => {
+                self.player_attacked_player_last_combat(controller, target)
+            }
+            (AttackSubject::Source, CombatHistoryScope::LastCombat) => {
+                self.creature_attacked_player_last_combat(controller, source_id, target)
             }
             // CR 508.6: one declaration is one combat, so the scope does not
             // narrow the event's attacked players.
@@ -29848,6 +29930,10 @@ impl GameState {
             CombatHistoryScope::ThisTurn => {
                 self.creature_blocked_attackers_this_turn.contains(&pair)
             }
+            // CR 506.1: only ATTACKS are kept per past combat (Territorial
+            // Hellkite); no printed "blocked during your last combat" exists,
+            // so no block ledger is kept for it.
+            CombatHistoryScope::LastCombat => false,
         }
     }
 
@@ -30118,6 +30204,8 @@ impl GameState {
             attacked_defenders_this_turn: HashMap::new(),
             attacked_defenders_last_turn: Box::default(),
             creature_attacked_defenders_this_turn: HashMap::new(),
+            creature_attacked_defenders_recent_combat: Box::default(),
+            creature_attacked_defenders_last_combat: Box::default(),
             creature_blocked_attackers_this_turn: HashSet::new(),
             steps_started_this_turn: StepTally::default(),
             creatures_attacked_this_turn: HashSet::new(),
@@ -33153,6 +33241,8 @@ fn _gamestate_partition_is_total(s: &GameState) {
         attacked_defenders_this_turn: _,
         attacked_defenders_last_turn: _,
         creature_attacked_defenders_this_turn: _,
+        creature_attacked_defenders_recent_combat: _,
+        creature_attacked_defenders_last_combat: _,
         creature_blocked_attackers_this_turn: _,
         steps_started_this_turn: _,
         creatures_attacked_this_turn: _,
@@ -33513,6 +33603,10 @@ impl PartialEq for GameState {
             && self.attacked_defenders_last_turn == other.attacked_defenders_last_turn
             && self.creature_attacked_defenders_this_turn
                 == other.creature_attacked_defenders_this_turn
+            && self.creature_attacked_defenders_recent_combat
+                == other.creature_attacked_defenders_recent_combat
+            && self.creature_attacked_defenders_last_combat
+                == other.creature_attacked_defenders_last_combat
             && self.creature_blocked_attackers_this_turn
                 == other.creature_blocked_attackers_this_turn
             && self.steps_started_this_turn == other.steps_started_this_turn

@@ -94,7 +94,7 @@
 use crate::analysis::resource::{HistoryMember, HistoryReads};
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AttachCardinality, AttachSelection,
-    AttachmentReferent, AttackSubject, CardTypeSetSource, CastingPermission,
+    AttachmentReferent, AttackSubject, CardTypeSetSource, CastingPermission, CombatHistoryScope,
     ContinuousModification, ControllerRef, CountScope, DelayedTriggerCondition, Duration,
     EachDamageRecipient, Effect, EffectScope, FilterProp, ForEachCategoryAction, GuessSubject,
     KeeperConstraint, ManaProduction, ModalChoice, ModalSelectionCondition,
@@ -3357,6 +3357,7 @@ fn scan_ability_condition(x: &AbilityCondition, mode: ScanMode) -> Axes {
             acc
         }
         AbilityCondition::HasObjectTarget => Axes::NONE,
+        AbilityCondition::NoPlayerChosen => Axes::NONE,
         AbilityCondition::TriggeringSpellTargetsFilter { filter } => {
             let mut acc = Axes {
                 event: true,
@@ -5085,6 +5086,15 @@ fn scan_player_filter(x: &PlayerFilter, mode: ScanMode) -> Axes {
         }
         // CR 603.2: the event attackers are read from the trigger event, like
         // `TriggeringPlayer`.
+        // CR 506.1 + CR 508.6: "your last combat" (Territorial Hellkite) is the
+        // only reader of the per-combat attack ledgers; attributing it lets a
+        // period that only grows them be covered while nothing on board reads them.
+        PlayerFilter::OpponentAttacked {
+            subject: AttackSubject::You | AttackSubject::Source,
+            scope: CombatHistoryScope::LastCombat,
+        } => Axes::history_of(HistoryMember::CreatureAttackedDefendersRecentCombat).or(
+            Axes::history_of(HistoryMember::CreatureAttackedDefendersLastCombat),
+        ),
         PlayerFilter::OpponentAttacked { subject, scope: _ } => match subject {
             AttackSubject::You | AttackSubject::Source => Axes::NONE,
             AttackSubject::EventAttackers => Axes {

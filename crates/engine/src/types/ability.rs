@@ -11910,6 +11910,14 @@ pub enum CombatHistoryScope {
     /// CR 511.3: the current combat phase only — the window that ends when the
     /// end of combat step ends.
     ThisCombat,
+    /// CR 506.1 + CR 508.6: the controller's LAST combat phase — "didn't attack
+    /// during your last combat" (Territorial Hellkite). While a combat of the
+    /// controller is in progress this is the one BEFORE it (the
+    /// beginning-of-combat trigger asks about the previous combat, not the one
+    /// just starting); otherwise it is the controller's most recent combat.
+    /// Read through `GameState::creature_attacked_player_last_combat` /
+    /// `player_attacked_player_last_combat`.
+    LastCombat,
 }
 
 /// A filter matching players by game-state conditions.
@@ -30487,6 +30495,13 @@ pub enum AbilityCondition {
     /// antecedent's `multi_target.min_is_fixed_zero()` — a no-op for
     /// mandatory-single-target cards (`multi_target == None`).
     HasObjectTarget,
+    /// CR 608.2c + CR 608.2d: "If you can't choose an opponent this way" — true
+    /// when the preceding `Choose(Opponent/Player)` of this resolution chose
+    /// nobody because no player was a legal option (Territorial Hellkite: every
+    /// opponent was attacked by it during your last combat). Reads the resolving
+    /// ability's `chosen_players`, which the choice appends to and the chain
+    /// propagates to its subs.
+    NoPlayerChosen,
     /// CR 608.2c + CR 603.2: "if it targets a [filter]" on a triggered ability —
     /// gates the sub_ability on whether the triggering spell's chosen targets
     /// include at least one permanent or player matching `filter`. The pronoun
@@ -30790,6 +30805,7 @@ impl AbilityCondition {
             | AbilityCondition::DiscardedCardMatchesFilter { .. }
             | AbilityCondition::IsRingBearer
             | AbilityCondition::HasObjectTarget
+            | AbilityCondition::NoPlayerChosen
             | AbilityCondition::IsYourTurn
             | AbilityCondition::FirstCombatPhaseOfTurn
             | AbilityCondition::FirstEndStepOfTurn
@@ -30873,6 +30889,7 @@ impl AbilityCondition {
             | AbilityCondition::DiscardedCardMatchesFilter { .. }
             | AbilityCondition::IsRingBearer
             | AbilityCondition::HasObjectTarget
+            | AbilityCondition::NoPlayerChosen
             | AbilityCondition::IsYourTurn
             | AbilityCondition::FirstCombatPhaseOfTurn
             | AbilityCondition::FirstEndStepOfTurn
@@ -31027,6 +31044,7 @@ impl AbilityCondition {
             | AbilityCondition::DiscardedCardMatchesFilter { .. }
             | AbilityCondition::IsRingBearer
             | AbilityCondition::HasObjectTarget
+            | AbilityCondition::NoPlayerChosen
             | AbilityCondition::IsYourTurn
             | AbilityCondition::FirstCombatPhaseOfTurn
             | AbilityCondition::FirstEndStepOfTurn
@@ -31108,6 +31126,7 @@ impl AbilityCondition {
             | AbilityCondition::DiscardedCardMatchesFilter { .. }
             | AbilityCondition::IsRingBearer
             | AbilityCondition::HasObjectTarget
+            | AbilityCondition::NoPlayerChosen
             | AbilityCondition::IsYourTurn
             | AbilityCondition::FirstCombatPhaseOfTurn
             | AbilityCondition::FirstEndStepOfTurn

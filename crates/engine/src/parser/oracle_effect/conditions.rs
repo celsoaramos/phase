@@ -4817,6 +4817,7 @@ pub(super) fn reads_cast_time_snapshot(condition: &AbilityCondition) -> bool {
         | AbilityCondition::DiscardedCardMatchesFilter { .. }
         | AbilityCondition::IsRingBearer
         | AbilityCondition::HasObjectTarget
+        | AbilityCondition::NoPlayerChosen
         | AbilityCondition::IsYourTurn
         | AbilityCondition::FirstCombatPhaseOfTurn
         | AbilityCondition::FirstEndStepOfTurn
@@ -6546,6 +6547,7 @@ pub(crate) fn ability_condition_to_static_condition(
         // CR 601.2c + CR 115.1: reads the resolved ability's declared targets;
         // a resolution-flow guard with no continuous-effect (StaticCondition) form.
         | AbilityCondition::HasObjectTarget
+        | AbilityCondition::NoPlayerChosen
         | AbilityCondition::TriggeringSpellTargetsFilter { .. }
         | AbilityCondition::ZoneChangeObjectMatchesFilter { .. }
         | AbilityCondition::ZoneChangedThisWay { .. }
@@ -7320,6 +7322,26 @@ fn try_unrouted_nom_condition_tail(text: &str, ctx: &mut ParseContext) -> Option
         return Some(AbilityCondition::Not {
             condition: Box::new(AbilityCondition::effect_performed()),
         });
+    }
+
+    // CR 608.2c + CR 608.2d: "if you can't choose an opponent/a player this
+    // way" (Territorial Hellkite) reads the preceding player CHOICE, not a zone
+    // change: true when that choice had no legal option and chose nobody. Must
+    // precede the generic "you can't" arm below, which would read it as "nothing
+    // changed zone" — always true for a choice, so the rider always fired.
+    if all_consuming(terminated(
+        (
+            alt((tag::<_, _, OracleError<'_>>("you can't"), tag("you cannot"))),
+            tag(" choose "),
+            alt((tag("an opponent"), tag("a player"))),
+            tag(" this way"),
+        ),
+        (multispace0, opt(char('.')), multispace0),
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        return Some(AbilityCondition::NoPlayerChosen);
     }
 
     // CR 608.2c: "if you can't, [effect]" — the preceding mandatory instruction

@@ -3879,6 +3879,10 @@ fn auto_advance_once(state: &mut GameState, events: &mut Vec<GameEvent>) -> Auto
             // the active player receives priority. Set combat state before
             // processing triggers so it is available to every resulting prompt
             // and to abilities that later resolve from that trigger batch.
+            // CR 506.1 + CR 508.6: a new combat phase of the active player
+            // begins — its previous combat becomes "your last combat" before
+            // any beginning-of-combat trigger (Territorial Hellkite) asks.
+            state.rotate_combat_attack_ledger(state.active_player);
             state.combat = Some(crate::game::combat::CombatState::default());
             let event_snapshot = events.clone();
             let (_, ordering_prompt) = process_phase_triggers(state, &event_snapshot, events);

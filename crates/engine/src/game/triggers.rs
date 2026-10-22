@@ -12304,6 +12304,7 @@ fn gate_binding_diverges_at_fire_time(condition: &AbilityCondition) -> bool {
         | AbilityCondition::TargetMatchesFilter { .. }
         | AbilityCondition::TargetHasKeywordInstead { .. }
         | AbilityCondition::HasObjectTarget
+        | AbilityCondition::NoPlayerChosen
         | AbilityCondition::ObjectsShareQuality { .. }
         | AbilityCondition::TargetSharesNameWithOtherExiledThisWay { .. }
         | AbilityCondition::CostPaidObjectMatchesFilter { .. }
