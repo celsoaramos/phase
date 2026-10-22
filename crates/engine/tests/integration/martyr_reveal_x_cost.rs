@@ -634,7 +634,9 @@ fn martyr_of_frost_unless_pay_scales_with_x() {
     }
     assert!(trace.saw_reveal_prompt);
 
-    // Reach guard: X = 0 asks nothing and leaves the spell on the stack.
+    // Reach guard: X = 0 reaches the unless-cost as {0} — still asked, never
+    // auto-paid (CR 118.5 + CR 118.12a, upstream #9943) — and the spell is
+    // still on the stack while the payer decides.
     let (mut runner, martyr, _, spell) = frost_board();
     activate(&mut runner, martyr);
     let answers = Answers {
@@ -652,10 +654,21 @@ fn martyr_of_frost_unless_pay_scales_with_x() {
                     .iter()
                     .all(|entry| entry.source_id != martyr))
     });
-    assert!(!matches!(
-        runner.state().waiting_for,
-        WaitingFor::UnlessPayment { .. }
-    ));
+    match runner.state().waiting_for.clone() {
+        WaitingFor::UnlessPayment { player, cost, .. } => {
+            assert_eq!(player, P1);
+            assert!(
+                matches!(
+                    cost,
+                    AbilityCost::Mana {
+                        cost: ManaCost::Cost { generic: 0, .. }
+                    }
+                ),
+                "X = 0 must reach the unless cost as {{0}}, got {cost:?}"
+            );
+        }
+        other => panic!("expected the {{0}} UnlessPayment, got {other:?}"),
+    }
     assert!(runner.state().stack.iter().any(|entry| entry.id == spell));
 }
 
