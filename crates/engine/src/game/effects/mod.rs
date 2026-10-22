@@ -15528,11 +15528,13 @@ fn should_repeat_while_condition(
     // the process root, whose own context never records the iteration's "you may"
     // outcome (the accept runs on a resumed copy). Seed the performed signal from
     // the controller's acceptance in the iteration that just resolved (cleared at
-    // each iteration's start in `resolve_ability_chain`).
+    // each iteration's start in `resolve_ability_chain`). The acceptance only ever
+    // RAISES the signal: a root whose own context already records the outcome (a
+    // performed unless-payment, with no "you may" in the body) keeps it.
     let seeded;
     let ability = if condition_depends_on_effect_performed(condition) {
         let mut owned = ability.clone();
-        owned.context.optional_effect_performed = state
+        owned.context.optional_effect_performed |= state
             .player_actions_this_way
             .contains(&(ability.controller, PlayerActionKind::AcceptedOptionalEffect));
         seeded = owned;
