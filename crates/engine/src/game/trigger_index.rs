@@ -847,6 +847,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::Behold
         | EffectKind::Vote
         | EffectKind::SeparateIntoPiles
+        | EffectKind::ExileTopCardContest
         | EffectKind::SwitchPT
         | EffectKind::CopySpell
         | EffectKind::EpicCopy
@@ -920,9 +921,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::LoseTheGame
         | EffectKind::WinTheGame
         | EffectKind::RollDie
-        | EffectKind::FlipCoin
         | EffectKind::FlipCoins
-        | EffectKind::FlipCoinUntilLose
         | EffectKind::RingTemptsYou
         | EffectKind::VentureIntoDungeon
         | EffectKind::VentureInto
