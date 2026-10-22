@@ -7,7 +7,7 @@ use crate::types::ability::AttachmentReferent;
 
 use super::ability::{
     AbilityTag, AttachmentKind, CostPaidObjectSnapshot, EffectKind, FilterProp, TargetFilter,
-    TargetRef, ThisWayCause, TypeFilter, TypedFilter,
+    TargetRef, ThisWayCause, TriggerDefinitionRef, TypeFilter, TypedFilter,
 };
 use super::card::PrintedCardRef;
 use super::card_type::{CardType, CoreType, Supertype};
@@ -754,6 +754,9 @@ impl EventObjectSnapshot {
 
             // ---- embedded exact source relations ----
             FilterProp::SaddledSource | FilterProp::ConvokedSource => Supported,
+            // CR 702.122c: the crew ledger is keyed by the subject's own
+            // incarnation, which the snapshot carries (look-back arm in filter.rs).
+            FilterProp::CrewedThisTurn { .. } => Supported,
 
             // ---- embedded per-turn history ----
             FilterProp::WasDealtDamageThisTurn
@@ -806,6 +809,16 @@ impl EventObjectSnapshot {
             // LOUDLY rather than silently reading an ungoaded snapshot. Deferred follow-up
             // (option a): snapshot goaded onto EventObjectSnapshot + ZoneChangeRecord.
             FilterProp::Goaded
+            // CR 722.3a: prepared is a designation on the LIVE permanent
+            // (`GameObject::prepared`). The departure ledger carries it
+            // (`LKISnapshot` / `ZoneChangeRecord::was_prepared`, read by the
+            // runtime), but the event-subject projection (`EventObjectSnapshot`)
+            // this reach gate walks does not, so an event-subject prepared
+            // filter cannot be answered from a snapshot. Classify Unsupported so
+            // a future prepared event-subject filter fails the reach gate LOUDLY
+            // rather than silently reading an unprepared projection. Deferred
+            // follow-up (option a): snapshot prepared onto EventObjectSnapshot.
+            | FilterProp::Prepared
             | FilterProp::WasPlayed
             // CR 108.2 + CR 108.2b: event snapshots retain token status but not whether
             // a nontoken object is a copy, so card representation cannot be reconstructed.
@@ -877,6 +890,18 @@ impl PartialEq for LifeTotalReading {
 }
 
 impl Eq for LifeTotalReading {}
+
+/// CR 701.43: the way a permanent came to be exerted. CR 701.43d links an attack
+/// exert to its own "when you do" trigger (CR 607.2h), so that trigger must not
+/// see an exert paid as part of an activated ability's cost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExertOrigin {
+    /// CR 701.43d: the optional cost of attacking ("exert this creature as it attacks").
+    #[default]
+    AttackCost,
+    /// CR 602.2b + CR 605.3b: an `{Exert}` cost of an activated ability.
+    AbilityCost,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
@@ -1010,6 +1035,13 @@ pub enum GameEvent {
         /// Omitted on the wire when `Pending`.
         #[serde(default, skip_serializing_if = "ActivationTriggerState::is_pending")]
         trigger_state: ActivationTriggerState,
+        /// CR 602.2a + CR 113.7a: the stack object this activation created — the
+        /// ability "that ability" / "it" names for a trigger on this event, never
+        /// another object of the same source. `None` when the activation used no
+        /// stack (a mana-ability activation, CR 605.3b) and for an event decoded from
+        /// a state predating the field. Omitted on the wire when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stack_entry: Option<ObjectId>,
     },
     /// CR 603.6a: Enters-the-battlefield and zone-change triggers fire on this
     /// event. `from` is `None` when an object is created directly in a zone
@@ -1125,11 +1157,29 @@ pub enum GameEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         incarnation: Option<u64>,
     },
-    /// CR 701.43a + CR 701.43d: A creature was exerted as it attacked. Fires the
-    /// linked `TriggerMode::Exerted` "when you do" trigger (Combat Celebrant,
-    /// Glory-Bound Initiate, ...).
+    /// CR 701.43a: A permanent was exerted by `player`, either as an optional
+    /// attack cost (CR 701.43d) or as part of an activated ability's cost.
+    /// Fires the linked `TriggerMode::Exerted` "when you do" trigger (Combat
+    /// Celebrant, Glory-Bound Initiate, ...) and "whenever you exert a creature"
+    /// observers, which key on `player`.
     CreatureExerted {
         object_id: ObjectId,
+        /// The player who chose to exert it. `None` on a legacy event: the
+        /// historical shape (an attack exert) never recorded its actor, and no
+        /// actor is invented for it - an observer keyed on "you exert" does not
+        /// match an event whose actor was not saved.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        player: Option<PlayerId>,
+        /// Which exert this was. A legacy event defaults to
+        /// [`ExertOrigin::AttackCost`]: attack exert was the only emitter before
+        /// activated-ability exert costs were recorded, so that is the saved
+        /// fact, not a guess.
+        #[serde(default)]
+        origin: ExertOrigin,
+        /// CR 607.2h: Exact optional attack permission whose cost was paid.
+        /// Historical completed events retain their original unbound meaning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attack_permission: Option<TriggerDefinitionRef>,
     },
     /// CR 702.154c: A creature enlisted another creature as it attacked. Fires
     /// the linked `TriggerMode::Enlisted` "when you do" trigger and carries the
@@ -1937,6 +1987,20 @@ pub enum GameEvent {
         amount_spent: u32,
         new_cumulative: u32,
     },
+    /// Eye to Eye / Mouth to Mouth: the real-time contest between `participants`
+    /// (controller first) has begun. See `types::contest`.
+    PhysicalContestStarted {
+        kind: crate::types::contest::ContestKind,
+        participants: [PlayerId; 2],
+    },
+    /// The contest reached a terminal state and its result was applied to the
+    /// game exactly once. `result` distinguishes a decided win, a tie, and a
+    /// technical cancellation.
+    PhysicalContestResolved {
+        kind: crate::types::contest::ContestKind,
+        participants: [PlayerId; 2],
+        result: crate::types::contest::ContestResult,
+    },
     /// CR 701.30: A clash occurred between two players.
     Clash {
         controller: PlayerId,
@@ -2093,6 +2157,7 @@ mod tests {
                 kind,
                 departed_source_lki,
                 trigger_state,
+                stack_entry,
                 ..
             } => {
                 assert_eq!(kind, ActivatedAbilityKind::Normal);
@@ -2104,6 +2169,10 @@ mod tests {
                     trigger_state,
                     ActivationTriggerState::Pending,
                     "a legacy event is observed by ordinary collection"
+                );
+                assert_eq!(
+                    stack_entry, None,
+                    "a legacy event predating the field names no stack entry"
                 );
             }
             other => panic!("expected AbilityActivated, got {other:?}"),
@@ -2124,6 +2193,7 @@ mod tests {
                 kind,
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
+                stack_entry: None,
             };
             let json = serde_json::to_value(&event).unwrap();
             let back: GameEvent = serde_json::from_value(json).unwrap();
@@ -2132,6 +2202,31 @@ mod tests {
                 other => panic!("expected AbilityActivated, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn ability_activated_stack_entry_round_trips_and_defaults_to_none() {
+        // CR 602.2a: the stack object a stack-using activation created survives
+        // serialization, and a mana activation's absent entry is omitted.
+        let event = |stack_entry| GameEvent::AbilityActivated {
+            player_id: PlayerId(1),
+            source_id: ObjectId(9),
+            kind: ActivatedAbilityKind::Normal,
+            departed_source_lki: None,
+            trigger_state: ActivationTriggerState::Pending,
+            stack_entry,
+        };
+        let named = event(Some(ObjectId(42)));
+        let json = serde_json::to_value(&named).unwrap();
+        assert_eq!(json["data"]["stack_entry"], 42);
+        let back: GameEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(back, named);
+
+        let json = serde_json::to_value(event(None)).unwrap();
+        assert!(
+            json["data"].get("stack_entry").is_none(),
+            "an activation that used no stack omits the key"
+        );
     }
 
     #[test]
@@ -2344,6 +2439,25 @@ mod tests {
             properties: vec![FilterProp::Goaded],
         });
         assert_eq!(classify(&goaded), Unsupported);
+    }
+
+    /// CR 722.3a: prepared is a designation on the LIVE permanent. The
+    /// departure ledger now carries it (`LKISnapshot` / `ZoneChangeRecord::
+    /// was_prepared`, read by the runtime), but the event-subject projection
+    /// (`EventObjectSnapshot`) still does not. The reach-gate classifier must
+    /// AGREE: a prepared event-subject filter is `Unsupported`, so a future
+    /// card that reaches it fails the gate loudly instead of silently
+    /// certifying unprepared.
+    /// Revert-probe: returning Prepared to the Supported group makes classify
+    /// yield Supported, flipping this assertion.
+    #[test]
+    fn prepared_subject_filter_is_unsupported() {
+        let prepared = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Creature],
+            controller: None,
+            properties: vec![FilterProp::Prepared],
+        });
+        assert_eq!(classify(&prepared), Unsupported);
     }
 
     /// `Unsupported` dominates a composite: if one branch cannot be answered, the whole

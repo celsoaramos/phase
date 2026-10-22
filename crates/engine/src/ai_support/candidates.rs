@@ -575,6 +575,26 @@ pub fn candidate_actions_exact(state: &GameState) -> Vec<CandidateAction> {
                 )
             })
             .collect(),
+        // Digital-only Alchemy (no CR entry): a batch-semantics boon's "one
+        // of them" token-host pick — one candidate per legal entrant. The
+        // token resolver only pauses with 2+ candidates, so no `None` arm
+        // is needed.
+        WaitingFor::ChooseTokenHost {
+            player,
+            legal_targets,
+            ..
+        } => legal_targets
+            .iter()
+            .map(|target| {
+                candidate(
+                    GameAction::ChooseTarget {
+                        target: Some(target.clone()),
+                    },
+                    TacticalClass::Selection,
+                    Some(*player),
+                )
+            })
+            .collect(),
         WaitingFor::CastOffer {
             player,
             kind: CastOfferKind::Discover { .. },
@@ -957,6 +977,10 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
     candidate_actions_broad_with_probe(state, None)
 }
 
+/// Enumerates the broad candidate actions for the current `WaitingFor`.
+///
+/// Priority enumeration asks many off-zone keyword questions of one unchanged
+/// state, so it runs inside an off-zone keyword scope and shares one gather.
 pub fn candidate_actions_broad_with_probe(
     state: &GameState,
     probe: Option<&casting::PriorityCastProbe>,
@@ -977,7 +1001,11 @@ pub fn candidate_actions_broad_with_probe(
             debug_assert!(exact_owns_candidate_domain(&state.waiting_for));
             candidate_actions_exact(state)
         }
-        WaitingFor::Priority { player } => priority_actions_with_probe(state, *player, probe),
+        WaitingFor::Priority { player } => {
+            crate::game::off_zone_characteristics::with_off_zone_keyword_scope(state, || {
+                priority_actions_with_probe(state, *player, probe)
+            })
+        }
         WaitingFor::ManaPayment {
             player,
             convoke_mode,
@@ -3514,6 +3542,7 @@ pub fn candidate_actions_broad_with_probe(
         | WaitingFor::CopyTargetChoice { .. }
         | WaitingFor::ExploreChoice { .. }
         | WaitingFor::ReturnAsAuraTarget { .. }
+        | WaitingFor::ChooseTokenHost { .. }
         | WaitingFor::CastOffer {
             kind: CastOfferKind::Discover { .. },
             ..
@@ -3542,6 +3571,7 @@ pub fn candidate_actions_broad_with_probe(
         | WaitingFor::ClashChooseOpponent { .. }
         | WaitingFor::ChooseFromZoneOpponentChooser { .. }
         | WaitingFor::ClashCardPlacement { .. }
+        | WaitingFor::PhysicalContest { .. }
         | WaitingFor::BetweenGamesChoosePlayDraw { .. }
         | WaitingFor::OrderTriggers { .. }
         | WaitingFor::MulliganDecision { .. }
@@ -3716,16 +3746,18 @@ pub fn candidate_actions_broad_with_probe(
             // (nothing to pin, so `template: None` is the complete answer), a published set
             // the offer ALREADY carries a declaration for, or a recorded period the take replays,
             // whose recorded answers `handle_declare_shortcut` admits with `template: None`. That
-            // `template` is the ENGINE'S OWN published declaration — the very value
-            // `handle_declare_shortcut` will validate — so there is exactly one pin authority at
-            // this node and the AI never constructs one. An offer with an empty period,
+            // `template` is the ENGINE'S OWN suggestion (`ShortcutDecisionSchema::suggestion`) —
+            // the very value `handle_declare_shortcut` resolves `template: None` to and validates
+            // — so there is exactly one pin authority at this node and the AI never constructs
+            // one. An offer with an empty period,
             // published points and NO declaration (a seat that never answered, or a `Conflicted`
             // latch) still fail-closes: the conjunct below is false, and `DeclineShortcut`
             // remains the only candidate.
             // CR 732.2a: THE SUGGESTION, not the capacity — and the two are no longer one number.
             // The capacity is the widest count SOME legal declaration may specify; the suggestion
-            // is a count the offer's OWN published declaration drives, which is the declaration
-            // this candidate carries (and which `template: None` would resolve to anyway). A
+            // is the count the offer's suggested declaration drives (see
+            // `ShortcutDecisionSchema::suggested_declaration`), which is the declaration this
+            // candidate carries (and which `template: None` would resolve to anyway). A
             // candidate at the capacity opens the CR 732.2b window and is then refused by the
             // consumption seam's drivability gate, committing zero cycles — the engine refusing
             // its own candidate. Reading `iteration_count` rather than re-deriving anything keeps
@@ -3745,7 +3777,7 @@ pub fn candidate_actions_broad_with_probe(
                 v.push(candidate(
                     GameAction::DeclareShortcut {
                         count: crate::analysis::decision_template::IterationCount::Fixed(n),
-                        template: declaration.clone(),
+                        template: schema.suggestion(declaration.as_ref()).cloned(),
                     },
                     TacticalClass::Utility,
                     Some(*proposer),
@@ -6536,6 +6568,127 @@ fn lethal_first_distribution(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legal_actions_prune_total_mana_value_return_combinations() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::types::phase::Phase;
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let ids: Vec<_> = [
+            ("Canoptek Tomb Sentinel", 4, 4, 3),
+            ("Hexmark Destroyer", 6, 6, 6),
+            ("Myr Retriever", 2, 1, 1),
+        ]
+        .into_iter()
+        .map(|(name, value, power, toughness)| {
+            let cost = if value == 6 {
+                ManaCost::Cost {
+                    generic: 4,
+                    shards: vec![ManaCostShard::Black; 2],
+                }
+            } else {
+                ManaCost::generic(value)
+            };
+            scenario
+                .add_creature_to_graveyard(P0, name, power, toughness)
+                .as_artifact_creature()
+                .with_mana_cost(cost)
+                .id()
+        })
+        .collect();
+        // Exact Technomancer return clause isolates the choice class; the full
+        // creature ETB and mill pipeline is covered by integration regressions.
+        let spell = scenario.add_spell_to_hand_from_oracle(P0, "Return clause harness", false,
+            "Return any number of artifact creature cards with total mana value 6 or less from your graveyard to the battlefield.")
+            .with_mana_cost(ManaCost::zero()).id();
+        let mut runner = scenario.build();
+        let outcome = runner.cast(spell).resolve();
+        assert!(
+            matches!(outcome.final_waiting_for(), WaitingFor::ChooseFromZoneChoice { cards, .. }
+            if ids.iter().all(|id| cards.contains(id)))
+        );
+        let actions = crate::ai_support::legal_actions(runner.state());
+        let selections: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                GameAction::SelectCards { cards } => Some(cards),
+                _ => None,
+            })
+            .collect();
+        assert!(selections.iter().any(|cards| cards.is_empty()));
+        assert!(selections.iter().any(|cards| cards.as_slice() == [ids[1]]));
+        assert!(selections
+            .iter()
+            .any(|cards| cards.len() == 2 && cards.contains(&ids[0]) && cards.contains(&ids[2])));
+        assert!(!selections
+            .iter()
+            .any(|cards| cards.contains(&ids[0]) && cards.contains(&ids[1])));
+    }
+    #[test]
+    fn legal_actions_bounded_zero_mana_value_return_count() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::types::phase::Phase;
+        // Synthetic return-clause harness: verbatim Lively Dirge return mode,
+        // without its separate spree payment machinery.
+        for reject_three in [true, false] {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain);
+            let ids: Vec<_> = (0..3)
+                .map(|index| {
+                    scenario
+                        .add_creature_to_graveyard(P0, &format!("Zero {index}"), 1, 1)
+                        .as_artifact_creature()
+                        .with_mana_cost(ManaCost::zero())
+                        .id()
+                })
+                .collect();
+            let spell = scenario.add_spell_to_hand_from_oracle(P0, "Bounded return clause harness", false,
+                "Return up to two creature cards with total mana value 4 or less from your graveyard to the battlefield.")
+                .with_mana_cost(ManaCost::zero()).id();
+            let mut runner = scenario.build();
+            let outcome = runner.cast(spell).resolve();
+            assert!(
+                matches!(outcome.final_waiting_for(), WaitingFor::ChooseFromZoneChoice { cards, .. }
+                if cards.len() == 3 && ids.iter().all(|id| cards.contains(id)))
+            );
+            outcome.assert_zone(&ids, Zone::Graveyard);
+            let actions = crate::ai_support::legal_actions(runner.state());
+            let selections: Vec<_> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    GameAction::SelectCards { cards } => Some(cards),
+                    _ => None,
+                })
+                .collect();
+            // CR 608.2d: Zero mana value does not remove the independent two-card ceiling.
+            for count in 0..=2 {
+                assert!(selections
+                    .iter()
+                    .any(|cards| cards.as_slice() == &ids[..count]));
+            }
+            assert!(!selections.iter().any(|cards| cards.len() > 2));
+            if reject_three {
+                let prompt = runner.state().waiting_for.clone();
+                assert!(runner
+                    .act(GameAction::SelectCards { cards: ids.clone() })
+                    .is_err());
+                assert_eq!(runner.state().waiting_for, prompt);
+                assert!(ids
+                    .iter()
+                    .all(|id| runner.state().objects[id].zone == Zone::Graveyard));
+            } else {
+                runner
+                    .act(GameAction::SelectCards {
+                        cards: ids[..2].to_vec(),
+                    })
+                    .expect("two zero-MV cards are legal");
+                assert!(ids[..2]
+                    .iter()
+                    .all(|id| runner.state().objects[id].zone == Zone::Battlefield));
+                assert_eq!(runner.state().objects[&ids[2]].zone, Zone::Graveyard);
+            }
+        }
+    }
     use crate::game::game_object::RoomDoor;
     use crate::types::game_state::TargetEffectDetail;
     use std::sync::Arc;
@@ -6861,7 +7014,8 @@ mod tests {
             predicted_winner: Some(PlayerId(0)),
             certificate: crate::analysis::loop_check::LoopCertificate {
                 unbounded: vec![],
-                win_kind: crate::analysis::loop_check::WinKind::LethalDamage,
+                win_kind: Some(crate::analysis::loop_check::WinKind::LethalDamage),
+                win_kind_at: None,
                 mandatory: false,
                 residual_board_delta: crate::analysis::resource::BoardDelta::default(),
                 per_cycle: None,
@@ -7325,7 +7479,9 @@ mod tests {
             .push(CoreType::Creature);
         state.objects.get_mut(&prepared_id).unwrap().prepared = Some(PreparedState);
         state.objects.get_mut(&prepared_id).unwrap().back_face =
-            Some(prepare_back_face_with_cost(ManaCost::NoCost));
+            // A {0} prepare spell needs no mana. `NoCost` would be an
+            // unpayable cost (CR 118.6), so the copy could not be cast.
+            Some(prepare_back_face_with_cost(ManaCost::zero()));
 
         // Create an unprepared creature on battlefield (must NOT appear).
         let plain_id = create_object(
@@ -7508,6 +7664,109 @@ mod tests {
                 } if source_id == hand_sliver && ability_index == printed_len
             )
         }));
+    }
+
+    /// Priority enumeration asks for the off-zone keywords of several cards
+    /// against one unchanged state; the dispatcher's scope must make them share
+    /// one gather without changing the enumerated actions.
+    #[test]
+    fn priority_enumeration_shares_one_keyword_gather() {
+        use crate::game::off_zone_characteristics::{
+            off_zone_keyword_scope_counts, off_zone_keyword_scope_depth,
+            reset_off_zone_keyword_scope_counts,
+        };
+
+        let mut state = GameState::new_two_player(42);
+        let p0 = PlayerId(0);
+        state.phase = Phase::PreCombatMain;
+        state.active_player = p0;
+        state.priority_player = p0;
+        state.waiting_for = WaitingFor::Priority { player: p0 };
+
+        let granter = create_object(
+            &mut state,
+            CardId(100),
+            p0,
+            "Homing Sliver".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&granter).unwrap();
+            obj.static_definitions.push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::Typed(
+                        TypedFilter::card()
+                            .subtype("Sliver".to_string())
+                            .properties(vec![FilterProp::InZone { zone: Zone::Hand }]),
+                    ))
+                    .modifications(vec![ContinuousModification::AddKeyword {
+                        keyword: Keyword::Typecycling {
+                            cost: ManaCost::NoCost,
+                            subtype: "Sliver".to_string(),
+                        },
+                    }]),
+            );
+            obj.static_definitions.push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::Typed(
+                        TypedFilter::card()
+                            .subtype("Sliver".to_string())
+                            .properties(vec![FilterProp::InZone {
+                                zone: Zone::Graveyard,
+                            }]),
+                    ))
+                    .modifications(vec![ContinuousModification::AddKeyword {
+                        keyword: Keyword::Flashback(crate::types::keywords::FlashbackCost::Mana(
+                            ManaCost::NoCost,
+                        )),
+                    }]),
+            );
+        }
+        let mut slivers = Vec::new();
+        for (index, zone) in [Zone::Hand, Zone::Hand, Zone::Graveyard, Zone::Graveyard]
+            .into_iter()
+            .enumerate()
+        {
+            let id = create_object(
+                &mut state,
+                CardId(101 + index as u64),
+                p0,
+                format!("Sliver {index}"),
+                zone,
+            );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.card_types.subtypes.push("Sliver".to_string());
+            obj.base_card_types = obj.card_types.clone();
+            slivers.push(id);
+        }
+
+        // Called directly, the enumeration runs outside any scope.
+        reset_off_zone_keyword_scope_counts();
+        let direct = priority_actions_with_probe(&state, p0, None);
+        let unscoped = off_zone_keyword_scope_counts();
+        assert_eq!(unscoped.matched, 0, "{unscoped:?}");
+        assert!(
+            unscoped.unmatched > 1,
+            "reach-guard: enumeration issues several off-zone keyword queries: {unscoped:?}"
+        );
+        assert!(
+            direct.iter().any(|candidate| matches!(
+                candidate.action,
+                GameAction::ActivateAbility { source_id, .. } if source_id == slivers[0]
+            )),
+            "reach-guard: a granted off-zone keyword produces an action"
+        );
+
+        reset_off_zone_keyword_scope_counts();
+        let dispatched = candidate_actions_broad_with_probe(&state, None);
+        let counts = off_zone_keyword_scope_counts();
+        assert!(counts.matched > 1, "reach-guard: {counts:?}");
+        assert_eq!(counts.fills, 1, "{counts:?}");
+        assert_eq!(counts.hits, counts.matched - 1, "{counts:?}");
+        assert_eq!(counts.context_fall_opens, 0, "{counts:?}");
+        assert_eq!(off_zone_keyword_scope_depth(), 0);
+        assert_eq!(format!("{dispatched:?}"), format!("{direct:?}"));
     }
 
     #[test]
@@ -9627,12 +9886,15 @@ mod tests {
             predicted_winner: None,
             certificate: crate::analysis::loop_check::LoopCertificate {
                 unbounded: vec![],
-                win_kind: crate::analysis::loop_check::WinKind::Advantage,
+                win_kind: Some(crate::analysis::loop_check::WinKind::Advantage),
+                win_kind_at: None,
                 mandatory: false,
                 residual_board_delta: crate::analysis::resource::BoardDelta::default(),
                 per_cycle: None,
             },
             schema: ShortcutDecisionSchema {
+                suggested_declaration: None,
+                leading_aims: Vec::new(),
                 iteration_count: IterationCount::Fixed(5),
                 measured_repetition_bound: Some(5),
                 deliverable_capacity: 5,

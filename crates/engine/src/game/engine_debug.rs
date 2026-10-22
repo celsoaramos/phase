@@ -907,6 +907,7 @@ fn enter_battlefield_with_etb(
         face_down_in_exile: crate::types::ability::ExileConcealment::Public,
         chain_referent: crate::types::zones::ChainReferentIntent::Silent,
         enter_as_copy: None,
+        enter_with_choices: None,
         discard_frame: None,
         performed_by: None,
         applied: HashSet::new(),
@@ -963,10 +964,10 @@ fn route_debug_token_to_battlefield(
     let values = super::printed_cards::intrinsic_copiable_values(&staged);
     let copy = CopyTokenSpec {
         values: Box::new(values.clone()),
-        display_source: staged.display_source,
-        printed_ref: staged.printed_ref.clone(),
-        token_image_ref: staged.token_image_ref.clone(),
-        token_art: None,
+        display: super::game_object::DisplayIdentity {
+            token_art: None,
+            ..staged.display_identity()
+        },
         extra_keywords: Vec::new(),
         additional_modifications: Vec::new(),
         tapped: false,

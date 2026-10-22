@@ -66,8 +66,8 @@ fn corpus_table_shape_is_locked() {
         .filter(|&i| corpus::row(i).gated_on.is_some())
         .count();
     assert_eq!(
-        gated, 4,
-        "exactly 4 rows are card-gated (Doc Aurlock / Professor Onyx / Animate Dead / Grindstone)"
+        gated, 5,
+        "exactly 5 rows are card-gated (Doc Aurlock / Professor Onyx / Animate Dead / Grindstone / Helm of Obedience)"
     );
     // Every row's expected axis must be derivable (total match over the enum).
     for i in 0..corpus::corpus_len() {
@@ -85,7 +85,7 @@ fn corpus_table_shape_is_locked() {
     }
     // The testable rows are the complement of the gated rows.
     let testable = corpus::corpus_len() - gated;
-    assert_eq!(testable, 57, "57 corpus combos are testable once driven");
+    assert_eq!(testable, 56, "56 corpus combos are testable once driven");
 }
 
 /// META-TEST: the corpus is a clean partition — every row is exactly one of
@@ -105,8 +105,8 @@ fn corpus_partition_is_locked() {
         .collect();
 
     assert_eq!(driven.len(), 22, "22 driven rows");
-    assert_eq!(gated.len(), 4, "4 gated rows");
-    assert_eq!(deferred.len(), 35, "35 deferred rows");
+    assert_eq!(gated.len(), 5, "5 gated rows");
+    assert_eq!(deferred.len(), 34, "34 deferred rows");
 
     assert!(driven.is_disjoint(&gated), "driven ∩ gated must be empty");
     assert!(
@@ -221,7 +221,8 @@ fn confirmed_drivers_match_expected() {
 
 /// The shared CLI dispatch ([`corpus::drive_row`]) classifies each status class
 /// through the REAL pipeline. NOTE: these are ARRAY indices; the gated rows are
-/// 2 / 21 / 39 / 52 (Doc Aurlock / Professor Onyx / Animate Dead / Grindstone) —
+/// 2 / 21 / 39 / 52 / 53 (Doc Aurlock / Professor Onyx / Animate Dead / Grindstone /
+/// Helm of Obedience) —
 /// NOT the ComboRow doc-comment's FEASIBILITY numbering (array idx 50 is a
 /// CONFIRMED driver, Spike Feeder + Archangel, not a gated row).
 #[test]
@@ -362,7 +363,8 @@ fn classify_status_compares_against_spec_not_rubber_stamp() {
     // Wrong win_kind ⇒ Failed. Revert "classify any Some(cert) as Confirmed" flips this.
     let wrong_win = LoopCertificate {
         unbounded: vec![ResourceAxis::DamageDealt(P1)],
-        win_kind: WinKind::LethalDamage,
+        win_kind: Some(WinKind::LethalDamage),
+        win_kind_at: None,
         mandatory: false,
         residual_board_delta: BoardDelta::default(),
         per_cycle: None,
@@ -378,7 +380,8 @@ fn classify_status_compares_against_spec_not_rubber_stamp() {
     // Right win_kind but wrong family ⇒ Failed. Revert "drop the family check" flips this.
     let wrong_family = LoopCertificate {
         unbounded: vec![ResourceAxis::TokensCreated],
-        win_kind: WinKind::Advantage,
+        win_kind: Some(WinKind::Advantage),
+        win_kind_at: None,
         mandatory: false,
         residual_board_delta: BoardDelta::default(),
         per_cycle: None,
@@ -404,7 +407,8 @@ fn classify_status_compares_against_spec_not_rubber_stamp() {
     // the three Failed assertions above are discriminating, not always-Failed.
     let right = LoopCertificate {
         unbounded: vec![ResourceAxis::Mana(ManaType::Green)],
-        win_kind: WinKind::Advantage,
+        win_kind: Some(WinKind::Advantage),
+        win_kind_at: None,
         mandatory: false,
         residual_board_delta: BoardDelta::default(),
         per_cycle: None,
@@ -475,7 +479,7 @@ fn assert_combo(idx: usize, cert: &LoopCertificate) {
         cert.unbounded,
         row.family,
     );
-    assert_eq!(cert.win_kind, row.win_kind, "{}: win_kind", row.name);
+    assert_eq!(cert.win_kind, Some(row.win_kind), "{}: win_kind", row.name);
 }
 
 /// HELIOD, SUN-CROWNED + WALKING BALLISTA — the canonical driving combo.
@@ -485,7 +489,7 @@ fn drive_heliod_ballista_certificate() {
     let cert = corpus::drive_offline_heliod_ballista(card_db()).expect(
         "Heliod + Ballista must be confirmed: board identical modulo life/damage, +1 damage/cycle",
     );
-    assert_eq!(cert.win_kind, WinKind::LethalDamage);
+    assert_eq!(cert.win_kind, Some(WinKind::LethalDamage));
     assert!(
         cert.covers(&[ResourceAxis::DamageDealt(P1)]),
         "certificate must name unbounded damage to the opponent (got {:?})",
@@ -569,7 +573,7 @@ fn drive_pentad_prism_charge_growth_certificate() {
     );
     assert_eq!(
         cert.win_kind,
-        WinKind::Advantage,
+        Some(WinKind::Advantage),
         "a charge-counter growth loop is a CR 104.4b optional advantage engine, not a win"
     );
     assert!(
@@ -628,7 +632,7 @@ fn drive_kilo_freed_relic_ballista_certificate() {
     );
     assert_eq!(
         cert.win_kind,
-        WinKind::LethalDamage,
+        Some(WinKind::LethalDamage),
         "a +1 damage/cycle ping on the opponent is an unbounded CR 704.5a lethal-damage loop"
     );
     assert!(
@@ -660,7 +664,7 @@ fn drive_kilo_freed_relic_ballista_x0_no_damage_axis() {
     );
     assert_eq!(
         cert.win_kind,
-        WinKind::Advantage,
+        Some(WinKind::Advantage),
         "with a dead Ballista the only unbounded axis is the proliferate trigger — an \
          advantage engine, not a lethal win"
     );
@@ -694,7 +698,7 @@ fn one_ring_burden_growth_certificate() {
     );
     assert_eq!(
         cert.win_kind,
-        WinKind::Advantage,
+        Some(WinKind::Advantage),
         "a burden-counter growth loop is a CR 104.4b optional advantage engine, not a win"
     );
     assert!(
@@ -898,7 +902,7 @@ fn drive_damage_loop_certificate() {
     let cert = detect_loop(&cycle_start, &cycle_end, &delta, P0, true)
         .expect("board-identical +damage cycle must be confirmed as a net-progress loop");
 
-    assert_eq!(cert.win_kind, WinKind::LethalDamage);
+    assert_eq!(cert.win_kind, Some(WinKind::LethalDamage));
     assert!(
         cert.covers(&[ResourceAxis::DamageDealt(P1)]),
         "the certificate must name unbounded damage to the opponent (got {:?})",

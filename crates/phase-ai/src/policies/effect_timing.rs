@@ -530,10 +530,12 @@ fn counter_target_worth(ctx: &PolicyContext<'_>, entry: &StackEntry) -> f64 {
 /// every stack entry the AI does not control.
 ///
 /// Approximation: the counter's own target filter is not applied (the engine
-/// matcher is not reachable from here), so a counter that can only hit creature
-/// spells still sees a noncreature entry's impact. Accepted — the filter narrows
-/// the set, so this can only over-estimate, and `SelectTarget` still picks
-/// legally.
+/// matcher is not reachable from here), so a counter that can only hit
+/// noncreature spells still sees a creature entry's impact. Accepted — the
+/// filter narrows the set, so this can only over-estimate. Target selection
+/// picks legally, but "legally" can mean the AI's own spell when that is all
+/// the filter reaches; that cast is vetoed in `tactical_gate`
+/// (`counter_reaches_nothing_foreign`), not here.
 fn best_counter_impact(ctx: &PolicyContext<'_>) -> f64 {
     ctx.state
         .stack
@@ -2127,7 +2129,7 @@ mod tests {
 
     fn counter_effect() -> Effect {
         Effect::Counter {
-            target: TargetFilter::Any,
+            target: TargetFilter::StackSpell,
             source_rider: None,
             countered_spell_zone: None,
         }
@@ -2159,8 +2161,7 @@ mod tests {
             obj.toughness = Some(toughness);
         }
         let ability = ResolvedAbility::new(effect, targets, source_id, controller);
-        let id = ObjectId(state.next_object_id);
-        state.next_object_id += 1;
+        let id = source_id;
         state.stack.push_back(StackEntry {
             id,
             source_id,

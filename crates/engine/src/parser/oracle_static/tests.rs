@@ -196,6 +196,71 @@ fn classify_quoted_inner_normalizes_trailing_sentence_comma() {
     );
 }
 
+/// CR 602.1 + CR 602.1a + CR 604.1: text of the shape "[Cost]: [Effect]" is an
+/// ACTIVATED ability, so the static-line authority must decline it. Before the
+/// guard, the "~ has/gets …" arm admitted `{R}: ~ gets +1/+0 until end of turn.`
+/// on a subject heuristic (the subject slice `{r}: ~` carries no
+/// creature/permanent/land) and produced a bare `AddPower`/`AddToughness` static —
+/// the cost and the duration were dropped outright. Dragon Egg's token, Nesting
+/// Dragon's nested token, and Kargan Dragonlord's `LEVEL 8+` line all reached it
+/// through this path. Building-block level, not that card: the predicate is the
+/// single authority both static entry points consult.
+#[test]
+fn unquoted_cost_separator_declines_costed_lines_in_the_static_authority() {
+    // Revert-failing: pre-guard `parse_static_line` returned the flattened
+    // `Continuous { SelfRef, [AddPower 1, AddToughness 0] }`.
+    assert!(
+        parse_static_line("{R}: ~ gets +1/+0 until end of turn.").is_none(),
+        "a costed pump line is an activated ability, not a static"
+    );
+    assert!(
+        parse_static_line_multi("{R}: ~ gets +1/+0 until end of turn.").is_empty(),
+        "the multi-entry fallback must decline it too"
+    );
+
+    // Reminder-text control pair. The parenthetical `({2}: Attach …)` colon IS a
+    // cost separator for the bare predicate — the predicate does not strip reminder
+    // text — but `parse_static_line_inner` strips reminders BEFORE consulting it, so
+    // the line stays a static and the equipped arm still claims it. Both legs are
+    // real, which is what makes this pair non-vacuous.
+    let equipped = "Equipped creature gets +2/+2. ({2}: Attach to target creature you control. \
+                    Equip only as a sorcery.)";
+    assert!(
+        super::grammar::unquoted_cost_separator(equipped).is_some(),
+        "the bare predicate does see the parenthetical colon"
+    );
+    let def = parse_static_line(equipped).expect("equip static must survive the guard");
+    assert!(def
+        .modifications
+        .contains(&ContinuousModification::AddPower { value: 2 }));
+
+    // Quote-masking guard: the colon belongs to the INNER granted ability, so the
+    // outer line stays a static grant. Goes red if the guard were
+    // `find_cost_separator(text)` without `strip_quoted_segments`.
+    let granted = parse_static_line("Creatures you control have \"{T}: Add {G}.\"")
+        .expect("a quoted granted activated ability keeps the outer line static");
+    assert!(
+        granted
+            .modifications
+            .iter()
+            .any(|m| matches!(m, ContinuousModification::GrantAbility { .. })),
+        "quoted inner ability must be granted, got {:?}",
+        granted.modifications
+    );
+
+    // Adjacent statics are untouched.
+    assert!(parse_static_line("~ can't block.").is_some());
+    assert!(parse_static_line("Other Merfolk creatures you control get +1/+1.").is_some());
+
+    // Class boundary (documents the scanner's coverage, not a discriminating
+    // row): a text-based cost the scanner recognizes declines here too. Measured
+    // empty BEFORE the guard as well — no static arm ever claimed it.
+    assert!(
+        parse_static_line("Tap an untapped creature you control: Add {G}.").is_none(),
+        "text-based cost prefix is a cost separator"
+    );
+}
+
 // Regression: a for-each pump with only a trailing KEYWORD is unchanged and gains
 // no spurious subtype/grant.
 #[test]
@@ -10362,6 +10427,7 @@ fn parse_continuous_modifications_grants_all_activated_abilities_of_exiled() {
             vec![ContinuousModification::GrantAllActivatedAbilitiesOf {
                 source: TargetFilter::ExiledBySource,
                 cap: None,
+                kind: None,
             }],
             "predicate: {predicate}"
         );
@@ -10390,6 +10456,7 @@ fn parse_continuous_modifications_grants_each_activated_ability_of_craft_pile() 
                 // so the craft grant is uncapped here (the cap appears only on the
                 // full two-sentence Locus line; see the whole-line test below).
                 cap: None,
+                kind: None,
             }],
             "predicate: {predicate}"
         );
@@ -10416,6 +10483,7 @@ fn locus_of_enlightenment_grant_static_parses_whole_line() {
         vec![ContinuousModification::GrantAllActivatedAbilitiesOf {
             source: TargetFilter::ExiledBySource,
             cap: Some(ActivationRestriction::OnlyOnceEachTurn),
+            kind: None,
         }]
     );
 
@@ -10435,6 +10503,7 @@ fn locus_of_enlightenment_grant_static_parses_whole_line() {
         vec![ContinuousModification::GrantAllActivatedAbilitiesOf {
             source: TargetFilter::ExiledBySource,
             cap: None,
+            kind: None,
         }]
     );
 }
@@ -10468,7 +10537,138 @@ fn grant_cap_rider_folds_over_any_grant_source() {
                     }]),
             ),
             cap: Some(ActivationRestriction::OnlyOnceEachTurn),
+            kind: None,
         }]
+    );
+}
+
+/// CR 602.5b + CR 602.5c: kind-selected grant riders remain unsupported by
+/// the static parser. Synthetic text checks that this combination declines
+/// instead of silently dropping an explicit restriction on the acquired ability.
+#[test]
+fn grant_cap_rider_never_folds_onto_loyalty_grant() {
+    // Hostile leg: loyalty grant + rider. The line yields NO static defs —
+    // asserted EXPLICITLY (a rider-fold regression that capped the loyalty
+    // grant would emit a def and fail) — and the card-level parse carries
+    // the single static_structure gap. Lock-in: passes via the rider-decline
+    // path at base and via the loyalty-refusal path post-change.
+    let defs = parse_static_line_multi(
+        "~ has all loyalty abilities of all lands on the battlefield. You may activate each of those abilities only once each turn.",
+    );
+    assert!(
+        defs.is_empty(),
+        "loyalty+rider line must yield no static defs; got {defs:?}"
+    );
+    let refused = parse_card(
+        "Grant Recipient has all loyalty abilities of all lands on the battlefield. You may activate each of those abilities only once each turn.",
+        "Grant Recipient",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    assert!(refused.statics.is_empty(), "{:?}", refused.statics);
+    assert_eq!(refused.abilities.len(), 1, "{:?}", refused.abilities);
+    assert!(
+        matches!(&*refused.abilities[0].effect, Effect::Unimplemented { name, .. } if name == "static_structure"),
+        "{:?}",
+        refused.abilities,
+    );
+
+    // Reach-guard leg: the SAME rider after an ACTIVATED grant still folds —
+    // proving the guard discriminates by kind instead of breaking the fold.
+    let activated = parse_static_line_multi(
+        "~ has all activated abilities of all lands on the battlefield. You may activate each of those abilities only once each turn.",
+    );
+    assert_eq!(
+        activated.len(),
+        1,
+        "expected one grant static, got {activated:?}"
+    );
+    assert_eq!(
+        activated[0].modifications,
+        vec![ContinuousModification::GrantAllActivatedAbilitiesOf {
+            source: TargetFilter::Typed(TypedFilter::land().properties(vec![FilterProp::InZone {
+                zone: Zone::Battlefield,
+            }]),),
+            cap: Some(ActivationRestriction::OnlyOnceEachTurn),
+            kind: None,
+        }],
+        "the same rider must still fold onto an activated grant; got {activated:?}",
+    );
+}
+
+/// A refused kind-selected rider must decline the whole sibling-static line,
+/// rather than attaching to an older all-activated grant. This synthetic
+/// composition tests parser coverage honesty, not a printed card's behavior.
+#[test]
+fn grant_cap_rider_after_loyalty_grant_does_not_cap_older_sibling() {
+    let grants = "Grant Recipient has all activated abilities of all lands on the battlefield. Grant Recipient has all loyalty abilities of all other planeswalkers on the battlefield.";
+    // The loyalty sentence refuses at emission, so the whole line declines —
+    // the same observable as the rider-refusal leg below (documents that a
+    // loyalty sentence sharing a line with an admitted grant takes the line
+    // down with it; only Bolas prints the leaf).
+    let loyalty_line = parse_card(grants, "Grant Recipient", &[], &["Artifact"], &[]);
+    assert!(
+        loyalty_line.statics.is_empty(),
+        "{:?}",
+        loyalty_line.statics
+    );
+    assert_eq!(
+        loyalty_line.abilities.len(),
+        1,
+        "{:?}",
+        loyalty_line.abilities
+    );
+    assert!(
+        matches!(&*loyalty_line.abilities[0].effect, Effect::Unimplemented { name, .. } if name == "static_structure"),
+        "{:?}",
+        loyalty_line.abilities,
+    );
+
+    let refused = parse_card(
+        &format!("{grants} You may activate each of those abilities only once each turn."),
+        "Grant Recipient",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    assert!(refused.statics.is_empty(), "{:?}", refused.statics);
+    assert_eq!(refused.abilities.len(), 1, "{:?}", refused.abilities);
+    assert!(
+        matches!(&*refused.abilities[0].effect, Effect::Unimplemented { name, .. } if name == "static_structure"),
+        "{:?}",
+        refused.abilities,
+    );
+
+    // The same sibling structure still caps the latest all-activated grant.
+    let activated = parse_card(
+        "Grant Recipient has all activated abilities of all lands on the battlefield. Grant Recipient has all activated abilities of all other planeswalkers on the battlefield. You may activate each of those abilities only once each turn.",
+        "Grant Recipient",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    assert!(activated.abilities.is_empty(), "{:?}", activated.abilities);
+    assert_eq!(activated.statics.len(), 2, "{:?}", activated.statics);
+    // The older sibling keeps the exact mods leg 1 asserted before the
+    // loyalty refusal (inlined: leg 1 no longer emits statics to compare to).
+    assert_eq!(
+        activated.statics[0].modifications,
+        vec![ContinuousModification::GrantAllActivatedAbilitiesOf {
+            source: TargetFilter::Typed(TypedFilter::land().properties(vec![FilterProp::InZone {
+                zone: Zone::Battlefield,
+            }])),
+            cap: None,
+            kind: None,
+        }],
+    );
+    assert_eq!(
+        activated.statics[1].modifications,
+        vec![ContinuousModification::GrantAllActivatedAbilitiesOf {
+            source: all_other_planeswalkers_source(),
+            cap: Some(ActivationRestriction::OnlyOnceEachTurn),
+            kind: None,
+        }],
     );
 }
 
@@ -10498,6 +10698,7 @@ fn locus_cap_via_standard_oracle_dispatch() {
         vec![ContinuousModification::GrantAllActivatedAbilitiesOf {
             source: TargetFilter::ExiledBySource,
             cap: Some(ActivationRestriction::OnlyOnceEachTurn),
+            kind: None,
         }]
     );
 }
@@ -10516,6 +10717,7 @@ fn parse_continuous_modifications_grants_creature_cards_exiled() {
             ],
         },
         cap: None,
+        kind: None,
     };
     for predicate in [
         "all activated abilities of all creature cards exiled with it",
@@ -10544,6 +10746,7 @@ fn parse_continuous_modifications_grants_land_cards_exiled() {
             ],
         },
         cap: None,
+        kind: None,
     };
     for predicate in [
         "all activated abilities of all land cards exiled with it",
@@ -10591,6 +10794,7 @@ fn land_cards_exiled_grant_declines_mis_scoped_sets() {
                 ],
             },
             cap: None,
+            kind: None,
         }]
     );
     let grants_exiled = |mods: &[ContinuousModification]| {
@@ -10659,6 +10863,7 @@ fn parse_continuous_modifications_grants_creatures_you_control_not_same_name() {
                 }]),
         ),
         cap: None,
+        kind: None,
     };
     for predicate in [
         "all activated abilities of creatures you control that don't have the same name as it",
@@ -10695,6 +10900,7 @@ fn parse_grant_all_activated_abilities_each_other_creature_with_counter() {
             ],
         },
         cap: None,
+        kind: None,
     };
     for predicate in [
         "all activated abilities of each other creature with a +1/+1 counter on it",
@@ -10722,6 +10928,7 @@ fn parse_grant_all_activated_abilities_opponents_creatures() {
                 }]),
         ),
         cap: None,
+        kind: None,
     };
     for predicate in [
         "all activated abilities of all creatures your opponents control",
@@ -10745,6 +10952,7 @@ fn parse_grant_all_activated_abilities_creature_cards_in_graveyards() {
             zone: Zone::Graveyard,
         }])),
         cap: None,
+        kind: None,
     };
     for predicate in [
         "all activated abilities of all creature cards in all graveyards",
@@ -10768,6 +10976,7 @@ fn parse_grant_all_activated_abilities_all_lands() {
             zone: Zone::Battlefield,
         }])),
         cap: None,
+        kind: None,
     };
     for predicate in [
         "all activated abilities of all lands on the battlefield",
@@ -10779,6 +10988,140 @@ fn parse_grant_all_activated_abilities_all_lands() {
             "predicate: {predicate}"
         );
     }
+}
+
+/// CR 613.1f: the provider set "all other planeswalkers on the battlefield"
+/// (Nicol Bolas, Dragon-God) — battlefield-pinned planeswalkers (the Manascape
+/// zone shape) AND NOT the host itself (the Kraj self-exclusion conjunct, for
+/// the English "other"). Shared by the Bolas clause test and the
+/// activated-category hostile so the emission shape cannot drift.
+fn all_other_planeswalkers_source() -> TargetFilter {
+    use crate::types::ability::{FilterProp, TypedFilter};
+    use crate::types::zones::Zone;
+    use crate::types::TypeFilter;
+    TargetFilter::And {
+        filters: vec![
+            TargetFilter::Typed(TypedFilter::new(TypeFilter::Planeswalker).properties(vec![
+                FilterProp::InZone {
+                    zone: Zone::Battlefield,
+                },
+            ])),
+            TargetFilter::Not {
+                filter: Box::new(TargetFilter::SelfRef),
+            },
+        ],
+    }
+}
+
+/// CR 613.1f + CR 606.2 + CR 607.5: emission-level refusal — the loyalty
+/// category over the battlefield-wide planeswalker source set (Nicol Bolas,
+/// Dragon-God) yields NO mods: the donated linked pairs are unrepresentable
+/// in the source-level exile ledger, so the emission declines. Re-admitting
+/// the loyalty arm restores emission and strands the emptiness assert (red).
+#[test]
+fn parse_grant_all_loyalty_abilities_all_other_planeswalkers() {
+    for predicate in [
+        "all loyalty abilities of all other planeswalkers on the battlefield",
+        "has all loyalty abilities of all other planeswalkers on the battlefield",
+    ] {
+        assert!(
+            parse_continuous_modifications(predicate).is_empty(),
+            "loyalty × planeswalker-source grant must refuse at emission; predicate: {predicate}"
+        );
+    }
+}
+
+/// CR 613.1f: axis-independence (a) — the NEW source arm composes with the OLD
+/// activated category, proving the source arm is an independent per-axis
+/// addition rather than part of a Bolas-specific branch. Reaches exactly one
+/// new `alt` arm: reverting the source arm turns this red while the category
+/// hostile stays green, and vice versa.
+#[test]
+fn parse_grant_new_source_arm_composes_with_activated() {
+    assert_eq!(
+        parse_continuous_modifications(
+            "has all activated abilities of all other planeswalkers on the battlefield"
+        ),
+        vec![ContinuousModification::GrantAllActivatedAbilitiesOf {
+            source: all_other_planeswalkers_source(),
+            cap: None,
+            kind: None,
+        }],
+    );
+}
+
+/// CR 613.1f + CR 607.5: emission-level refusal across the source axis too —
+/// the loyalty category over the Manascape land source yields NO mods (the
+/// refusal is on the kinds axis, so it covers every source arm uniformly).
+/// Re-admitting the loyalty arm restores emission and strands the emptiness
+/// assert (red).
+#[test]
+fn parse_grant_new_category_arm_composes_with_land_source() {
+    assert!(
+        parse_continuous_modifications("has all loyalty abilities of all lands on the battlefield")
+            .is_empty(),
+        "loyalty × land-source grant must refuse at emission"
+    );
+}
+
+/// CR 613.1f + CR 606.2 + CR 607.5: the verbatim Bolas grant clause REFUSES
+/// loudly — zero statics, exactly one `static_structure` honest gap (the
+/// 2024-01-12 acquired-pair linkage the grant donates is unrepresentable in
+/// the source-level exile ledger, so the sentence stays a loud gap rather
+/// than over-granting). Re-admitting the loyalty emission arm restores the
+/// typed static and strands the refusal asserts (red).
+#[test]
+fn bolas_grant_clause_refuses_with_static_structure() {
+    use crate::parser::oracle::parse_oracle_text;
+    use crate::types::ability::{AbilityDefinition, Effect};
+
+    let parsed = parse_oracle_text(
+        "Nicol Bolas has all loyalty abilities of all other planeswalkers on the battlefield.",
+        "Nicol Bolas, Dragon-God",
+        &[],
+        &["Legendary".to_string(), "Planeswalker".to_string()],
+        &["Bolas".to_string()],
+    );
+
+    // Walk the whole ability tree (each ability plus its sub_ability chain) so
+    // the gap cannot hide — and so the walk FINDS exactly one gap.
+    fn walk<'a>(ability: &'a AbilityDefinition, out: &mut Vec<&'a Effect>) {
+        out.push(&ability.effect);
+        if let Some(sub) = &ability.sub_ability {
+            walk(sub, out);
+        }
+    }
+    let mut effects = Vec::new();
+    for ability in &parsed.abilities {
+        walk(ability, &mut effects);
+    }
+    let gaps: Vec<&&Effect> = effects
+        .iter()
+        .filter(|effect| matches!(effect, Effect::Unimplemented { .. }))
+        .collect();
+    assert_eq!(
+        gaps.len(),
+        1,
+        "verbatim Bolas grant clause must emit exactly one gap; got {effects:?}"
+    );
+    assert!(
+        matches!(gaps[0], Effect::Unimplemented { name, .. } if name == "static_structure"),
+        "the gap must be the static_structure honest gap; got {:?}",
+        gaps[0]
+    );
+
+    // Refusal shape: zero statics, one gap ability.
+    assert!(
+        parsed.statics.is_empty(),
+        "verbatim Bolas grant clause must refuse with zero statics; got {:?}",
+        parsed.statics
+    );
+    assert_eq!(
+        parsed.abilities.len(),
+        1,
+        "verbatim Bolas grant clause must lower to exactly one gap ability; got {:?}",
+        parsed.abilities
+    );
 }
 
 /// CR 613.1f: "all legendary creatures you control" (Robaran Mercenaries)
@@ -10801,6 +11144,7 @@ fn parse_grant_all_activated_abilities_legendary_creatures_you_control() {
                 ]),
         ),
         cap: None,
+        kind: None,
     };
     for predicate in [
         "all activated abilities of all legendary creatures you control",
@@ -10812,6 +11156,190 @@ fn parse_grant_all_activated_abilities_legendary_creatures_you_control() {
             "predicate: {predicate}"
         );
     }
+}
+
+/// CR 613.1f + CR 606.2 + CR 607.5: hostile multi-sentence composition — a
+/// quoted-grant sentence sharing a line with the refused by-reference loyalty
+/// leaf does NOT refuse whole-line. The loyalty segment emits nothing, so the
+/// multi-sentence parse defers and falls through to the single-sentence
+/// fallback per the reviewed chain: the fallback re-parses the WHOLE line
+/// after the first " has " as one predicate, the by-reference clause match is
+/// `all_consuming` so it fails over the two-sentence predicate (the predicate
+/// never evaluates and the loyalty leaf is never emitted), while the quoted
+/// emission fires on the original quoted text. Observable pinned here: the
+/// quoted static IS present carrying only the quoted mod, ZERO kind-Loyalty
+/// by-reference grants are emitted, and exactly ONE `static_structure` gap
+/// records the refused leaf (the non-empty defs adopt at Priority 7, and the
+/// recognized refusal is carried across the fallback boundary as the same
+/// typed residual 14a would have emitted — Matt review 5564241267 MED).
+/// Coupling trap: re-admitting the `:1360` loyalty emission makes the finder
+/// a false positive, so the finder and the early return must change together.
+#[test]
+fn quoted_grant_with_refused_loyalty_leaf_falls_back_to_quoted_static() {
+    for line in [
+        // Quoted sentence first (plan-r3 V9 hostile shape).
+        "Grant Recipient has \"[0]: Proliferate\". Grant Recipient has all loyalty abilities of all other planeswalkers on the battlefield.",
+        // Leaf first: order-independent — the first-" has " combined predicate
+        // fails the all_consuming by-reference clause match either way.
+        "Grant Recipient has all loyalty abilities of all other planeswalkers on the battlefield. Grant Recipient has \"[0]: Proliferate\".",
+    ] {
+        let parsed = parse_card(line, "Grant Recipient", &[], &["Artifact"], &[]);
+
+        // The quoted static IS present, carrying only the quoted mod. This
+        // positive leg is the reach-guard proving the absence legs below are
+        // not vacuous (the line parsed — the leaf was dropped, not the line).
+        assert_eq!(
+            parsed.statics.len(),
+            1,
+            "the quoted static must survive the fallback; line: {line}\n{:?}",
+            parsed.statics
+        );
+        assert_eq!(
+            parsed.statics[0].modifications.len(),
+            1,
+            "the fallback static must carry only the quoted mod; line: {line}\n{:?}",
+            parsed.statics
+        );
+        let ContinuousModification::GrantAbility { definition } =
+            &parsed.statics[0].modifications[0]
+        else {
+            panic!(
+                "the surviving mod must be the quoted GrantAbility; line: {line}\n{:?}",
+                parsed.statics
+            );
+        };
+        assert!(
+            matches!(definition.cost, Some(AbilityCost::Loyalty { amount: 0 })),
+            "the quoted grant must be the [0] loyalty ability; line: {line}\n{:?}",
+            parsed.statics
+        );
+        assert!(
+            matches!(*definition.effect, Effect::Proliferate),
+            "the quoted grant must be Proliferate; line: {line}\n{:?}",
+            parsed.statics
+        );
+
+        // ZERO kind-Loyalty by-reference grants anywhere in the line's statics:
+        // the fallback route must never re-admit the refused leaf.
+        for def in &parsed.statics {
+            for modification in &def.modifications {
+                assert!(
+                    !matches!(
+                        modification,
+                        ContinuousModification::GrantAllActivatedAbilitiesOf {
+                            kind: Some(ActivatedAbilityKind::Loyalty),
+                            ..
+                        }
+                    ),
+                    "no kind-Loyalty by-reference grant may emit through the fallback; line: {line}\n{:?}",
+                    parsed.statics
+                );
+            }
+        }
+
+        // Carried-marker observation: the non-empty fallback defs adopt at
+        // Priority 7, and the refused leaf is recorded as exactly one
+        // `static_structure` gap whose fragment names the leaf (unit-scoped,
+        // not whole-line).
+        assert_eq!(
+            parsed.abilities.len(),
+            1,
+            "expected one carried gap for the refused leaf; line: {line}\n{:?}",
+            parsed.abilities
+        );
+        assert!(
+            matches!(&*parsed.abilities[0].effect, Effect::Unimplemented { name, .. } if name == "static_structure"),
+            "the carried gap must be the static_structure honest gap; line: {line}\n{:?}",
+            parsed.abilities
+        );
+        assert!(
+            matches!(&*parsed.abilities[0].effect, Effect::Unimplemented { description: Some(desc), .. } if desc.contains("all loyalty abilities of all other planeswalkers on the battlefield")),
+            "the carried gap fragment must name the refused leaf; line: {line}\n{:?}",
+            parsed.abilities
+        );
+    }
+}
+
+/// CR 606.3 + CR 606.2: adjacent-grammar negative (V8) — the Oath sentence
+/// names "the loyalty abilities of ..." but is an activation-limit static, not
+/// a by-reference grant, so the refusal finder must stay silent (the sentence
+/// carries no get/has/have/lose marker and fails the `all_consuming` clause
+/// match regardless — a substring finder would fire here). Reach-guard: the
+/// `ModifyActivationLimit` static itself proves the line parsed.
+#[test]
+fn oath_sentence_gains_no_refusal_marker() {
+    let parsed = parse_card(
+        "You may activate the loyalty abilities of planeswalkers you control twice each turn rather than only once.",
+        "Oath of Teferi",
+        &[],
+        &["Enchantment"],
+        &[],
+    );
+    assert_eq!(
+        parsed.statics.len(),
+        1,
+        "the Oath static must survive; got {:?}",
+        parsed.statics
+    );
+    assert_eq!(
+        parsed.statics[0].mode,
+        StaticMode::ModifyActivationLimit {
+            keyword: "loyalty".to_string(),
+            new_limit: 2,
+        },
+        "reach-guard: the activation-limit static must parse; got {:?}",
+        parsed.statics
+    );
+    assert!(
+        parsed.abilities.is_empty(),
+        "expected zero gaps for the Oath sentence; got {:?}",
+        parsed.abilities
+    );
+}
+
+/// CR 613.1f + CR 606.2 + CR 607.5: single-sentence hybrid negative (V10) —
+/// `~ has "X" and all loyalty abilities of ...` — the quote-stripped
+/// predicate fails the `all_consuming` clause match at the emission site AND
+/// at the finder identically, so no refusal exists to carry and no gap is
+/// recorded. Reach-guard: the adopted quoted static proves the line parsed.
+#[test]
+fn hybrid_single_sentence_gains_no_refusal_marker() {
+    let line = "Grant Recipient has \"[0]: Proliferate\" and all loyalty abilities of all other planeswalkers on the battlefield.";
+    let parsed = parse_card(line, "Grant Recipient", &[], &["Artifact"], &[]);
+    assert_eq!(
+        parsed.statics.len(),
+        1,
+        "the quoted static must survive; line: {line}\n{:?}",
+        parsed.statics
+    );
+    assert_eq!(
+        parsed.statics[0].modifications.len(),
+        1,
+        "the static must carry only the quoted mod; line: {line}\n{:?}",
+        parsed.statics
+    );
+    let ContinuousModification::GrantAbility { definition } = &parsed.statics[0].modifications[0]
+    else {
+        panic!(
+            "the surviving mod must be the quoted GrantAbility; line: {line}\n{:?}",
+            parsed.statics
+        );
+    };
+    assert!(
+        matches!(definition.cost, Some(AbilityCost::Loyalty { amount: 0 })),
+        "the quoted grant must be the [0] loyalty ability; line: {line}\n{:?}",
+        parsed.statics
+    );
+    assert!(
+        matches!(*definition.effect, Effect::Proliferate),
+        "the quoted grant must be Proliferate; line: {line}\n{:?}",
+        parsed.statics
+    );
+    assert!(
+        parsed.abilities.is_empty(),
+        "expected zero gaps for the hybrid sentence; line: {line}\n{:?}",
+        parsed.abilities
+    );
 }
 
 /// CR 613.1f + CR 108.3: "all artifact cards in your graveyard" — ownership-based
@@ -10832,6 +11360,7 @@ fn parse_grant_all_activated_abilities_artifact_cards_in_your_graveyard() {
             },
         ])),
         cap: None,
+        kind: None,
     };
     for predicate in [
         "all activated abilities of all artifact cards in your graveyard",
@@ -10865,6 +11394,7 @@ fn parse_grant_all_activated_abilities_subtype_cards_in_graveyard() {
             ]),
         ),
         cap: None,
+        kind: None,
     };
     for predicate in [
         "all activated abilities of all elf cards in your graveyard",
@@ -10886,6 +11416,7 @@ fn parse_grant_all_activated_abilities_subtype_cards_in_graveyard() {
             ]),
         ),
         cap: None,
+        kind: None,
     };
     assert_eq!(
         parse_continuous_modifications(
@@ -11946,6 +12477,200 @@ fn static_boast_abilities_activate_as_instant() {
     );
 }
 
+/// CR 606.3: Oath of Teferi line 2 (verbatim) lowers to the shared
+/// `ModifyActivationLimit` mode with the `"loyalty"` keyword convention (the
+/// Eidolon cost-gate spelling), scoped to planeswalkers its controller
+/// controls. Reverting the `dispatch.rs` call site yields `None` here.
+#[test]
+fn static_oath_of_teferi_loyalty_activation_limit() {
+    let def = parse_static_line(
+        "You may activate the loyalty abilities of planeswalkers you control twice each turn rather than only once.",
+    )
+    .unwrap();
+    assert_eq!(
+        def.mode,
+        StaticMode::ModifyActivationLimit {
+            keyword: "loyalty".to_string(),
+            new_limit: 2,
+        }
+    );
+    assert_eq!(
+        def.affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::new(TypeFilter::Planeswalker).controller(ControllerRef::You),
+        ))
+    );
+}
+
+/// CR 606.3 + CR 201.5 + CR 201.5c: Urza, Planeswalker's self-scoped sibling — the
+/// production pipeline normalizes "Urza" to `~` before the static line parses,
+/// so the unit shape uses `~` directly and expects `SelfRef`. Runtime scope is
+/// pinned by the `oath_of_teferi` integration seam test, not here.
+#[test]
+fn static_urza_planeswalker_loyalty_activation_limit_is_self_scoped() {
+    let def = parse_static_line(
+        "You may activate the loyalty abilities of ~ twice each turn rather than only once.",
+    )
+    .unwrap();
+    assert_eq!(
+        def.mode,
+        StaticMode::ModifyActivationLimit {
+            keyword: "loyalty".to_string(),
+            new_limit: 2,
+        }
+    );
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+}
+
+/// CR 606.3: the count axis composes (`twice`/`thrice`/N) — no printed card
+/// carries the thrice/N-time loyalty shape yet, so these are labeled
+/// combinator tests, not card tests.
+#[test]
+fn static_loyalty_activation_limit_count_axis_composes() {
+    let thrice = parse_static_line(
+        "You may activate the loyalty abilities of planeswalkers you control thrice each turn rather than only once.",
+    )
+    .unwrap();
+    assert_eq!(
+        thrice.mode,
+        StaticMode::ModifyActivationLimit {
+            keyword: "loyalty".to_string(),
+            new_limit: 3,
+        }
+    );
+    let n = parse_static_line(
+        "You may activate the loyalty abilities of planeswalkers you control 4 times each turn rather than only once.",
+    )
+    .unwrap();
+    assert_eq!(
+        n.mode,
+        StaticMode::ModifyActivationLimit {
+            keyword: "loyalty".to_string(),
+            new_limit: 4,
+        }
+    );
+}
+
+/// Synthetic numeric grammar controls: representable nonzero limits retain
+/// their exact value; zero and overflowing limits keep honest unsupported output.
+#[test]
+fn static_loyalty_activation_limit_numeric_bounds_are_honest() {
+    for limit in [1u8, 4, 255] {
+        let text = format!(
+            "You may activate the loyalty abilities of planeswalkers you control {limit} times each turn rather than only once."
+        );
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            &text,
+            "Numeric Limit",
+            &[],
+            &["Enchantment".to_string()],
+            &[],
+        );
+        assert!(
+            parsed.statics.iter().any(|definition| matches!(
+                &definition.mode,
+                StaticMode::ModifyActivationLimit { keyword, new_limit }
+                    if keyword == "loyalty" && *new_limit == limit
+            )),
+            "limit {limit} must retain its exact value: {parsed:?}"
+        );
+        assert!(
+            !parsed
+                .abilities
+                .iter()
+                .any(|ability| matches!(ability.effect.as_ref(), Effect::Unimplemented { .. })),
+            "representable limit {limit} must parse completely: {parsed:?}"
+        );
+    }
+
+    for limit in [0, 256, 257] {
+        let text = format!(
+            "You may activate the loyalty abilities of planeswalkers you control {limit} times each turn rather than only once."
+        );
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            &text,
+            "Numeric Limit",
+            &[],
+            &["Enchantment".to_string()],
+            &[],
+        );
+        assert!(
+            parsed
+                .abilities
+                .iter()
+                .any(|ability| matches!(ability.effect.as_ref(), Effect::Unimplemented { .. })),
+            "unfaithful limit {limit} must remain unsupported: {parsed:?}"
+        );
+        assert!(
+            !parsed.statics.iter().any(|definition| matches!(
+                &definition.mode,
+                StaticMode::ModifyActivationLimit { keyword, .. } if keyword == "loyalty"
+            )),
+            "unfaithful limit {limit} must not produce a loyalty cap: {parsed:?}"
+        );
+    }
+}
+
+/// CR 606.3: routing claims exactly its class. Kaito, Dancing Shadow's line is
+/// trigger-led ("Whenever ..."), so the full pipeline must keep it a trigger
+/// and produce NO `ModifyActivationLimit` static — the trigger slot precedes
+/// the static slot and the new routing entry must not steal the line.
+#[test]
+fn static_routing_does_not_steal_trigger_led_loyalty_line() {
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        "Whenever one or more creatures you control deal combat damage to a player, you may return one of them to its owner's hand. If you do, you may activate loyalty abilities of Kaito twice this turn rather than only once.",
+        "Kaito, Dancing Shadow",
+        &[],
+        &["Planeswalker".to_string()],
+        &[],
+    );
+    assert!(
+        !parsed.triggers.is_empty(),
+        "the trigger-led line must stay a trigger, got {:?}",
+        parsed.triggers
+    );
+    assert!(
+        !parsed.statics.iter().any(|d| matches!(
+            &d.mode,
+            StaticMode::ModifyActivationLimit { keyword, .. } if keyword == "loyalty"
+        )),
+        "no loyalty activation-limit static may be claimed from a trigger-led line, got {:?}",
+        parsed.statics
+    );
+}
+
+/// CR 606.3: scope wording selects mechanism. A permanent-led "twice THIS turn"
+/// loyalty sentence is a one-shot SET grant, not a continuous static — the
+/// grammar must fail closed so it keeps today's honest `Unimplemented`, and the
+/// `Unimplemented` assertion below is the reach-guard against a vacuous pass.
+#[test]
+fn static_loyalty_activation_limit_rejects_this_turn_scope() {
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        "You may activate the loyalty abilities of planeswalkers you control twice this turn rather than only once.",
+        "Test Card",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+    assert!(
+        parsed
+            .abilities
+            .iter()
+            .any(|a| matches!(a.effect.as_ref(), Effect::Unimplemented { .. })),
+        "the one-shot scope must stay an honest Unimplemented, got abilities={:?} statics={:?}",
+        parsed.abilities,
+        parsed.statics
+    );
+    assert!(
+        !parsed.statics.iter().any(|d| matches!(
+            &d.mode,
+            StaticMode::ModifyActivationLimit { keyword, .. } if keyword == "loyalty"
+        )),
+        "no permanent static may be claimed from a this-turn scope, got {:?}",
+        parsed.statics
+    );
+}
+
 // CR 400.7: Crew Captain — "This creature has indestructible as long as it
 // entered this turn." For a SelfRef static the bound pronoun "it" co-refers with
 // the source, so `rewrite_self_pronoun_subject` on the SelfRef path normalizes
@@ -12516,6 +13241,77 @@ fn quoted_ability_sacrifice_cost_separator() {
         ),
         "effect should not be Unimplemented, got {:?}",
         def.effect
+    );
+    // CR 606.2: the loyalty-timing attach is cost-keyed — a non-loyalty quote
+    // gains no AsSorcery. Guards the fix shape against a blanket push.
+    assert!(
+        !def.activation_restrictions
+            .contains(&ActivationRestriction::AsSorcery),
+        "non-loyalty quote must not carry AsSorcery, got {:?}",
+        def.activation_restrictions
+    );
+}
+
+#[test]
+fn quoted_ability_riderless_tap_cost_gains_no_sorcery_timing() {
+    // CR 606.2 hostile: riderless Tap-cost quote on a second cost shape. A
+    // blanket-push mutation (attach without the loyalty predicate) would put
+    // AsSorcery here; the correct cost-keyed fix leaves it empty.
+    let def = parse_quoted_ability("{T}: Draw a card.");
+    assert_eq!(def.kind, AbilityKind::Activated);
+    assert!(
+        matches!(def.cost, Some(AbilityCost::Tap)),
+        "should retain the tap cost, got {:?}",
+        def.cost
+    );
+    assert!(
+        matches!(
+            *def.effect,
+            Effect::Draw {
+                target: TargetFilter::Controller,
+                ..
+            }
+        ),
+        "effect should parse to Draw, got {:?}",
+        def.effect
+    );
+    assert_eq!(
+        def.activation_restrictions,
+        Vec::<ActivationRestriction>::new(),
+        "riderless tap quote must carry no restrictions, got {:?}",
+        def.activation_restrictions
+    );
+}
+
+#[test]
+fn quoted_loyalty_ability_with_sorcery_rider_dedups_to_one() {
+    // CR 606.3: a quoted loyalty ability with an explicit textual sorcery
+    // rider already carries AsSorcery via `strip_activated_constraints`; the
+    // loyalty attach must dedup to exactly one. Dropping the guard
+    // (unconditional push) yields two → red.
+    let def = parse_quoted_ability("[+1]: Draw a card. Activate only as a sorcery.");
+    assert_eq!(def.kind, AbilityKind::Activated);
+    assert!(
+        matches!(def.cost, Some(AbilityCost::Loyalty { amount: 1 })),
+        "cost should be Loyalty +1, got {:?}",
+        def.cost
+    );
+    assert!(
+        matches!(
+            *def.effect,
+            Effect::Draw {
+                target: TargetFilter::Controller,
+                ..
+            }
+        ),
+        "effect should parse to Draw, got {:?}",
+        def.effect
+    );
+    assert_eq!(
+        def.activation_restrictions,
+        vec![ActivationRestriction::AsSorcery],
+        "dedup guard must leave exactly one AsSorcery, got {:?}",
+        def.activation_restrictions
     );
 }
 
@@ -13118,8 +13914,8 @@ fn parse_compound_static_kaito_animation() {
         .contains(&ContinuousModification::SetToughness { value: 4 }));
     assert!(def
         .modifications
-        .contains(&ContinuousModification::AddType {
-            core_type: crate::types::card_type::CoreType::Creature,
+        .contains(&ContinuousModification::SetCardTypes {
+            core_types: vec![crate::types::card_type::CoreType::Creature],
         }));
     assert!(def
         .modifications
@@ -20609,8 +21405,8 @@ fn omo_nonland_creature_counter_subject_is_all_creature_types() {
 // [non-creature type]" with no CR 205.1b retention marker REPLACES the object's
 // card types, so the Kraken stops being a creature while it slumbers. The
 // modification must be a REPLACING `SetCardTypes`, not an additive `AddType`
-// (which left the impossible "Creature Land"). Creature animations, "artifact
-// creature" forms, and "in addition to its other types" stay additive.
+// (which left the impossible "Creature Land"). Explicit retention and "artifact
+// creature" forms stay additive under CR 205.1b.
 #[test]
 fn arixmethes_bare_is_a_land_replaces_card_types() {
     use crate::types::card_type::CoreType;
@@ -20650,13 +21446,162 @@ fn arixmethes_bare_is_a_land_replaces_card_types() {
     );
     // An artifact-creature compound retains its prior types (CR 205.1b).
     let artifact_creature = parse_static_line("~ is an artifact creature.").unwrap();
-    assert!(
+    assert_eq!(
+        artifact_creature.modifications,
+        vec![
+            ContinuousModification::AddType {
+                core_type: CoreType::Artifact
+            },
+            ContinuousModification::AddType {
+                core_type: CoreType::Creature
+            },
+        ],
+        "'artifact creature' must retain both additive types"
+    );
+}
+
+// SHAPE: CR 205.1a + CR 613.1d + CR 613.4b: Futurist sets subtypes and base
+// P/T without setting a card type, even though its subject says "this creature".
+#[test]
+fn futurist_operative_subtype_animation_preserves_card_types_shape() {
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        "As long as this creature is tapped, it's a Human Citizen with base power and toughness 1/1 and can't be blocked.\n{2}{U}: Untap this creature.",
+        "Futurist Operative",
+        &[],
+        &["Creature".to_string()],
+        &["Human".to_string(), "Ninja".to_string()],
+    );
+    let animation = parsed
+        .statics
+        .iter()
+        .find(|definition| {
+            definition
+                .modifications
+                .contains(&ContinuousModification::SetPower { value: 1 })
+        })
+        .expect("Futurist must parse its base-P/T animation");
+    assert_eq!(animation.affected, Some(TargetFilter::SelfRef));
+    for modification in [
+        ContinuousModification::SetPower { value: 1 },
+        ContinuousModification::SetToughness { value: 1 },
+        ContinuousModification::AddSubtype {
+            subtype: "Human".to_string(),
+        },
+        ContinuousModification::AddSubtype {
+            subtype: "Citizen".to_string(),
+        },
+        ContinuousModification::AddType {
+            core_type: CoreType::Creature,
+        },
+    ] {
+        assert!(animation.modifications.contains(&modification));
+    }
+    assert!(!animation
+        .modifications
+        .iter()
+        .any(|modification| matches!(modification, ContinuousModification::SetCardTypes { .. })));
+}
+
+// SHAPE: CR 205.1a / CR 205.1b: mixed animation modifications do not imply
+// retention; explicit retention and artifact-creature wording do.
+#[test]
+fn self_animation_card_type_replacement_preserves_other_modifications() {
+    let mixed = vec![
+        ContinuousModification::SetPower { value: 3 },
+        ContinuousModification::SetToughness { value: 4 },
+        ContinuousModification::AddSubtype {
+            subtype: "Ninja".to_string(),
+        },
+        ContinuousModification::AddType {
+            core_type: CoreType::Creature,
+        },
+        ContinuousModification::AddKeyword {
+            keyword: Keyword::Hexproof,
+        },
+    ];
+    let replaced = super::type_change::maybe_replace_card_types(
+        mixed.clone(),
+        "3/4 ninja creature with hexproof",
+    );
+    assert_eq!(
+        replaced[0],
+        ContinuousModification::SetCardTypes {
+            core_types: vec![CoreType::Creature]
+        }
+    );
+    let non_types: Vec<_> = mixed
+        .iter()
+        .filter(|modification| !matches!(modification, ContinuousModification::AddType { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(&replaced[1..], non_types);
+    for explicit in [
+        "legendary blue and red ninja creature with hexproof",
+        "3/4 ninja creature.",
+        "3/4 ninja creature, with hexproof",
+    ] {
+        assert_eq!(
+            super::type_change::maybe_replace_card_types(mixed.clone(), explicit),
+            replaced
+        );
+    }
+    // CR 205.1a: inferred Creature does not make a subtype-only predicate
+    // replace card types. Core words in granted abilities are outside it.
+    for (first, second) in [("Human", "Citizen"), ("Elf", "Scout")] {
+        let inferred = vec![
+            ContinuousModification::SetPower { value: 1 },
+            ContinuousModification::SetToughness { value: 1 },
+            ContinuousModification::AddSubtype {
+                subtype: first.to_string(),
+            },
+            ContinuousModification::AddSubtype {
+                subtype: second.to_string(),
+            },
+            ContinuousModification::AddType {
+                core_type: CoreType::Creature,
+            },
+        ];
+        let descriptor = format!("{} {}", first.to_lowercase(), second.to_lowercase());
+        for body in [
+            descriptor.clone(),
+            format!("1/1 {descriptor}"),
+            format!("{descriptor} with base power and toughness 1/1"),
+            format!("{descriptor} with \"Whenever this creature attacks, draw a card.\""),
+            format!("{descriptor} and has \"Whenever this creature attacks, draw a card.\""),
+            format!("{descriptor} where X is the number of creature cards in your graveyard"),
+            format!("{descriptor} creaturely"),
+        ] {
+            assert_eq!(
+                super::type_change::maybe_replace_card_types(inferred.clone(), &body),
+                inferred,
+                "subtype-only descriptor must preserve its modifications: {body}"
+            );
+        }
+    }
+    for retention in [
+        "in addition to its other types",
+        "that's still a planeswalker",
+        "that's still an enchantment",
+    ] {
+        assert_eq!(
+            super::type_change::maybe_replace_card_types(mixed.clone(), retention),
+            mixed
+        );
+    }
+    let mut artifact_creature = mixed.clone();
+    artifact_creature.push(ContinuousModification::AddType {
+        core_type: CoreType::Artifact,
+    });
+    assert_eq!(
+        super::type_change::maybe_replace_card_types(
+            artifact_creature.clone(),
+            "3/4 ninja artifact creature with hexproof"
+        ),
         artifact_creature
-            .modifications
-            .iter()
-            .all(|m| matches!(m, ContinuousModification::AddType { .. })),
-        "'artifact creature' must stay additive: {:?}",
-        artifact_creature.modifications
+    );
+    assert_eq!(
+        super::type_change::maybe_replace_card_types(non_types.clone(), "with hexproof"),
+        non_types
     );
 }
 
@@ -26958,6 +27903,46 @@ fn static_life_total_cant_change_opponent_scope() {
     }
 }
 
+/// CR 101.2 + CR 121.3 + CR 119.7: "[Subject] can't draw cards or gain life." emits both
+/// prohibitions, and the life clause binds the same subject as the draw clause
+/// (Mornsong Aria: "Players"; an opponent subject scopes both to opponents).
+#[test]
+fn static_cant_draw_cards_or_gain_life_binds_one_subject() {
+    let defs = parse_static_line_multi("Players can't draw cards or gain life.");
+    let modes: Vec<_> = defs.iter().map(|d| d.mode.clone()).collect();
+    assert_eq!(
+        modes,
+        vec![
+            StaticMode::CantDraw {
+                who: ProhibitionScope::AllPlayers
+            },
+            StaticMode::CantGainLife,
+        ]
+    );
+    assert_eq!(
+        defs[1].affected,
+        Some(TargetFilter::Typed(TypedFilter::default()))
+    );
+
+    let defs = parse_static_line_multi("Each opponent can't draw cards or gain life.");
+    let modes: Vec<_> = defs.iter().map(|d| d.mode.clone()).collect();
+    assert_eq!(
+        modes,
+        vec![
+            StaticMode::CantDraw {
+                who: ProhibitionScope::Opponents
+            },
+            StaticMode::CantGainLife,
+        ]
+    );
+    assert_eq!(
+        defs[1].affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::default().controller(ControllerRef::Opponent)
+        ))
+    );
+}
+
 #[test]
 fn static_life_total_cannot_change_alt_spelling() {
     // "cannot" alternative phrasing should also work.
@@ -32637,6 +33622,21 @@ fn ichormoon_gauntlet_grants_loyalty_abilities_to_planeswalkers() {
         "second grant effect should be ExtraTurn, got {:?}",
         grants[1].effect
     );
+    // CR 606.3: quoted granted loyalty abilities carry sorcery-speed timing,
+    // the same attach the printed-loyalty path performs.
+    for (i, grant) in grants.iter().enumerate() {
+        assert_eq!(
+            grant.activation_restrictions,
+            vec![ActivationRestriction::AsSorcery],
+            "grant {i} must carry exactly [AsSorcery], got {:?}",
+            grant.activation_restrictions
+        );
+        assert!(
+            !matches!(*grant.effect, Effect::Unimplemented { .. }),
+            "grant {i} effect must not be Unimplemented, got {:?}",
+            grant.effect
+        );
+    }
 }
 
 #[test]
@@ -33116,6 +34116,47 @@ fn static_creatures_defending_player_controls_not_via_suffix_parser() {
         result.is_none(),
         "parse_creature_subject_filter must not accept 'defending player controls' as a controller suffix"
     );
+}
+
+#[test]
+fn static_creatures_an_opponent_controls_not_via_suffix_parser() {
+    // Positive guard: the plural opponent form shares `ControllerRef::Opponent`
+    // with "an opponent controls" and IS accepted.
+    let plural = parse_creature_subject_filter("Creatures your opponents control")
+        .expect("'your opponents control' is a static subject controller suffix");
+    assert!(matches!(
+        plural,
+        TargetFilter::Typed(TypedFilter {
+            controller: Some(ControllerRef::Opponent),
+            ..
+        })
+    ));
+    // The singular "an opponent controls" is not in the static subject set.
+    assert!(
+        parse_creature_subject_filter("Creatures an opponent controls").is_none(),
+        "parse_creature_subject_filter must not accept 'an opponent controls' as a controller suffix"
+    );
+}
+
+#[test]
+fn static_creatures_controller_suffix_admits_its_set() {
+    for (subject, expected) in [
+        ("Creatures you don't control", ControllerRef::Opponent),
+        (
+            "Creatures enchanted player controls",
+            ControllerRef::EnchantedPlayer,
+        ),
+    ] {
+        let filter = parse_creature_subject_filter(subject)
+            .unwrap_or_else(|| panic!("{subject:?} should parse"));
+        assert!(
+            matches!(
+                &filter,
+                TargetFilter::Typed(TypedFilter { controller: Some(c), .. }) if *c == expected
+            ),
+            "{subject:?} → {filter:?}"
+        );
+    }
 }
 #[test]
 fn static_creatures_enchanted_player_controls_attack_each_combat_if_able() {
@@ -39317,4 +40358,471 @@ fn for_each_creature_assign_damage_as_though_unblocked_declines_unmodeled_forms(
     ] {
         assert!(!grants_unblocked(text), "{text}: must not yield a grant");
     }
+}
+
+// ── Cost-modifier gates fail closed (CR 601.2f) ─────────────────────────────
+
+fn parse_card(
+    text: &str,
+    name: &str,
+    keywords: &[&str],
+    types: &[&str],
+    subtypes: &[&str],
+) -> crate::parser::oracle::ParsedAbilities {
+    let owned = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    crate::parser::oracle::parse_oracle_text(
+        text,
+        name,
+        &owned(keywords),
+        &owned(types),
+        &owned(subtypes),
+    )
+}
+
+fn modify_cost_statics(parsed: &crate::parser::oracle::ParsedAbilities) -> Vec<&StaticDefinition> {
+    parsed
+        .statics
+        .iter()
+        .filter(|s| matches!(s.mode, StaticMode::ModifyCost { .. }))
+        .collect()
+}
+
+fn ability_chain_has_unimplemented(def: &crate::types::ability::AbilityDefinition) -> bool {
+    def.effect.unimplemented_description().is_some()
+        || def
+            .sub_ability
+            .as_deref()
+            .is_some_and(ability_chain_has_unimplemented)
+}
+
+fn ability_chain_has(
+    def: &crate::types::ability::AbilityDefinition,
+    pred: &dyn Fn(&Effect) -> bool,
+) -> bool {
+    pred(&def.effect)
+        || def
+            .sub_ability
+            .as_deref()
+            .is_some_and(|sub| ability_chain_has(sub, pred))
+}
+
+/// CR 601.2f + CR 109.4: Hagra Mauling's "an opponent controls no basic lands"
+/// gate is carried on the reduction.
+#[test]
+fn hagra_mauling_cost_gate_is_carried() {
+    let def = parse_static_line(
+        "This spell costs {1} less to cast if an opponent controls no basic lands.",
+    )
+    .expect("the cost reduction must parse");
+    assert!(matches!(
+        def.mode,
+        StaticMode::ModifyCost {
+            mode: CostModifyMode::Reduce,
+            amount: ManaCost::Cost { generic: 1, .. },
+            ..
+        }
+    ));
+    let Some(StaticCondition::QuantityComparison {
+        lhs:
+            QuantityExpr::Ref {
+                qty:
+                    QuantityRef::ControlledByEachPlayer {
+                        aggregate: AggregateFunction::Min,
+                        relation: PlayerRelation::Opponent,
+                        ..
+                    },
+            },
+        comparator: Comparator::EQ,
+        rhs: QuantityExpr::Fixed { value: 0 },
+    }) = &def.condition
+    else {
+        panic!(
+            "expected an existential-opponent controls-no gate, got {:?}",
+            def.condition
+        );
+    };
+}
+
+/// CR 601.2f: a line that prints two gates (two reductions, or a disjunction)
+/// is two cost modifiers; this static carries one — fail closed.
+#[test]
+fn multi_marker_cost_lines_fail_closed() {
+    // Mothrider Cavalry: "if … or if …".
+    let mothrider = parse_card(
+        "This spell costs {2} less to cast if you have no other creature cards in hand or if the only other creature cards in your hand are named Mothrider Cavalry.\nFlying\nOther creatures you control get +1/+1.",
+        "Mothrider Cavalry",
+        &["Flying"],
+        &["Creature"],
+        &["Human", "Samurai"],
+    );
+    assert!(
+        modify_cost_statics(&mothrider).is_empty(),
+        "{:?}",
+        mothrider.statics
+    );
+    assert!(
+        mothrider.abilities.iter().any(|a| a
+            .effect
+            .unimplemented_description()
+            .is_some_and(|d| d.contains("less to cast"))),
+        "{:?}",
+        mothrider.abilities
+    );
+    // Reach-guard: the anthem line still parses.
+    assert!(
+        mothrider
+            .statics
+            .iter()
+            .any(|s| s.description.as_deref() == Some("Other creatures you control get +1/+1.")),
+        "{:?}",
+        mothrider.statics
+    );
+
+    // Assassin's Ink: one sentence, two markers.
+    let ink = parse_card(
+        "This spell costs {1} less to cast if you control an artifact and {1} less to cast if you control an enchantment.\nDestroy target creature or planeswalker.",
+        "Assassin's Ink",
+        &[],
+        &["Instant"],
+        &[],
+    );
+    assert!(modify_cost_statics(&ink).is_empty(), "{:?}", ink.statics);
+    assert!(
+        ink.abilities.iter().any(ability_chain_has_unimplemented),
+        "{:?}",
+        ink.abilities
+    );
+
+    // Geistlight Snare: two sentences, one marker each (at base one reduction
+    // gated on the enchantment shipped).
+    let snare = parse_card(
+        "This spell costs {1} less to cast if you control a Spirit. It also costs {1} less to cast if you control an enchantment.\nCounter target spell unless its controller pays {3}.",
+        "Geistlight Snare",
+        &[],
+        &["Instant"],
+        &[],
+    );
+    assert!(
+        modify_cost_statics(&snare).is_empty(),
+        "{:?}",
+        snare.statics
+    );
+    // Reach-guard: the head ability is the cost-line `Unimplemented`, and the
+    // counter effect is reached through its `sub_ability` chain.
+    assert!(
+        snare
+            .abilities
+            .first()
+            .is_some_and(|a| a.effect.unimplemented_description().is_some()),
+        "{:?}",
+        snare.abilities
+    );
+    assert!(
+        snare
+            .abilities
+            .iter()
+            .any(|a| ability_chain_has(a, &|e| matches!(e, Effect::Counter { .. }))),
+        "{:?}",
+        snare.abilities
+    );
+
+    // Reach-guard for the pair: a single gate parses gated.
+    let single = parse_static_line("This spell costs {1} less to cast if you control an artifact.")
+        .expect("a single-gate reduction must parse");
+    assert!(single.condition.is_some());
+
+    // Dargo, the Shipwrecker: two reductions, zero markers — unchanged (the
+    // guard counts markers, not cost verbs).
+    let dargo = parse_card(
+        "As an additional cost to cast this spell, you may sacrifice any number of artifacts and/or creatures. This spell costs {2} less to cast for each permanent sacrificed this way and {2} less to cast for each other artifact or creature you've sacrificed this turn.\nTrample\nPartner (You can have two commanders if both have partner.)",
+        "Dargo, the Shipwrecker",
+        &["Trample", "Partner"],
+        &["Creature"],
+        &["Giant", "Pirate"],
+    );
+    let dargo_costs = modify_cost_statics(&dargo);
+    assert_eq!(dargo_costs.len(), 1, "{:?}", dargo.statics);
+    assert_eq!(
+        dargo_costs[0].condition,
+        Some(StaticCondition::AdditionalCostPaid)
+    );
+}
+
+/// CR 601.2f: the marker count runs over the whole post-verb remainder, so a
+/// later-sentence marker is counted (Divine Purge's effect line, claimed as a
+/// `ModifyCost` static at base through its quoted grant).
+#[test]
+fn later_sentence_cost_gate_marker_is_counted() {
+    assert!(parse_static_line(
+        "Exile all artifacts and creatures with mana value 3 or less. They perpetually gain \"This spell costs {2} more to cast\" and \"~ enters the battlefield tapped.\" For as long as each of them remain exiled, its owner may play it.",
+    )
+    .is_none());
+    // Centaur Omenreader's body: no post-verb marker → today's static.
+    let omen = parse_static_line("Creature spells you cast cost {2} less to cast.")
+        .expect("the body parses");
+    assert!(matches!(omen.mode, StaticMode::ModifyCost { .. }));
+}
+
+/// CR 601.2f: the `spell_filter`-lowered "if it targets …" gate is not a
+/// dropped gate; an unlowered targets gate fails closed.
+#[test]
+fn self_spell_targets_gate_cohort_is_preserved() {
+    let ajani =
+        parse_static_line("This spell costs {3} less to cast if it targets a tapped creature.")
+            .expect("Ajani's Response reduction must parse");
+    assert_eq!(ajani.condition, None);
+    let StaticMode::ModifyCost {
+        spell_filter: Some(TargetFilter::Typed(tf)),
+        ..
+    } = &ajani.mode
+    else {
+        panic!("expected a Targets spell filter, got {:?}", ajani.mode);
+    };
+    assert!(tf
+        .properties
+        .iter()
+        .any(|p| matches!(p, FilterProp::Targets { .. })));
+
+    // Lullmage's Domination: the targets gate does not lower — fail closed.
+    assert!(parse_static_line(
+        "This spell costs {3} less to cast if it targets a creature whose controller has eight or more cards in their graveyard.",
+    )
+    .is_none());
+}
+
+/// CR 601.2f: a leading "If <condition>, …" gate the typed surface cannot carry
+/// fails closed; a recognized leading gate is preserved.
+#[test]
+fn leading_cost_gate_is_three_state() {
+    let avatar = parse_static_line(
+        "If an opponent controls seven or more lands, this spell costs {6} less to cast.",
+    )
+    .expect("Avatar of Fury reduction must parse");
+    assert!(avatar.condition.is_some());
+    assert!(parse_static_line("If the moon is full, this spell costs {1} less to cast.").is_none());
+}
+
+/// CR 702.166a + CR 701.59a + CR 701.59c: the linked-additional-cost gate
+/// ("if evidence was collected") lowers to `AdditionalCostPaid`.
+#[test]
+fn collect_evidence_cost_gate_is_additional_cost_paid() {
+    use super::static_helpers::parse_cost_modifier_condition;
+    for text in ["evidence was collected", "evidence has been collected"] {
+        assert_eq!(
+            parse_cost_modifier_condition(text),
+            Some(StaticCondition::AdditionalCostPaid),
+            "{text}"
+        );
+    }
+    // All-consuming: trailing text declines.
+    assert_eq!(
+        parse_cost_modifier_condition("evidence was collected this turn"),
+        None
+    );
+}
+
+/// CR 701.59c: Bite Down on Crime's reduction stays one `ModifyCost` gated on
+/// exactly `AdditionalCostPaid` through the Priority-8b composition.
+#[test]
+fn bite_down_on_crime_cost_gate_is_preserved() {
+    let parsed = parse_card(
+        "As an additional cost to cast this spell, you may collect evidence 6. This spell costs {2} less to cast if evidence was collected. (To collect evidence 6, exile cards with total mana value 6 or greater from your graveyard.)\nTarget creature you control gets +2/+0 until end of turn. It deals damage equal to its power to target creature you don't control.",
+        "Bite Down on Crime",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    // Reach-guard: the Priority-8b block ran.
+    assert!(parsed.additional_cost.is_some());
+    let costs = modify_cost_statics(&parsed);
+    assert_eq!(costs.len(), 1, "{:?}", parsed.statics);
+    assert!(matches!(
+        costs[0].mode,
+        StaticMode::ModifyCost {
+            mode: CostModifyMode::Reduce,
+            amount: ManaCost::Cost { generic: 2, .. },
+            ..
+        }
+    ));
+    assert_eq!(
+        costs[0].description.as_deref(),
+        Some("This spell costs {2} less to cast if evidence was collected.")
+    );
+    assert_eq!(
+        costs[0].condition,
+        Some(StaticCondition::AdditionalCostPaid)
+    );
+    assert!(
+        parsed
+            .abilities
+            .iter()
+            .all(|a| a.effect.unimplemented_description().is_none()),
+        "{:?}",
+        parsed.abilities
+    );
+
+    // Bargain sibling (no Priority 8b): unchanged.
+    let ice_out = parse_card(
+        "Bargain (You may sacrifice an artifact, enchantment, or token as you cast this spell.)\nThis spell costs {1} less to cast if it's bargained.\nCounter target spell.",
+        "Ice Out",
+        &["Bargain"],
+        &["Instant"],
+        &[],
+    );
+    let costs = modify_cost_statics(&ice_out);
+    assert_eq!(costs.len(), 1, "{:?}", ice_out.statics);
+    assert_eq!(
+        costs[0].condition,
+        Some(StaticCondition::AdditionalCostPaid)
+    );
+    assert!(
+        ice_out
+            .abilities
+            .iter()
+            .any(|a| ability_chain_has(a, &|e| matches!(e, Effect::Counter { .. }))),
+        "{:?}",
+        ice_out.abilities
+    );
+}
+
+/// CR 122.1: Sab-Sunen's counter-count parity gate has no typed carrier, so its
+/// restriction keeps an `Unrecognized` gap marker (the `an ` article must not
+/// type a counter named "even number of").
+#[test]
+fn sab_sunen_parity_gate_stays_unrecognized() {
+    let parsed = parse_card(
+        "Reach, trample, indestructible\nSab-Sunen can't attack or block unless it has an even number of counters on it. (Zero is even.)\nAt the beginning of your first main phase, put a +1/+1 counter on Sab-Sunen. Then if it has an odd number of counters on it, draw two cards.",
+        "Sab-Sunen, Luxa Embodied",
+        &["indestructible", "reach", "trample"],
+        &["Creature"],
+        &["God"],
+    );
+    let restrictions: Vec<_> = parsed
+        .statics
+        .iter()
+        .filter(|s| s.mode == StaticMode::CantAttackOrBlock)
+        .collect();
+    assert_eq!(restrictions.len(), 1, "{:?}", parsed.statics);
+    assert!(
+        restrictions[0]
+            .condition
+            .as_ref()
+            .is_some_and(|c| c.contains_unrecognized()),
+        "{:?}",
+        restrictions[0].condition
+    );
+}
+
+/// Every `GrantAbility` definition parsed out of `line`.
+fn granted_ability_definitions(line: &str) -> Vec<crate::types::ability::AbilityDefinition> {
+    parse_static_line_multi(line)
+        .into_iter()
+        .flat_map(|def| def.modifications)
+        .filter_map(|m| match m {
+            ContinuousModification::GrantAbility { definition } => Some(*definition),
+            _ => None,
+        })
+        .collect()
+}
+
+/// CR 606.2 + CR 606.3: a loyalty ability granted through quoted text carries
+/// the same timing restriction as a printed one — exactly one `AsSorcery`, and
+/// never the per-ability `OnlyOnceEachTurn` (the per-permanent cap is enforced
+/// by the planeswalker activation gate). Verbatim Oracle lines from the
+/// granted-loyalty class (issue #9936), covering `[+N]`, `[0]` and `[−N]`
+/// costs and a nested quoted ability.
+#[test]
+fn granted_loyalty_abilities_carry_cr_606_3_timing() {
+    use crate::types::ability::{is_loyalty_ability_cost, AbilityCost};
+
+    let cases: [(&str, usize); 4] = [
+        // Way of the Pyromancer
+        ("Planeswalkers you control have \"[+1]: Add {R}.\"", 1),
+        // Ichormoon Gauntlet (two grants)
+        (
+            "Planeswalkers you control have \"[0]: Proliferate\" and \"[−12]: Take an extra turn after this one.\"",
+            2,
+        ),
+        // Teferi's Talent
+        (
+            "Enchanted planeswalker has \"[−12]: You get an emblem with 'You may activate loyalty abilities of planeswalkers you control on any player's turn any time you could cast an instant.'\"",
+            1,
+        ),
+        // Way of the Warlord
+        (
+            "Planeswalkers you control have \"[−4]: This planeswalker deals 2 damage to up to one target creature or planeswalker and 2 damage to target player.\"",
+            1,
+        ),
+    ];
+    for (line, expected) in cases {
+        let grants = granted_ability_definitions(line);
+        assert_eq!(grants.len(), expected, "{line}: grants {grants:?}");
+        for def in grants {
+            assert!(
+                def.cost.as_ref().is_some_and(is_loyalty_ability_cost),
+                "reach-guard: {line}: granted cost is a loyalty cost: {:?}",
+                def.cost
+            );
+            assert!(
+                matches!(def.cost, Some(AbilityCost::Loyalty { .. })),
+                "{line}: {:?}",
+                def.cost
+            );
+            let as_sorcery = def
+                .activation_restrictions
+                .iter()
+                .filter(|r| matches!(r, ActivationRestriction::AsSorcery))
+                .count();
+            assert_eq!(
+                as_sorcery, 1,
+                "{line}: exactly one AsSorcery: {:?}",
+                def.activation_restrictions
+            );
+            assert!(
+                !def.activation_restrictions
+                    .contains(&ActivationRestriction::OnlyOnceEachTurn),
+                "{line}: per-permanent cap must not be OnlyOnceEachTurn"
+            );
+        }
+    }
+
+    // Negative: a granted non-loyalty mana ability gains no timing restriction
+    // and stays a mana ability (CR 605.1a).
+    let grants = granted_ability_definitions("Creatures you control have \"{T}: Add {R}.\"");
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    let def = &grants[0];
+    assert_eq!(def.cost, Some(AbilityCost::Tap), "reach-guard: {{T}} cost");
+    assert!(
+        !def.activation_restrictions
+            .contains(&ActivationRestriction::AsSorcery),
+        "{:?}",
+        def.activation_restrictions
+    );
+    assert!(crate::game::mana_abilities::is_mana_ability(def));
+}
+
+/// CR 702.16i + CR 903.4: Commander's Plate — "Equipped creature gets +3/+3 and
+/// has protection from each color that's not in your commander's color
+/// identity." The protection quality is a typed `EachColor` set, not an
+/// untyped `CardType` string that no source could ever match.
+#[test]
+fn commanders_plate_static_line_parses_to_each_color_protection_set() {
+    use crate::types::keywords::{ProtectionColorSet, ProtectionTarget};
+
+    let def = parse_static_line(
+        "Equipped creature gets +3/+3 and has protection from each color that's not in your commander's color identity.",
+    )
+    .expect("Commander's Plate static line must parse");
+    assert_eq!(
+        def.modifications,
+        vec![
+            ContinuousModification::AddPower { value: 3 },
+            ContinuousModification::AddToughness { value: 3 },
+            ContinuousModification::AddKeyword {
+                keyword: Keyword::Protection(ProtectionTarget::EachColor(
+                    ProtectionColorSet::OutsideCommanderColorIdentity
+                )),
+            },
+        ]
+    );
 }
