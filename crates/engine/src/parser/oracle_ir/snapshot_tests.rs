@@ -12,10 +12,11 @@ use crate::parser::oracle_ir::trigger::TriggerNodeIr;
 use crate::parser::{parse_oracle_text, parse_oracle_text_traced};
 use crate::types::ability::MultiTargetSpec;
 use crate::types::ability::{
-    AbilityCost, ActivationRestriction, ControllerRef, Effect, FilterProp, TargetChoiceTiming,
-    TargetFilter, TriggerCondition, TypedFilter,
+    AbilityCost, ActivationRestriction, ControllerRef, Effect, FilterProp, QuantityExpr,
+    QuantityRef, TargetChoiceTiming, TargetFilter, TriggerCondition, TypedFilter,
 };
 use crate::types::game_state::DistributionUnit;
+use crate::types::mana::{ManaCost, ManaCostShard};
 
 fn ability_has_unimplemented(def: &crate::types::ability::AbilityDefinition) -> bool {
     matches!(def.effect.as_ref(), Effect::Unimplemented { .. })
@@ -103,6 +104,32 @@ fn parser_trace_uses_production_output_and_records_real_item_routes() {
     assert!(!ability_has_unimplemented(
         exploit.execute.as_deref().expect("Skull Skaab payoff")
     ));
+}
+
+#[test]
+fn elenda_life_threshold_static_preserves_ir_and_lowered_shape() {
+    let text = "As long as your life total is greater than your starting life total, Elenda gets +1/+1 and has menace. Elenda gets an additional +5/+5 as long as your life total is at least 10 greater than your starting life total.";
+    let (ir, lowered) = parse_two_layer(
+        text,
+        "Elenda, Saint of Dusk",
+        &["Legendary", "Creature"],
+        &["Vampire", "Knight"],
+    );
+
+    assert_eq!(
+        lowered.statics.len(),
+        2,
+        "both printed conditional statics must survive lowering: {lowered:#?}"
+    );
+    assert!(
+        lowered
+            .statics
+            .iter()
+            .all(|static_def| static_def.condition.is_some()),
+        "both printed Elenda statics must carry their life conditions: {lowered:#?}"
+    );
+    insta::assert_json_snapshot!("elenda_life_threshold_ir", &ir);
+    insta::assert_json_snapshot!("elenda_life_threshold_lowered", &lowered);
 }
 
 #[test]
@@ -702,25 +729,27 @@ fn trigger_die_table_scanner_preserves_non_table_and_unsupported_rows() {
 /// to give it a private one. `OracleDocIr.diagnostics` is the single warning
 /// channel; `parse_warnings` is a copy of it.
 ///
-/// Fixture is pool-verified, not synthetic: Boing!'s Oracle text is verbatim
-/// MTGJSON, and it carries a live `DynamicQty` swallowed-clause warning — "scry
-/// a number of cards equal to the result" lowers to a fixed `Scry` count, so
-/// the die-result-dependent quantity is genuinely dropped from the parse. A
-/// synthetic fixture could go vacuously green if the detector stopped firing;
-/// this one cannot without that separately-tracked defect being fixed.
+/// Fixture is pool-verified, not synthetic: Hinder's Oracle text is verbatim
+/// MTGJSON, and it carries a live `Replacement_Instead` swallowed-clause warning —
+/// "put that card on your choice of the top or bottom of its owner's library
+/// instead of into that player's graveyard" has no modeled countered-spell
+/// destination, so the redirect is genuinely dropped from the parse. A synthetic
+/// fixture could go vacuously green if the detector stopped firing; this one
+/// cannot without that separately-tracked defect being fixed.
 ///
-/// (Intermediate Chirography previously served as this fixture, but issue
+/// (Boing! previously served as this fixture, until its "scry a number of cards
+/// equal to the result" stopped swallowing: the count position now reads or
+/// fails closed. Intermediate Chirography served before that, until issue
 /// #5638's fix taught `parse_class_oracle_text` to compose a level-gated
 /// trigger's printed intervening-if with its `ClassLevelGE` condition instead
-/// of overwriting it — the card's `Duration_ThisTurn` warning was that
-/// overwrite silently dropping the "this turn" scoped condition, and is gone
-/// now that the condition survives.)
+/// of overwriting it.)
 #[test]
 fn swallow_diagnostics_are_homed_in_the_doc_ir_channel() {
     let (ir, lowered) = parse_two_layer(
-        "Return target creature to its owner's hand, then roll a six-sided die. \
-         If the result is 3 or less, scry a number of cards equal to the result.",
-        "Boing!",
+        "Counter target spell. If that spell is countered this way, put that card on your \
+         choice of the top or bottom of its owner's library instead of into that player's \
+         graveyard.",
+        "Hinder",
         &["Instant"],
         &[],
     );
@@ -2027,7 +2056,11 @@ fn laezels_acrobatics_inline_die_table_is_owned_by_nonterminal_roll() {
         "Exile all nontoken creatures you control, then roll a d20.\n1—9 | Return those cards to the battlefield under their owner's control at the beginning of the next end step.\n10—20 | Return those cards to the battlefield under their owner's control, then exile them again. Return those cards to the battlefield under their owner's control at the beginning of the next end step.",
         "Lae'zel's Acrobatics",
         &["Instant"],
-        1,
+        // CR 706.3b: BOTH printed rows. This pin read 1 while the card prints 2,
+        // because the spell-resolution continuation loop swallowed the `1—9` row
+        // before the attach pass could collect it. The continuation guard
+        // restores the collector's precondition, so the whole table now attaches.
+        2,
     );
 }
 
@@ -2037,7 +2070,11 @@ fn overwhelming_encounter_inline_die_table_is_owned_by_nonterminal_roll() {
         "Creatures you control gain vigilance and trample until end of turn. Roll a d20.\n1—9 | Creatures you control get +2/+2 until end of turn.\n10—19 | Put two +1/+1 counters on each creature you control.\n20 | Put four +1/+1 counters on each creature you control.",
         "Overwhelming Encounter",
         &["Sorcery"],
-        2,
+        // CR 706.3b: ALL THREE printed rows. Same cause as Lae'zel's above — the
+        // swallowed `1—9` row now attaches, and it lowers to the mass
+        // `PumpAll{Typed{Creature, controller: You}}` the print states, not the
+        // single-target `Pump{Any}` the swallowed sibling used to produce.
+        3,
     );
 }
 
@@ -2151,9 +2188,10 @@ fn evils_thrall() {
     insta::assert_json_snapshot!("evils_thrall_lowered", &lowered);
 }
 
-// CR 608.2c: KeywordOverride — a "TargetHasKeywordInstead"-conditioned clause
-// builds its def from the parsed effect + condition and attaches as the prior
-// def's `sub_ability` (Conformer Shuriken's granted attack trigger).
+// CR 208.1 + CR 608.2c: a typed "if that creature has greater power than ~"
+// gate (QuantityCheck) on the tap's chained clause, linked to the tap's target
+// through `TargetReadOrigin::ParentAnnouncement`, with "the difference" bound
+// to the gate's operands (Conformer Shuriken's granted attack trigger).
 #[test]
 fn conformer_shuriken() {
     let (ir, lowered) = parse_two_layer(
@@ -3145,4 +3183,175 @@ mod diagnostic_snapshots {
     // for cascade-diff detection in swallow_check.rs but no current Oracle text
     // triggers it. A test will be added when a card that produces this diagnostic
     // is identified.
+}
+
+/// Row 1.C — restored result rows must carry the CONCRETE effect the print
+/// states, not merely "something that is not a failure marker".
+///
+/// `assert_inline_die_table` above checks only `results.len()`, so it cannot
+/// distinguish the mass `PumpAll` the card prints from the single-target
+/// `Pump { target: Any }` the swallowed sibling used to produce. That exact
+/// wrong shape is what the row loss emitted before the continuation guard
+/// landed, so a regression to it would restore the row COUNT and still be wrong.
+/// These assertions are what fail in that case.
+fn die_branches(
+    def: &crate::types::ability::AbilityDefinition,
+) -> Option<&[crate::types::ability::DieResultBranch]> {
+    match def.effect.as_ref() {
+        Effect::RollDie { results, .. } => Some(results.as_slice()),
+        _ => def
+            .sub_ability
+            .as_deref()
+            .and_then(die_branches)
+            .or_else(|| def.else_ability.as_deref().and_then(die_branches)),
+    }
+}
+
+#[test]
+fn overwhelming_encounter_restored_row_is_a_mass_pump_not_a_single_target_pump() {
+    use crate::types::ability::{ControllerRef, PtValue, TargetFilter, TypeFilter};
+
+    let (_, lowered) = parse_two_layer(
+        "Creatures you control gain vigilance and trample until end of turn. Roll a d20.\n1—9 | Creatures you control get +2/+2 until end of turn.\n10—19 | Put two +1/+1 counters on each creature you control.\n20 | Put four +1/+1 counters on each creature you control.",
+        "Overwhelming Encounter",
+        &["Sorcery"],
+        &[],
+    );
+    let branches = die_branches(&lowered.abilities[0]).expect("the roll must own its table");
+    assert_eq!(branches.len(), 3);
+    assert_eq!((branches[0].min, branches[0].max), (1, 9));
+
+    // THE DISCRIMINATOR. `Pump { target: Any }` — the swallowed sibling's shape —
+    // would satisfy any "not Unimplemented" check and fails here.
+    match branches[0].effect.effect.as_ref() {
+        Effect::PumpAll {
+            power,
+            toughness,
+            target,
+            ..
+        } => {
+            assert_eq!(*power, PtValue::Fixed(2));
+            assert_eq!(*toughness, PtValue::Fixed(2));
+            match target {
+                TargetFilter::Typed(typed) => {
+                    assert_eq!(typed.type_filters, vec![TypeFilter::Creature]);
+                    assert_eq!(typed.controller, Some(ControllerRef::You));
+                }
+                other => panic!("the restored row must pump a TYPED creature set, got {other:?}"),
+            }
+        }
+        other => panic!(
+            "the restored 1—9 row must be a MASS pump (PumpAll), not a single-target \
+             Pump — got {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn farideh_fireball_restored_rows_carry_distinct_damage_scopes() {
+    use crate::types::ability::PlayerFilter;
+
+    let (_, lowered) = parse_two_layer(
+        "Farideh's Fireball deals 5 damage to target creature or planeswalker. Roll a d20.\n1—9 | Farideh's Fireball deals 2 damage to each player.\n10—20 | Farideh's Fireball deals 2 damage to each opponent.",
+        "Farideh's Fireball",
+        &["Sorcery"],
+        &[],
+    );
+    let branches = die_branches(&lowered.abilities[0]).expect("the roll must own its table");
+    assert_eq!(branches.len(), 2);
+    assert_eq!((branches[0].min, branches[0].max), (1, 9));
+    assert_eq!((branches[1].min, branches[1].max), (10, 20));
+
+    // The two rows must have DIFFERENT player scopes — that difference is the
+    // whole rules content of the card, and the runtime branch-selection test
+    // depends on it.
+    let scope = |b: &crate::types::ability::DieResultBranch| match b.effect.effect.as_ref() {
+        Effect::DamageEachPlayer { player_filter, .. } => player_filter.clone(),
+        other => panic!("expected DamageEachPlayer, got {other:?}"),
+    };
+    assert_eq!(scope(&branches[0]), PlayerFilter::All);
+    assert_eq!(scope(&branches[1]), PlayerFilter::Opponent);
+}
+
+/// Druid of the Emerald Grove reaches the P-D **trigger** attach path
+/// (`attach_trigger_die_result_branches`), which the seam tests in `oracle.rs`
+/// deliberately do NOT cover — those reconstruct the P-B spell path. This is the
+/// only end-to-end pin that the `"N or less"` row arm and the trigger attach path
+/// compose correctly for a real card.
+#[test]
+fn druid_of_the_emerald_grove_trigger_owns_all_three_printed_rows() {
+    let (_, lowered) = parse_two_layer(
+        "When this creature enters, search your library for up to two basic land cards and reveal them, then roll a d20.\n9 or less | Put those cards into your hand, then shuffle.\n10—19 | Put one of those cards onto the battlefield tapped and the other into your hand, then shuffle.\n20+ | Put those cards onto the battlefield tapped, then shuffle.",
+        "Druid of the Emerald Grove",
+        &["Creature"],
+        &["Druid"],
+    );
+    assert_eq!(
+        lowered.triggers.len(),
+        1,
+        "the printed line is one ETB trigger"
+    );
+    let branches = die_branches(
+        lowered.triggers[0]
+            .execute
+            .as_deref()
+            .expect("the ETB trigger must carry an execute body"),
+    )
+    .expect("the trigger's terminal roll must own the table");
+    assert_eq!(
+        branches
+            .iter()
+            .map(|b| (b.min, b.max))
+            .collect::<Vec<(u8, u8)>>(),
+        vec![(0, 9), (10, 19), (20, u8::MAX)],
+        "all three printed rows, including the \"9 or less\" wording (resolvable \
+         lower bound 0, because CR 706.2 selects on the post-modifier result and \
+         `apply_modifier` clamps it to 0) and the open-ended \"20+\" (u8::MAX)"
+    );
+}
+
+// SHAPE: CR 107.3a + CR 602.5d + CR 701.63a: the full printed activation
+// keeps the same X in mana, life payment and Endure, with sorcery timing.
+#[test]
+fn krumar_initiate_preserves_full_activation_in_both_layers() {
+    let (ir, lowered) = parse_two_layer(
+        "{X}{B}, {T}, Pay X life: This creature endures X. Activate only as a sorcery. (Put X +1/+1 counters on it or create an X/X white Spirit creature token.)",
+        "Krumar Initiate", &["Creature"], &["Human", "Cleric"],
+    );
+    assert_eq!(ir.items.len(), 1);
+    assert_eq!(lowered.abilities.len(), 1);
+    let def = &lowered.abilities[0];
+    assert!(matches!(def.effect.as_ref(), Effect::Endure {
+        amount: QuantityExpr::Ref { qty: QuantityRef::Variable { name } }, subject: TargetFilter::SelfRef,
+    } if name == "X"));
+    assert_eq!(
+        def.cost,
+        Some(AbilityCost::Composite {
+            costs: vec![
+                AbilityCost::Mana {
+                    cost: ManaCost::Cost {
+                        shards: vec![ManaCostShard::X, ManaCostShard::Black],
+                        generic: 0
+                    }
+                },
+                AbilityCost::Tap,
+                AbilityCost::PayLife {
+                    amount: QuantityExpr::Ref {
+                        qty: QuantityRef::Variable {
+                            name: "X".to_string()
+                        }
+                    }
+                },
+            ]
+        })
+    );
+    assert_eq!(
+        def.activation_restrictions,
+        vec![ActivationRestriction::AsSorcery]
+    );
+    assert!(!ability_has_unimplemented(def));
+    assert!(def.sub_ability.is_none());
+    assert!(lowered.parse_warnings.is_empty());
+    insta::assert_json_snapshot!("krumar_initiate_ir", &ir);
+    insta::assert_json_snapshot!("krumar_initiate_lowered", &lowered);
 }

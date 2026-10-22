@@ -47,7 +47,11 @@ fn run(played: usize) -> (engine::game::scenario::GameRunner, Vec<ObjectId>) {
     let mut runner = scenario.build();
     runner.cast(glimpse).free_cast().resolve();
     for id in &top {
-        assert_eq!(runner.state().objects[id].zone, Zone::Exile, "the top three are exiled");
+        assert_eq!(
+            runner.state().objects[id].zone,
+            Zone::Exile,
+            "the top three are exiled"
+        );
     }
     let mut events = Vec::new();
     for id in top.iter().take(played) {
@@ -60,7 +64,13 @@ fn run(played: usize) -> (engine::game::scenario::GameRunner, Vec<ObjectId>) {
 
 #[test]
 fn glimpse_parses_with_no_unimplemented_sweep() {
-    let parsed = parse_oracle_text(GLIMPSE, "Glimpse the Impossible", &[], &["Sorcery".to_string()], &[]);
+    let parsed = parse_oracle_text(
+        GLIMPSE,
+        "Glimpse the Impossible",
+        &[],
+        &["Sorcery".to_string()],
+        &[],
+    );
     let dbg = format!("{parsed:?}");
     assert!(!dbg.contains("Unimplemented"), "no residual gap: {dbg}");
 }
@@ -76,7 +86,11 @@ fn unplayed_cards_go_to_the_graveyard_as_eldrazi_spawn() {
         );
     }
     let spawns = spawns(&runner);
-    assert_eq!(spawns.len(), 3, "one Eldrazi Spawn per card put into the graveyard");
+    assert_eq!(
+        spawns.len(),
+        3,
+        "one Eldrazi Spawn per card put into the graveyard"
+    );
     for id in &spawns {
         let obj = &runner.state().objects[id];
         assert_eq!((obj.power, obj.toughness), (Some(0), Some(1)));
@@ -91,13 +105,23 @@ fn unplayed_cards_go_to_the_graveyard_as_eldrazi_spawn() {
 #[test]
 fn a_card_that_left_exile_is_not_counted() {
     let (runner, top) = run(1);
-    assert_eq!(runner.state().objects[&top[0]].zone, Zone::Hand, "the played card stays where it went");
-    assert_eq!(spawns(&runner).len(), 2, "only the two cards still exiled make tokens");
+    assert_eq!(
+        runner.state().objects[&top[0]].zone,
+        Zone::Hand,
+        "the played card stays where it went"
+    );
+    assert_eq!(
+        spawns(&runner).len(),
+        2,
+        "only the two cards still exiled make tokens"
+    );
 }
 
 #[test]
 fn nothing_left_in_exile_makes_nothing() {
     let (runner, _) = run(3);
-    assert!(spawns(&runner).is_empty(), "no card remained exiled → no token");
+    assert!(
+        spawns(&runner).is_empty(),
+        "no card remained exiled → no token"
+    );
 }
-
