@@ -213,6 +213,9 @@ pub(crate) fn gate_prepared_candidates(
 }
 
 fn assess_candidate(ctx: &PolicyContext<'_>) -> GateDecision {
+    if crate::flag_gates::rejects(ctx) {
+        return GateDecision::Reject;
+    }
     match &ctx.candidate.action {
         GameAction::CastSpell { .. } | GameAction::ActivateAbility { .. } => assess_pre_cast(ctx),
         GameAction::ChooseX { .. } | GameAction::SelectModes { .. } => {
