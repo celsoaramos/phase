@@ -8354,7 +8354,7 @@ fn effect_fields_read_filter_population(
         Effect::Pump { target, .. } => has_filter(target),
         Effect::PairWith { target } => has_filter(target),
         Effect::Destroy { target, .. } => has_filter(target),
-        Effect::Regenerate { target } => has_filter(target),
+        Effect::Regenerate { target, .. } => has_filter(target),
         Effect::RemoveAllDamage { target } => has_filter(target),
         Effect::CounterAll { target } => has_filter(target),
         Effect::Token {

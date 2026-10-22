@@ -21984,6 +21984,7 @@ fn optional_target_fixup_declines_a_context_reference_target() {
     // quantifier cannot govern a target phrase here.
     let mut context_ref = parsed_clause(Effect::Regenerate {
         target: TargetFilter::SelfRef,
+        scope: EffectScope::Single,
     });
     apply_optional_target_fixup(&mut context_ref, "Up to one target creature gets +1/+1.");
     assert!(context_ref.multi_target.is_none());
