@@ -256,5 +256,8 @@
   },
   {
     "branch": "card/territorial-hellkite-last-combat"
+  },
+  {
+    "branch": "ai/bot-flags-1022"
   }
 ]
