@@ -116,6 +116,7 @@ fn sacrifice_counters_only_spells_with_the_exiled_names() {
 
     runner
         .act(GameAction::ActivateAbility {
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             source_id: thief,
             ability_index: 0,
         })

@@ -73,6 +73,7 @@ fn table(opponent_has_island: bool) -> Table {
 fn activate_at(runner: &mut GameRunner, source: ObjectId, target: ObjectId) {
     runner
         .act(GameAction::ActivateAbility {
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             source_id: source,
             ability_index: 0,
         })
@@ -97,6 +98,7 @@ fn activate_at(runner: &mut GameRunner, source: ObjectId, target: ObjectId) {
 fn seasinger_legal_targets(runner: &mut GameRunner, seasinger: ObjectId) -> Vec<TargetRef> {
     runner
         .act(GameAction::ActivateAbility {
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             source_id: seasinger,
             ability_index: 0,
         })
