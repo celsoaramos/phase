@@ -1032,6 +1032,7 @@ where
         | Effect::SkipNextStep { .. }
         | Effect::AdditionalPhase { .. }
         | Effect::Double { .. }
+        | Effect::ModifyAnnouncedX { .. }
         | Effect::RuntimeHandled { .. }
         | Effect::Incubate { .. }
         | Effect::Amass { .. }
@@ -1232,6 +1233,9 @@ pub(crate) fn node_fields(node: $Node<'_>, v: &mut impl FnMut(Symbol<'_>)) {
             }
             if let Some(condition) = &$($mut_)? trigger.condition {
                 trigger_condition(condition, v);
+            }
+            if let Some(condition) = &$($mut_)? trigger.attack_cost_condition {
+                static_condition(condition, v);
             }
         }
         $Node::Static(def) => {
