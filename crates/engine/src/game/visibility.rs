@@ -1234,7 +1234,8 @@ pub(crate) fn proposer_hidden_view_as_of(
 /// - a paused cost move (`pending_cost_move_resume`: a cast/activation root, a
 ///   sacrifice or mill payment, collected evidence, or a loyalty tail);
 /// - a deferred life-cost payment (`pending_deferred_life_cost_resume`);
-/// - every activated ability on the stack (a second line of defense).
+/// - every activated ability on the stack or departed from it
+///   (`departed_activated_abilities`; a second line of defense).
 ///
 /// The two resume carriers are also dropped wholesale later in this
 /// projection; clearing their records here keeps the redaction local to one
@@ -1257,7 +1258,8 @@ fn redact_activation_records(filtered: &mut GameState) {
     if let Some(resume) = filtered.pending_cost_move_resume.as_mut() {
         match resume {
             PendingCostMoveResume::Cast { pending, .. }
-            | PendingCostMoveResume::SacrificeForCost { pending, .. } => {
+            | PendingCostMoveResume::SacrificeForCost { pending, .. }
+            | PendingCostMoveResume::CounterCostRemovalPayment { pending, .. } => {
                 if let Some(pending) = pending.as_deref_mut() {
                     clear(pending);
                 }
@@ -1292,7 +1294,12 @@ fn redact_activation_records(filtered: &mut GameState) {
             DeferredLifeCostResume::PayAmount { .. } | DeferredLifeCostResume::ManaRoot { .. } => {}
         }
     }
-    for entry in filtered.stack.iter_mut() {
+    for entry in filtered.stack.iter_mut().chain(
+        filtered
+            .departed_activated_abilities
+            .iter_mut()
+            .map(|(_, entry)| entry),
+    ) {
         if let StackEntryKind::ActivatedAbility { ability, .. } = &mut entry.kind {
             ability.activation_record = None;
         }
@@ -1325,6 +1332,7 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
         None => crate::game::payment_transaction::project_without_viewer(state),
     };
     filtered.play_trace = None;
+    filtered.spell_cast_reversal = None;
     let viewer_knows = |object_id: ObjectId| {
         viewer.is_some_and(|viewer| state.viewer_knows_card_identity(viewer, object_id))
     };
@@ -1827,7 +1835,9 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
     // hidden-object redaction in every carrier the projection retains:
     // installed delayed triggers, queued/ordering/deferred triggers, and stack
     // entries. (`resolution_stack` and the paused-resolution resumes are blanked
-    // above; `departed_stack_spells` holds spells, never delayed abilities.)
+    // above; the departed tables hold spells and activated abilities, never delayed
+    // abilities; a departed activated ability takes this same per-entry redaction,
+    // CR 400.2: it was public on the stack.)
     // CR 601.2h + CR 113.7a: the same carriers latch their source's payment snapshots in
     // `ResolvedAbility::trigger_source`; a hidden mana source's entry is blanked there too,
     // and a hidden linked-exile member's mana value is zeroed (CR 406.3).
@@ -1843,6 +1853,12 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
         .stack
         .iter_mut()
         .chain(filtered.resolving_stack_entry.iter_mut())
+        .chain(
+            filtered
+                .departed_activated_abilities
+                .iter_mut()
+                .map(|(_, entry)| entry),
+        )
     {
         if let Some(ability) = entry.ability_mut() {
             ability.for_each_creation_lookback_event_mut(&mut redact_lookback);
@@ -1886,6 +1902,10 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
             record
         })
         .collect();
+    // Engine-internal trigger-collection authority with no client consumer; a face-down
+    // entrant's projection carries its card_id/printed_ref, which other players may not see
+    // (CR 708.5).
+    filtered.battlefield_entry_observations.clear();
     redact_hidden_identity_side_tables(&mut filtered, &hidden_zone_change_ids);
 
     // Source-bound named choices carry complete source contexts in authoritative
@@ -2170,15 +2190,23 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
             // the entire declaration. The predicate itself is `pins_name_hidden_source` (this
             // file), the single authority shared with the `RespondToShortcut` projection below,
             // which receives this very template verbatim one state transition later.
-            let declaration = declaration.clone().filter(|template| {
-                !pins_name_hidden_source(
-                    &template.decisions,
-                    &target_hidden,
-                    PinCarrier::OfferWithSchema,
-                )
-            });
+            let keep_visible =
+                |template: &Option<crate::analysis::decision_template::DecisionTemplate>| {
+                    template.clone().filter(|template| {
+                        !pins_name_hidden_source(
+                            &template.decisions,
+                            &target_hidden,
+                            PinCarrier::OfferWithSchema,
+                        )
+                    })
+                };
+            let declaration = keep_visible(declaration);
             (
                 ShortcutDecisionSchema {
+                    // The suggestion is a declaration like the one above, under the same rule.
+                    suggested_declaration: keep_visible(&schema.suggested_declaration),
+                    // Public: a published slot and the seat a trigger already on the stack targets.
+                    leading_aims: schema.leading_aims.clone(),
                     iteration_count: schema.iteration_count.clone(),
                     // CR 732.2a: BOTH published answers are derived from PUBLIC board state
                     // (life, poison, library sizes over the living players) and the engine's own
@@ -3867,7 +3895,8 @@ fn redact_hidden_zone_change_event(event: &mut GameEvent, hidden_ids: &HashSet<O
 /// `pending_deferred_life_cost_resume`, `pending_triggered_mana_resume`,
 /// `pending_discard_batch`, `resolution_stack` and the other private resume cursors
 /// cleared above, `payment_transaction` (`None` in every projection); not serialized:
-/// `pending_discard_for_cost`, `resolving_player_scope_linked_exile`;
+/// `pending_discard_for_cost`, `resolving_player_scope_tail`,
+/// `resolving_created_token_seats`;
 /// `return_result_frames`, `LogicalZoneChangeGroup` latches and
 /// `ResolvedCommands.zone_change_record` (cleared with `resolution_stack` /
 /// `resolved_rules_journal`), `NamedChoiceSource.context` and `OpponentGuessOwner.context`
@@ -4258,6 +4287,9 @@ fn redact_paused_ability_payment(state: &mut GameState, hidden_ids: &HashSet<Obj
 /// - id-keyed LKI (`lki_cache`, `lki_by_incarnation`, `lki_copiable_values`,
 ///   `lki_copiable_values_by_incarnation`, `departed_stack_spells`, and `linked_exile_lki`
 ///   keyed by a hidden source) is dropped;
+/// - a departed activated ability whose source is hidden from the viewer is dropped (the
+///   same rule as a departed spell keyed by a hidden id: once the ability left the stack,
+///   its CR 701.20a reveal or its source's public zone is gone);
 /// - a hidden `linked_exile_lki` member keeps its slot (the per-source count is read) but
 ///   loses its mana value, and the same rule applies to the `linked_exile_snapshot` vectors
 ///   nested in zone-change records and source contexts;
@@ -4290,6 +4322,12 @@ fn redact_hidden_identity_side_tables(state: &mut GameState, hidden_ids: &HashSe
         state.departed_stack_spells.remove(id);
         state.linked_exile_lki.remove(id);
     }
+    // CR 400.2: a departed activated ability names its source and carries that source's
+    // ability. Once the source is hidden from this viewer the record is dropped, as a
+    // departed spell keyed by a hidden id is. Projection only.
+    state
+        .departed_activated_abilities
+        .retain(|_, entry| !hidden_ids.contains(&entry.source_id));
     // CR 601.2h + CR 400.2: only public-id departed spells remain; each keeps its entry and
     // object, and loses the last-known identity of any hidden mana source that paid for it.
     // A read-only pass selects the incarnations that name a hidden source; only those are
@@ -4540,6 +4578,7 @@ fn redact_lki_snapshot(snapshot: &mut crate::types::game_state::LKISnapshot) {
         counters,
         tapped: _,
         is_suspected: _,
+        was_prepared: _,
         attachments,
     } = snapshot;
     *name = HIDDEN_CARD_NAME.to_string();
@@ -4780,6 +4819,12 @@ fn redact_hidden_library_identity_carriers(
         .stack
         .iter_mut()
         .chain(filtered.resolving_stack_entry.iter_mut())
+        .chain(
+            filtered
+                .departed_activated_abilities
+                .iter_mut()
+                .map(|(_, entry)| entry),
+        )
     {
         match &mut entry.kind {
             StackEntryKind::Spell {
@@ -4899,6 +4944,35 @@ mod tests {
     use crate::types::resolution::OptionalEffectFrame;
     use crate::types::zones::{ExileCostSourceZone, Zone};
     use rand::RngCore;
+
+    /// U4 — CR 708.5: the battlefield-entry observation table is engine-internal (a face-down
+    /// entrant's projection carries its card identity), so every viewer projection strips it.
+    #[test]
+    fn viewer_projections_strip_battlefield_entry_observations() {
+        let mut state = GameState::new_two_player(42);
+        let id = create_object(
+            &mut state,
+            CardId(7),
+            PlayerId(0),
+            "Observed".to_string(),
+            Zone::Battlefield,
+        );
+        let observation =
+            crate::game::triggers::trigger_source_context_for_latch(&state, &state.objects[&id]);
+        state.battlefield_entry_observations.insert(0, observation);
+        assert!(
+            !state.battlefield_entry_observations.is_empty(),
+            "precondition"
+        );
+        for viewer in [Some(PlayerId(0)), Some(PlayerId(1)), None] {
+            assert!(
+                filter_state_for_scope(&state, viewer)
+                    .battlefield_entry_observations
+                    .is_empty(),
+                "viewer {viewer:?} must not receive the observation table"
+            );
+        }
+    }
 
     /// CR 400.2 + CR 400.7: a permanent that returns to its owner's hand leaves id-keyed LKI
     /// behind. The opponent's projection must not name it, in any table, while the owner's
@@ -5484,6 +5558,44 @@ mod tests {
                 (2u64, departed_spell(sub_only, unpaid_object)),
             ]),
         );
+        // CR 113.7a + CR 608.2h: a countered activated ability of the public `paid` source
+        // keeps its entry whole, latched ability chain and in-flight activation record
+        // included; the projection redacts it exactly as it did on the stack (CR 400.2).
+        let departed_activation = ObjectId(804);
+        let mut departed_ability = ability.clone();
+        departed_ability.activation_record = Some(Box::new(
+            crate::types::game_state::AbilityActivationRecord {
+                activator: owner,
+                source: paid,
+                source_lki: state.objects[&paid].snapshot_public_characteristics(),
+                source_zone: Zone::Battlefield,
+                ability_tag: None,
+                is_loyalty_ability: false,
+                activation_cost: crate::types::events::BoundActivationCost::Unknown,
+                targets: Vec::new(),
+            },
+        ));
+        state.departed_activated_abilities.insert(
+            departed_activation,
+            StackEntry {
+                id: departed_activation,
+                source_id: paid,
+                controller: owner,
+                kind: StackEntryKind::ActivatedAbility {
+                    source_id: paid,
+                    ability: Box::new(departed_ability),
+                },
+            },
+        );
+        let departed_activation_record = |state: &GameState| {
+            state.departed_activated_abilities[&departed_activation]
+                .ability()
+                .and_then(|ability| ability.activation_record.clone())
+        };
+        assert!(
+            departed_activation_record(&state).is_some(),
+            "reach-guard: the departed activation carries its activation record"
+        );
 
         // Every payment vector the projection retains, labelled by carrier.
         fn carriers(state: &GameState) -> Vec<(String, Vec<ManaSpentSourceSnapshot>)> {
@@ -5687,6 +5799,26 @@ mod tests {
                     );
                 }
             }
+            for (id, entry) in state.departed_activated_abilities.iter() {
+                if let Some(ability) = entry.ability() {
+                    push(
+                        &format!("departed activation {id:?} ability"),
+                        &from_ability(ability),
+                    );
+                    if let Some(sub) = ability.sub_ability.as_deref() {
+                        push(
+                            &format!("departed activation {id:?} sub_ability"),
+                            &from_ability(sub),
+                        );
+                    }
+                    if let Some(other) = ability.else_ability.as_deref() {
+                        push(
+                            &format!("departed activation {id:?} else_ability"),
+                            &from_ability(other),
+                        );
+                    }
+                }
+            }
             for (_, incarnations) in state.departed_stack_spells.iter() {
                 for (incarnation, spell) in incarnations.iter() {
                     if !spell.object.mana_spent_source_snapshots.is_empty() {
@@ -5754,6 +5886,9 @@ mod tests {
             "departed 1 entry ability",
             "departed 1 entry sub_ability",
             "departed 2 entry sub_ability",
+            "departed activation ObjectId(804) ability",
+            "departed activation ObjectId(804) sub_ability",
+            "departed activation ObjectId(804) else_ability",
         ];
         for label in expected_labels {
             assert!(
@@ -5805,6 +5940,28 @@ mod tests {
             raw,
             "authoritative state is untouched by the projection"
         );
+        // CR 602.2: the activation record is engine authority, cleared from every viewer's
+        // copy of the departed activation as from a live one; authoritative state keeps it.
+        let spectator_view = filter_state_for_unseated_viewer(&state);
+        for (label, view) in [
+            ("opponent", &opponent),
+            ("spectator", &spectator_view),
+            ("owner", &owner_view),
+        ] {
+            assert!(
+                view.departed_activated_abilities
+                    .contains_key(&departed_activation),
+                "reach-guard ({label}): the public source's departed activation is kept"
+            );
+            assert!(
+                departed_activation_record(view).is_none(),
+                "{label}: the departed activation's activation record is cleared"
+            );
+        }
+        assert!(
+            departed_activation_record(&state).is_some(),
+            "authoritative state keeps the departed activation's record"
+        );
 
         // CR 406.3 + CR 406.3a: the linked-exile vectors ride the same carriers. Independent
         // JSON key-walk oracle over the whole state; the visible member and every id, owner,
@@ -5831,6 +5988,7 @@ mod tests {
             "/waiting_for/",
             "/transient_continuous_effects/",
             "/departed_stack_spells/",
+            "/departed_activated_abilities/",
         ] {
             assert!(
                 raw_linked
@@ -6599,6 +6757,7 @@ mod tests {
                     source_id: paid,
                     counter_type: None,
                     available: Vec::new(),
+                    max_total: None,
                     pending_effect: effect(),
                 }),
             ),
@@ -7096,6 +7255,8 @@ mod tests {
                 next_exiled: 0,
                 next_sacrificed: 0,
                 next_counter_choice: 0,
+                cost_removed_counters: None,
+                counter_removal: None,
                 selected_exile_remaining: None,
                 selected_sacrifice_remaining: None,
                 deferred_cost_events: Vec::new(),
@@ -7376,6 +7537,9 @@ mod tests {
             deferred_target_selection: false,
             chosen_modes: Vec::new(),
             additional_cost_decided: false,
+            keyword_queue_before_targets: false,
+            alternative_cost_election:
+                crate::types::game_state::SpellAlternativeCostElection::Undecided,
             declared_kickers_to_pay: Vec::new(),
             declined_kickers: Vec::new(),
             convoked_creatures: Vec::new(),
@@ -7391,6 +7555,7 @@ mod tests {
             activation_cost_committed: false,
             alt_cost_grant_source: None,
             activation_trigger_collection: None,
+            activation_phyrexian_intent: None,
         })
     }
 
@@ -7438,6 +7603,7 @@ mod tests {
             ability_index: None,
             rules_execution_node: None,
             ability_snapshot: None,
+            announced_source_incarnation: None,
             color_override: None,
             resume: ManaAbilityResume::Priority,
             cost_move_resume: None,
@@ -7450,6 +7616,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         })
     }
@@ -7672,6 +7839,7 @@ mod tests {
                     entry_ref,
                     enter_tapped: crate::types::proposed_event::EtbTapState::Unspecified,
                     enter_with_counters: Vec::new(),
+                    enter_with_choices: None,
                     applied: std::collections::HashSet::new(),
                 },
             });
@@ -11357,10 +11525,10 @@ mod tests {
             source: crate::types::game_state::OpponentGuessSource {
                 prompt: expected_prompt.clone(),
             },
-            owner: Some(crate::types::game_state::OpponentGuessOwner {
+            owner: Some(Box::new(crate::types::game_state::OpponentGuessOwner {
                 context: source_context,
                 committed_choice: None,
-            }),
+            })),
             proposition_truth: Some(true),
         };
 
@@ -11545,10 +11713,10 @@ mod tests {
                     &source_context,
                 ),
             },
-            owner: Some(crate::types::game_state::OpponentGuessOwner {
+            owner: Some(Box::new(crate::types::game_state::OpponentGuessOwner {
                 context: source_context,
                 committed_choice: Some(ChosenAttribute::Number(5)),
-            }),
+            })),
             proposition_truth: None,
         };
 
@@ -11619,6 +11787,8 @@ mod tests {
                 next_exiled: 0,
                 next_sacrificed: 0,
                 next_counter_choice: 0,
+                cost_removed_counters: None,
+                counter_removal: None,
                 selected_exile_remaining: Some(vec![hidden]),
                 selected_sacrifice_remaining: None,
                 deferred_cost_events: Vec::new(),
@@ -11634,6 +11804,8 @@ mod tests {
                 paused_at_index: 0,
                 destination: Zone::Exile,
                 completion: PendingCostMoveCompletion::FinishPending,
+                deferred_cost_events: Vec::new(),
+                departure_record_indices: Vec::new(),
             },
             PendingCostMoveResume::Foretell {
                 player: PlayerId(0),
@@ -11651,6 +11823,8 @@ mod tests {
                     phyrexian_choices: None,
                     pre_payment_checks: None,
                 },
+                deferred_cost_events: Vec::new(),
+                departure_record_indices: Vec::new(),
             },
             PendingCostMoveResume::SacrificeForCost {
                 player: PlayerId(0),
@@ -12937,6 +13111,8 @@ mod tests {
                 per_cycle: None,
             },
             schema: ShortcutDecisionSchema {
+                suggested_declaration: None,
+                leading_aims: Vec::new(),
                 iteration_count: IterationCount::Fixed(3),
                 measured_repetition_bound: Some(3),
                 deliverable_capacity: 3,
@@ -13365,6 +13541,7 @@ mod tests {
                 per_cycle: None,
                 shortened_by: None,
                 published_declaration: Some(declaration),
+                leading_aims: Vec::new(),
                 road: crate::analysis::loop_check::OfferRoad::Ring,
                 period: Default::default(),
             },
@@ -14237,6 +14414,28 @@ mod tests {
             });
             state.current_trigger_events.push(event);
         }
+        // A departed activation record of a public source gets the per-entry
+        // redaction a live stack entry gets.
+        for (id, object) in [(ObjectId(810), library_card), (ObjectId(811), permanent)] {
+            state.departed_activated_abilities.insert(
+                id,
+                StackEntry {
+                    id,
+                    source_id: permanent,
+                    controller: PlayerId(0),
+                    kind: StackEntryKind::ActivatedAbility {
+                        source_id: permanent,
+                        ability: Box::new(with_context(object, &state)),
+                    },
+                },
+            );
+        }
+        let departed_context = |state: &GameState, id: ObjectId| {
+            state.departed_activated_abilities[&id]
+                .ability()
+                .and_then(|ability| ability.effect_context_object.as_ref())
+                .map(|snapshot| snapshot.object_id)
+        };
         state.last_revealed_ids = vec![library_card];
 
         let stripped = |event: &GameEvent| match event {
@@ -14288,6 +14487,14 @@ mod tests {
                 ],
                 "stack carriers, viewer {viewer:?}"
             );
+            assert_eq!(
+                (
+                    departed_context(&projected, ObjectId(810)),
+                    departed_context(&projected, ObjectId(811)),
+                ),
+                (None, Some(permanent)),
+                "departed activation carriers, viewer {viewer:?}"
+            );
         }
         let projected = filter_state_for_unseated_viewer(&state);
         assert!(projected.last_revealed_ids.is_empty());
@@ -14295,7 +14502,13 @@ mod tests {
             projected.current_trigger_events,
             vec![stripped(&library_event), permanent_event.clone()]
         );
+        assert_eq!(departed_context(&projected, ObjectId(810)), None);
         assert_eq!(state.last_revealed_ids, vec![library_card]);
+        assert_eq!(
+            departed_context(&state, ObjectId(810)),
+            Some(library_card),
+            "the rules state keeps the departed record's context"
+        );
         assert!(matches!(
             &state.current_trigger_events[0],
             GameEvent::EffectResolved {

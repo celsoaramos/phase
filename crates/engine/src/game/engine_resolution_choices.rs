@@ -7,15 +7,15 @@ use rand::seq::SliceRandom;
 use crate::types::ability::{
     AbilityCost, ChoiceType, ChosenAttribute, DigRestOrder, DigRestSplitScope, Effect, EffectKind,
     ForwardedResultContext, GuessOutcome, LibraryPosition, ParentTargetMissingReason, QuantityExpr,
-    QuantityRef, ReciprocalZoneChoiceRole, ResolvedAbility, TargetRef,
+    QuantityRef, ReciprocalZoneChoiceRole, ResolvedAbility, TapCreaturesSelectionMode, TargetRef,
 };
 use crate::types::actions::{GameAction, LearnOption, OutsideGameSelection};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    ActionResult, BatchCompletion, CastOfferKind, ChosenDamageSource, CopyChosenSelection,
-    GameState, OutsideGameChoiceSource, PayableResource, PendingContinuation,
-    PendingPlayerScopeSacrificeCompletion, PersistentAxisMaterialization, WaitingFor,
-    ZoneOpponentChooserPurpose,
+    ActionResult, BatchCompletion, CastOfferKind, ChosenDamageSource, ContinuationXAnnouncement,
+    CopyChosenSelection, CostResume, GameState, OutsideGameChoiceSource, PayCostKind,
+    PayableResource, PendingContinuation, PendingPlayerScopeSacrificeCompletion,
+    PersistentAxisMaterialization, WaitingFor, ZoneOpponentChooserPurpose,
 };
 use crate::types::identifiers::ObjectId;
 use crate::types::resolved_commands::{
@@ -32,6 +32,23 @@ use super::{
     casting, casting_costs, engine_priority, mana_abilities, payment_transaction, public_state,
     zone_pipeline,
 };
+
+/// CR 608.2c: does the parked zone-choice continuation `chain` treat
+/// the objects NOT picked as "the rest" for its next instruction (a
+/// `ChooseFromZone` partition)?
+///
+/// It does not for counter-placement continuations (Bolster, Gluntch: their
+/// `sub_ability` is an independent trailing clause), nor for a parked
+/// untargeted `TargetOnly` chooser, whose pick is the whole choice (CR 115.10a).
+/// A `Stack`-timed `TargetOnly` is an ordinary wrapper and keeps the forward.
+fn continuation_forwards_unchosen_complement(chain: &ResolvedAbility) -> bool {
+    use crate::types::ability::{Effect, TargetChoiceTiming};
+    !matches!(
+        chain.effect,
+        Effect::PutCounter { .. } | Effect::ChooseCounterKind { .. }
+    ) && !(matches!(chain.effect, Effect::TargetOnly { .. })
+        && chain.target_choice_timing == TargetChoiceTiming::Resolution)
+}
 
 /// CR 115.1a + CR 601.2c + CR 702.47d: Dig's selected result cannot replace
 /// an instruction's announced targets. Result-dependent instructions bind the
@@ -737,6 +754,28 @@ pub(super) fn park_cast_during_resolution_cast_observers(
     Ok(Some(settled))
 }
 
+/// CR 603.2c: the not-yet-collected events of `events[start..end]`. A
+/// completion that resumes a parked counter-cost root before collecting has
+/// already had that root's announcement commit collect and claim them; every
+/// ledger writer pairs its claim with a collection, so this drops only those
+/// re-collections and is a no-op when nothing was claimed.
+fn unclaimed_observer_events(
+    state: &GameState,
+    events: &[GameEvent],
+    start: usize,
+    end: usize,
+) -> Vec<GameEvent> {
+    if end <= start {
+        return Vec::new();
+    }
+    super::triggers::filter_consumed_trigger_events_from(
+        &events[..end],
+        start,
+        super::triggers::TriggerCollectionRequester::Ordinary,
+        &state.consumed_before_priority_trigger_events,
+    )
+}
+
 /// CR 603.2 + CR 603.3b: After a resolution-choice handler has moved objects
 /// (sacrifice, change-zone, bounce, discard) and resolved any reflexive
 /// continuation, dispatch the observer triggers (dies-, discarded-, etc.)
@@ -762,33 +801,46 @@ fn batch_or_drain_observer_triggers(
     // `triggers::filter_already_collected_trigger_events_from` instead.
     zone_changes_are_logically_owned: bool,
 ) -> Option<ResolutionChoiceOutcome> {
-    if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
-        // B1: this action settled. Merge this slice's observer triggers into
-        // the parked queue before draining — otherwise the last segment's
-        // triggers (e.g. the final Syphon Mind opponent discard) never enter
-        // `deferred_triggers` and are lost when ordering runs (issue #1793).
-        let trigger_events: Vec<GameEvent> = events[event_slice_start..event_slice_end]
-            .iter()
+    // CR 601.2h + CR 602.2b + CR 603.3: under a live announcement (a child of a
+    // parked cost root, or a resolution-time step under a cast's payment) these
+    // events wait in the announcement's carrier; only the span it does not own is
+    // collected here.
+    let owned =
+        super::announcement_triggers::take_inline_trigger_span(state, events, event_slice_start);
+    let announced = owned.is_empty() && owned.end < events.len();
+    let slice_end = event_slice_end.min(owned.end);
+    let completion_start = event_slice_end.min(owned.end);
+    let trigger_events: Vec<GameEvent> =
+        unclaimed_observer_events(state, events, event_slice_start, slice_end)
+            .into_iter()
             .filter(|ev| {
                 !matches!(ev, GameEvent::PhaseChanged { .. })
                     && (!zone_changes_are_logically_owned
                         || !matches!(ev, GameEvent::ZoneChanged { .. }))
             })
-            .cloned()
             .chain(
                 // CR 603.2 + CR 608.2c: a typed completion continuation may
                 // publish the player action that the interactive move just
                 // completed. Include that semantic event without widening the
                 // owner-bounded zone slice to continuation-produced zone moves.
-                events[event_slice_end..]
-                    .iter()
-                    .filter(|event| matches!(event, GameEvent::PlayerPerformedAction { .. }))
-                    .cloned(),
+                unclaimed_observer_events(state, events, completion_start, owned.end)
+                    .into_iter()
+                    .filter(|event| matches!(event, GameEvent::PlayerPerformedAction { .. })),
             )
             .collect();
+    if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+        // B1: this action settled. Merge this slice's observer triggers into
+        // the parked queue before draining — otherwise the last segment's
+        // triggers (e.g. the final Syphon Mind opponent discard) never enter
+        // `deferred_triggers` and are lost when ordering runs (issue #1793).
         super::triggers::collect_triggers_into_deferred(state, &trigger_events);
         if let Some(wf) = super::triggers::drain_deferred_trigger_queue(state, events) {
             return Some(ResolutionChoiceOutcome::WaitingFor(wf));
+        }
+        if announced {
+            return Some(ResolutionChoiceOutcome::WaitingFor(
+                state.waiting_for.clone(),
+            ));
         }
         Some(ResolutionChoiceOutcome::WaitingForWithInlineTriggers(
             state.waiting_for.clone(),
@@ -796,24 +848,6 @@ fn batch_or_drain_observer_triggers(
     } else {
         // B2: paused — `run_post_action_pipeline` will not scan this action.
         // Park this move's observer triggers for a later settle.
-        let trigger_events: Vec<GameEvent> = events[event_slice_start..event_slice_end]
-            .iter()
-            .filter(|ev| {
-                !matches!(ev, GameEvent::PhaseChanged { .. })
-                    && (!zone_changes_are_logically_owned
-                        || !matches!(ev, GameEvent::ZoneChanged { .. }))
-            })
-            .cloned()
-            .chain(
-                // CR 603.2 + CR 608.2c: see the settled branch above. Park a
-                // completion action across a further continuation prompt, but
-                // do not fold that continuation's zone changes into this owner.
-                events[event_slice_end..]
-                    .iter()
-                    .filter(|event| matches!(event, GameEvent::PlayerPerformedAction { .. }))
-                    .cloned(),
-            )
-            .collect();
         super::triggers::collect_triggers_into_deferred(state, &trigger_events);
         None
     }
@@ -822,16 +856,22 @@ fn batch_or_drain_observer_triggers(
 /// CR 603.2 + CR 603.3b: Preserve triggers from events that occurred while a
 /// resolution choice paused; they trigger now and wait for the next priority
 /// window's APNAP placement rather than being lost with the action's event slice.
+///
+/// `events` is the current action buffer. Under a live announcement only the
+/// span it does not own is collected here (CR 601.2h + CR 603.3), and an event
+/// another collector already claimed this action is not collected again
+/// (CR 603.2c).
 pub(crate) fn defer_observer_triggers_for_paused_choice(
     state: &mut GameState,
-    events: &[GameEvent],
+    events: &mut Vec<GameEvent>,
     event_start: usize,
 ) {
-    let trigger_events: Vec<GameEvent> = events[event_start..]
-        .iter()
-        .filter(|event| !matches!(event, GameEvent::PhaseChanged { .. }))
-        .cloned()
-        .collect();
+    let owned = super::announcement_triggers::take_inline_trigger_span(state, events, event_start);
+    let trigger_events: Vec<GameEvent> =
+        unclaimed_observer_events(state, events, owned.start, owned.end)
+            .into_iter()
+            .filter(|event| !matches!(event, GameEvent::PhaseChanged { .. }))
+            .collect();
     if !trigger_events.is_empty() {
         super::triggers::collect_triggers_into_deferred(state, &trigger_events);
     }
@@ -853,12 +893,16 @@ pub(crate) fn defer_observer_triggers_for_paused_choice(
 /// observers fire twice.
 fn collect_search_observer_triggers(
     state: &mut GameState,
-    events: &[GameEvent],
+    events: &mut Vec<GameEvent>,
     events_before_drain: usize,
 ) -> ResolutionChoiceOutcome {
+    // CR 601.2h + CR 603.3: a live announcement takes custody of the span it owns.
+    let owned =
+        super::announcement_triggers::take_inline_trigger_span(state, events, events_before_drain);
+    let announced = owned.is_empty() && owned.end < events.len();
     let uncollected_events = super::triggers::filter_already_collected_trigger_events_from(
         state,
-        events,
+        &events[..owned.end],
         events_before_drain,
         &state.consumed_before_priority_trigger_events,
     );
@@ -873,6 +917,9 @@ fn collect_search_observer_triggers(
     // shared carrier authority prove that every such frame has drained before
     // retiring the parent and releasing its CR 400.7j self-move link.
     super::engine::settle_resolving_stack_entry_after_continuation_resume(state);
+    if announced {
+        return ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone());
+    }
     ResolutionChoiceOutcome::WaitingForWithInlineTriggers(state.waiting_for.clone())
 }
 
@@ -3323,6 +3370,16 @@ pub(super) fn handle_resolution_choice(
                     mana_abilities::continue_mana_ability_activation(state, pending, events)?;
                 return Ok(ResolutionChoiceOutcome::WaitingFor(waiting_for));
             }
+            // CR 614.12a: a pre-entry as-enters life payment answers the parked
+            // battlefield entry, not a resolving ability — no `last_effect_count`
+            // stamp, no continuation. Mirrors the `PendingEntry` branch of the
+            // `NamedChoice` arm; range validation is inherited from the shared
+            // guard above, so an over-cap submission fails closed there.
+            if super::replacement::pending_entry_payment_is_live(state) {
+                let waiting_for =
+                    super::engine_replacement::handle_entry_payment(state, amount, events)?;
+                return Ok(ResolutionChoiceOutcome::WaitingFor(waiting_for));
+            }
             match resource {
                 PayableResource::LoopCollapse { .. } => {
                     // CR 732.2a: an accepted unbounded loop shortcut deferred its finite
@@ -3398,11 +3455,11 @@ pub(super) fn handle_resolution_choice(
                                     count: growth.per_cycle_delta.saturating_mul(amount),
                                     copy: Box::new(crate::types::proposed_event::CopyTokenSpec {
                                         values: growth.profile.clone(),
-                                        display_source:
-                                            crate::game::game_object::DisplaySource::Token,
-                                        printed_ref: None,
-                                        token_image_ref: None,
-                                        token_art: None,
+                                        display: crate::game::game_object::DisplayIdentity {
+                                            display_source:
+                                                crate::game::game_object::DisplaySource::Token,
+                                            ..Default::default()
+                                        },
                                         extra_keywords: vec![],
                                         additional_modifications: vec![],
                                         tapped: true,
@@ -3410,6 +3467,8 @@ pub(super) fn handle_resolution_choice(
                                         sacrifice_at: None,
                                         source_id: ObjectId(0),
                                         controller: player,
+                                        // Source-less growth mint from a fodder profile; empty mods are stamp-proof.
+                                        donor: None,
                                     }),
                                 };
                                 crate::game::effects::token_copy::drive_copy_token_batches(
@@ -3713,6 +3772,8 @@ pub(super) fn handle_resolution_choice(
                                     player,
                                     total: accumulated.saturating_add(amount),
                                     resume_at_resolution_depth,
+                                    // Resolution-time prompt: no parked entry.
+                                    pending_entry: None,
                                 },
                             );
                             return Ok(ResolutionChoiceOutcome::WaitingFor(
@@ -5597,12 +5658,11 @@ pub(super) fn handle_resolution_choice(
                 // control") is NOT a partition — its `sub_ability` is an
                 // independent trailing clause (e.g. the next `Choose`) and
                 // must not have the non-picked objects forced into its target
-                // list. Gate the forward on the continuation's own effect.
-                let is_partition = !matches!(
-                    cont.chain.effect,
-                    crate::types::ability::Effect::PutCounter { .. }
-                        | crate::types::ability::Effect::ChooseCounterKind { .. }
-                );
+                // list. Neither is a parked untargeted `TargetOnly` chooser
+                // ("choose a creature you control", CR 115.10a): the pick is
+                // the whole choice, and the unchosen candidates are not "the
+                // rest". Gate the forward on the continuation's own effect.
+                let is_partition = continuation_forwards_unchosen_complement(&cont.chain);
                 if is_partition {
                     if let Some(ref mut next_sub) = cont.chain.sub_ability {
                         // CR 707.12a: A `CastCopyOfCard` continuation casts the
@@ -6045,18 +6105,26 @@ pub(super) fn handle_resolution_choice(
             // stay bounded to the move itself, but an early drain after only the
             // discard slice would return `WaitingForWithInlineTriggers` and skip
             // the continuation slice entirely (issue #4245).
+            // CR 601.2h + CR 603.3: a live announcement takes custody of the span
+            // it owns; only the rest is collected here.
+            let owned = super::announcement_triggers::take_inline_trigger_span(
+                state,
+                events,
+                events_before_effect,
+            );
+            let announced = owned.is_empty() && owned.end < events.len();
             for (start, end) in [
-                (events_before_effect, events_after_move),
-                (events_after_move, events.len()),
+                (events_before_effect, events_after_move.min(owned.end)),
+                (events_after_move, owned.end),
             ] {
                 if end <= start {
                     continue;
                 }
-                let trigger_events: Vec<GameEvent> = events[start..end]
-                    .iter()
-                    .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
-                    .cloned()
-                    .collect();
+                let trigger_events: Vec<GameEvent> =
+                    unclaimed_observer_events(state, events, start, end)
+                        .into_iter()
+                        .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
+                        .collect();
                 if !trigger_events.is_empty() {
                     super::triggers::collect_triggers_into_deferred(state, &trigger_events);
                 }
@@ -6065,6 +6133,9 @@ pub(super) fn handle_resolution_choice(
             if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
                 if let Some(wf) = super::triggers::drain_deferred_trigger_queue(state, events) {
                     return Ok(ResolutionChoiceOutcome::WaitingFor(wf));
+                }
+                if announced {
+                    return Ok(ResolutionChoiceOutcome::WaitingFor(waiting_for));
                 }
                 return Ok(ResolutionChoiceOutcome::WaitingForWithInlineTriggers(
                     waiting_for,
@@ -6692,32 +6763,48 @@ pub(super) fn handle_resolution_choice(
                             marker.group = Some(logical_zone_change_group.logical_group_id);
                         }
                     }
+                    // CR 603.6a + CR 614.12: one event — every member's gates
+                    // read the board before any member moves. The resolving
+                    // stack ability may be a root whose effect is not this move
+                    // (the move can be any sub-ability), so it binds only the
+                    // gate filters and counter quantities; the move's own
+                    // descriptor is the entry context.
+                    let binding =
+                        effects::change_zone::resolving_stack_ability_for_source(state, source_id);
+                    let entry_spec = effects::change_zone::ChangeZoneEntrySpec {
+                        entry: effects::change_zone::EntryGateContext {
+                            destination: dest_zone,
+                            controller_override: enters_under_player,
+                            enter_transformed,
+                        },
+                        source_id,
+                        enter_with_counters: &enter_with_counters,
+                        conditional_enter_with_counters: &conditional_enter_with_counters,
+                        enter_tapped,
+                        enters_attacking,
+                        enters_modified_if: enters_modified_if.as_ref(),
+                    };
+                    let members = effects::change_zone::resolve_change_zone_member_entries(
+                        state,
+                        binding.as_ref(),
+                        &entry_spec,
+                        &chosen_ids,
+                    );
                     let logical_group_event_start = events.len();
-                    for (i, card_id) in chosen_ids.iter().enumerate() {
+                    for (i, member) in members.iter().enumerate() {
+                        let card_id = &member.object_id;
                         let origin = state
                             .objects
                             .get(card_id)
                             .map(|object| object.zone)
                             .unwrap_or(zone);
-                        let per_obj_enter_counters =
-                            effects::change_zone::enter_with_counters_for_pending_object(
-                                state,
-                                source_id,
-                                *card_id,
-                                &enter_with_counters,
-                                &conditional_enter_with_counters,
-                            );
                         let ctx = effects::change_zone::ChangeZoneIterationCtx {
                             source_id,
                             controller: player,
                             origin: Some(origin),
                             destination: dest_zone,
                             enter_transformed,
-                            enter_tapped,
                             enters_under_player,
-                            enters_attacking,
-                            enter_with_counters: per_obj_enter_counters,
-                            conditional_enter_with_counters: vec![],
                             // CR 611.2a + CR 610.3: the duration carried across
                             // the `EffectZoneChoice` round-trip — an
                             // "exile ... until ~ leaves the battlefield" move
@@ -6735,10 +6822,6 @@ pub(super) fn handle_resolution_choice(
                             // resuming face up and exposing the real object.
                             face_down_profile: face_down_profile.clone(),
                             library_placement: None,
-                            // CR 614.12: evaluate the moved-object type gate carried
-                            // across the `EffectZoneChoice` round-trip against each
-                            // chosen object (Summoner's Grimoire).
-                            enters_modified_if: enters_modified_if.clone(),
                             enter_attached_to: None,
                         };
                         let anticipated_pause =
@@ -6751,7 +6834,7 @@ pub(super) fn handle_resolution_choice(
                             );
                         let delivery_start = events.len();
                         match effects::change_zone::process_one_zone_move_with_terminal(
-                            state, &ctx, *card_id, events,
+                            state, &ctx, member, events,
                         ) {
                             crate::game::zone_pipeline::ZoneMoveTerminalResult::Completed(completion) => {
                                 logical_zone_change_group
@@ -6795,7 +6878,7 @@ pub(super) fn handle_resolution_choice(
                                             boundary.mark_counted();
                                             boundary
                                         }),
-                                        remaining: chosen_ids[i + 1..].to_vec(),
+                                        remaining: members[i + 1..].to_vec(),
                                         source_id: ctx.source_id,
                                         controller: ctx.controller,
                                         // EffectZoneChoice can select across multiple
@@ -6805,12 +6888,7 @@ pub(super) fn handle_resolution_choice(
                                         origin: None,
                                         destination: ctx.destination,
                                         enter_transformed: ctx.enter_transformed,
-                                        enter_tapped: ctx.enter_tapped,
                                         enters_under_player: ctx.enters_under_player,
-                                        enters_attacking: ctx.enters_attacking,
-                                        enter_with_counters: enter_with_counters.clone(),
-                                        conditional_enter_with_counters:
-                                            conditional_enter_with_counters.clone(),
                                         duration: ctx.duration.clone(),
                                         track_exiled_by_source: ctx.track_exiled_by_source,
                                         face_down_in_exile: ctx.face_down_in_exile,
@@ -6828,9 +6906,6 @@ pub(super) fn handle_resolution_choice(
                                         // face-down profile across a further pause.
                                         face_down_profile: ctx.face_down_profile.clone(),
                                         library_placement: ctx.library_placement.clone(),
-                                        // CR 614.12: preserve the moved-object type
-                                        // gate across a further as-enters pause.
-                                        enters_modified_if: ctx.enters_modified_if.clone(),
                                         enter_attached_to: None,
                                         effect_kind,
                                     },
@@ -6880,7 +6955,7 @@ pub(super) fn handle_resolution_choice(
                                                 })
                                                 .expect("zone-change pause must retain its exact boundary"),
                                         ),
-                                        remaining: chosen_ids[i + 1..].to_vec(),
+                                        remaining: members[i + 1..].to_vec(),
                                         source_id: ctx.source_id,
                                         controller: ctx.controller,
                                         // EffectZoneChoice can select across multiple
@@ -6890,12 +6965,7 @@ pub(super) fn handle_resolution_choice(
                                         origin: None,
                                         destination: ctx.destination,
                                         enter_transformed: ctx.enter_transformed,
-                                        enter_tapped: ctx.enter_tapped,
                                         enters_under_player: ctx.enters_under_player,
-                                        enters_attacking: ctx.enters_attacking,
-                                        enter_with_counters: enter_with_counters.clone(),
-                                        conditional_enter_with_counters:
-                                            conditional_enter_with_counters.clone(),
                                         duration: ctx.duration.clone(),
                                         track_exiled_by_source: ctx.track_exiled_by_source,
                                         face_down_in_exile: ctx.face_down_in_exile,
@@ -6913,9 +6983,6 @@ pub(super) fn handle_resolution_choice(
                                         // face-down profile across a further pause.
                                         face_down_profile: ctx.face_down_profile.clone(),
                                         library_placement: ctx.library_placement.clone(),
-                                        // CR 614.12: preserve the moved-object type
-                                        // gate across a further as-enters pause.
-                                        enters_modified_if: ctx.enters_modified_if.clone(),
                                         enter_attached_to: None,
                                         effect_kind,
                                     },
@@ -7229,11 +7296,7 @@ pub(super) fn handle_resolution_choice(
                         origin: Some(zone),
                         destination: dest_zone,
                         enter_transformed,
-                        enter_tapped,
                         enters_under_player,
-                        enters_attacking,
-                        enter_with_counters: vec![],
-                        conditional_enter_with_counters: vec![],
                         // CR 118.3: cost-payment exile is unbounded — no
                         // "until ..." duration idiom pays a cost, so the
                         // round-trip `duration` (always `None` for `PayCost`
@@ -7243,20 +7306,41 @@ pub(super) fn handle_resolution_choice(
                         face_down_in_exile,
                         face_down_profile: face_down_profile.clone(),
                         library_placement: None,
-                        // CR 614.12: cost-payment exile carries no enter-modifier
-                        // gate; thread the (None) round-trip value for consistency.
-                        enters_modified_if: enters_modified_if.clone(),
                         enter_attached_to: None,
                     };
                     let events_before_effect = events.len();
                     let chosen_ids: Vec<_> = chosen.to_vec();
+                    // CR 118.3 + CR 614.12: cost-payment exile carries no entry
+                    // counters; thread the round-trip rider values (always
+                    // unconditional for `PayCost` producers) through the same
+                    // pre-event member resolution as every other ChangeZone loop.
+                    let entry_spec = effects::change_zone::ChangeZoneEntrySpec {
+                        entry: effects::change_zone::EntryGateContext {
+                            destination: dest_zone,
+                            controller_override: enters_under_player,
+                            enter_transformed,
+                        },
+                        source_id,
+                        enter_with_counters: &[],
+                        conditional_enter_with_counters: &[],
+                        enter_tapped,
+                        enters_attacking,
+                        enters_modified_if: enters_modified_if.as_ref(),
+                    };
+                    let members = effects::change_zone::resolve_change_zone_member_entries(
+                        state,
+                        None,
+                        &entry_spec,
+                        &chosen_ids,
+                    );
                     let mut logical_zone_change_group =
                         crate::game::triggers::allocate_logical_zone_change_group(
                             state,
                             &chosen_ids,
                         );
                     let logical_group_event_start = events.len();
-                    for (i, card_id) in chosen_ids.iter().enumerate() {
+                    for (i, member) in members.iter().enumerate() {
+                        let card_id = &member.object_id;
                         let anticipated_pause =
                             effects::change_zone::anticipated_zone_change_delivery(
                                 state,
@@ -7267,7 +7351,7 @@ pub(super) fn handle_resolution_choice(
                             );
                         let delivery_start = events.len();
                         match effects::change_zone::process_one_zone_move_with_terminal(
-                            state, &ctx, *card_id, events,
+                            state, &ctx, member, events,
                         ) {
                             crate::game::zone_pipeline::ZoneMoveTerminalResult::Completed(completion) => {
                                 logical_zone_change_group
@@ -7297,27 +7381,19 @@ pub(super) fn handle_resolution_choice(
                                             boundary.mark_counted();
                                             boundary
                                         }),
-                                        remaining: chosen_ids[i + 1..].to_vec(),
+                                        remaining: members[i + 1..].to_vec(),
                                         source_id: ctx.source_id,
                                         controller: ctx.controller,
                                         origin: ctx.origin,
                                         destination: ctx.destination,
                                         enter_transformed: ctx.enter_transformed,
-                                        enter_tapped: ctx.enter_tapped,
                                         enters_under_player: ctx.enters_under_player,
-                                        enters_attacking: ctx.enters_attacking,
-                                        enter_with_counters: enter_with_counters.clone(),
-                                        conditional_enter_with_counters:
-                                            conditional_enter_with_counters.clone(),
                                         duration: ctx.duration.clone(),
                                         track_exiled_by_source: ctx.track_exiled_by_source,
                                         face_down_in_exile: ctx.face_down_in_exile,
                                         moved_count: None,
                                         face_down_profile: ctx.face_down_profile.clone(),
                                         library_placement: ctx.library_placement.clone(),
-                                        // CR 614.12: preserve the moved-object type
-                                        // gate across a further as-enters pause.
-                                        enters_modified_if: ctx.enters_modified_if.clone(),
                                         enter_attached_to: None,
                                         effect_kind,
                                     },
@@ -7355,27 +7431,19 @@ pub(super) fn handle_resolution_choice(
                                                 })
                                                 .expect("zone-change pause must retain its exact boundary"),
                                         ),
-                                        remaining: chosen_ids[i + 1..].to_vec(),
+                                        remaining: members[i + 1..].to_vec(),
                                         source_id: ctx.source_id,
                                         controller: ctx.controller,
                                         origin: ctx.origin,
                                         destination: ctx.destination,
                                         enter_transformed: ctx.enter_transformed,
-                                        enter_tapped: ctx.enter_tapped,
                                         enters_under_player: ctx.enters_under_player,
-                                        enters_attacking: ctx.enters_attacking,
-                                        enter_with_counters: enter_with_counters.clone(),
-                                        conditional_enter_with_counters:
-                                            conditional_enter_with_counters.clone(),
                                         duration: ctx.duration.clone(),
                                         track_exiled_by_source: ctx.track_exiled_by_source,
                                         face_down_in_exile: ctx.face_down_in_exile,
                                         moved_count: None,
                                         face_down_profile: ctx.face_down_profile.clone(),
                                         library_placement: ctx.library_placement.clone(),
-                                        // CR 614.12: preserve the moved-object type
-                                        // gate across a further as-enters pause.
-                                        enters_modified_if: ctx.enters_modified_if.clone(),
                                         enter_attached_to: None,
                                         effect_kind,
                                     },
@@ -8395,12 +8463,22 @@ pub(super) fn handle_resolution_choice(
                         return Ok(ResolutionChoiceOutcome::WaitingFor(wf));
                     }
                 } else {
-                    let trigger_events: Vec<GameEvent> = events
-                        [events_before_sacrifice..events_after_sacrifice]
-                        .iter()
-                        .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
-                        .cloned()
-                        .collect();
+                    // CR 601.2h + CR 603.3: a live announcement takes custody of
+                    // the span it owns; only the rest is parked here.
+                    let owned = super::announcement_triggers::take_inline_trigger_span(
+                        state,
+                        events,
+                        events_before_sacrifice,
+                    );
+                    let trigger_events: Vec<GameEvent> = unclaimed_observer_events(
+                        state,
+                        events,
+                        events_before_sacrifice,
+                        events_after_sacrifice.min(owned.end),
+                    )
+                    .into_iter()
+                    .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
+                    .collect();
                     super::triggers::collect_triggers_into_deferred(state, &trigger_events);
                 }
                 ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
@@ -8512,11 +8590,19 @@ pub(super) fn handle_resolution_choice(
                     return Ok(ResolutionChoiceOutcome::WaitingFor(wf));
                 }
             } else {
-                let trigger_events: Vec<GameEvent> = events[events_before..]
-                    .iter()
-                    .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
-                    .cloned()
-                    .collect();
+                // CR 601.2h + CR 603.3: a live announcement takes custody of the
+                // span it owns; only the rest is parked here, less any event
+                // another collector already claimed (CR 603.2c).
+                let owned = super::announcement_triggers::take_inline_trigger_span(
+                    state,
+                    events,
+                    events_before,
+                );
+                let trigger_events: Vec<GameEvent> =
+                    unclaimed_observer_events(state, events, owned.start, owned.end)
+                        .into_iter()
+                        .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
+                        .collect();
                 super::triggers::collect_triggers_into_deferred(state, &trigger_events);
             }
             ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
@@ -8595,12 +8681,22 @@ pub(super) fn handle_resolution_choice(
                         return Ok(ResolutionChoiceOutcome::WaitingFor(wf));
                     }
                 } else {
-                    let trigger_events: Vec<GameEvent> = events
-                        [events_before_sacrifice..events_after_sacrifice]
-                        .iter()
-                        .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
-                        .cloned()
-                        .collect();
+                    // CR 601.2h + CR 603.3: a live announcement takes custody of
+                    // the span it owns; only the rest is parked here.
+                    let owned = super::announcement_triggers::take_inline_trigger_span(
+                        state,
+                        events,
+                        events_before_sacrifice,
+                    );
+                    let trigger_events: Vec<GameEvent> = unclaimed_observer_events(
+                        state,
+                        events,
+                        events_before_sacrifice,
+                        events_after_sacrifice.min(owned.end),
+                    )
+                    .into_iter()
+                    .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
+                    .collect();
                     super::triggers::collect_triggers_into_deferred(state, &trigger_events);
                 }
                 ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
@@ -8686,12 +8782,22 @@ pub(super) fn handle_resolution_choice(
                     return Ok(ResolutionChoiceOutcome::WaitingFor(wf));
                 }
             } else {
-                let trigger_events: Vec<GameEvent> = events
-                    [events_before_sacrifice..events_after_sacrifice]
-                    .iter()
-                    .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
-                    .cloned()
-                    .collect();
+                // CR 601.2h + CR 603.3: a live announcement takes custody of the
+                // span it owns; only the rest is parked here.
+                let owned = super::announcement_triggers::take_inline_trigger_span(
+                    state,
+                    events,
+                    events_before_sacrifice,
+                );
+                let trigger_events: Vec<GameEvent> = unclaimed_observer_events(
+                    state,
+                    events,
+                    events_before_sacrifice,
+                    events_after_sacrifice.min(owned.end),
+                )
+                .into_iter()
+                .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
+                .collect();
                 super::triggers::collect_triggers_into_deferred(state, &trigger_events);
             }
             ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
@@ -9424,6 +9530,79 @@ fn finish_with_continuation(
     state.waiting_for.clone()
 }
 
+/// CR 107.3f + CR 118.12: the X announcement a just-paused resolution-time payment makes for
+/// the instructions that follow it, keyed by the prompt the payment opened:
+/// * a "tap X untapped ..." payment (`TapCreaturesSelectionMode::VariableX`) announces the
+///   count tapped; a fixed count or a power threshold (Crew/Saddle shape) announces nothing;
+/// * a "pay any amount of energy / life" or unannounced-X mana payment (CR 107.14, CR 119.4)
+///   announces the amount paid. A mana ability's own amount prompt (`pending_mana_ability`)
+///   and a loop-collapse count are not resolution-time payments of an effect.
+pub(crate) fn paused_payment_x_announcement(
+    paying: &ResolvedAbility,
+    waiting_for: &WaitingFor,
+) -> Option<ContinuationXAnnouncement> {
+    if !matches!(paying.effect, Effect::PayCost { .. }) {
+        return None;
+    }
+    match waiting_for {
+        WaitingFor::PayCost {
+            kind: PayCostKind::TapCreatures { mode },
+            resume: CostResume::Resolution,
+            ..
+        } => match mode {
+            TapCreaturesSelectionMode::VariableX => Some(ContinuationXAnnouncement::TappedCount),
+            TapCreaturesSelectionMode::Fixed | TapCreaturesSelectionMode::Aggregate(_) => None,
+        },
+        WaitingFor::PayAmountChoice {
+            resource,
+            pending_mana_ability: None,
+            ..
+        } => match resource {
+            PayableResource::Energy
+            | PayableResource::Life
+            | PayableResource::ManaGeneric { .. } => Some(ContinuationXAnnouncement::PaidAmount),
+            PayableResource::Counters
+            | PayableResource::Speed
+            | PayableResource::LoopCollapse { .. } => None,
+        },
+        _ => None,
+    }
+}
+
+/// CR 107.3f + CR 107.3i + CR 608.2c: X announced by a resolution-time payment (a count of
+/// permanents tapped, an amount paid) is X for the instructions after that payment, and for no
+/// other chain. Finds the rider the paused payment parked (the frame marked with
+/// `announcement`, see `PendingContinuation::x_announcement`, located by
+/// `ResolutionStack::x_announcement_rider_mut` even when an unmarked chain was parked above
+/// it), consumes the mark, and stamps `value` on that rider's chain and every sub/else branch.
+/// No other frame is touched: a payment with no rider parked nothing, so an enclosing
+/// continuation keeps its own X, and a chain parked above the rider keeps its own X.
+///
+/// A paid amount is not stamped onto a rider that opens with its own unannounced-X payment
+/// prompt: that prompt asks for its X itself (the next `PayAmountChoice` accumulates).
+pub(crate) fn stamp_paused_payment_rider_x(
+    state: &mut GameState,
+    announcement: ContinuationXAnnouncement,
+    value: u32,
+) {
+    let Some(frame) = state
+        .resolution_stack
+        .x_announcement_rider_mut(announcement)
+    else {
+        return;
+    };
+    frame.pending.x_announcement = None;
+    let asks_for_its_own_x = match announcement {
+        ContinuationXAnnouncement::PaidAmount => {
+            starts_with_pay_amount_prompt(&frame.pending.chain)
+        }
+        ContinuationXAnnouncement::TappedCount => false,
+    };
+    if !asks_for_its_own_x {
+        frame.pending.chain.set_chosen_x_recursive(value);
+    }
+}
+
 /// CR 118.12 + CR 119.4 + CR 616.1: Complete the outer pay-amount action only
 /// after any interactive post-replacement child of the life payment has
 /// settled. Shared by the direct submit path and the deferred-life resumer.
@@ -9434,22 +9613,20 @@ pub(crate) fn finish_pay_amount_choice(
     events: &mut Vec<GameEvent>,
 ) -> WaitingFor {
     state.last_effect_count = Some(total as i32);
-    let pending_starts_with_pay_amount = state
-        .active_ability_continuation()
-        .is_some_and(|cont| starts_with_pay_amount_prompt(&cont.chain));
-    if !pending_starts_with_pay_amount {
-        if let Some(frame) = state.active_ability_continuation_frame_mut() {
-            frame.pending.chain.set_chosen_x_recursive(total);
-        }
-    }
+    stamp_paused_payment_rider_x(state, ContinuationXAnnouncement::PaidAmount, total);
     let mut waiting_for = finish_with_continuation(state, player, events);
     if let WaitingFor::PayAmountChoice {
         accumulated: next_accumulated,
         ..
     } = &mut waiting_for
     {
-        *next_accumulated = total;
-        state.waiting_for = waiting_for.clone();
+        // CR 614.12a: a nested pre-entry payment is a FRESH, independent
+        // payment (Phyrexian Processor put onto the battlefield mid-chain) —
+        // the outer total must not leak into its accumulator.
+        if !super::replacement::pending_entry_payment_is_live(state) {
+            *next_accumulated = total;
+            state.waiting_for = waiting_for.clone();
+        }
     }
     waiting_for
 }
@@ -14696,5 +14873,55 @@ mod tests {
             vec![pile[1], pile[3], p1c, pile[5], pile[9]],
             "separate libraries place the card third from the top of its owner's"
         );
+    }
+
+    /// CR 115.10a: only a parked UNTARGETED (Resolution-timed)
+    /// `TargetOnly` chooser, and the counter-placement continuations, decline the
+    /// unchosen-complement forward; a Stack-timed `TargetOnly` wrapper after a
+    /// `ChooseFromZone` and an ordinary partition head keep it.
+    #[test]
+    fn only_untargeted_choosers_and_counter_placements_skip_the_complement_forward() {
+        use crate::types::ability::{Effect, QuantityExpr, TargetChoiceTiming, TargetFilter};
+        let chain = |effect: Effect, timing: TargetChoiceTiming| {
+            let mut chain = ResolvedAbility::new(effect, vec![], ObjectId(1), PlayerId(0));
+            chain.target_choice_timing = timing;
+            chain
+        };
+        let target_only = || Effect::TargetOnly {
+            target: TargetFilter::Any,
+        };
+
+        assert!(
+            !continuation_forwards_unchosen_complement(&chain(
+                target_only(),
+                TargetChoiceTiming::Resolution
+            )),
+            "the Resolution-timed chooser's pick is the whole choice"
+        );
+        assert!(
+            continuation_forwards_unchosen_complement(&chain(
+                target_only(),
+                TargetChoiceTiming::Stack
+            )),
+            "reach: the same effect Stack-timed still forwards the complement"
+        );
+        assert!(
+            continuation_forwards_unchosen_complement(&chain(
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                TargetChoiceTiming::Resolution
+            )),
+            "an ordinary head keeps the forward"
+        );
+        assert!(!continuation_forwards_unchosen_complement(&chain(
+            Effect::PutCounter {
+                counter_type: crate::types::counter::CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Any,
+            },
+            TargetChoiceTiming::Resolution
+        )));
     }
 }
