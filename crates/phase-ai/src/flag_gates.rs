@@ -15,19 +15,32 @@
 //!   or turn, aimed at an opponent (Shadow of the Second Sun);
 //! * a "return a land you control" ETB returning the land that just entered
 //!   while another land could go (the bounce-land loop).
+//!
+//! Second batch (reports of 23–24/10):
+//!
+//! * "pay any amount of {E}, deal that much damage to that creature" paid 1 of
+//!   12 energy into a 6-toughness creature (Harnessed Lightning) — the amount
+//!   prompt was answered by its minimum;
+//! * a creature Aura that only helps the enchanted creature (Rancor) cast with
+//!   no own creature on the board, so its only legal target was the opponent's;
+//! * "target creature gains haste until end of turn" activated every turn on a
+//!   creature that could already attack (Hanweir Battlements).
 
+use engine::game::casting::activated_ability_definitions;
 use engine::game::game_object::GameObject;
 use engine::game::players::is_opponent;
 use engine::game::targeting::find_legal_targets;
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef, Duration,
-    Effect, EffectKind, ExtraPhaseRecipient, TargetFilter, TargetRef, UnlessPayModifier,
+    Effect, EffectKind, ExtraPhaseRecipient, FilterProp, QuantityExpr, QuantityRef,
+    ResolvedAbility, StaticDefinition, TargetFilter, TargetRef, UnlessPayModifier,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
-use engine::types::game_state::{GameState, StackEntryKind, WaitingFor};
+use engine::types::game_state::{GameState, PayableResource, StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
+use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
@@ -45,6 +58,7 @@ pub(crate) fn rejects(ctx: &PolicyContext<'_>) -> bool {
             harmful_spell_reaches_only_own(ctx)
                 || soft_counter_is_payable_at_cast(ctx)
                 || protection_spell_has_nothing_to_stop(ctx)
+                || boon_aura_reaches_only_foreign(ctx)
         }
         GameAction::ChooseTarget {
             target: Some(target),
@@ -53,12 +67,20 @@ pub(crate) fn rejects(ctx: &PolicyContext<'_>) -> bool {
             targets.iter().any(|target| target_is_rejected(ctx, target))
         }
         GameAction::SelectCards { cards } => bounce_land_returns_itself(ctx, cards),
+        GameAction::SubmitPayAmount { amount } => energy_pay_amount_misses_lethal(ctx, *amount),
+        GameAction::ActivateAbility {
+            source_id,
+            ability_index,
+        } => haste_grant_has_no_beneficiary(ctx, *source_id, *ability_index),
         _ => false,
     }
 }
 
 fn target_is_rejected(ctx: &PolicyContext<'_>, target: &TargetRef) -> bool {
-    soft_counter_target_is_payable(ctx, target) || boon_aura_targets_opponent(ctx, target)
+    soft_counter_target_is_payable(ctx, target)
+        || boon_aura_targets_opponent(ctx, target)
+        || boon_aura_targets_foreign_creature(ctx, target)
+        || haste_grant_target_needs_no_haste(ctx, target)
 }
 
 /// The instant/sorcery being cast and its root spell ability.
@@ -390,6 +412,337 @@ fn bounce_land_returns_itself(ctx: &PolicyContext<'_>, cards: &[ObjectId]) -> bo
     alternatives >= cards.len()
 }
 
+// ---------------------------------------------------------------------------
+// "Pay any amount of {E}; deal that much damage" paid below lethal
+// ---------------------------------------------------------------------------
+
+/// The creature a resolving "pay any amount of {E}, ~ deals that much damage
+/// to that creature" chain is pointed at: a `PayCost(PayEnergy X)` step whose
+/// next step is `DealDamage(EventContextAmount)` at the chain root's target
+/// (Harnessed Lightning). `None` for every other shape.
+fn damage_per_energy_target(root: &ResolvedAbility) -> Option<TargetRef> {
+    let mut node = Some(root);
+    while let Some(ability) = node {
+        if let Effect::PayCost {
+            cost:
+                AbilityCost::PayEnergy {
+                    amount:
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::Variable { .. },
+                        },
+                },
+            ..
+        } = &ability.effect
+        {
+            let next = ability.sub_ability.as_deref()?;
+            let Effect::DealDamage {
+                amount:
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::EventContextAmount,
+                    },
+                target: TargetFilter::TriggeringSource,
+                ..
+            } = &next.effect
+            else {
+                return None;
+            };
+            return root
+                .targets
+                .first()
+                .or_else(|| root.context.chain_root_targets.first())
+                .cloned();
+        }
+        node = ability.sub_ability.as_deref();
+    }
+    None
+}
+
+/// CR 107.14 + CR 120.3: the amount paid IS the damage. Field report (24/10,
+/// Kaladesh Energy challenger): Harnessed Lightning on an 18/6 with 12 energy
+/// in the pool, paid 1 — every amount was scored 0.1 apart and the prompt's
+/// default is its minimum. Rejected: any amount other than the lethal one,
+/// whenever lethal is within the legal range. Above the range (the creature
+/// cannot die) nothing is proven and the choice stays with scoring.
+fn energy_pay_amount_misses_lethal(ctx: &PolicyContext<'_>, amount: u32) -> bool {
+    let WaitingFor::PayAmountChoice {
+        player,
+        resource: PayableResource::Energy,
+        min,
+        max,
+        source_id,
+        ..
+    } = &ctx.decision.waiting_for
+    else {
+        return false;
+    };
+    if *player != ctx.ai_player {
+        return false;
+    }
+    let Some(entry) = ctx.state.resolving_stack_entry.as_ref() else {
+        return false;
+    };
+    if entry.id != *source_id || entry.controller != ctx.ai_player {
+        return false;
+    }
+    let StackEntryKind::Spell {
+        ability: Some(root),
+        ..
+    } = &entry.kind
+    else {
+        return false;
+    };
+    let Some(TargetRef::Object(target)) = damage_per_energy_target(root) else {
+        return false;
+    };
+    let Some(creature) = ctx.state.objects.get(&target) else {
+        return false;
+    };
+    if creature.zone != Zone::Battlefield
+        || !creature.card_types.core_types.contains(&CoreType::Creature)
+        || creature.has_keyword(&Keyword::Indestructible)
+    {
+        return false;
+    }
+    let toughness = creature.toughness.unwrap_or(0) - creature.damage_marked as i32;
+    if toughness <= 0 {
+        return false;
+    }
+    let lethal = toughness as u32;
+    if lethal < *min || lethal > *max {
+        return false;
+    }
+    amount != lethal
+}
+
+// ---------------------------------------------------------------------------
+// Creature Aura that only helps its creature, on the opponent's creature
+// ---------------------------------------------------------------------------
+
+/// A modification that can only help the creature carrying it.
+fn modification_is_boon(modification: &ContinuousModification) -> bool {
+    match modification {
+        ContinuousModification::AddPower { value }
+        | ContinuousModification::AddToughness { value } => *value >= 0,
+        ContinuousModification::AddKeyword { keyword } => !matches!(keyword, Keyword::Defender),
+        _ => false,
+    }
+}
+
+/// The Aura enchants a creature and every static it carries only helps the
+/// enchanted creature (Rancor: "+2/+0 and has trample"). Auras with any other
+/// static (a drawback, a tax on the controller) fail open.
+fn aura_is_boon_to_enchanted_creature(aura: &GameObject) -> bool {
+    if !aura
+        .card_types
+        .subtypes
+        .iter()
+        .any(|subtype| subtype == "Aura")
+    {
+        return false;
+    }
+    let enchants_creature = aura.keywords.iter().any(|keyword| {
+        matches!(keyword, Keyword::Enchant(TargetFilter::Typed(typed))
+            if typed.type_filters.iter().any(|filter| matches!(filter, engine::types::ability::TypeFilter::Creature)))
+    });
+    if !enchants_creature {
+        return false;
+    }
+    // "Enchanted creature gets…" parses as the typed filter with the
+    // `EnchantedBy` property; the bare `AttachedTo` form is kept for parity.
+    let affects_enchanted = |definition: &StaticDefinition| match &definition.affected {
+        Some(TargetFilter::AttachedTo) => true,
+        Some(TargetFilter::Typed(typed)) => typed
+            .properties
+            .iter()
+            .any(|property| matches!(property, FilterProp::EnchantedBy)),
+        _ => false,
+    };
+    let statics: Vec<&StaticDefinition> = aura.static_definitions.iter_unchecked().collect();
+    !statics.is_empty()
+        && statics.iter().all(|definition| {
+            affects_enchanted(definition)
+                && !definition.modifications.is_empty()
+                && definition.modifications.iter().all(modification_is_boon)
+        })
+}
+
+/// The Aura's enchant filter, when it is a typed one.
+fn aura_enchant_filter(aura: &GameObject) -> Option<&TargetFilter> {
+    aura.keywords.iter().find_map(|keyword| match keyword {
+        Keyword::Enchant(filter) => Some(filter),
+        _ => None,
+    })
+}
+
+/// CR 303.4a + CR 601.2c: an Aura that only helps its creature, cast when every
+/// creature it could enchant belongs to an opponent, can only help them. Field
+/// report (23/10): Rancor cast with the AI creatureless — its only legal
+/// targets were the opponent's Guttersnipe and Sneaky Snacker.
+fn boon_aura_reaches_only_foreign(ctx: &PolicyContext<'_>) -> bool {
+    let Some(aura) = ctx.source_object() else {
+        return false;
+    };
+    if !aura_is_boon_to_enchanted_creature(aura) {
+        return false;
+    }
+    let Some(filter) = aura_enchant_filter(aura) else {
+        return false;
+    };
+    let legal = find_legal_targets(ctx.state, filter, ctx.ai_player, aura.id);
+    !legal.is_empty()
+        && legal.iter().all(|target| match target {
+            TargetRef::Object(id) => ctx
+                .state
+                .objects
+                .get(id)
+                .is_some_and(|object| is_opponent(ctx.state, ctx.ai_player, object.controller)),
+            TargetRef::Player(_) => false,
+        })
+}
+
+/// Same Aura, at the target prompt: the opponent's creature chosen while an
+/// own creature is a legal choice in the same selection.
+fn boon_aura_targets_foreign_creature(ctx: &PolicyContext<'_>, target: &TargetRef) -> bool {
+    let TargetRef::Object(id) = target else {
+        return false;
+    };
+    let foreign = ctx
+        .state
+        .objects
+        .get(id)
+        .is_some_and(|object| is_opponent(ctx.state, ctx.ai_player, object.controller));
+    if !foreign {
+        return false;
+    }
+    let WaitingFor::TargetSelection {
+        pending_cast,
+        target_slots,
+        ..
+    } = &ctx.decision.waiting_for
+    else {
+        return false;
+    };
+    if pending_cast.ability.controller != ctx.ai_player {
+        return false;
+    }
+    let own_is_legal = target_slots.iter().any(|slot| {
+        slot.legal_targets.iter().any(|legal| match legal {
+            TargetRef::Object(legal_id) => ctx
+                .state
+                .objects
+                .get(legal_id)
+                .is_some_and(|object| object.controller == ctx.ai_player),
+            TargetRef::Player(_) => false,
+        })
+    });
+    own_is_legal
+        && ctx
+            .state
+            .objects
+            .get(&pending_cast.object_id)
+            .is_some_and(aura_is_boon_to_enchanted_creature)
+}
+
+// ---------------------------------------------------------------------------
+// "Target creature gains haste until end of turn" with nothing to hasten
+// ---------------------------------------------------------------------------
+
+/// The effect grants haste (and only haste) until end of turn.
+fn effect_is_haste_grant(effect: &Effect) -> bool {
+    let Effect::GenericEffect {
+        static_abilities,
+        duration,
+        ..
+    } = effect
+    else {
+        return false;
+    };
+    matches!(duration, Some(Duration::UntilEndOfTurn))
+        && !static_abilities.is_empty()
+        && static_abilities.iter().all(|definition| {
+            !definition.modifications.is_empty()
+                && definition.modifications.iter().all(|modification| {
+                    matches!(
+                        modification,
+                        ContinuousModification::AddKeyword {
+                            keyword: Keyword::Haste
+                        }
+                    )
+                })
+        })
+}
+
+/// CR 302.6: haste only matters to a creature that came under the AI's control
+/// this turn, and only before attackers are declared on the AI's own turn.
+fn haste_window_open(state: &GameState, ai: PlayerId) -> bool {
+    state.active_player == ai
+        && matches!(
+            state.phase,
+            Phase::Upkeep | Phase::Draw | Phase::PreCombatMain | Phase::BeginCombat
+        )
+}
+
+fn creature_needs_haste(state: &GameState, ai: PlayerId, object: &GameObject) -> bool {
+    object.controller == ai
+        && object.zone == Zone::Battlefield
+        && object.card_types.core_types.contains(&CoreType::Creature)
+        && !object.has_keyword(&Keyword::Haste)
+        && (object.summoning_sick || object.entered_battlefield_turn == Some(state.turn_number))
+}
+
+/// Field report (23/10, Amulet Titan challenger): Hanweir Battlements paid
+/// {R},{T} every upkeep to give haste to a creature that had been on the
+/// battlefield for turns. Rejected at activation when no own creature could use
+/// haste right now (none summoning-sick, or the window for attacking this turn
+/// has closed).
+fn haste_grant_has_no_beneficiary(
+    ctx: &PolicyContext<'_>,
+    source_id: ObjectId,
+    ability_index: usize,
+) -> bool {
+    let definitions = activated_ability_definitions(ctx.state, source_id);
+    let Some((_, definition)) = definitions
+        .iter()
+        .find(|(index, _)| *index == ability_index)
+    else {
+        return false;
+    };
+    if definition.kind != AbilityKind::Activated || !effect_is_haste_grant(&definition.effect) {
+        return false;
+    }
+    if !haste_window_open(ctx.state, ctx.ai_player) {
+        return true;
+    }
+    !ctx.state.battlefield.iter().any(|id| {
+        ctx.state
+            .objects
+            .get(id)
+            .is_some_and(|object| creature_needs_haste(ctx.state, ctx.ai_player, object))
+    })
+}
+
+/// Same grant, at the target prompt: the chosen creature is not one that
+/// needs haste (it can already attack, has haste, or is not the AI's).
+fn haste_grant_target_needs_no_haste(ctx: &PolicyContext<'_>, target: &TargetRef) -> bool {
+    let TargetRef::Object(id) = target else {
+        return false;
+    };
+    let WaitingFor::TargetSelection { pending_cast, .. } = &ctx.decision.waiting_for else {
+        return false;
+    };
+    let ability = &pending_cast.ability;
+    if ability.controller != ctx.ai_player || !effect_is_haste_grant(&ability.effect) {
+        return false;
+    }
+    if !haste_window_open(ctx.state, ctx.ai_player) {
+        return true;
+    }
+    !ctx.state
+        .objects
+        .get(id)
+        .is_some_and(|object| creature_needs_haste(ctx.state, ctx.ai_player, object))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +753,7 @@ mod tests {
     use engine::ai_support::{ActionMetadata, AiDecisionContext, CandidateAction, TacticalClass};
     use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
     use engine::game::zones::create_object;
+    use engine::types::ability::TypedFilter;
     use engine::types::game_state::{CastPaymentMode, CastingVariant, StackEntry};
     use engine::types::identifiers::CardId;
     use engine::types::keywords::Keyword;
@@ -754,6 +1108,221 @@ mod tests {
                 !attackers.contains(&gnome),
                 "blockers {blockers:?}: {attackers:?}"
             );
+        }
+    }
+
+    // ── Harnessed Lightning: pay what kills ────────────────────────────────
+
+    const HARNESSED: &str = "Choose target creature. You get {E}{E}{E} (three energy counters), then you may pay any amount of {E}. Harnessed Lightning deals that much damage to that creature.";
+
+    /// Casts Harnessed Lightning (free) at a 3/`toughness` with 9 energy in
+    /// the pool (12 after the spell's own three) and runs to the pay prompt.
+    fn harnessed_board(toughness: i32) -> (GameState, ObjectId) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let victim = scenario.add_vanilla(P1, 3, toughness);
+        let lightning = scenario
+            .add_spell_to_hand_from_oracle(P0, "Harnessed Lightning", true, HARNESSED)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut runner = scenario.build();
+        runner.state_mut().players[0].energy = 9;
+        priority_to_p0(&mut runner, P0);
+        let action = cast(runner.state(), lightning);
+        runner.act(action).expect("cast Harnessed Lightning");
+        if matches!(
+            runner.state().waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ) {
+            runner
+                .act(GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(victim)),
+                })
+                .expect("choose the creature");
+        }
+        for _ in 0..8 {
+            match runner.state().waiting_for {
+                WaitingFor::PayAmountChoice { .. } => break,
+                // "you may pay any amount": the engine asks whether to pay at
+                // all before asking how much.
+                WaitingFor::OptionalEffectChoice { .. } => {
+                    runner
+                        .act(GameAction::DecideOptionalEffect { accept: true })
+                        .expect("accept the optional payment");
+                }
+                _ => runner.pass_both_players(),
+            }
+        }
+        (runner.state().clone(), victim)
+    }
+
+    /// Field report (24/10, Kaladesh Energy): 12 energy, an 18/6 as the
+    /// target, paid 1. Only the lethal amount is kept.
+    #[test]
+    fn rejects_energy_amount_that_does_not_kill() {
+        let (state, _) = harnessed_board(6);
+        let WaitingFor::PayAmountChoice { min, max, .. } = &state.waiting_for else {
+            panic!(
+                "precondition: the spell asks how much energy to pay, got {:?}",
+                state.waiting_for
+            );
+        };
+        assert!(*min <= 6 && *max >= 6, "range {min}..={max}");
+        let pay = |amount| GameAction::SubmitPayAmount { amount };
+        assert!(kept(&state, pay(6)), "lethal");
+        assert!(!kept(&state, pay(1)), "one energy");
+        assert!(!kept(&state, pay(0)), "nothing");
+        assert!(!kept(&state, pay(*max)), "everything");
+    }
+
+    #[test]
+    fn energy_amount_is_free_when_the_creature_cannot_die() {
+        let (state, _) = harnessed_board(20);
+        if let WaitingFor::PayAmountChoice { max, .. } = &state.waiting_for {
+            assert!(kept(&state, GameAction::SubmitPayAmount { amount: 0 }));
+            assert!(kept(&state, GameAction::SubmitPayAmount { amount: *max }));
+        }
+    }
+
+    // ── Rancor with no own creature ────────────────────────────────────────
+
+    const RANCOR: &str = "Enchant creature\nEnchanted creature gets +2/+0 and has trample.\nWhen Rancor is put into a graveyard from the battlefield, return Rancor to its owner's hand.";
+
+    fn rancor_runner(own_creature: bool) -> (GameRunner, ObjectId, ObjectId, Option<ObjectId>) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let foe = scenario.add_vanilla(P1, 2, 2);
+        let own = own_creature.then(|| scenario.add_vanilla(P0, 2, 2));
+        let rancor = scenario
+            .add_spell_to_hand_from_oracle(P0, "Rancor", false, RANCOR)
+            .as_enchantment()
+            .with_subtypes(vec!["Aura"])
+            .with_keyword(Keyword::Enchant(TargetFilter::Typed(
+                TypedFilter::creature(),
+            )))
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut runner = scenario.build();
+        priority_to_p0(&mut runner, P0);
+        let parsed = &runner.state().objects[&rancor];
+        assert!(
+            aura_is_boon_to_enchanted_creature(parsed),
+            "precondition: Rancor parsed as a boon-only creature Aura — subtypes {:?}, keywords {:?}, statics {:?}",
+            parsed.card_types.subtypes,
+            parsed.keywords,
+            parsed.static_definitions.iter_unchecked().collect::<Vec<_>>()
+        );
+        (runner, rancor, foe, own)
+    }
+
+    /// Field report (23/10): the AI had no creature and cast Rancor — its only
+    /// legal target was the opponent's.
+    #[test]
+    fn rejects_boon_aura_cast_with_only_foreign_creatures() {
+        let (runner, rancor, _, _) = rancor_runner(false);
+        let state = runner.state();
+        assert!(!kept(state, cast(state, rancor)));
+    }
+
+    #[test]
+    fn boon_aura_with_an_own_creature_is_cast_and_aimed_at_it() {
+        let (mut runner, rancor, foe, own) = rancor_runner(true);
+        let own = own.expect("own creature");
+        let action = cast(runner.state(), rancor);
+        assert!(kept(runner.state(), action.clone()));
+        runner.act(action).expect("cast Rancor");
+        let state = runner.state();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::TargetSelection { .. }),
+            "precondition: the Aura asks for its creature, got {:?}",
+            state.waiting_for
+        );
+        let choose = |id| GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(id)),
+        };
+        assert!(!kept(state, choose(foe)), "the opponent's creature");
+        assert!(kept(state, choose(own)), "the AI's own creature");
+    }
+
+    // ── Hanweir Battlements: haste for a creature that can already attack ──
+
+    const BATTLEMENTS: &str = "{R}, {T}: Target creature gains haste until end of turn.";
+
+    fn battlements_runner(
+        phase: Phase,
+        sick_creature: bool,
+    ) -> (GameRunner, ObjectId, ObjectId, Option<ObjectId>, usize) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(phase);
+        scenario.add_basic_land(P0, ManaColor::Red);
+        scenario.add_basic_land(P0, ManaColor::Red);
+        let veteran = scenario.add_vanilla(P0, 3, 3);
+        let fresh = sick_creature.then(|| {
+            scenario
+                .add_creature(P0, "Fresh Bear", 2, 2)
+                .with_summoning_sickness()
+                .id()
+        });
+        let land = scenario
+            .add_land_from_oracle(P0, "Hanweir Battlements", BATTLEMENTS)
+            .id();
+        let mut runner = scenario.build();
+        priority_to_p0(&mut runner, P0);
+        let index = activated_ability_definitions(runner.state(), land)
+            .into_iter()
+            .find(|(_, definition)| effect_is_haste_grant(&definition.effect))
+            .map(|(index, _)| index)
+            .expect("precondition: the land parsed a haste grant");
+        (runner, land, veteran, fresh, index)
+    }
+
+    /// Field report (23/10): {R},{T} every upkeep to hasten a creature that had
+    /// been on the battlefield for turns.
+    #[test]
+    fn rejects_haste_grant_when_no_creature_needs_haste() {
+        let (runner, land, _, _, index) = battlements_runner(Phase::PreCombatMain, false);
+        assert!(!kept(
+            runner.state(),
+            GameAction::ActivateAbility {
+                source_id: land,
+                ability_index: index
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_haste_grant_after_combat_even_with_a_fresh_creature() {
+        let (runner, land, _, _, index) = battlements_runner(Phase::PostCombatMain, true);
+        assert!(!kept(
+            runner.state(),
+            GameAction::ActivateAbility {
+                source_id: land,
+                ability_index: index
+            }
+        ));
+    }
+
+    #[test]
+    fn haste_grant_with_a_fresh_creature_is_kept_and_aimed_at_it() {
+        let (mut runner, land, veteran, fresh, index) =
+            battlements_runner(Phase::PreCombatMain, true);
+        let fresh = fresh.expect("fresh creature");
+        let activate = GameAction::ActivateAbility {
+            source_id: land,
+            ability_index: index,
+        };
+        assert!(kept(runner.state(), activate.clone()));
+        runner.act(activate).expect("activate Hanweir Battlements");
+        let state = runner.state();
+        if matches!(state.waiting_for, WaitingFor::TargetSelection { .. }) {
+            let choose = |id| GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(id)),
+            };
+            assert!(
+                !kept(state, choose(veteran)),
+                "the creature that can already attack"
+            );
+            assert!(kept(state, choose(fresh)), "the summoning-sick creature");
         }
     }
 }
