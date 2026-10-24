@@ -170,9 +170,6 @@
     "branch": "card/if-you-do-repeat-process"
   },
   {
-    "branch": "card/cavalcade-attacked-player"
-  },
-  {
     "branch": "card/zurgo-siegebreaker"
   },
   {
@@ -262,5 +259,8 @@
   },
   {
     "branch": "ai/bot-flags-1024"
+  },
+  {
+    "branch": "card/moonmist-other-than-types"
   }
 ]
