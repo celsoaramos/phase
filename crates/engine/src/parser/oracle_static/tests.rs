@@ -35321,6 +35321,7 @@ fn subgoyf_cda_power_is_bare_count_toughness_is_count_plus_one() {
                 scope: CountScope::All,
             },
             exclude: SubtypeExclusion::CreatureTypes,
+            restrict: None,
         },
     };
 
@@ -40799,4 +40800,30 @@ fn granted_loyalty_abilities_carry_cr_606_3_timing() {
         def.activation_restrictions
     );
     assert!(crate::game::mana_abilities::is_mana_ability(def));
+}
+
+/// CR 702.16i + CR 903.4: Commander's Plate — "Equipped creature gets +3/+3 and
+/// has protection from each color that's not in your commander's color
+/// identity." The protection quality is a typed `EachColor` set, not an
+/// untyped `CardType` string that no source could ever match.
+#[test]
+fn commanders_plate_static_line_parses_to_each_color_protection_set() {
+    use crate::types::keywords::{ProtectionColorSet, ProtectionTarget};
+
+    let def = parse_static_line(
+        "Equipped creature gets +3/+3 and has protection from each color that's not in your commander's color identity.",
+    )
+    .expect("Commander's Plate static line must parse");
+    assert_eq!(
+        def.modifications,
+        vec![
+            ContinuousModification::AddPower { value: 3 },
+            ContinuousModification::AddToughness { value: 3 },
+            ContinuousModification::AddKeyword {
+                keyword: Keyword::Protection(ProtectionTarget::EachColor(
+                    ProtectionColorSet::OutsideCommanderColorIdentity
+                )),
+            },
+        ]
+    );
 }
