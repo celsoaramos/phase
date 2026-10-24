@@ -266,8 +266,6 @@
     "hostServerUnscored": "{{name}} — aún sin valorar",
     "sandboxMode": "Modo Sandbox — permitir acciones de depuración",
     "sandboxModeHelp": "El anfitrión puede manipular directamente el estado de la partida (mover cartas, cambiar vidas, modificar contadores) y otorgar permiso de depuración a otros jugadores. Úsalo para pruebas o juego de sandbox — no para partidas competitivas. Este ajuste no se puede cambiar una vez iniciada la partida.",
-    "experimentalDungeons": "Mazmorras experimentales",
-    "experimentalDungeonsHelp": "Adentrarse en la mazmorra ofrece Baldur's Gate Wilderness junto a las opciones habituales, y tomar la iniciativa la ofrece como alternativa a la Subciudad. Experimental y no oficial. Desactivado por defecto. Este ajuste no se puede cambiar una vez empezada la partida.",
     "setPassword": "Establecer contraseña",
     "passwordPlaceholder": "Contraseña de la partida",
     "back": "Atrás",
@@ -287,7 +285,8 @@
     "botGameNotice": "Organizando la partida de Discord {{code}}. La conexión y la privacidad las define la publicación de Discord.",
     "botSeedIgnored": "Algunos ajustes de la publicación de Discord no se pueden usar aquí — revisa el formato y el número de jugadores.",
     "botP2PNotice": "Tu dispositivo ejecuta la partida. Mantén la aplicación abierta y conectada.",
-    "botServerNotice": "Un servidor dedicado ejecuta la partida. Puede ralentizarse o desconectarse."
+    "botServerNotice": "Un servidor dedicado ejecuta la partida. Puede ralentizarse o desconectarse.",
+    "poolBracketConflict": "Ninguno de los {{selected}} mazos elegidos es legal con los filtros actuales, así que los rivales aleatorios eligen entre los {{total}} mazos."
   },
   "page": {
     "deckRejected": "El anfitrión rechazó el mazo.",

@@ -1135,6 +1135,7 @@ fn blitz_keeps_its_elected_permission_when_the_source_leaves_mid_payment() {
         .act(GameAction::ActivateAbility {
             source_id: ironworks,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("Krark-Clan Ironworks must be activatable during payment");
     runner
@@ -2065,6 +2066,7 @@ pub(crate) fn creature_permission(
         extra_cost: None,
         enters_with_counter: None,
         required_cast_keyword,
+        pool: engine::types::statics::GraveyardPermissionPool::OwnGraveyard,
     })
     .affected(TargetFilter::Typed(filter))
 }

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::game::game_object::{AttachTarget, DisplaySource};
+use crate::game::game_object::{AttachTarget, DisplayIdentity};
 
 use super::counter::CounterType;
 
@@ -10,7 +10,6 @@ use super::ability::{
     ContinuousModification, CopiableValues, DieRollIgnoreRule, Duration, FaceDownProfile,
     StaticDefinition, TargetRef,
 };
-use super::card::{PrintedCardRef, TokenImageRef};
 use super::card_type::{CoreType, Supertype};
 use super::events::EventObjectSnapshot;
 use super::identifiers::{ObjectId, ObjectIncarnationRef};
@@ -469,15 +468,19 @@ impl TokenHostRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CopyTokenSpec {
     pub values: Box<CopiableValues>,
-    pub display_source: DisplaySource,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub printed_ref: Option<PrintedCardRef>,
-    /// CR 111.1 + CR 707.2: exact token-art pointer of the copy source when it
-    /// is itself a true token (`display_source == Token`). Carried so a
-    /// token-copy of a token resolves the source token's art instead of falling
-    /// back to a name+filter Scryfall search. `None` for printed-card sources.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_image_ref: Option<TokenImageRef>,
+    /// Display routing of the copy source (see [`DisplayIdentity`]). CR 111.1 +
+    /// CR 707.2: carries the exact token-art pointer when the source is itself a
+    /// true token, so a token-copy of a token resolves the source token's art
+    /// instead of falling back to a name+filter Scryfall search. `token_art` is
+    /// captured by the enter-as-copy replacement selection so an enter-as-copy
+    /// recipient (which keeps its own base and never runs the token creation
+    /// injectors) renders from the source's printed shape even when no exact ref
+    /// matched; it is `None` for printed-card sources, departed (LKI) sources,
+    /// and created copy-tokens — the latter derive their descriptor from their
+    /// own base at injection, which also reflects copy exceptions the source
+    /// never had.
+    #[serde(flatten)]
+    pub display: DisplayIdentity,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_keywords: Vec<Keyword>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -488,6 +491,14 @@ pub struct CopyTokenSpec {
     pub sacrifice_at: Option<Duration>,
     pub source_id: ObjectId,
     pub controller: PlayerId,
+    /// CR 608.2h + CR 707.9b: the copy donor whose live (or last-known)
+    /// characteristics donor-referential copy exceptions read. Dynamic P/T
+    /// exceptions ("half that creature's power", Saw in Half) resolve their
+    /// `Source`-scoped quantity against this incarnation at the stamp, so a
+    /// departed donor reads LKI rather than the token's own copied base.
+    /// `None` where no donor is in scope; consumers fall back to the token id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub donor: Option<ObjectIncarnationRef>,
 }
 
 /// CR 701.31 + CR 901.9c + CR 701.31c: Which rules path is proposing a
@@ -571,6 +582,13 @@ pub enum ProposedEvent {
         /// delivered.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         enter_as_copy: Option<Box<CopyTokenSpec>>,
+        /// CR 614.12a + CR 614.12: the answers to the entrant's own "As ~ enters,
+        /// choose …" replacements, made before it enters. They ride the event so
+        /// later replacement passes match the entering permanent as it would
+        /// exist with its choices, and delivery installs them on the new object
+        /// after CR 400.7's reset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enter_with_choices: Option<Box<EntryChoices>>,
         /// CR 701.9a + CR 614.1: Preserves an operation-owned discard frame
         /// through the inner hand-to-destination move and any replacement
         /// choices. Unrelated zone changes omit it from the wire.
@@ -582,6 +600,8 @@ pub enum ProposedEvent {
         /// event through replacement and CR 616.1 pause/resume so delivery can
         /// record, per CR 406.6 + CR 400.8, who exiled the new exile object.
         /// `None` for moves no player performs (rules processes, raw movers).
+        /// Under `EntryOwnership::ActorOwns` delivery also reads it as the
+        /// player who becomes the card's owner (`zone_pipeline::entry_receiver`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         performed_by: Option<PlayerId>,
         #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
@@ -789,6 +809,13 @@ pub enum ProposedEvent {
         enter_tapped: EtbTapState,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         enter_with_counters: Vec<(CounterType, u32)>,
+        /// CR 614.12a + CR 707.2: the answers to the token entrant's own "As ~
+        /// enters, choose …" replacements plus its paid as-enters amount latch,
+        /// mirroring the ZoneChange field. Direct token copies (Rite of
+        /// Replication copying Minion of the Wastes) ride the entry-payment
+        /// continuation through this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enter_with_choices: Option<Box<EntryChoices>>,
         #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
         applied: HashSet<AppliedReplacementKey>,
     },
@@ -945,6 +972,22 @@ fn default_produce_mana_count() -> u32 {
     1
 }
 
+/// CR 614.12a: the answers to an entrant's own as-enters choices, carried by
+/// its battlefield entry (`ZoneChange::enter_with_choices` or
+/// `TokenEntry::enter_with_choices`). Boxed there because it is rarely populated.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EntryChoices(pub Vec<crate::types::ability::ChosenAttribute>);
+
+impl EntryChoices {
+    /// The carried choices of an entry (`[]` when it carries none).
+    pub fn of(choices: &Option<Box<EntryChoices>>) -> &[crate::types::ability::ChosenAttribute] {
+        choices
+            .as_deref()
+            .map_or(&[], |choices| choices.0.as_slice())
+    }
+}
+
 impl ProposedEvent {
     /// Construct a `ZoneChange` with default `enter_tapped: Unspecified` and empty `applied` set.
     pub fn zone_change(object_id: ObjectId, from: Zone, to: Zone, cause: Option<ObjectId>) -> Self {
@@ -963,6 +1006,7 @@ impl ProposedEvent {
             face_down_in_exile: crate::types::ability::ExileConcealment::Public,
             chain_referent: ChainReferentIntent::default(),
             enter_as_copy: None,
+            enter_with_choices: None,
             discard_frame: None,
             performed_by: None,
             applied: HashSet::new(),

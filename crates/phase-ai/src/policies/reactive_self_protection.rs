@@ -54,11 +54,7 @@ impl TacticalPolicy for ReactiveSelfProtectionPolicy {
     }
 
     fn verdict(&self, ctx: &PolicyContext<'_>) -> PolicyVerdict {
-        if let GameAction::ActivateAbility {
-            source_id,
-            ability_index: _,
-        } = &ctx.candidate.action
-        {
+        if let GameAction::ActivateAbility { source_id, .. } = &ctx.candidate.action {
             let Some(ability) = ctx.effective_activated_ability() else {
                 return PolicyVerdict::neutral(PolicyReason::new("reactive_self_protection_na"));
             };
@@ -222,6 +218,7 @@ mod tests {
                 bypass_beneficiary: None,
                 protection_does_not_remove: None,
                 room_door: None,
+                granting_object: None,
             }],
             target,
             duration: None,
@@ -256,6 +253,7 @@ mod tests {
             action: GameAction::ActivateAbility {
                 source_id,
                 ability_index: 0,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             },
             metadata: ActionMetadata::for_actor(Some(AI), TacticalClass::Ability),
         };
@@ -331,6 +329,7 @@ mod tests {
                 bypass_beneficiary: None,
                 protection_does_not_remove: None,
                 room_door: None,
+                granting_object: None,
             }],
             target: None,
             duration: None,
@@ -484,6 +483,7 @@ mod tests {
                 bypass_beneficiary: None,
                 protection_does_not_remove: None,
                 room_door: None,
+                granting_object: None,
             }],
             target: None,
             duration: None,
@@ -572,6 +572,7 @@ mod tests {
                 bypass_beneficiary: None,
                 protection_does_not_remove: None,
                 room_door: None,
+                granting_object: None,
             }],
             target: None,
             duration: None,

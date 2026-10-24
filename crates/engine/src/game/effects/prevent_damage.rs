@@ -235,9 +235,9 @@ fn untargeted_damage_filter(
         // the generic `is_context_ref()` catch-all (same ordering contract as
         // the `TrackedSet` carve-out above).
         TargetFilter::SelfRef => None,
-        filter if filter.is_context_ref() => Some(player_damage_filter(
-            super::resolve_player_for_context_ref(state, ability, filter),
-        )),
+        filter if filter.is_context_ref() => {
+            super::resolve_player_for_context_ref(state, ability, filter).map(player_damage_filter)
+        }
         _ => None,
     }
 }
@@ -362,6 +362,14 @@ pub fn resolve(
     let effect_source_filter = effect_source_filter
         .map(|filter| crate::game::targeting::resolve_tracked_set_sentinel(state, filter));
 
+    // CR 608.2b: a declared player with no legal referent is not protected, and
+    // a shield with no recipient filter would protect everyone.
+    if target.names_one_player()
+        && super::resolve_player_for_context_ref(state, ability, &target).is_none()
+    {
+        return Ok(());
+    }
+
     // CR 609.7 + CR 609.7a: A source-scoped prevent ("prevent all damage target
     // instant or sorcery spell would deal this turn") carries its chosen source
     // object in `ability.targets[0]` via a `ParentTargetSlot` sentinel in the
@@ -428,10 +436,12 @@ pub fn resolve(
     // (`Typed(instant|sorcery)` leaf) is a duration-bound continuous
     // `Prevention { All }` that must keep re-firing, so it does NOT match here.
     //
-    // NOTE: `target: Any` on the parsed effect is deliberately not consulted on
-    // the `source_scoped_prevent` path below — the target slot is carried by
-    // the `damage_source_filter`'s `And`, and `Any` simply means "no recipient
-    // scope" (CR 115.1: the target slot is hosted by the source-filter `And`).
+    // NOTE: on the `source_scoped_prevent` path `target` is never a declared
+    // target (CR 115.10a) — the only target slot is hosted by the
+    // `damage_source_filter`'s `And` (CR 115.1). It is an untargeted recipient
+    // SCOPE (CR 120.1): `Any` = no recipient scope (Awe Strike); `Player` /
+    // `Controller` ("to one or more players" / "to you" — Ria Ivor) lower to
+    // `damage_target_filter` via `untargeted_damage_filter` below.
     let oneshot_source_shape = effect_source_filter
         .as_ref()
         .is_some_and(crate::types::ability::is_oneshot_target_source_prevent_shape);
@@ -727,6 +737,19 @@ pub fn resolve(
         // CR 115.6: "up to" a number of targets with zero chosen leaves nothing to
         // affect, so no shield is installed (an untargeted shield here would
         // prevent damage to every matching object).
+    } else if ability.self_ref_binding(state).is_none()
+        && [
+            shield.valid_card.as_ref(),
+            shield.damage_source_filter.as_ref(),
+        ]
+        .into_iter()
+        .any(|filter| matches!(filter, Some(TargetFilter::SelfRef)))
+    {
+        // CR 400.7 + CR 615: the shield names "~" — as the damaged object (Gideon
+        // Jura) or the damage source (Mercenaries) — and the source left and
+        // returned before resolution. The returned permanent is a new object;
+        // latching it as the host below would protect it with an ability of the
+        // departed one. The shield has no referent and is not installed.
     } else {
         // CR 113.7a + CR 611.2a + CR 615.3: Untargeted (SOURCE-scoped) prevention.
         // This branch used to fork on storage -- object-hosted when

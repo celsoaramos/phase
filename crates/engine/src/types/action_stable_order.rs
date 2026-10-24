@@ -1,10 +1,11 @@
 // @generated-style: maintained by action enum structure; update when GameAction grows.
 //
 // Issue #4878: allocation-free total order for deterministic AI / legal-action
-// sorting. Every payload field type used below derives `Ord`, so payload
+// sorting. Ordinary generated payloads derive `Ord`, so their
 // comparison reduces to `cmp_val` (a thin `Ord::cmp` wrapper) chained with
-// `then_with`. The single exception is `GameAction::Debug`, whose payload
-// (`DebugAction`) transitively contains non-`Ord` types (`Keyword`,
+// `then_with`. Cold replacement-preference actions compare opaque selectors via
+// `cmp_val`. `GameAction::Debug` also has a payload (`DebugAction`) that
+// transitively contains non-`Ord` types (`Keyword`,
 // `TokenCharacteristics`); it is a cold path (debug actions are never in
 // `legal_actions()`) handled by the exhaustive `cmp_debug_action`. No `Debug`
 // string formatting is used for ordering.
@@ -13,7 +14,8 @@ use std::cmp::Ordering;
 use super::ability::LibraryPosition;
 use super::actions::{DebugAction, DebugTokenRequest, GameAction, GameActionKind};
 
-/// Total, allocation-free order over `GameAction`: variant discriminant first
+/// Total order over `GameAction`, allocation-free for generated gameplay actions:
+/// variant discriminant first
 /// (`GameActionKind`, declaration order), then payload fields.
 pub fn cmp_game_actions(a: &GameAction, b: &GameAction) -> Ordering {
     GameActionKind::from(a)
@@ -107,15 +109,19 @@ fn cmp_payload(a: &GameAction, b: &GameAction) -> Ordering {
         GameAction::ActivateAbility {
             source_id: a0,
             ability_index: a1,
+            payment_mode: a2,
         } => {
             let GameAction::ActivateAbility {
                 source_id: b0,
                 ability_index: b1,
+                payment_mode: b2,
             } = b
             else {
                 unreachable!("cmp_payload: same-variant invariant");
             };
-            cmp_val(a0, b0).then_with(|| cmp_val(a1, b1))
+            cmp_val(a0, b0)
+                .then_with(|| cmp_val(a1, b1))
+                .then_with(|| cmp_val(a2, b2))
         }
         GameAction::DeclareAttackers {
             attacks: a0,
@@ -311,6 +317,18 @@ fn cmp_payload(a: &GameAction, b: &GameAction) -> Ordering {
             {
                 cmp_val(a0, b0)
             }
+        }
+        GameAction::ChooseReplacementAndRemember { choice: a0 } => {
+            let GameAction::ChooseReplacementAndRemember { choice: b0 } = b else {
+                unreachable!("same variant")
+            };
+            cmp_val(a0, b0)
+        }
+        GameAction::SetReplacementAutoChoice { selector: a0 } => {
+            let GameAction::SetReplacementAutoChoice { selector: b0 } = b else {
+                unreachable!("same variant")
+            };
+            cmp_val(a0, b0)
         }
         GameAction::ChooseReplacement { index: a0 } => {
             let GameAction::ChooseReplacement { index: b0 } = b else {
@@ -1747,15 +1765,80 @@ mod tests {
         MayTriggerAutoChoiceOp, PrecastCopyShortcutResponse, ResolveAllConsentDecision,
     };
     use crate::types::game_state::{
-        EndEffectGroupId, MayTriggerAutoChoiceKey, MayTriggerAutoChoiceSelector, MayTriggerOrigin,
+        CastPaymentMode, EndEffectGroupId, MayTriggerAutoChoiceKey, MayTriggerAutoChoiceSelector,
+        MayTriggerOrigin, ReplacementAutoChoiceId,
     };
     use crate::types::identifiers::ObjectId;
     use crate::types::mana::{ManaCost, ManaCostShard};
     use crate::types::player::PlayerId;
 
+    #[test]
+    fn replacement_removal_orders_opaque_selectors() {
+        let id = ReplacementAutoChoiceId("r".to_owned() + &"a".repeat(64));
+        assert_distinct_order(
+            GameAction::SetReplacementAutoChoice {
+                selector: Some(id.clone()),
+            },
+            GameAction::SetReplacementAutoChoice {
+                selector: Some(ReplacementAutoChoiceId("r".to_owned() + &"b".repeat(64))),
+            },
+        );
+        assert_distinct_order(
+            GameAction::SetReplacementAutoChoice { selector: Some(id) },
+            GameAction::SetReplacementAutoChoice { selector: None },
+        );
+    }
+
     fn assert_distinct_order(a: GameAction, b: GameAction) {
         assert_ne!(a.cmp_stable(&b), Ordering::Equal);
         assert_eq!(a.cmp_stable(&b), b.cmp_stable(&a).reverse());
+    }
+
+    fn activation(source: u64, ability_index: usize, payment_mode: CastPaymentMode) -> GameAction {
+        GameAction::ActivateAbility {
+            source_id: ObjectId(source),
+            ability_index,
+            payment_mode,
+        }
+    }
+
+    /// An activation's payment mode is part of its payload: the Auto and Manual
+    /// siblings of one ability are distinct actions with a total, antisymmetric
+    /// order, compared after the source and ability index.
+    #[test]
+    fn activate_ability_orders_its_payment_mode_after_source_and_index() {
+        let modes = [
+            CastPaymentMode::Auto,
+            CastPaymentMode::AutoExceptSacrificialMana,
+            CastPaymentMode::Manual,
+        ];
+        for (i, a) in modes.iter().enumerate() {
+            for b in modes.iter().skip(i + 1) {
+                assert_distinct_order(activation(3, 1, *a), activation(3, 1, *b));
+            }
+            assert_eq!(
+                activation(3, 1, *a).cmp_stable(&activation(3, 1, *a)),
+                Ordering::Equal,
+                "an identical activation payload compares equal"
+            );
+        }
+        // Source and ability index still take precedence over the mode.
+        assert_eq!(
+            activation(3, 1, CastPaymentMode::Manual).cmp_stable(&activation(
+                4,
+                0,
+                CastPaymentMode::Auto
+            )),
+            Ordering::Less
+        );
+        assert_eq!(
+            activation(3, 0, CastPaymentMode::Manual).cmp_stable(&activation(
+                3,
+                1,
+                CastPaymentMode::Auto
+            )),
+            Ordering::Less
+        );
     }
 
     #[test]
