@@ -25634,6 +25634,12 @@ fn visit_cost_resume_chains<'a>(
         }
         // The resolving chain itself owns this payment's rider.
         CostResume::Resolution => Ok(()),
+        // CR 118.12: the guarded effect waits on the payer's interactive
+        // unless-cost choice.
+        CostResume::UnlessPayment { unless } => f(
+            &unless.pending_effect,
+            SuspendedChainEvent::Bound(unless.trigger_event.as_ref()),
+        ),
     }
 }
 
