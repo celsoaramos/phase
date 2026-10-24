@@ -78,6 +78,7 @@ fn activate(b: &mut Board, accept: bool, pick: Option<ObjectId>) -> Option<Vec<T
     let runner = &mut b.runner;
     runner
         .act(GameAction::ActivateAbility {
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             source_id: b.akiri,
             ability_index: 0,
         })
