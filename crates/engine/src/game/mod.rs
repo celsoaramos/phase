@@ -30,6 +30,7 @@ pub mod combat_damage;
 pub mod commander;
 pub mod companion;
 pub(crate) mod conditions;
+pub mod contest;
 pub mod contraptions;
 #[cfg(test)]
 #[path = "contraptions_tests.rs"]
@@ -64,6 +65,7 @@ pub mod engine_resolve_batch;
 pub(crate) mod engine_stack;
 // CR 116.2c: the "pay a cost to end a continuous effect" special action.
 pub mod end_continuous_effect;
+pub(crate) mod exert;
 pub(crate) mod exile_links;
 pub mod filter;
 // CR 710: Kamigawa flip cards (flipping, alternative-face application).

@@ -112,6 +112,36 @@ fn subject_phrase_ast(application: Option<SubjectApplication>) -> SubjectPhraseA
     }
 }
 
+/// CR 121.1 + CR 608.2c: the may-axis player-action verb for a `target opponent
+/// may <verb>` clause whose actor is the announced target opponent. Pinned to the
+/// corpus-proven `draw` (five cards: Tataru Taru, Kuroki, Thief of Talents,
+/// Phelddagrif, Questing Phelddagrif, Soldevi Heretic). The axis is deliberately
+/// draw-only. The other corpus `target opponent may <verb>` shapes (`may have you …`,
+/// `may sacrifice …`, `may choose …`, `may pay …`, `may exile …`, …) keep the base
+/// `player_scope: Opponent` fan-out (they are the same announced-actor class but are
+/// NOT part of this change; two of them, Gravestorm and Rakdos, Patron of Chaos, still
+/// fan the "may" out to every opponent). Widening the axis requires a real card AND a
+/// verified subject-path lowering for its actor.
+pub(crate) fn parse_player_action_verb(input: &str) -> OracleResult<'_, ()> {
+    value((), tag("draw")).parse(input)
+}
+
+/// CR 608.2d + CR 115.1: true when `lower` begins with the
+/// `"target opponent may <player-action verb>"` shape whose actor is the announced
+/// target opponent. The single authority for the clause-shell peel discriminator
+/// (`clause_shell::try_peel_opponent_may_prefix`), the subject witness in
+/// `try_parse_subject_predicate_ast`, and the
+/// `optional_player = TargetFilter::DeclaredPlayer { group }` stamp in
+/// `assembly::assemble_effect_chain` — so the three cannot drift.
+pub(crate) fn targeted_opponent_may_player_action(lower: &str) -> bool {
+    preceded(
+        tag::<_, _, OracleError<'_>>("target opponent may "),
+        parse_player_action_verb,
+    )
+    .parse(lower)
+    .is_ok()
+}
+
 pub(super) fn try_parse_subject_predicate_ast(
     text: &str,
     ctx: &mut ParseContext,
@@ -227,6 +257,21 @@ pub(super) fn try_parse_subject_predicate_ast(
         return Some(clause);
     }
 
+    // Runs before the continuous arm, which would otherwise take "your life total"
+    // as a subject and harvest a later conjunct's keywords onto it.
+    if let Some(clause) = try_parse_life_lock_clause(text) {
+        return Some(subject_predicate_ast_from_clause(
+            text,
+            clause,
+            |effect, duration, sub_ability| PredicateAst::Restriction {
+                effect,
+                duration,
+                sub_ability,
+            },
+            ctx,
+        ));
+    }
+
     if let Some(clause) = try_parse_subject_continuous_clause(text, ctx) {
         return Some(subject_predicate_ast_from_clause(
             text,
@@ -322,7 +367,21 @@ pub(super) fn try_parse_subject_predicate_ast(
         // permanent; see `SubjectPhraseAst::affected`. This is the arm that
         // matters — `ImperativeFallback` is the only predicate kind that applies
         // the subject filter, so it is the one that fails closed on `None`.
-        let application = parse_subject_application(&subject_text, ctx);
+        let mut application = parse_subject_application(&subject_text, ctx);
+        // CR 608.2d + CR 115.1: "target opponent may <action>" names the
+        // announced target opponent as the actor, so this clause is optional for
+        // THAT player (CR 608.2d). The subject text alone cannot separate it from
+        // the causative "target opponent may have you …" (both present the
+        // identical subject `"target opponent may"` to `parse_subject_application`),
+        // so the witness reads the WHOLE printed clause through the shared
+        // `targeted_opponent_may_player_action` authority. `is_optional` is only
+        // ever raised here, never cleared, so a pre-existing optional subject
+        // stays optional.
+        if targeted_opponent_may_player_action(&text.to_lowercase()) {
+            if let Some(application) = application.as_mut() {
+                application.is_optional = true;
+            }
+        }
         // Diagnostics: when the subject is unbound the whole clause is the gap,
         // so carry the WHOLE printed clause as the fragment. The stripped
         // predicate alone would hide the subject that actually failed, which is
@@ -709,6 +768,7 @@ fn build_conditional_protection_grant_clause(
         })
         .collect();
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities,
@@ -772,6 +832,7 @@ fn build_additive_type_continuous_clause(
     let affected = static_affected_for_application(application);
 
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities: vec![StaticDefinition::continuous()
@@ -854,6 +915,7 @@ fn try_parse_compound_all_subjects_become_clause(
     }
 
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities,
@@ -1591,6 +1653,7 @@ fn try_parse_combat_tax_effect_clause(text: &str) -> Option<ParsedEffectClause> 
         return None;
     }
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities: vec![StaticDefinition::continuous().modifications(vec![
@@ -1778,6 +1841,7 @@ fn try_parse_target_and_same_name_pump_clause(
         ],
     };
     let mass_clause = ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::PumpAll {
             power,
@@ -1906,6 +1970,7 @@ fn try_parse_subject_restriction_clause(
             parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)?;
         let affected = static_affected_for_application(&application);
         return Some(ParsedEffectClause {
+            optional_targeting: false,
             unlowered_guard: None,
             effect: Effect::GenericEffect {
                 static_abilities: vec![StaticDefinition::new(StaticMode::MustBeBlocked {
@@ -1960,6 +2025,7 @@ fn try_parse_subject_restriction_clause(
                 .map(|def| def.affected(affected.clone()))
                 .collect();
             return Some(ParsedEffectClause {
+                optional_targeting: false,
                 unlowered_guard: None,
                 effect: Effect::GenericEffect {
                     static_abilities,
@@ -1993,6 +2059,7 @@ fn try_parse_subject_restriction_clause(
                 parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)?;
             let affected = static_affected_for_application(&application);
             return Some(ParsedEffectClause {
+                optional_targeting: false,
                 unlowered_guard: None,
                 effect: Effect::GenericEffect {
                     static_abilities: vec![
@@ -2056,6 +2123,7 @@ fn try_parse_subject_restriction_clause(
                     });
             if let Some(application) = broadcast {
                 return Some(ParsedEffectClause {
+                    optional_targeting: false,
                     unlowered_guard: None,
                     effect: Effect::ForceAttack {
                         target: static_affected_for_application(&application),
@@ -2088,6 +2156,7 @@ fn try_parse_subject_restriction_clause(
                 parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)?;
             let affected = static_affected_for_application(&application);
             return Some(ParsedEffectClause {
+                optional_targeting: false,
                 unlowered_guard: None,
                 effect: Effect::GenericEffect {
                     static_abilities: vec![
@@ -2154,6 +2223,7 @@ fn try_parse_subject_restriction_clause(
             kind: None,
         };
         return Some(ParsedEffectClause {
+            optional_targeting: false,
             unlowered_guard: None,
             effect: Effect::GenericEffect {
                 static_abilities: vec![StaticDefinition::new(mode.clone())
@@ -2200,6 +2270,7 @@ fn try_parse_subject_restriction_clause(
         let affected = static_affected_for_application(&application);
         let mode = StaticMode::CantBeRegenerated;
         return Some(ParsedEffectClause {
+            optional_targeting: false,
             unlowered_guard: None,
             effect: Effect::GenericEffect {
                 static_abilities: vec![StaticDefinition::new(mode.clone())
@@ -2219,31 +2290,6 @@ fn try_parse_subject_restriction_clause(
         });
     }
 
-    // CR 119.7 + CR 119.8: "[possessor] life total can't change" — bidirectional
-    // life-lock for the named player (Teferi's Protection: "your life total can't
-    // change"). Distinct from the generic " can't " split below because the
-    // subject is a possessive noun phrase ("your") rather than a player subject.
-    if let Some((before, _)) = tp.split_around(" life total can't change") {
-        let possessor = before.original.trim().to_lowercase();
-        let scope_filter = life_lock_scope_from_possessor(&possessor);
-        return Some(build_life_lock_clause(scope_filter));
-    }
-    if let Some((before, _)) = tp.split_around(" life totals can't change") {
-        let possessor = before.original.trim().to_lowercase();
-        let scope_filter = life_lock_scope_from_possessor(&possessor);
-        return Some(build_life_lock_clause(scope_filter));
-    }
-    if let Some((before, _)) = tp.split_around(" life total cannot change") {
-        let possessor = before.original.trim().to_lowercase();
-        let scope_filter = life_lock_scope_from_possessor(&possessor);
-        return Some(build_life_lock_clause(scope_filter));
-    }
-    if let Some((before, _)) = tp.split_around(" life totals cannot change") {
-        let possessor = before.original.trim().to_lowercase();
-        let scope_filter = life_lock_scope_from_possessor(&possessor);
-        return Some(build_life_lock_clause(scope_filter));
-    }
-
     // CR 510.1a: "[subject] assigns no combat damage [this turn/this combat]"
     // Transient rule modification that prevents combat damage assignment.
     if let Some((before, after)) = tp.split_around(" assigns no combat damage") {
@@ -2259,6 +2305,7 @@ fn try_parse_subject_restriction_clause(
         };
         let affected = static_affected_for_application(&application);
         return Some(ParsedEffectClause {
+            optional_targeting: false,
             unlowered_guard: None,
             effect: Effect::GenericEffect {
                 static_abilities: vec![StaticDefinition::new(StaticMode::AssignNoCombatDamage)
@@ -2363,6 +2410,7 @@ fn try_parse_can_attack_with_defender(
         def = def.condition(condition);
     }
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities: vec![def],
@@ -2410,6 +2458,7 @@ fn try_parse_targeting_bypass_clause(text: &str) -> Option<ParsedEffectClause> {
         return None;
     }
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::unimplemented("targeting_bypass_unmodeled", text),
         duration,
@@ -2466,6 +2515,7 @@ fn try_parse_can_block_additional(
     let mode = StaticMode::ExtraBlockers { count };
     let affected = static_affected_for_application(&application);
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities: vec![StaticDefinition::new(mode.clone())
@@ -2935,13 +2985,20 @@ fn parse_subject_application_for(
     // "each" with an interposed "of" that parse_target doesn't handle directly.
     // Must check before "each " to avoid the generic "each" path swallowing "each of".
     if let Ok((remainder, _)) = tag::<_, _, OracleError<'_>>("each of ").parse(lower.as_str()) {
-        if alt((
+        if let Ok((after_opponents, _)) = alt((
             tag::<_, _, OracleError<'_>>("your opponents"),
             tag("your opponent"),
         ))
         .parse(remainder)
-        .is_ok()
         {
+            // CR 608.2c: an unmodelled "who …" restriction stays unbound, as
+            // in the "each <player> who" arm below.
+            if tag::<_, _, OracleError<'_>>(" who ")
+                .parse(after_opponents)
+                .is_ok()
+            {
+                return None;
+            }
             return subject_filter_application(
                 TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
                 false,
@@ -2993,6 +3050,28 @@ fn parse_subject_application_for(
     if let Ok((rest_lower, _)) =
         alt((tag::<_, _, OracleError<'_>>("all "), tag("each "))).parse(lower.as_str())
     {
+        // CR 608.2c: a player population restricted by a relative clause no
+        // arm here models ("each opponent who lost life this turn" — Papalymo
+        // Totolymo) is not that population: the type-phrase reader below
+        // would drop the clause, leaving a subject-less effect its controller
+        // performs. Leave it unbound so the clause fails closed
+        // (`UNBOUND_SUBJECT_GAP`).
+        if (
+            alt((
+                tag::<_, _, OracleError<'_>>("other players"),
+                tag("other player"),
+                tag("players"),
+                tag("player"),
+                tag("opponents"),
+                tag("opponent"),
+            )),
+            tag(" who "),
+        )
+            .parse(rest_lower)
+            .is_ok()
+        {
+            return None;
+        }
         let consumed = lower.len() - rest_lower.len();
         let phrase = &subject[consumed..];
         let (filter, rest) = ctx
@@ -3720,8 +3799,17 @@ fn parse_subject_application_for(
     )))
     .parse(lower.as_str())
     {
+        // CR 608.2c + CR 111.3: after a clause that created tokens, "they" as the object of a
+        // grant is those tokens — the sentence defines what the tokens have.
+        let names_created_tokens = consumer == AnaphorConsumer::AffectedObject
+            && ctx.token_created_in_chain
+            && ctx.chain_prior_mass_population.is_none();
         return Some(SubjectApplication {
-            affected: resolve_they_pronoun(ctx, consumer),
+            affected: if names_created_tokens {
+                TargetFilter::LastCreated
+            } else {
+                resolve_they_pronoun(ctx, consumer)
+            },
             target: None,
             multi_target: None,
             inherits_parent: false,
@@ -4687,6 +4775,7 @@ fn try_split_pump_compound(
         )))
     };
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect,
         duration,
@@ -4888,6 +4977,7 @@ fn build_keyword_choice_clause(
     };
 
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect,
         duration: None,
@@ -5089,6 +5179,7 @@ fn build_pt_choice_clause(
     };
 
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect,
         duration: None,
@@ -5134,6 +5225,7 @@ fn build_continuous_clause(
     {
         let effect = build_pump_effect(&application, power, toughness);
         return Some(ParsedEffectClause {
+            optional_targeting: false,
             unlowered_guard: None,
             effect,
             duration,
@@ -5189,6 +5281,7 @@ fn build_continuous_clause(
         build_defender_attack_continuous_compound(&application, predicate_text)
     {
         return Some(ParsedEffectClause {
+            optional_targeting: false,
             unlowered_guard: None,
             effect: Effect::GenericEffect {
                 static_abilities,
@@ -5303,6 +5396,7 @@ fn build_continuous_clause(
     if let Some((power, toughness)) = extract_pump_modifiers(&modifications) {
         let effect = build_pump_effect(&application, power, toughness);
         return Some(ParsedEffectClause {
+            optional_targeting: false,
             unlowered_guard: None,
             effect,
             duration,
@@ -5340,6 +5434,7 @@ fn build_continuous_clause(
         };
 
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities,
@@ -5685,6 +5780,7 @@ fn build_become_clause(
             end_cost: None,
         };
         return Some(ParsedEffectClause {
+            optional_targeting: false,
             unlowered_guard: None,
             effect,
             duration,
@@ -5715,6 +5811,7 @@ fn build_become_clause(
             end_cost: None,
         };
         return Some(ParsedEffectClause {
+            optional_targeting: false,
             unlowered_guard: None,
             effect,
             duration,
@@ -5771,6 +5868,7 @@ fn build_become_clause(
             end_cost: None,
         };
         return Some(ParsedEffectClause {
+            optional_targeting: false,
             unlowered_guard: None,
             effect,
             duration,
@@ -5906,6 +6004,7 @@ fn build_become_clause(
                 .unwrap_or_default();
         let recipient = copy_recipient_for_application(&application, &target);
         return Some(ParsedEffectClause {
+            optional_targeting: false,
             unlowered_guard: None,
             effect: Effect::BecomeCopy {
                 target,
@@ -5945,6 +6044,7 @@ fn build_become_clause(
                 .unwrap_or_default();
         let recipient = copy_recipient_for_application(&application, &target);
         return Some(ParsedEffectClause {
+            optional_targeting: false,
             unlowered_guard: None,
             effect: Effect::BecomeCopy {
                 target,
@@ -5987,6 +6087,7 @@ fn build_become_clause(
             end_cost: None,
         };
         return Some(ParsedEffectClause {
+            optional_targeting: false,
             unlowered_guard: None,
             effect,
             duration,
@@ -6046,6 +6147,7 @@ fn build_become_clause(
 
     let affected = static_affected_for_application(&application);
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities: vec![StaticDefinition::continuous()
@@ -6183,6 +6285,7 @@ fn try_parse_become_and_attack_if_able(
     };
 
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities: vec![StaticDefinition::continuous()
@@ -6290,6 +6393,7 @@ fn try_parse_set_life_total(
         .clone()
         .unwrap_or_else(|| application.affected.clone());
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::SetLifeTotal { target, amount },
         duration: None,
@@ -6550,6 +6654,7 @@ fn try_parse_become_choice(
     )));
 
     let clause = ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::Choose {
             choice_type,
@@ -6574,6 +6679,22 @@ fn try_parse_become_choice(
             None => clause,
         },
     )
+}
+
+/// CR 119.7 + CR 119.8: "[possessor] life total(s) can't change" — bidirectional
+/// life-lock for the named player (Teferi's Protection: "your life total can't
+/// change"). The subject is a possessive noun phrase rather than a player subject.
+fn try_parse_life_lock_clause(text: &str) -> Option<ParsedEffectClause> {
+    let lower = text.to_lowercase();
+    let (_, (possessor, _, _)) = (
+        take_until::<_, _, OracleError<'_>>(" life total"),
+        alt((tag(" life totals"), tag(" life total"))),
+        alt((tag(" can't change"), tag(" cannot change"))),
+    )
+        .parse(lower.as_str())
+        .ok()?;
+    let scope_filter = life_lock_scope_from_possessor(possessor.trim());
+    Some(build_life_lock_clause(scope_filter))
 }
 
 /// CR 119.7 + CR 119.8: Map the possessive subject of a "life total can't change"
@@ -6610,6 +6731,7 @@ fn build_life_lock_clause(scope_filter: TargetFilter) -> ParsedEffectClause {
             .modifications(vec![ContinuousModification::AddStaticMode { mode }])
     };
     ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities: vec![
@@ -6678,6 +6800,7 @@ fn build_restriction_clause(
             .modifications(vec![ContinuousModification::AddKeyword { keyword }])
             .description(predicate.to_string());
         return Some(ParsedEffectClause {
+            optional_targeting: false,
             unlowered_guard: None,
             effect: Effect::GenericEffect {
                 static_abilities: vec![static_def],
@@ -6857,6 +6980,7 @@ fn build_restriction_clause(
             | TargetFilter::PostReplacementDamageTarget
             | TargetFilter::PostReplacementDamageTargetOwner
             | TargetFilter::DefendingPlayer
+            | TargetFilter::AttackedPlayerOrPlaneswalker
             | TargetFilter::HasChosenName
             | TargetFilter::ChosenDamageSource { .. }
             | TargetFilter::Named { .. }
@@ -6878,6 +7002,7 @@ fn build_restriction_clause(
                 }])
                 .description(predicate.to_string());
             return Some(ParsedEffectClause {
+                optional_targeting: false,
                 unlowered_guard: None,
                 effect: Effect::GenericEffect {
                     static_abilities: vec![installer],
@@ -6994,6 +7119,7 @@ fn build_restriction_clause(
         .collect();
 
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities,
@@ -7541,6 +7667,7 @@ fn try_parse_copula_goaded_clause(
     };
     let target = resolve_it_pronoun(ctx);
     Some(ParsedEffectClause {
+        optional_targeting: false,
         unlowered_guard: None,
         effect: Effect::Goad { target },
         duration,
@@ -8238,7 +8365,7 @@ pub(crate) const PREDICATE_VERBS: &[&str] = &[
     // CR 705.1: Coin flips — "you flip a coin" / "that player flips a coin" /
     // "each player flips a coin". The self/player subject is stripped here so the
     // deconjugated predicate ("flip a coin") re-dispatches through the imperative
-    // path to `Effect::FlipCoin`. The flip arm in `imperative.rs` requires the
+    // path to `Effect::FlipCoins`. The flip arm in `imperative.rs` requires the
     // literal "a coin", so the Kamigawa "flip <permanent>" flip-card mechanic
     // ("flip ~" / "flip it", CR 710.4) is never mis-routed to a coin flip.
     "flip",
