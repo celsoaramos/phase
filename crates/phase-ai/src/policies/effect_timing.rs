@@ -2634,6 +2634,7 @@ mod tests {
         state.phase = phase;
         let candidate = CandidateAction {
             action: GameAction::ActivateAbility {
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
                 source_id: source,
                 ability_index: 0,
             },
