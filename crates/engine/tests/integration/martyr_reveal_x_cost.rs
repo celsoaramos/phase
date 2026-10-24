@@ -94,6 +94,7 @@ fn activate(runner: &mut GameRunner, source: ObjectId) -> Vec<GameEvent> {
     let ability_index = activated_index(runner, source);
     runner
         .act(GameAction::ActivateAbility {
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             source_id: source,
             ability_index,
         })
@@ -524,6 +525,7 @@ fn illuminated_folio_share_a_color_is_not_activatable() {
     // (c) forced submission
     let hand_before = runner.state().players[P0.0 as usize].hand.len();
     let mut result = runner.act(GameAction::ActivateAbility {
+        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         source_id: folio,
         ability_index: activated_index(&runner, folio),
     });
@@ -713,6 +715,7 @@ fn spirit_en_dal_forecast_reveals_itself() {
     trace.events.extend(
         runner
             .act(GameAction::ActivateAbility {
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
                 source_id: spirit,
                 ability_index: forecast,
             })
@@ -857,6 +860,7 @@ fn reveal_x_disjunctive_branch_is_not_offered() {
     let life_before = runner.life(P0);
     let hand_before = runner.state().players[P0.0 as usize].hand.len();
     let result = runner.act(GameAction::ActivateAbility {
+        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         source_id: reliquary,
         ability_index: activated_index(&runner, reliquary),
     });
