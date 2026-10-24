@@ -79,6 +79,7 @@ fn tapping_a_creature_for_mana_puts_that_many_counters_on_it() {
     let mut runner = scenario.build();
     runner
         .act(GameAction::ActivateAbility {
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             source_id: druid,
             ability_index: 0,
         })
@@ -110,6 +111,7 @@ fn non_tap_mana_ability_triggers_and_only_once_each_turn() {
     for _ in 0..2 {
         runner
             .act(GameAction::ActivateAbility {
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
                 source_id: elf,
                 ability_index: 0,
             })
@@ -141,6 +143,7 @@ fn opponents_creatures_do_not_have_the_ability() {
 
     runner
         .act(GameAction::ActivateAbility {
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             source_id: theirs,
             ability_index: 0,
         })
