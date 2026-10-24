@@ -1436,6 +1436,7 @@ pub(crate) fn any_action_may_interfere(
         GameAction::ActivateAbility {
             source_id,
             ability_index,
+            ..
         } => indexed_ability_window_reach(state, *source_id, *ability_index).may_interfere(),
         // Every other priority action (play a land, declare attackers, special
         // actions, ...) is unclassified and therefore interference.
@@ -1448,6 +1449,7 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::parser::oracle::parse_oracle_text;
+    use crate::types::ability::ChooseOneOfKind;
     use crate::types::card::{CardFace, CardMetadata};
     use crate::types::keywords::Keyword;
 
@@ -1933,6 +1935,7 @@ mod tests {
         let container = Effect::ChooseOneOf {
             chooser: PlayerFilter::Controller,
             branches: vec![confined_branch.clone(), confined_branch],
+            kind: ChooseOneOfKind::Ordinary,
         };
         assert_eq!(
             effect_window_reach(&container),
@@ -2605,6 +2608,7 @@ mod tests {
                 &[GameAction::ActivateAbility {
                     source_id: missing,
                     ability_index: 7,
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto
                 }]
             ),
             "an out-of-range ability index is interference, not a confined no-op"

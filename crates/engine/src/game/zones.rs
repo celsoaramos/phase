@@ -159,6 +159,19 @@ pub(crate) fn capture_attachment_snapshot(
         .collect()
 }
 
+fn clear_exert_history_on_zone_change(
+    state: &mut GameState,
+    object_id: ObjectId,
+    from: Zone,
+    to: Zone,
+) {
+    // CR 400.7: Exert history belongs to the departed object, even when its
+    // replacement incarnation reuses the same storage id. Reorders keep it.
+    if from != to {
+        state.exerted_this_turn.remove(&object_id);
+    }
+}
+
 /// CR 400.7: Snapshot LKI and apply all cleanup side effects when an object
 /// leaves its current zone. Shared by `move_to_zone` and `move_to_library_at_index`.
 ///
@@ -233,6 +246,7 @@ pub(crate) fn apply_zone_exit_cleanup(
     state
         .activated_abilities_this_game
         .retain(|(id, _), _| *id != object_id);
+    clear_exert_history_on_zone_change(state, object_id, from, to);
 
     // CR 400.7: Snapshot LKI before a zone change out of any zone whose
     // characteristics are not recomputed on demand. Power/toughness reflect
@@ -287,6 +301,11 @@ pub(crate) fn apply_zone_exit_cleanup(
                 // CR 701.60b: Capture suspected status at zone exit for
                 // "was suspected" look-back riders.
                 is_suspected: obj.is_suspected,
+                // CR 722.3a + CR 608.2h: Capture the prepared designation at
+                // zone exit, before the move clears it — a departed source's
+                // "isn't prepared" intervening-if recheck (CR 603.4) reads
+                // this exit value, not the trigger-time appearance.
+                was_prepared: obj.prepared.is_some(),
                 // CR 608.2h: The attachment set as it stood BEFORE the departure
                 // sever (CR 701.3d) cleared it, so a source-referential intervening-if
                 // re-checked at resolution ("if this creature is enchanted" — Dreampod
@@ -1210,6 +1229,8 @@ pub fn apply_resolved_zone_change(
         );
     }
 
+    clear_exert_history_on_zone_change(state, command.object.object_id, command.from, command.to);
+
     if command.from == Zone::Battlefield {
         crate::game::effects::prepare::replay_remove_linked_prepared_copy_if_idle(
             state,
@@ -1538,13 +1559,16 @@ pub(crate) fn move_to_zone_with_entry_flags(
             .unwrap_or_default(),
     );
     zone_change_record.combat_status = if let Some(target) = liminal_attack_target {
+        // CR 508.4a: a stale destination yields no defending player and then no
+        // attack target either, so the latch is never half-populated.
+        let defending_player =
+            super::combat::entry_attack_target_defender(state, snapshot_object.controller, target);
         ZoneChangeCombatStatus {
-            attacking: true,
-            defending_player: super::combat::entry_attack_target_defender(
-                state,
-                snapshot_object.controller,
-                target,
-            ),
+            attacking: defending_player.is_some(),
+            defending_player,
+            attack_target: defending_player.map(|_| target),
+            attack_target_identity: defending_player
+                .and_then(|_| super::combat::bind_attack_target(state, target)),
             ..ZoneChangeCombatStatus::default()
         }
     } else {
@@ -1902,6 +1926,12 @@ pub(crate) fn record_and_emit_entry_from_no_zone(
         .objects
         .get(&object_id)
         .map(|obj| obj.snapshot_for_zone_change(object_id, None, Zone::Battlefield))?;
+    // CR 400.7: entries from no zone are created in place — no `move_to_zone`
+    // call fills the entered incarnation — so the authority fills it here from
+    // the birth incarnation, mirroring the battlefield arm there. Without it,
+    // entry-event pins (`zone_change_parent_target_pin`) and arrival
+    // forwarding cannot see token/conjured entrants at all.
+    record.entered_incarnation = state.objects.get(&object_id).map(|obj| obj.incarnation);
     super::restrictions::record_zone_change(state, &mut record);
     events.push(GameEvent::ZoneChanged {
         object_id,
@@ -1910,6 +1940,75 @@ pub(crate) fn record_and_emit_entry_from_no_zone(
         record: Box::new(record.clone()),
     });
     Some(record)
+}
+
+/// CR 603.10 + CR 603.6a + CR 611.3c + CR 608.2c: record, for every completed battlefield entry
+/// in `events` not yet observed, the entrant as it exists now — at an instruction boundary,
+/// after the entering instruction completed and before the next instruction can change it.
+/// Layers are flushed first (CR 613.1), so static continuous effects and the counters it
+/// entered with (CR 614.1c) are part of the observation. An entry whose `ZoneChanged` is parked
+/// in `deferred_entry_events` is still mid-entry (CR 614.12a / CR 707.5: its choice is made
+/// before it enters) and is skipped; its replay collects against the realized object.
+/// Idempotent. An entrant that is no longer the exact entered incarnation on the battlefield is
+/// not observed.
+pub(crate) fn settle_battlefield_entry_observations(state: &mut GameState, events: &[GameEvent]) {
+    let parked_entry_keys: Vec<(u32, usize)> = state
+        .deferred_entry_events
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::ZoneChanged { record, .. } => {
+                Some((record.recorded_turn_number, record.turn_zone_change_index))
+            }
+            _ => None,
+        })
+        .collect();
+    let pending: Vec<(usize, ObjectId, Option<u64>)> = events
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::ZoneChanged { to, record, .. } if *to == Zone::Battlefield => Some(record),
+            _ => None,
+        })
+        .filter(|record| {
+            record.recorded_turn_number == state.turn_number
+                && !state
+                    .battlefield_entry_observations
+                    .contains_key(&record.turn_zone_change_index)
+                // CR 614.12a + CR 707.5: a parked mid-entry entry is matched by its ledger key,
+                // not by full event equality, so later record stamping cannot unpark it.
+                && !parked_entry_keys
+                    .contains(&(record.recorded_turn_number, record.turn_zone_change_index))
+        })
+        .map(|record| {
+            (
+                record.turn_zone_change_index,
+                record.object_id,
+                record.entered_incarnation,
+            )
+        })
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    // CR 613.1 + CR 611.3c: the observation reads layer-applied characteristics.
+    super::layers::flush_layers(state);
+    for (index, object_id, entered_incarnation) in pending {
+        // CR 400.7: only the exact entered incarnation, still on the battlefield and phased in,
+        // is the entrant this entry describes.
+        let observation = state
+            .objects
+            .get(&object_id)
+            .filter(|obj| {
+                obj.zone == Zone::Battlefield
+                    && !obj.is_phased_out()
+                    && entered_incarnation.is_none_or(|incarnation| obj.incarnation == incarnation)
+            })
+            .map(|obj| super::triggers::trigger_source_context_for_latch(state, obj));
+        if let Some(observation) = observation {
+            state
+                .battlefield_entry_observations
+                .insert(index, observation);
+        }
+    }
 }
 
 /// CR 603.10a: Record that every member of `group` left the battlefield in the
@@ -2341,6 +2440,7 @@ pub(crate) fn capture_combat_status(
         .attackers
         .iter()
         .find(|attacker| attacker.object_id == object_id);
+    let active_target = attacker.and_then(|info| super::combat::active_attack_target(state, info));
 
     ZoneChangeCombatStatus {
         attacking: attacker.is_some(),
@@ -2352,6 +2452,10 @@ pub(crate) fn capture_combat_status(
         attacking_alone: crate::game::combat::attacking_alone(state, object_id),
         blocking_alone: crate::game::combat::blocking_alone(state, object_id),
         defending_player: attacker.map(|attacker| attacker.defending_player),
+        // CR 506.4c + CR 608.2h: capture the active relation before removal,
+        // including its explicit absence, independently of the original defender.
+        attack_target: active_target.map(|(target, _)| target),
+        attack_target_identity: active_target.and_then(|(_, pin)| pin),
     }
 }
 
@@ -3086,15 +3190,177 @@ mod tests {
 
     use super::*;
     use crate::types::ability::{
-        ContinuousModification, ControllerRef, FilterProp, StaticDefinition, TargetFilter,
-        TypeFilter, TypedFilter,
+        ContinuousModification, ControllerRef, FilterProp, StaticCondition, StaticDefinition,
+        TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::game_state::GameState;
     use crate::types::keywords::Keyword;
     use crate::types::mana::ManaCost;
+    use crate::types::resolved_commands::ResolvedObjectStatus;
 
     fn setup() -> GameState {
         GameState::new_two_player(42)
+    }
+
+    /// A 1/1 creature that has just entered the battlefield from no zone, with its recorded
+    /// `ZoneChanged` in `events`.
+    fn entered_one_one(state: &mut GameState, events: &mut Vec<GameEvent>) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(9),
+            PlayerId(0),
+            "Entrant".into(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&id).expect("created");
+            obj.card_types.core_types = vec![CoreType::Creature];
+            obj.base_power = Some(1);
+            obj.base_toughness = Some(1);
+            obj.power = Some(1);
+            obj.toughness = Some(1);
+        }
+        crate::game::layers::mark_layers_full(state);
+        crate::game::layers::flush_layers(state);
+        record_and_emit_entry_from_no_zone(state, id, events).expect("entrant exists");
+        id
+    }
+
+    /// U5 — CR 613.1 + CR 611.3c: capture flushes layers first, so a counter the entrant
+    /// carries is part of the observed power even when layers were still dirty.
+    #[test]
+    fn settle_entry_observation_flushes_layers_first() {
+        let mut state = setup();
+        let mut events = Vec::new();
+        let id = entered_one_one(&mut state, &mut events);
+        state
+            .objects
+            .get_mut(&id)
+            .unwrap()
+            .counters
+            .insert(crate::types::counter::CounterType::Plus1Plus1, 1);
+        crate::game::layers::mark_layers_full(&mut state);
+        assert_eq!(
+            state.objects[&id].power,
+            Some(1),
+            "precondition: power not yet flushed"
+        );
+
+        settle_battlefield_entry_observations(&mut state, &events);
+
+        let row = state
+            .battlefield_entry_observations
+            .values()
+            .next()
+            .expect("the entry is observed");
+        assert_eq!(row.identity.reference.object_id, id);
+        assert_eq!(row.lki.power, Some(2));
+    }
+
+    /// U5 — capture is idempotent: an entry already observed keeps its first row.
+    #[test]
+    fn settle_entry_observation_is_idempotent() {
+        let mut state = setup();
+        let mut events = Vec::new();
+        let id = entered_one_one(&mut state, &mut events);
+        settle_battlefield_entry_observations(&mut state, &events);
+        assert_eq!(state.battlefield_entry_observations.len(), 1);
+
+        state
+            .objects
+            .get_mut(&id)
+            .unwrap()
+            .counters
+            .insert(crate::types::counter::CounterType::Plus1Plus1, 2);
+        crate::game::layers::mark_layers_full(&mut state);
+        settle_battlefield_entry_observations(&mut state, &events);
+
+        assert_eq!(state.battlefield_entry_observations.len(), 1);
+        let row = state
+            .battlefield_entry_observations
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(row.lki.power, Some(1), "the first observation is kept");
+    }
+
+    /// U5 — CR 400.7: an entrant that is no longer the entered incarnation is not observed;
+    /// a phased-out entrant is not observed. The paired fresh entrant is.
+    #[test]
+    fn settle_entry_observation_skips_other_incarnation_and_phased_out() {
+        let mut state = setup();
+        let mut events = Vec::new();
+        let id = entered_one_one(&mut state, &mut events);
+        state.objects.get_mut(&id).unwrap().incarnation += 1;
+        settle_battlefield_entry_observations(&mut state, &events);
+        assert!(
+            state.battlefield_entry_observations.is_empty(),
+            "a later incarnation is a different object"
+        );
+
+        let mut state = setup();
+        let mut events = Vec::new();
+        let id = entered_one_one(&mut state, &mut events);
+        state.objects.get_mut(&id).unwrap().phase_status =
+            crate::game::game_object::PhaseStatus::PhasedOut {
+                cause: crate::game::game_object::PhaseOutCause::Directly,
+            };
+        settle_battlefield_entry_observations(&mut state, &events);
+        assert!(
+            state.battlefield_entry_observations.is_empty(),
+            "a phased-out entrant is not observed"
+        );
+
+        let mut state = setup();
+        let mut events = Vec::new();
+        entered_one_one(&mut state, &mut events);
+        settle_battlefield_entry_observations(&mut state, &events);
+        assert_eq!(
+            state.battlefield_entry_observations.len(),
+            1,
+            "paired positive"
+        );
+    }
+
+    #[test]
+    fn exert_history_predicate_tracks_zone_lifetime() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(6991),
+            PlayerId(0),
+            "Exert source".into(),
+            Zone::Battlefield,
+        );
+        super::super::object_state::resolve_and_apply_object_edit(
+            &mut state,
+            source,
+            ResolvedObjectStatus::Exerted,
+            true,
+        )
+        .unwrap();
+        let exerted = StaticCondition::SourceExertedThisTurn;
+        let fresh = StaticCondition::Not {
+            condition: Box::new(exerted.clone()),
+        };
+        // CR 400.7 + CR 701.43b: The source predicate survives a same-object
+        // no-op, but both predicate polarities change after a real departure.
+        for before_departure in [true, false] {
+            if before_departure {
+                move_to_zone(&mut state, source, Zone::Battlefield, &mut Vec::new());
+            } else {
+                move_to_zone(&mut state, source, Zone::Exile, &mut Vec::new());
+                move_to_zone(&mut state, source, Zone::Battlefield, &mut Vec::new());
+            }
+            assert_eq!(
+                crate::game::layers::evaluate_condition(&state, &exerted, PlayerId(0), source),
+                before_departure
+            );
+            assert_eq!(
+                crate::game::layers::evaluate_condition(&state, &fresh, PlayerId(0), source),
+                !before_departure
+            );
+        }
     }
 
     #[test]
@@ -6611,5 +6877,116 @@ mod hand_entry_rebind_tests {
             wire["ZoneChange"].get("rebound_from").is_some(),
             "reach: a rebound command carries the key"
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_combat_status_tests {
+    use super::*;
+    use crate::game::combat::{AttackTarget, AttackerInfo, CombatState};
+
+    const P0: PlayerId = PlayerId(0);
+    const P1: PlayerId = PlayerId(1);
+    const P2: PlayerId = PlayerId(2);
+
+    /// CR 506.3 + CR 508.5: the capture holds the declared attack target
+    /// beside the collapsed defending player, for every kind of target.
+    /// Siblings (a non-attacker, a blocker, no combat) hold none.
+    #[test]
+    fn capture_combat_status_holds_the_declared_attack_target() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::standard(), 3, 42);
+        let mut attacker = |n: u64| {
+            create_object(
+                &mut state,
+                CardId(n),
+                P0,
+                format!("A{n}"),
+                Zone::Battlefield,
+            )
+        };
+        let (a_player, a_walker, a_battle) = (attacker(1), attacker(2), attacker(3));
+        let bystander = attacker(4);
+        let blocker = attacker(5);
+        let walker = create_object(
+            &mut state,
+            CardId(900),
+            P2,
+            "Walker".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&walker)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Planeswalker];
+        let battle = create_object(
+            &mut state,
+            CardId(901),
+            P0,
+            "Battle".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&battle)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Battle];
+
+        let mut combat = CombatState::default();
+        combat
+            .attackers
+            .push(AttackerInfo::new(a_player, AttackTarget::Player(P1), P1));
+        // The planeswalker's controller (P2) is the collapsed defender.
+        combat.attackers.push(AttackerInfo::new(
+            a_walker,
+            AttackTarget::Planeswalker(walker),
+            P2,
+        ));
+        // The battle's protector (P1) is the collapsed defender.
+        combat.attackers.push(AttackerInfo::new(
+            a_battle,
+            AttackTarget::Battle(battle),
+            P1,
+        ));
+        combat.blocker_to_attacker.insert(blocker, vec![a_player]);
+        combat.attacked_permanents.insert(
+            a_walker,
+            super::super::combat::bind_attack_target(&state, AttackTarget::Planeswalker(walker))
+                .unwrap(),
+        );
+        combat.attacked_permanents.insert(
+            a_battle,
+            super::super::combat::bind_attack_target(&state, AttackTarget::Battle(battle)).unwrap(),
+        );
+        state.combat = Some(combat);
+
+        for (id, target, defender) in [
+            (a_player, AttackTarget::Player(P1), P1),
+            (a_walker, AttackTarget::Planeswalker(walker), P2),
+            (a_battle, AttackTarget::Battle(battle), P1),
+        ] {
+            let status = capture_combat_status(&state, id);
+            assert!(status.attacking, "reach guard: {target:?}");
+            assert_eq!(status.defending_player, Some(defender), "{target:?}");
+            assert_eq!(status.attack_target, Some(target), "{target:?}");
+            assert_eq!(
+                status.attack_target_identity,
+                super::super::combat::bind_attack_target(&state, target)
+            );
+        }
+
+        let blocking = capture_combat_status(&state, blocker);
+        assert!(blocking.blocking, "reach guard: the blocker is in combat");
+        assert_eq!(blocking.attack_target, None);
+        let outside = capture_combat_status(&state, bystander);
+        assert!(!outside.attacking && !outside.blocking);
+        assert_eq!(outside.attack_target, None);
+
+        state.combat = None;
+        let no_combat = capture_combat_status(&state, a_player);
+        assert!(!no_combat.attacking, "reach guard: combat is gone");
+        assert_eq!(no_combat.attack_target, None);
     }
 }

@@ -151,6 +151,8 @@ pub(crate) fn handle_select_modes(
     // Build a chain of ResolvedAbility from chosen modes (in order)
     let mut resolved = build_chained_resolved(&abilities, &indices, pending.object_id, controller)?;
     resolved.set_context_recursive(pending.ability.context.clone());
+    // CR 601.2b + CR 601.2c: the chosen modes declare only the targets chosen for them.
+    resolved.start_target_record_recursive();
     resolved.selected_mode_labels = selected_mode_labels(&modal.mode_descriptions, &indices);
     // CR 700.2a + CR 700.2d + CR 601.2b: latch the chosen modal-mode indices onto
     // the spell's context so finalize can stamp them on the stack object (read by
@@ -686,11 +688,17 @@ pub(super) fn extract_distribution_total(
 ///
 /// `stack_entry` is the stack object a stack-using activation created (CR
 /// 602.2a); a mana-ability activation passes `None` (CR 605.3b).
+///
+/// `activation_cost` is the activation's cost bound before payment (CR
+/// 602.1a): the record's for a stack activation, the pending snapshot's for a
+/// mana activation, `{T}` for an intrinsic land tap (CR 305.6).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_ability_activated(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
     kind: crate::types::events::ActivatedAbilityKind,
+    activation_cost: crate::types::events::BoundActivationCost,
     stack_entry: Option<ObjectId>,
     announced_zone: crate::types::zones::Zone,
     events: &mut Vec<GameEvent>,
@@ -710,6 +718,7 @@ pub(crate) fn emit_ability_activated(
         departed_source_lki,
         trigger_state: crate::types::events::ActivationTriggerState::Pending,
         stack_entry,
+        activation_cost,
     });
     events.len() - 1
 }

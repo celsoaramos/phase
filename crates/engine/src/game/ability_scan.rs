@@ -94,17 +94,19 @@
 use crate::analysis::resource::{HistoryMember, HistoryReads};
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AttachCardinality, AttachSelection,
-    AttachmentReferent, AttackSubject, CardTypeSetSource, ContinuousModification, ControllerRef,
-    CountScope, DelayedTriggerCondition, Duration, EachDamageRecipient, Effect, EffectScope,
-    FilterProp, ForEachCategoryAction, GuessSubject, KeeperConstraint, ManaProduction, ModalChoice,
-    ModalSelectionCondition, ModalSelectionConstraint, MultiTargetSpec, NameStickerSet,
-    ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
-    ReciprocalZoneChoiceRole, RepeatContinuation, ReplacementCondition, ResolvedAbility,
-    StaticCondition, TargetFilter, TrackedAnaphorSource, TriggerCondition, TriggerConstraint,
-    TriggerDefinition, TypedFilter, UnlessPayModifier, ZoneChangeClause, ZoneChoiceCandidateSource,
+    AttachmentReferent, AttackSubject, CardTypeSetSource, CastingPermission,
+    ContinuousModification, ControllerRef, CountScope, DelayedTriggerCondition, Duration,
+    EachDamageRecipient, Effect, EffectScope, FilterProp, ForEachCategoryAction, GuessSubject,
+    KeeperConstraint, ManaProduction, ModalChoice, ModalSelectionCondition,
+    ModalSelectionConstraint, MultiTargetSpec, NameStickerSet, ObjectScope, PlayerFilter,
+    PlayerScope, PtValue, QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole, RepeatContinuation,
+    ReplacementCondition, ResolvedAbility, StaticCondition, TargetFilter, TrackedAnaphorSource,
+    TriggerCondition, TriggerConstraint, TriggerDefinition, TypedFilter, UnlessPayModifier,
+    ZoneChangeClause, ZoneChoiceCandidateSource,
 };
 use crate::types::game_state::TargetSelectionConstraint;
 use crate::types::keywords::{DisguiseCost, Keyword};
+use crate::types::statics::CastFrequency;
 
 /// The three independent classification axes, accumulated over one AST walk.
 /// `true` on an axis means "reads (or may read) that dimension"; the fail-safe
@@ -262,6 +264,7 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
         source_id: _,              // object id
         cast_occurrence: _,        // finalized-cast provenance, no dynamic read
         source_incarnation: _,     // self-transform epoch latch, no dynamic read
+        announced_source_incarnation: _, // announcement-time source epoch, no dynamic read
         noted_mana_payment: _,     // concrete activation-payment snapshot, no dynamic read
         trigger_source: _,         // exact triggered-source authority, no dynamic read
         trigger_definition_ref: _, // exact trigger occurrence, no dynamic read
@@ -269,6 +272,7 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
         force_block_attacker: _,   // exact force-block referent, no dynamic read
         target_incarnations: _,    // CR 400.7 referent pins, no dynamic read
         target_pins: _,            // CR 400.7 selected-target pins, no dynamic read
+        chosen_target_slots: _,    // CR 115.1 announced-target record, no dynamic read
         legacy_selected_target_incarnations: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp, no dynamic read
         unjudged_target_slots: _, // CR 608.2b resolution legality stamp, no dynamic read
@@ -1073,6 +1077,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
         Effect::EndTheTurn => Axes::NONE,
         Effect::EndCombatPhase => Axes::NONE,
         Effect::Vote { .. } => Axes::CONSERVATIVE,
+        Effect::ExileTopCardContest { .. } => Axes::CONSERVATIVE,
         Effect::SeparateIntoPiles { .. } => Axes::CONSERVATIVE,
         Effect::SwitchPT { target } => {
             let mut acc = Axes::NONE;
@@ -1080,6 +1085,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc
         }
         Effect::CopySpell { .. } => Axes::CONSERVATIVE,
+        Effect::ModifyAnnouncedX { .. } => Axes::CONSERVATIVE,
         Effect::EpicCopy { .. } => Axes::CONSERVATIVE,
         Effect::CastCopyOfCard {
             target,
@@ -1595,6 +1601,21 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
                 }
             }
         },
+        // Digital-only Alchemy (no CR entry): a boon installs a delayed
+        // trigger for its holder — the same CR 603.7 boundary as
+        // `CreateDelayedTrigger`, so the same mode split. Under
+        // `LoopFirewall` there is no tracked-set form (the recipient is a
+        // single player, scanned as a target filter) and the granted
+        // trigger scans whole, body included.
+        Effect::CreateBoon { recipient, trigger } => match mode {
+            ScanMode::Conservative => Axes::CONSERVATIVE,
+            ScanMode::LoopFirewall => {
+                let mut acc = scan_target_filter(recipient, target_ctx, mode);
+                acc = acc.or(scan_trigger_definition(trigger, mode));
+                acc
+            }
+        },
+        Effect::NoteNumber { value } => scan_quantity_expr(value, mode),
         Effect::AddTargetReplacement { .. } => Axes::CONSERVATIVE,
         Effect::AddRestriction { .. } => Axes::CONSERVATIVE,
         Effect::ReduceNextSpellCost {
@@ -1712,9 +1733,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc
         }
         Effect::RollDie { .. } => Axes::CONSERVATIVE,
-        Effect::FlipCoin { .. } => Axes::CONSERVATIVE,
         Effect::FlipCoins { .. } => Axes::CONSERVATIVE,
-        Effect::FlipCoinUntilLose { .. } => Axes::CONSERVATIVE,
         Effect::RingTemptsYou => Axes::NONE,
         Effect::VentureIntoDungeon => Axes::NONE,
         Effect::VentureInto { dungeon: _ } => Axes::NONE,
@@ -1785,7 +1804,17 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc
         }
         Effect::ProcessRadCounters => Axes::NONE,
-        Effect::GrantCastingPermission { .. } => Axes::CONSERVATIVE,
+        // The walk reads the grant's history and leaves its other axes undescended.
+        Effect::GrantCastingPermission {
+            permission,
+            target,
+            grantee: _,
+        } => Axes {
+            history: scan_target_filter(target, target_ctx, mode)
+                .history
+                .or(casting_permission_history(permission, mode)),
+            ..Axes::CONSERVATIVE
+        },
         Effect::ChooseFromZone {
             zone,
             filter,
@@ -1930,6 +1959,10 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc = acc.or(scan_target_filter(player, target_ctx, mode));
             acc
         }
+        Effect::PhysicalContest {
+            kind: _,
+            contestant,
+        } => scan_target_filter(contestant, target_ctx, mode),
         Effect::Heist {
             target,
             look_count: _,
@@ -2230,6 +2263,63 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             name: _,
             description: _,
         } => Axes::NONE,
+    }
+}
+
+/// CR 601.3: the history a casting permission reads when it allows a card to be cast or played:
+/// its duration, filter and cost, the ledgers a frequency consults, and the turn a turn-stamped
+/// permission is compared with.
+fn casting_permission_history(permission: &CastingPermission, mode: ScanMode) -> HistoryReads {
+    match permission {
+        CastingPermission::AdventureCreature | CastingPermission::ExileWithEnergyCost => {
+            HistoryReads::NONE
+        }
+        CastingPermission::WarpExile {
+            castable_after_turn: _,
+        }
+        | CastingPermission::Plotted { turn_plotted: _ }
+        | CastingPermission::Foretold {
+            cost: _,
+            turn_foretold: _,
+        } => HistoryReads::of(HistoryMember::TurnNumber),
+        // Not descended: a constraint, a cost and entry modifications can each express a read.
+        CastingPermission::ExileWithAltCost { .. }
+        | CastingPermission::ExileWithAltAbilityCost { .. } => HistoryReads::ALL,
+        CastingPermission::PlayFromExile {
+            duration,
+            granted_to: _,
+            mode: _,
+            frequency,
+            source_id: _,
+            exiled_by_ability_controller: _,
+            mana_spend_permission: _,
+            card_filter,
+            single_use_group: _,
+            single_use: _,
+            cast_cost_modifier: _,
+            alt_ability_cost,
+            without_paying_mana_cost: _,
+            land_enter_tapped: _,
+            invalidation: _,
+            provenance: _,
+        } => {
+            let mut reads = scan_duration(duration, mode).history;
+            reads = reads.or(match frequency {
+                CastFrequency::Unlimited => HistoryReads::NONE,
+                CastFrequency::OncePerTurn | CastFrequency::OncePerTurnPerPermanentType => {
+                    HistoryReads::of(HistoryMember::ExilePlayPermissionsUsed)
+                        .or(HistoryReads::of(HistoryMember::ExileCastPermissionsUsed))
+                }
+            });
+            if let Some(filter) = card_filter {
+                let census = FilterReadContext::LiveBoardCensus;
+                reads = reads.or(scan_target_filter(filter, census, mode).history);
+            }
+            if let Some(cost) = alt_ability_cost {
+                reads = reads.or(scan_ability_cost(cost, mode).history);
+            }
+            reads
+        }
     }
 }
 
@@ -2586,7 +2676,16 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
         // not decomposed here because no caller needs a narrower answer.
         QuantityRef::DistinctCardTypes { .. } => Axes::CONSERVATIVE,
         QuantityRef::SharedCardTypes { .. } => Axes::CONSERVATIVE,
-        QuantityRef::DistinctSubtypes { .. } => Axes::CONSERVATIVE,
+        // `restrict` narrows which subtype VALUES tally within the same
+        // population scan (a value filter, not a new state axis — the
+        // population read is unchanged), so the verdict stays `CONSERVATIVE`.
+        // Explicit destructure (not `{ .. }`) so the next field addition is
+        // compiler-visible.
+        QuantityRef::DistinctSubtypes {
+            source: _,
+            exclude: _,
+            restrict: _,
+        } => Axes::CONSERVATIVE,
         QuantityRef::CardsExiledBySource => Axes::NONE,
         QuantityRef::ExiledCardPower { index: _ } => Axes::NONE,
         QuantityRef::ZoneCardCount {
@@ -2889,7 +2988,7 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
             ));
             acc
         }
-        QuantityRef::ChosenNumber => Axes::NONE,
+        QuantityRef::ChosenNumber | QuantityRef::NotedNumber => Axes::NONE,
         // CR 101.4 + CR 608.2d: the number a player chose this resolution. Like
         // its object-axis sibling `ChosenNumber` this is a bounded one-shot
         // answer, not an accumulating projected resource — a re-choose REPLACES
@@ -3207,6 +3306,10 @@ fn scan_ability_condition(x: &AbilityCondition, mode: ScanMode) -> Axes {
             acc = acc.or(scan_quantity_expr(rhs, mode));
             acc
         }
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => scan_quantity_expr(quantity, mode),
         AbilityCondition::PreviousEffectAmount {
             rhs,
             comparator: _,
@@ -3683,6 +3786,15 @@ fn scan_target_filter(x: &TargetFilter, ctx: FilterReadContext, mode: ScanMode) 
             history: HistoryReads::NONE,
         },
         TargetFilter::DefendingPlayer => Axes::NONE,
+        // CR 506.3: reads the bound attack event (event) and live combat and
+        // battlefield state (a planeswalker's loyalty is changed by the damage it
+        // receives, so a sibling trigger can interact: sibling). Not DefendingPlayer's NONE.
+        TargetFilter::AttackedPlayerOrPlaneswalker => Axes {
+            event: true,
+            sibling: true,
+            projected: false,
+            history: HistoryReads::NONE,
+        },
         TargetFilter::HasChosenName => Axes::NONE,
         TargetFilter::ChosenDamageSource { filter } => {
             let mut acc = Axes {
@@ -3776,6 +3888,7 @@ fn scan_trigger_definition(t: &TriggerDefinition, mode: ScanMode) -> Axes {
         // ---- read-bearing: scanned into `acc` below ----
         execute,
         condition,
+        attack_cost_condition,
         // CR 603.2 + CR 603.2h: a fire-count / fire-window gate, which can carry
         // its own spell filter. NOT an event matcher, and no firewall surface
         // reads it (`analysis::resource` reads only `condition` and `execute`), so
@@ -3867,6 +3980,9 @@ fn scan_trigger_definition(t: &TriggerDefinition, mode: ScanMode) -> Axes {
     let mut acc = Axes::NONE;
     if let Some(exec) = execute {
         acc = acc.or(ability_definition_axes(exec, mode));
+    }
+    if let Some(condition) = attack_cost_condition {
+        acc = acc.or(scan_static_condition(condition, mode));
     }
     if let Some(cond) = condition {
         acc = acc.or(scan_trigger_condition(cond, mode));
@@ -4195,12 +4311,19 @@ fn scan_trigger_condition(x: &TriggerCondition, mode: ScanMode) -> Axes {
             acc = acc.or(scan_quantity_expr(rhs, mode));
             acc
         }
+        TriggerCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => scan_quantity_expr(quantity, mode),
         TriggerCondition::HasMaxSpeed => Axes::NONE,
         // CR 725.1: the monarch predicate itself reads no axis; its subject
         // scope is classified per-axis by the shared `PlayerScope` classifier,
         // mirroring `WasStartingPlayer { controller }`'s delegation to
         // `scan_controller_ref`.
         TriggerCondition::IsMonarch { player } => scan_player_scope(player),
+        // Digital-only Alchemy (no CR entry): "if you have a boon" — the
+        // subject scope classifies exactly like the monarch's.
+        TriggerCondition::HasBoon { player } => scan_player_scope(player),
         TriggerCondition::IsInitiative => Axes::NONE,
         TriggerCondition::NoMonarch => Axes::NONE,
         TriggerCondition::WasStartingPlayer { controller, .. } => {
@@ -4568,6 +4691,10 @@ fn scan_static_condition(x: &StaticCondition, mode: ScanMode) -> Axes {
             acc = acc.or(scan_quantity_expr(rhs, mode));
             acc
         }
+        StaticCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => scan_quantity_expr(quantity, mode),
         StaticCondition::HasMaxSpeed => Axes::NONE,
         StaticCondition::SpeedGE { threshold: _ } => Axes::NONE,
         StaticCondition::And { conditions } => {
@@ -4620,6 +4747,7 @@ fn scan_static_condition(x: &StaticCondition, mode: ScanMode) -> Axes {
         // CR 725.1: see the `TriggerCondition::IsMonarch` arm above — the
         // subject scope is classified through the shared `PlayerScope` walker.
         StaticCondition::IsMonarch { player } => scan_player_scope(player),
+        StaticCondition::HasBoon { player } => scan_player_scope(player),
         StaticCondition::IsInitiative => Axes::NONE,
         StaticCondition::NoMonarch => Axes::NONE,
         StaticCondition::HasCityBlessing => Axes::NONE,
@@ -4661,6 +4789,7 @@ fn scan_static_condition(x: &StaticCondition, mode: ScanMode) -> Axes {
             projected: true,
             history: HistoryReads::of(HistoryMember::TurnNumber),
         },
+        StaticCondition::SourceExertedThisTurn => Axes::CONSERVATIVE,
         StaticCondition::SourceHasDealtDamage => Axes {
             event: false,
             sibling: false,
@@ -4725,6 +4854,12 @@ fn scan_static_condition(x: &StaticCondition, mode: ScanMode) -> Axes {
         StaticCondition::SourceIsFaceUp => Axes::NONE,
         StaticCondition::AdditionalCostPaid => Axes::NONE,
         StaticCondition::CastingAsVariant { variant: _ } => Axes::NONE,
+        StaticCondition::FirstCombatPhaseOfTurn => Axes {
+            event: false,
+            sibling: false,
+            projected: true,
+            history: HistoryReads::NONE,
+        },
         StaticCondition::None => Axes::NONE,
     }
 }
@@ -4813,6 +4948,7 @@ fn scan_filter_prop(x: &FilterProp, mode: ScanMode) -> Axes {
         | FilterProp::NotColor { .. }
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
+        | FilterProp::Prepared
         | FilterProp::Renowned
         // CR 701.15b/c: goad is a candidate-local designation read; it scans no
         // board/object axis.
@@ -5290,7 +5426,7 @@ fn scan_player_scope(x: &PlayerScope) -> Axes {
         }
         PlayerScope::RecipientController => Axes::NONE,
         PlayerScope::DefendingPlayer => Axes::NONE,
-        PlayerScope::ParentObjectTargetController => Axes {
+        PlayerScope::ParentObjectTarget { .. } => Axes {
             event: true,
             sibling: false,
             projected: false,
@@ -6466,6 +6602,7 @@ pub(crate) fn delayed_trigger_reads_growing_class_for_loop(
         source_id: _,
         one_shot: _,
         provenance: _,
+        kind: _,
     } = trigger;
     scan_delayed_trigger_condition(condition, ScanMode::LoopFirewall)
         .or(resolved_ability_axes(ability, ScanMode::LoopFirewall))
@@ -6600,6 +6737,7 @@ fn replacement_definition_axes(
         origin: _,
         counter_replacement_subject: _,
         granting_object: _,
+        entry_payment_max,
         // The objects these create are scanned once they are live.
         additional_token_spec: _,
         ensure_token_specs: _,
@@ -6641,6 +6779,10 @@ fn replacement_definition_axes(
     if let Some(controller) = enters_under {
         acc = acc.or(scan_controller_ref(controller));
     }
+    // CR 614.12a: the entry-payment cap reads live game state (Nameless Race).
+    if let Some(max) = entry_payment_max {
+        acc = acc.or(scan_quantity_expr(max, mode));
+    }
     match damage_modification {
         Some(DamageModification::Plus { value })
         | Some(DamageModification::PreventionMinus {
@@ -6674,6 +6816,7 @@ pub(crate) fn delayed_trigger_history(
         source_id: _,
         one_shot: _,
         provenance: _,
+        kind: _,
     } = trigger;
     scan_delayed_trigger_condition(condition, ScanMode::LoopFirewall)
         .or(resolved_ability_axes(ability, ScanMode::LoopFirewall))
@@ -6953,8 +7096,10 @@ fn effect_target_ctx(e: &Effect, mode: ScanMode) -> FilterReadContext {
         | Effect::EndCombatPhase
         | Effect::Vote { .. }
         | Effect::SeparateIntoPiles { .. }
+        | Effect::ExileTopCardContest { .. }
         | Effect::SwitchPT { .. }
         | Effect::CopySpell { .. }
+        | Effect::ModifyAnnouncedX { .. }
         | Effect::EpicCopy { .. }
         | Effect::CastCopyOfCard { .. }
         | Effect::CopyTokenOf { .. }
@@ -7014,6 +7159,8 @@ fn effect_target_ctx(e: &Effect, mode: ScanMode) -> FilterReadContext {
         | Effect::BecomeBlocked { .. }
         | Effect::SetClassLevel { .. }
         | Effect::CreateDelayedTrigger { .. }
+        | Effect::CreateBoon { .. }
+        | Effect::NoteNumber { .. }
         | Effect::AddTargetReplacement { .. }
         | Effect::AddRestriction { .. }
         | Effect::ReduceNextSpellCost { .. }
@@ -7031,9 +7178,7 @@ fn effect_target_ctx(e: &Effect, mode: ScanMode) -> FilterReadContext {
         | Effect::LoseTheGame { .. }
         | Effect::WinTheGame { .. }
         | Effect::RollDie { .. }
-        | Effect::FlipCoin { .. }
         | Effect::FlipCoins { .. }
-        | Effect::FlipCoinUntilLose { .. }
         | Effect::RingTemptsYou
         | Effect::VentureIntoDungeon
         | Effect::VentureInto { .. }
@@ -7064,6 +7209,7 @@ fn effect_target_ctx(e: &Effect, mode: ScanMode) -> FilterReadContext {
         | Effect::ExileFromTopUntil { .. }
         | Effect::RevealUntil { .. }
         | Effect::Discover { .. }
+        | Effect::PhysicalContest { .. }
         | Effect::Heist { .. }
         | Effect::HeistExile
         | Effect::Cascade
@@ -7307,6 +7453,7 @@ fn effect_census_role(e: &Effect) -> CensusRole {
         | Effect::ExileFromTopUntil { .. }
         | Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
         | Effect::Discover { .. }
+        | Effect::PhysicalContest { .. }
         | Effect::Cascade
         | Effect::Ripple { .. }
         | Effect::MiracleCast { .. }
@@ -7372,8 +7519,10 @@ fn effect_census_role(e: &Effect) -> CensusRole {
         | Effect::EndCombatPhase
         | Effect::Vote { .. }
         | Effect::SeparateIntoPiles { .. }
+        | Effect::ExileTopCardContest { .. }
         | Effect::SwitchPT { .. }
         | Effect::CopySpell { .. }
+        | Effect::ModifyAnnouncedX { .. }
         | Effect::EpicCopy { .. }
         | Effect::CopyTokenOf { .. }
         | Effect::Myriad
@@ -7426,6 +7575,8 @@ fn effect_census_role(e: &Effect) -> CensusRole {
         | Effect::BecomeBlocked { .. }
         | Effect::SetClassLevel { .. }
         | Effect::CreateDelayedTrigger { .. }
+        | Effect::CreateBoon { .. }
+        | Effect::NoteNumber { .. }
         | Effect::AddTargetReplacement { .. }
         | Effect::AddRestriction { .. }
         | Effect::ReduceNextSpellCost { .. }
@@ -7440,9 +7591,7 @@ fn effect_census_role(e: &Effect) -> CensusRole {
         | Effect::LoseTheGame { .. }
         | Effect::WinTheGame { .. }
         | Effect::RollDie { .. }
-        | Effect::FlipCoin { .. }
         | Effect::FlipCoins { .. }
-        | Effect::FlipCoinUntilLose { .. }
         | Effect::RingTemptsYou
         | Effect::VentureIntoDungeon
         | Effect::VentureInto { .. }
@@ -7526,6 +7675,7 @@ mod tests {
         ZoneChoiceCandidateSource, ZoneChoiceChooser, ZoneOwner,
     };
     use crate::types::counter::CounterType;
+    use crate::types::events::ActivatedAbilityKind;
     use crate::types::identifiers::{ExtraPhaseId, ObjectId};
     use crate::types::keywords::CostBearingKeywordKind;
     use crate::types::mana::{ManaColor, ManaCost};
@@ -11146,9 +11296,15 @@ mod tests {
             ContinuousModification::GrantAllActivatedAbilitiesOf {
                 source: TargetFilter::Any,
                 cap: None,
+                kind: None,
             },
             ContinuousModification::GrantAllTriggeredAbilitiesOf {
                 source: TargetFilter::Any,
+            },
+            ContinuousModification::GrantAllActivatedAbilitiesOf {
+                source: TargetFilter::Any,
+                cap: None,
+                kind: Some(ActivatedAbilityKind::Loyalty),
             },
             ContinuousModification::RetainPrintedTriggerFromSource {
                 source_trigger_index: 0,
@@ -11172,8 +11328,8 @@ mod tests {
         ];
         assert_eq!(
             survivors.len(),
-            10,
-            "scope guard covers 10 of the arm's 11 members; CopyValues is the \
+            11,
+            "scope guard covers 11 of the arm's 12 members; CopyValues is the \
              documented omission"
         );
         for m in &survivors {
@@ -11333,5 +11489,52 @@ mod tests {
             loop_axes(&grant_until_end_of_turn(not_continuous)),
             (true, true, true)
         );
+    }
+
+    /// CR 702.170d + CR 702.143a: a casting-permission grant reads the history its permission
+    /// reads: the turn for a plotted or foretold card, the permissions used for a once-each-turn
+    /// permission, nothing for an unlimited one, and everything for an alternative cost the walk
+    /// does not descend.
+    #[test]
+    fn a_casting_permission_grant_reads_the_history_its_permission_reads() {
+        let db = crate::test_support::shared_card_db();
+        let history = |name: &str, trigger: usize| {
+            let face = db
+                .get_face_by_name(name)
+                .unwrap_or_else(|| panic!("{name} is in the card fixture"));
+            trigger_definition_history(&face.triggers[trigger])
+        };
+        let turn = HistoryReads::of(HistoryMember::TurnNumber);
+        assert_eq!(history("Ramirez DePietro, Pillager", 1), HistoryReads::NONE);
+        assert_eq!(history("Kellan Joins Up", 0), turn);
+        assert_eq!(history("The Foretold Soldier", 0), turn);
+        assert_eq!(
+            history("Evelyn, the Covetous", 0),
+            HistoryReads::of(HistoryMember::ExilePlayPermissionsUsed)
+                .or(HistoryReads::of(HistoryMember::ExileCastPermissionsUsed))
+        );
+        assert_eq!(history("Aang, Swift Savior", 0), HistoryReads::ALL);
+    }
+}
+
+#[cfg(test)]
+mod attacked_referent_scan_tests {
+    use super::*;
+
+    /// CR 506.3: reads the bound attack event and live battlefield state; a sibling
+    /// trigger's damage changes planeswalker loyalty. Not DefendingPlayer's NONE.
+    #[test]
+    fn attacked_referent_scan_axes() {
+        let f = TargetFilter::AttackedPlayerOrPlaneswalker;
+        for mode in [ScanMode::Conservative, ScanMode::LoopFirewall] {
+            let axes = scan_target_filter(&f, FilterReadContext::SnapshotOrEvent, mode);
+            assert!(axes.event && axes.sibling && !axes.projected, "{mode:?}");
+            let none = scan_target_filter(
+                &TargetFilter::DefendingPlayer,
+                FilterReadContext::SnapshotOrEvent,
+                mode,
+            );
+            assert!(!none.event && !none.sibling, "contrast: {mode:?}");
+        }
     }
 }

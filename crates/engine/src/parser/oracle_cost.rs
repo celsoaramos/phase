@@ -13,7 +13,9 @@ use super::oracle_nom::bridge::nom_on_lower;
 use super::oracle_nom::primitives as nom_primitives;
 use super::oracle_nom::primitives::{scan_contains, split_once_on};
 use super::oracle_nom::quantity as nom_quantity;
-use super::oracle_nom::target::parse_cost_self_reference;
+use super::oracle_nom::target::{
+    parse_cost_self_reference, split_counted_return_to_hand_object, CountedReturnObject,
+};
 use super::oracle_static::parse_dynamic_x_clause;
 use super::oracle_target::{
     distribute_shared_properties, fold_article_led_type_union, parse_target,
@@ -1030,93 +1032,8 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
     // "Discard a card" / "Discard N cards"
     if let Some(((), rest)) = nom_on_lower(text, &lower, |i| value((), tag("discard ")).parse(i)) {
         let rest_lower = rest.to_lowercase();
-        // CR 207.2c: "Discard this card" — Channel self-ref cost (ability word, not keyword).
-        if rest_lower == "this card" {
-            return AbilityCost::Discard {
-                count: QuantityExpr::Fixed { value: 1 },
-                filter: None,
-                selection: crate::types::ability::CardSelectionMode::Chosen,
-                self_scope: crate::types::ability::DiscardSelfScope::SourceCard,
-            };
-        }
-        if all_consuming(tag::<_, _, nom::error::Error<&str>>("a card"))
-            .parse(rest_lower.as_str())
-            .is_ok()
-        {
-            return AbilityCost::Discard {
-                count: QuantityExpr::Fixed { value: 1 },
-                filter: None,
-                selection: crate::types::ability::CardSelectionMode::Chosen,
-                self_scope: crate::types::ability::DiscardSelfScope::FromHand,
-            };
-        }
-        if rest_lower == "your hand" {
-            return AbilityCost::Discard {
-                count: QuantityExpr::Ref {
-                    qty: QuantityRef::HandSize {
-                        player: PlayerScope::Controller,
-                    },
-                },
-                filter: None,
-                selection: crate::types::ability::CardSelectionMode::Chosen,
-                self_scope: crate::types::ability::DiscardSelfScope::FromHand,
-            };
-        }
-        // CR 701.9b: Random is a selection mode on an otherwise ordinary
-        // hand-discard cost. Accept only the complete unfiltered grammar used
-        // by the measured card corpus. A typed or malformed random phrase must
-        // fail closed below instead of falling through to the chosen parser and
-        // silently giving the payer a choice.
-        if let Ok((_, count)) =
-            all_consuming(parse_random_discard_cost_body).parse(rest_lower.as_str())
-        {
-            return AbilityCost::Discard {
-                count,
-                filter: None,
-                selection: crate::types::ability::CardSelectionMode::Random,
-                self_scope: crate::types::ability::DiscardSelfScope::FromHand,
-            };
-        }
-        if preceded(take_until::<_, _, E<'_>>(" at random"), tag(" at random"))
-            .parse(rest_lower.as_str())
-            .is_ok()
-        {
-            return AbilityCost::Unimplemented {
-                description: text.to_string(),
-            };
-        }
-        // CR 701.9a + CR 608.2c: "Discard a/<N> <type> card(s)" — capture the
-        // card-type filter so only matching cards can pay the cost (Lotleth
-        // Troll: "Discard a creature card:"). Without this the typed
-        // restriction is dropped and any card pays the cost. Mirrors the
-        // effect-form discard and the trigger-side cost parser, which both
-        // delegate to `parse_discard_card_filter`: `parse_count_expr` eats the
-        // leading count token ("a "/"two ") and the remainder is the typed noun
-        // phrase. Ordered before the plain `parse_number` arm so "two creature
-        // cards" is not swallowed as an untyped count.
-        if let Some((count, after_count)) = parse_count_expr(&rest_lower) {
-            let noun = after_count.trim_start();
-            if let Some(filter) = parse_discard_card_filter(noun) {
-                return AbilityCost::Discard {
-                    count,
-                    filter: Some(filter),
-                    selection: crate::types::ability::CardSelectionMode::Chosen,
-                    self_scope: crate::types::ability::DiscardSelfScope::FromHand,
-                };
-            }
-            // CR 107.3a: an untyped "discard X cards" keeps X symbolic so the
-            // announced value is discarded, not the X→0 of `parse_number`.
-            if all_consuming(alt((tag::<_, _, E<'_>>("cards"), tag("card"))))
-                .parse(noun)
-                .is_ok()
-            {
-                return AbilityCost::Discard {
-                    count,
-                    filter: None,
-                    selection: crate::types::ability::CardSelectionMode::Chosen,
-                    self_scope: crate::types::ability::DiscardSelfScope::FromHand,
-                };
-            }
+        if let Some(cost) = parse_discard_cost_body(text, &rest_lower) {
+            return cost;
         }
         if let Some((n, _)) = parse_number(&rest_lower) {
             return AbilityCost::Discard {
@@ -1559,6 +1476,108 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
     AbilityCost::Unimplemented {
         description: text.to_string(),
     }
+}
+
+/// CR 701.9a + CR 701.9b: Strict grammar for a hand-discard cost body (the
+/// lowercase text after "discard "). Single authority shared by
+/// `parse_single_cost` and the ward-cost reader. `None` when no modeled shape
+/// consumes the whole body; `Some(Unimplemented)` for the recognized-but-
+/// unmodeled typed random discard. `text` is the full original cost text,
+/// used only for that description.
+pub(crate) fn parse_discard_cost_body(text: &str, body: &str) -> Option<AbilityCost> {
+    type E<'a> = super::oracle_nom::error::OracleError<'a>;
+    // CR 207.2c: "Discard this card" — Channel self-ref cost (ability word, not keyword).
+    if all_consuming(tag::<_, _, E<'_>>("this card"))
+        .parse(body)
+        .is_ok()
+    {
+        return Some(AbilityCost::Discard {
+            count: QuantityExpr::Fixed { value: 1 },
+            filter: None,
+            selection: crate::types::ability::CardSelectionMode::Chosen,
+            self_scope: crate::types::ability::DiscardSelfScope::SourceCard,
+        });
+    }
+    if all_consuming(tag::<_, _, E<'_>>("a card"))
+        .parse(body)
+        .is_ok()
+    {
+        return Some(AbilityCost::Discard {
+            count: QuantityExpr::Fixed { value: 1 },
+            filter: None,
+            selection: crate::types::ability::CardSelectionMode::Chosen,
+            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+        });
+    }
+    if all_consuming(tag::<_, _, E<'_>>("your hand"))
+        .parse(body)
+        .is_ok()
+    {
+        return Some(AbilityCost::Discard {
+            count: QuantityExpr::Ref {
+                qty: QuantityRef::HandSize {
+                    player: PlayerScope::Controller,
+                },
+            },
+            filter: None,
+            selection: crate::types::ability::CardSelectionMode::Chosen,
+            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+        });
+    }
+    // CR 701.9b: Random is a selection mode on an otherwise ordinary
+    // hand-discard cost. Accept only the complete unfiltered grammar used
+    // by the measured card corpus. A typed or malformed random phrase must
+    // fail closed below instead of falling through to the chosen parser and
+    // silently giving the payer a choice.
+    if let Ok((_, count)) = all_consuming(parse_random_discard_cost_body).parse(body) {
+        return Some(AbilityCost::Discard {
+            count,
+            filter: None,
+            selection: crate::types::ability::CardSelectionMode::Random,
+            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+        });
+    }
+    if preceded(take_until::<_, _, E<'_>>(" at random"), tag(" at random"))
+        .parse(body)
+        .is_ok()
+    {
+        return Some(AbilityCost::Unimplemented {
+            description: text.to_string(),
+        });
+    }
+    // CR 701.9a + CR 608.2c: "Discard a/<N> <type> card(s)" — capture the
+    // card-type filter so only matching cards can pay the cost (Lotleth
+    // Troll: "Discard a creature card:"). Without this the typed
+    // restriction is dropped and any card pays the cost. Mirrors the
+    // effect-form discard and the trigger-side cost parser, which both
+    // delegate to `parse_discard_card_filter`: `parse_count_expr` eats the
+    // leading count token ("a "/"two ") and the remainder is the typed noun
+    // phrase. Ordered before the plain `parse_number` arm so "two creature
+    // cards" is not swallowed as an untyped count.
+    let (count, after_count) = parse_count_expr(body)?;
+    let noun = after_count.trim_start();
+    if let Some(filter) = parse_discard_card_filter(noun) {
+        return Some(AbilityCost::Discard {
+            count,
+            filter: Some(filter),
+            selection: crate::types::ability::CardSelectionMode::Chosen,
+            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+        });
+    }
+    // CR 107.3a: an untyped "discard X cards" keeps X symbolic so the
+    // announced value is discarded, not the X→0 of `parse_number`.
+    if all_consuming(alt((tag::<_, _, E<'_>>("cards"), tag("card"))))
+        .parse(noun)
+        .is_ok()
+    {
+        return Some(AbilityCost::Discard {
+            count,
+            filter: None,
+            selection: crate::types::ability::CardSelectionMode::Chosen,
+            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+        });
+    }
+    None
 }
 
 /// CR 701.9b: Complete grammar for the unfiltered random discard-cost body.
@@ -2206,23 +2225,16 @@ fn try_parse_energy_cost(lower: &str) -> Option<QuantityExpr> {
     None
 }
 
-/// Parse "return a land you control to its owner's hand" style bounce costs.
+/// Parse "return [count|article] <filter> to <its owner's hand | their owner's
+/// hand | their owners' hands | your hand>" costs.
 fn try_parse_return_to_hand_cost(rest_lower: &str) -> Option<AbilityCost> {
-    // Must end with "to its owner's hand" or "to your hand"
-    if !scan_contains(rest_lower, "to its owner's hand")
-        && !scan_contains(rest_lower, "to your hand")
-    {
-        return None;
-    }
-    // Strip the destination
-    let filter_text = split_once_on(rest_lower, " to its owner's hand")
-        .map(|(_, (before, _))| before)
-        .or_else(|_| split_once_on(rest_lower, " to your hand").map(|(_, (before, _))| before))
-        .ok()?;
-    // Strip article using nom
-    let filter_text = nom_on_lower(filter_text, filter_text, nom_primitives::parse_article)
-        .map(|((), rest)| rest)
-        .unwrap_or(filter_text);
+    // CR 400.3 + CR 601.2h: shared destination/count grammar (also used by
+    // trigger unless-costs). `trailing` is ignored exactly as before.
+    let CountedReturnObject {
+        count,
+        object: filter_text,
+        ..
+    } = split_counted_return_to_hand_object(rest_lower)?;
     // CR 201.5 / CR 201.5a: "~" / "this X" is the host self-reference; the
     // granter placeholder is a granted body's by-name reference to its granting
     // object. Preserve the explicit filter so the runtime does not treat an
@@ -2247,7 +2259,7 @@ fn try_parse_return_to_hand_cost(rest_lower: &str) -> Option<AbilityCost> {
     }) {
         if rest.trim().is_empty() {
             return Some(AbilityCost::ReturnToHand {
-                count: 1,
+                count,
                 filter: Some(filter),
                 from_zone: None,
             });
@@ -2262,26 +2274,27 @@ fn try_parse_return_to_hand_cost(rest_lower: &str) -> Option<AbilityCost> {
         filter
     };
     let filter = match filter {
-        TargetFilter::Any => {
-            // CR 201.5: A cost using the source card's own name, such as
-            // "Return Recurring Nightmare to its owner's hand", refers to that
-            // source object.
-            TargetFilter::SelfRef
-        }
+        // CR 201.5: A cost using the source card's own name, such as
+        // "Return Recurring Nightmare to its owner's hand", refers to that
+        // source object. Only one object is the source, so an unreadable
+        // object phrase with a count above one is declined rather than
+        // lowered as an unpayable self-reference.
+        TargetFilter::Any if count == 1 => TargetFilter::SelfRef,
+        TargetFilter::Any => return None,
         TargetFilter::Typed(TypedFilter {
             type_filters,
             controller: None,
             properties,
         }) if type_filters.is_empty() && properties.is_empty() => {
-            // CR 201.5: A cost using the source card's own name, such as
-            // "Return Recurring Nightmare to its owner's hand", refers to that
-            // source object.
+            if count != 1 {
+                return None;
+            }
             TargetFilter::SelfRef
         }
         filter => filter,
     };
     Some(AbilityCost::ReturnToHand {
-        count: 1,
+        count,
         filter: Some(filter),
         from_zone: None,
     })
@@ -2361,16 +2374,7 @@ fn parse_life_equal_to_quantity_nom(
     i: &str,
 ) -> super::oracle_nom::error::OracleResult<'_, QuantityRef> {
     let (i, _) = value((), tag("life equal to the number of colors in ")).parse(i)?;
-    let (i, _) = value(
-        (),
-        alt((
-            tag("your commander's "),
-            tag("your commanders' "),
-            tag("your commanders "),
-        )),
-    )
-    .parse(i)?;
-    let (i, _) = tag("color identity").parse(i)?;
+    let (i, ()) = nom_primitives::parse_your_commanders_color_identity(i)?;
     Ok((i, QuantityRef::ColorsInCommandersColorIdentity))
 }
 
@@ -4628,6 +4632,152 @@ mod tests {
             }
             other => panic!("Expected ReturnToHand Forest filter, got {:?}", other),
         }
+    }
+
+    /// Asserts `text` parses as a counted `ReturnToHand` of `subtype` you control.
+    fn assert_counted_subtype_return(text: &str, expected_count: u32, subtype: &str) {
+        match parse_oracle_cost(text) {
+            AbilityCost::ReturnToHand {
+                count,
+                filter: Some(TargetFilter::Typed(filter)),
+                from_zone: None,
+            } => {
+                assert_eq!(count, expected_count, "{text}");
+                assert_eq!(filter.get_subtype(), Some(subtype), "{text}");
+                assert_eq!(filter.controller, Some(ControllerRef::You), "{text}");
+            }
+            other => panic!("Expected counted ReturnToHand for {text:?}, got {other:?}"),
+        }
+    }
+
+    /// Ensnare / Thwart class: a counted plural return with a plural owner
+    /// destination. BASE lowered this to `EffectCost { Bounce }`, which the
+    /// spell payer silently skipped.
+    #[test]
+    fn cost_return_two_islands_to_their_owners_hand() {
+        assert_counted_subtype_return(
+            "Return two Islands you control to their owner's hand",
+            2,
+            "Island",
+        );
+        assert_counted_subtype_return(
+            "Return three Islands you control to their owners' hands",
+            3,
+            "Island",
+        );
+        // Singular guard: same filter shape, count 1.
+        assert_counted_subtype_return(
+            "Return an Island you control to its owner's hand",
+            1,
+            "Island",
+        );
+        // "another" is not the article "an": count 1 and the Another property kept.
+        match parse_oracle_cost("Return another creature you control to its owner's hand") {
+            AbilityCost::ReturnToHand {
+                count,
+                filter: Some(TargetFilter::Typed(filter)),
+                ..
+            } => {
+                assert_eq!(count, 1);
+                assert!(filter.properties.contains(&FilterProp::Another));
+            }
+            other => panic!("Expected ReturnToHand another creature, got {other:?}"),
+        }
+        // "to your hand" sibling stays a ReturnToHand.
+        assert!(matches!(
+            parse_oracle_cost("Return a creature card from your graveyard to your hand"),
+            AbilityCost::ReturnToHand { count: 1, .. }
+        ));
+    }
+
+    /// A plural owner destination with no parsed count token must not be
+    /// lowered as a count-1 return (r1 M2).
+    #[test]
+    fn cost_return_x_lands_to_their_owners_hand_declines() {
+        // Reach guard: the counted variant of the same destination shape parses.
+        assert!(matches!(
+            parse_oracle_cost("Return two lands you control to their owner's hand"),
+            AbilityCost::ReturnToHand { count: 2, .. }
+        ));
+        for text in [
+            "Return X lands you control to their owner's hand",
+            "Return any number of lands you control to their owners' hands",
+        ] {
+            let cost = parse_oracle_cost(text);
+            assert!(
+                !matches!(cost, AbilityCost::ReturnToHand { .. }),
+                "{text:?} must not lower to ReturnToHand, got {cost:?}"
+            );
+        }
+    }
+
+    /// "your hand" is number-neutral: a non-count quantity must not be lowered
+    /// as a count-1 return there either.
+    #[test]
+    fn cost_return_x_cards_to_your_hand_declines() {
+        // Reach guard: the same object phrase and destination with an article.
+        assert!(matches!(
+            parse_oracle_cost("Return a creature card from your graveyard to your hand"),
+            AbilityCost::ReturnToHand { count: 1, .. }
+        ));
+        for text in [
+            "Return X creature cards from your graveyard to your hand",
+            "Return any number of creature cards from your graveyard to your hand",
+        ] {
+            let cost = parse_oracle_cost(text);
+            assert!(
+                !matches!(cost, AbilityCost::ReturnToHand { .. }),
+                "{text:?} must not lower to ReturnToHand, got {cost:?}"
+            );
+        }
+    }
+
+    /// A count token followed by a range tail ("one or more", "two or fewer") is
+    /// a quantifier, not an exact count; it must not lower to a count-1 or
+    /// self-referential return.
+    #[test]
+    fn cost_return_range_quantifier_declines() {
+        // Reach guard: the exact count of the same destination parses.
+        assert!(matches!(
+            parse_oracle_cost("Return two lands you control to their owner's hand"),
+            AbilityCost::ReturnToHand { count: 2, .. }
+        ));
+        for text in [
+            "Return one or more lands you control to their owner's hand",
+            "Return two or more lands you control to their owner's hand",
+            "Return 2 or more lands you control to their owner's hand",
+            "Return one or fewer lands you control to their owner's hand",
+            "Return three or fewer lands you control to their owner's hand",
+            "Return one or more lands you control to your hand",
+        ] {
+            let cost = parse_oracle_cost(text);
+            assert!(
+                !matches!(cost, AbilityCost::ReturnToHand { .. }),
+                "{text:?} must not lower to ReturnToHand, got {cost:?}"
+            );
+        }
+    }
+
+    /// The source-name self-reference fallback names ONE object; a counted
+    /// return of an unreadable object phrase must not lower to an unpayable
+    /// `ReturnToHand { count: 2, filter: SelfRef }`.
+    #[test]
+    fn cost_counted_return_of_unreadable_phrase_is_not_self_ref() {
+        // Reach guard: the same object phrase with an article reaches the
+        // fallback and becomes the self-reference.
+        assert_eq!(
+            parse_oracle_cost("Return a Recurring Nightmare to its owner's hand"),
+            AbilityCost::ReturnToHand {
+                count: 1,
+                filter: Some(TargetFilter::SelfRef),
+                from_zone: None,
+            }
+        );
+        let cost = parse_oracle_cost("Return two Recurring Nightmares to their owner's hand");
+        assert!(
+            !matches!(cost, AbilityCost::ReturnToHand { .. }),
+            "counted unreadable phrase must not lower to ReturnToHand, got {cost:?}"
+        );
     }
 
     #[test]
