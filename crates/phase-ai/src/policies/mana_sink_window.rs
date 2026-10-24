@@ -76,6 +76,7 @@ impl TacticalPolicy for ManaSinkWindowPolicy {
         let GameAction::ActivateAbility {
             source_id,
             ability_index,
+            ..
         } = &ctx.candidate.action
         else {
             return neutral("mana_sink_window_na");
