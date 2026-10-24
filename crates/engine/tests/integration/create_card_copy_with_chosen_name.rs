@@ -348,6 +348,7 @@ fn garth_with_mana(green: usize) -> (GameRunner, ObjectId) {
 fn activate_to_the_prompt(runner: &mut GameRunner, garth: ObjectId) {
     runner
         .act(GameAction::ActivateAbility {
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             source_id: garth,
             ability_index: 0,
         })
