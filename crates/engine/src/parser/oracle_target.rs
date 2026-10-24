@@ -3735,9 +3735,11 @@ pub fn parse_type_phrase_folding_with_ctx<'a>(
         }
     }
 
-    // CR 608.2c + CR 205.2b: "<type> except for <type-list>" — plain type-list
-    // exclusion (Scourglass: "Destroy all permanents except for artifacts and
-    // lands"; Elspeth Tirel: "except for lands and tokens"), distinct from the
+    // CR 608.2c + CR 205.2b: "<type> except for <type-list>" / "<type> other
+    // than <type-list>" — plain type-list exclusion (Scourglass: "Destroy all
+    // permanents except for artifacts and lands"; Elspeth Tirel: "except for
+    // lands and tokens"; Moonmist: "creatures other than Werewolves and
+    // Wolves"), distinct from the
     // predicate-based "except those that" clause immediately above. Tried only
     // when that block didn't match — "except those "/"other than those " vs
     // "except for " diverge at the 8th character of "except ", so the two are
@@ -9647,9 +9649,19 @@ fn preceded_color_separator(input: &str) -> super::oracle_nom::error::OracleResu
 fn parse_except_for_type_list_suffix(
     text: &str,
 ) -> Option<(Vec<TypeFilter>, Vec<FilterProp>, usize)> {
-    let (mut rest, _) = tag::<_, _, OracleError<'_>>("except for ")
-        .parse(text)
-        .ok()?;
+    // CR 608.2c + CR 205.3a: "other than <type-list>" is the same plain
+    // type-list exclusion as "except for <type-list>" — Moonmist: "creatures
+    // other than Werewolves and Wolves". The self-reference and attached-host
+    // forms ("other than ~", "other than enchanted creature") and "other than
+    // those that …" are consumed by earlier suffixes of the type phrase; any
+    // other non-vocabulary word ("other than Mageta", "other than the first")
+    // still declines below, exactly as "except for" does.
+    let (mut rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("except for "),
+        tag("other than "),
+    ))
+    .parse(text)
+    .ok()?;
     let mut consumed = text.len() - rest.len();
     let mut neg_types = Vec::new();
     let mut props = Vec::new();

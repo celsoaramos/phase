@@ -1219,6 +1219,7 @@ mod mogg_fanatic_target_before_cost;
 mod mogg_war_marshal_echo_dies_trigger;
 mod mold_folk_sacrifice_type_union;
 mod mole_man_moloid_optional_mill;
+mod moonmist_prevents_only_non_werewolf_wolf_damage;
 mod moraug_extra_combat_usable_7197;
 mod morbid_curiosity_cost_paid_mana_value_draw;
 mod morkrut_ashaya_self_sacrifice;
