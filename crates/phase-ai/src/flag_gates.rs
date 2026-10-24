@@ -71,6 +71,7 @@ pub(crate) fn rejects(ctx: &PolicyContext<'_>) -> bool {
         GameAction::ActivateAbility {
             source_id,
             ability_index,
+            ..
         } => haste_grant_has_no_beneficiary(ctx, *source_id, *ability_index),
         _ => false,
     }
@@ -1284,6 +1285,7 @@ mod tests {
         assert!(!kept(
             runner.state(),
             GameAction::ActivateAbility {
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
                 source_id: land,
                 ability_index: index
             }
@@ -1296,6 +1298,7 @@ mod tests {
         assert!(!kept(
             runner.state(),
             GameAction::ActivateAbility {
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
                 source_id: land,
                 ability_index: index
             }
@@ -1308,6 +1311,7 @@ mod tests {
             battlements_runner(Phase::PreCombatMain, true);
         let fresh = fresh.expect("fresh creature");
         let activate = GameAction::ActivateAbility {
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             source_id: land,
             ability_index: index,
         };
