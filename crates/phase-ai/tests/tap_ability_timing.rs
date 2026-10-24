@@ -217,6 +217,7 @@ fn cam_at_target_prompt() -> (engine::game::scenario::GameRunner, ObjectId, Obje
         .act(GameAction::ActivateAbility {
             source_id: cam,
             ability_index,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activating the Cam must be legal");
     assert!(

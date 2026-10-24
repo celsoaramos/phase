@@ -106,6 +106,7 @@ impl TacticalPolicy for CreatureTapPatiencePolicy {
         let GameAction::ActivateAbility {
             source_id,
             ability_index,
+            ..
         } = &ctx.candidate.action
         else {
             return neutral("creature_tap_patience_na");
