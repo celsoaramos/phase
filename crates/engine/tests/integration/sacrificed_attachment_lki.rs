@@ -130,6 +130,7 @@ fn activate_sacrifice(board: &mut Board) {
     board
         .runner
         .act(GameAction::ActivateAbility {
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             source_id: source,
             ability_index: index,
         })
@@ -380,6 +381,7 @@ fn aura_destroyed_in_response_still_pumps_its_last_host() {
     let source = b.source;
     b.runner
         .act(GameAction::ActivateAbility {
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             source_id: source,
             ability_index: 0,
         })
