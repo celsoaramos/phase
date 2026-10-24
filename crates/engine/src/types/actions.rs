@@ -66,6 +66,8 @@ pub enum CastChoice {
 ///   Only available when `object_id` references a card named "Serum Powder" in
 ///   the actor's hand (CR 103.5b and Serum Powder Oracle text). The player
 ///   remains pending and may keep, mulligan, or use another Serum Powder next.
+/// - `FreeReveal` — reveal the hand, return it and redraw without taking a
+///   regular mulligan (the Dandan free-reveal rule).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum MulliganChoice {
@@ -76,6 +78,11 @@ pub enum MulliganChoice {
     UseSerumPowder {
         object_id: ObjectId,
     },
+    /// CR 103.5 as modified by the Dandan free-reveal rule: reveal the hand,
+    /// return it and redraw; the mulligan count is unchanged and nothing is
+    /// bottomed. Legal only where `GameFormat::free_reveal_mulligan()` offers
+    /// it, before this player's first regular mulligan, while the hand qualifies.
+    FreeReveal,
 }
 
 /// CR 118.9: Player decision at a `WaitingFor::AlternativeCastChoice` prompt —
@@ -181,6 +188,11 @@ pub enum GameAction {
     ActivateAbility {
         source_id: ObjectId,
         ability_index: usize,
+        /// CR 602.2b + CR 601.2g-h: the activation's mana-payment preference,
+        /// the same opt-in as `CastSpell`'s. `Manual` stops in `ManaPayment`
+        /// after targets so the player activates mana abilities themself.
+        #[serde(default, skip_serializing_if = "CastPaymentMode::is_auto")]
+        payment_mode: CastPaymentMode,
     },
     DeclareAttackers {
         attacks: Vec<(ObjectId, AttackTarget)>,
@@ -371,6 +383,9 @@ pub enum GameAction {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         hybrid_announcement: Vec<crate::types::mana::ManaCostShard>,
     },
+    /// CR 601.2 + CR 602.2b: withdraw a pending spell cast or a pre-cost
+    /// keyword-activation announcement (Equip/Crew/Station/Saddle selection),
+    /// restoring priority with nothing to unwind.
     CancelCast,
     Equip {
         equipment_id: ObjectId,
@@ -829,8 +844,13 @@ pub enum GameAction {
         amount: u32,
     },
     /// CR 115.7: Choose new target(s) for a spell or ability on the stack.
+    /// One entry per addressed position of `WaitingFor::RetargetChoice`:
+    /// `None` leaves that target unchanged with its announced incarnation
+    /// (CR 115.7d: "leave any number of the targets unchanged, even if those
+    /// targets would be illegal"); `Some(t)` chooses `t`. A bare target (the
+    /// pre-nullable wire form) decodes as `Some`.
     RetargetSpell {
-        new_targets: Vec<TargetRef>,
+        new_targets: Vec<Option<TargetRef>>,
     },
     /// CR 701.48a: Learn — choose to rummage (discard a card, draw a card) or skip.
     LearnDecision {
@@ -1830,16 +1850,14 @@ fn push_decision_template(ids: &mut Vec<ObjectId>, template: &DecisionTemplate) 
     }
     for decision in &template.decisions {
         match decision {
-            PinnedDecision::Order { source, .. } => {
-                push_yield_target(ids, source);
-            }
             PinnedDecision::Targets { slot, targets } => {
                 push_decision_slot(ids, slot);
                 for target in targets {
                     push_target_pin(ids, target);
                 }
             }
-            PinnedDecision::Mode { slot, .. }
+            PinnedDecision::Order { slot, .. }
+            | PinnedDecision::Mode { slot, .. }
             | PinnedDecision::MayChoice { slot, .. }
             | PinnedDecision::UnlessBreak { slot, .. }
             | PinnedDecision::ConvokeTaps { slot }
@@ -1929,11 +1947,12 @@ impl GameAction {
         )
     }
 
-    /// The cast payment preference carried by this action, if it is one of
-    /// the cast-family variants (CR 601.2g).
+    /// The payment preference carried by this action, if it is one of the
+    /// cast-family variants (CR 601.2g) or an activation (CR 602.2b).
     pub(crate) fn payment_mode_mut(&mut self) -> Option<&mut CastPaymentMode> {
         match self {
             GameAction::CastSpell { payment_mode, .. }
+            | GameAction::ActivateAbility { payment_mode, .. }
             | GameAction::CastSpellForFree { payment_mode, .. }
             | GameAction::CastSpellAsMiracle { payment_mode, .. }
             | GameAction::CastSpellAsMadness { payment_mode, .. }
@@ -2222,7 +2241,11 @@ impl GameAction {
                     push_related_object_id(&mut ids, selection.destination_id);
                 }
             }
-            Self::RetargetSpell { new_targets } => push_target_refs(&mut ids, new_targets),
+            Self::RetargetSpell { new_targets } => {
+                for target in new_targets.iter().flatten() {
+                    push_target_ref(&mut ids, target);
+                }
+            }
             Self::LearnDecision { choice } => {
                 if let LearnOption::Rummage { card_id } = choice {
                     push_related_object_id(&mut ids, *card_id);
@@ -2570,6 +2593,7 @@ mod tests {
                 GameAction::ActivateAbility {
                     source_id: oid,
                     ability_index: 0,
+                    payment_mode: CastPaymentMode::Auto,
                 },
                 Some(oid),
             ),

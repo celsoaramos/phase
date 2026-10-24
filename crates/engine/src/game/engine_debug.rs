@@ -163,9 +163,8 @@ pub fn apply_debug_action(
 
         DebugAction::Mill { player_id, count } => {
             validate_player(state, player_id)?;
-            let player = state.players.iter().find(|p| p.id == player_id).unwrap();
-            let top_ids: Vec<ObjectId> = player
-                .library
+            let top_ids: Vec<ObjectId> = state
+                .library_of(player_id)
                 .iter()
                 .take(count as usize)
                 .copied()
@@ -908,6 +907,7 @@ fn enter_battlefield_with_etb(
         face_down_in_exile: crate::types::ability::ExileConcealment::Public,
         chain_referent: crate::types::zones::ChainReferentIntent::Silent,
         enter_as_copy: None,
+        enter_with_choices: None,
         discard_frame: None,
         performed_by: None,
         applied: HashSet::new(),
@@ -964,10 +964,10 @@ fn route_debug_token_to_battlefield(
     let values = super::printed_cards::intrinsic_copiable_values(&staged);
     let copy = CopyTokenSpec {
         values: Box::new(values.clone()),
-        display_source: staged.display_source,
-        printed_ref: staged.printed_ref.clone(),
-        token_image_ref: staged.token_image_ref.clone(),
-        token_art: None,
+        display: super::game_object::DisplayIdentity {
+            token_art: None,
+            ..staged.display_identity()
+        },
         extra_keywords: Vec::new(),
         additional_modifications: Vec::new(),
         tapped: false,
@@ -975,6 +975,8 @@ fn route_debug_token_to_battlefield(
         sacrifice_at: None,
         source_id: object_id,
         controller: staged.controller,
+        // Debug-token route stages no donor; empty mods are stamp-proof.
+        donor: None,
     };
     let mut token = super::game_object::GameObject::new(
         object_id,
@@ -1019,6 +1021,7 @@ fn route_debug_token_to_battlefield(
         entry_ref: object_id,
         enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         enter_with_counters: Vec::new(),
+        enter_with_choices: None,
         applied: HashSet::new(),
     };
     match replacement::replace_event(state, proposed, &mut events) {
@@ -1796,8 +1799,7 @@ mod tests {
 
         let ids: Vec<u64> = state.players[0]
             .mana_pool
-            .mana
-            .iter()
+            .units()
             .map(|u| u.pip_id.0)
             .collect();
         assert_eq!(ids.len(), 3, "three AddMana entries → three pool units");
