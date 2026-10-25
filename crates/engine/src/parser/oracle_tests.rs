@@ -31943,7 +31943,9 @@ fn census_variant_names(body: &str) -> Vec<String> {
 /// it.
 #[test]
 fn render_net_effect_carrier_census() {
-    const EFFECT_VARIANT_PIN: usize = 237;
+    // `Effect::CreateCardCopyByName` (Garth One-Eye) carries a card name, a zone and a
+    // count — no `description` string, so `render_effect_descriptions` needs no arm.
+    const EFFECT_VARIANT_PIN: usize = 238;
     /// `(enum header, pinned variant count, the ONE variant the net destructures)`.
     const PAYLOAD_ENUM_PINS: &[(&str, usize, &str)] = &[
         ("pub enum CastingPermission {", 8, "ExileWithAltCost"),
