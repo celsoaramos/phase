@@ -1757,17 +1757,25 @@ fn parse_lose_life_replacement(text: &str, lower: &str) -> Option<ReplacementDef
     }
     if during_your_turn {
         // CR 109.5 + CR 102.1: "during your turn" means while the source's
-        // controller is the active player.
-        // Reuse the existing parameterized active-player gate rather than
-        // hiding Bloodletter's restriction in the LoseLife event matcher.
-        def = def.condition(ReplacementCondition::OnlyIfQuantity {
-            lhs: QuantityExpr::Fixed { value: 0 },
-            comparator: Comparator::EQ,
-            rhs: QuantityExpr::Fixed { value: 0 },
-            active_player_req: Some(ControllerRef::You),
-        });
+        // controller is the active player. Kept out of the LoseLife event
+        // matcher: it is the shared active-player gate.
+        def = def.condition(only_during_your_turn());
     }
     Some(def)
+}
+
+/// CR 109.5 + CR 102.1: the replacement gate for "during your turn" — applies
+/// only while the source's controller is the active player. One carrier for
+/// every replacement class (Bloodletter of Aclazotz's life loss, Gideon
+/// Blackblade's prevention shield): the parameterized active-player gate of
+/// `OnlyIfQuantity` over a trivially true comparison.
+fn only_during_your_turn() -> ReplacementCondition {
+    ReplacementCondition::OnlyIfQuantity {
+        lhs: QuantityExpr::Fixed { value: 0 },
+        comparator: Comparator::EQ,
+        rhs: QuantityExpr::Fixed { value: 0 },
+        active_player_req: Some(ControllerRef::You),
+    }
 }
 
 fn parse_lose_life_subject(input: &str) -> OracleResult<'_, Option<ReplacementPlayerScope>> {
@@ -14572,6 +14580,30 @@ fn has_coordinated_predicate_conjunct(working_lower: &str) -> bool {
     .is_some()
 }
 
+/// CR 109.5 + CR 102.1: split a clause-final "during your turn" / "during each
+/// of your turns" window off a replacement clause. Returns the clause without
+/// the window and the active-player gate it states (`None` when the clause
+/// does not end with one).
+fn strip_clause_final_turn_gate(clause_lower: &str) -> (&str, Option<ReplacementCondition>) {
+    let window = nom_primitives::scan_last_at_word_boundaries_with_offset(clause_lower, |i| {
+        (
+            tag("during "),
+            alt((tag("each of your turns"), tag("your turn"))),
+            opt(char('.')),
+            multispace0,
+            eof,
+        )
+            .parse(i)
+    });
+    match window {
+        Some((offset, _, _)) => (
+            clause_lower[..offset].trim_end(),
+            Some(only_during_your_turn()),
+        ),
+        None => (clause_lower, None),
+    }
+}
+
 /// CR 615: Parse damage prevention replacement effects.
 /// Handles:
 /// - "prevent all combat damage that would be dealt [this turn]" (Fog, Moments Peace)
@@ -14606,6 +14638,17 @@ fn parse_damage_prevention_replacement(
         // become an unconditional shield — fail closed (the route lands the line in
         // `Effect::unimplemented`, see `as_long_as_gate_is_unparsed`).
         AsLongAsGate::Unparsed => return Err(PreventionDecline::NotThisShape),
+    };
+    // CR 615.1a + CR 109.5: a clause-final "during your turn" bounds the shield
+    // to its controller's turns (Gideon Blackblade: "Prevent all damage that
+    // would be dealt to ~ during your turn."). Dropped, the shield would also
+    // prevent the damage dealt on every opponent's turn.
+    let (working_lower, turn_gate) = strip_clause_final_turn_gate(working_lower);
+    let prefix_condition = match (prefix_condition, turn_gate) {
+        (Some(prefix), Some(gate)) => Some(ReplacementCondition::And {
+            conditions: vec![prefix, gate],
+        }),
+        (prefix, gate) => prefix.or(gate),
     };
 
     // Must contain "prevent" and "damage" to be a prevention pattern
