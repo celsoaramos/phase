@@ -454,11 +454,22 @@ fn tovolar_night_with_only_daybound_finishes_without_a_choice() {
         .get_mut(&tovolar)
         .unwrap()
         .back_face = Some(werewolf_back("Tovolar, the Midnight Scourge"));
-    runner.state_mut().day_night = Some(engine::types::game_state::DayNight::Day);
+    opponent_keeps_it_day(&mut runner, spell);
+    assert_eq!(
+        runner.state().day_night,
+        Some(engine::types::game_state::DayNight::Day)
+    );
 
     // Pass into P0's next upkeep; the trigger must resolve on its own.
     let mut night = false;
     for _ in 0..300 {
+        if runner.state().day_night == Some(engine::types::game_state::DayNight::Night) {
+            assert_eq!(
+                runner.state().active_player,
+                P0,
+                "night comes from Tovolar's upkeep trigger, not the turn change"
+            );
+        }
         if runner.state().day_night == Some(engine::types::game_state::DayNight::Night)
             && runner.state().stack.is_empty()
         {
