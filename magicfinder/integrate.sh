@@ -8,6 +8,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$REPO"
 D=docs/parser-misparse-backlog.md
 F=crates/engine/tests/fixtures/integration_cards.json.gz
+M=crates/engine/tests/fixtures/cr733/authority_matrix.json.gz
 export GIT_AUTHOR_NAME=magicfinder-bot GIT_COMMITTER_NAME=magicfinder-bot
 export GIT_AUTHOR_EMAIL=actions@users.noreply.github.com GIT_COMMITTER_EMAIL=actions@users.noreply.github.com
 FIXED_DATE=$(git log -1 --format=%cI "$TAG^{commit}")
@@ -23,6 +24,9 @@ for b in "$@"; do
       "$F")
         python3 "$HERE/merge-fixture.py" "$(git merge-base HEAD "origin/$b")" HEAD "origin/$b" "$F"
         git add "$F"; echo "  $b: fixture mesclada carta a carta" ;;
+      "$M")
+        python3 "$HERE/merge-matrix.py" "$(git merge-base HEAD "origin/$b")" HEAD "origin/$b" "$M"
+        git add "$M"; echo "  $b: matriz CR733 mesclada campo a campo" ;;
       *)
         echo "::error::conflito de CÓDIGO em $f ao mesclar $b sobre $TAG — resolva no fork (rebase da branch)"
         git merge --abort; exit 1 ;;

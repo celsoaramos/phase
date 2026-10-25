@@ -265,5 +265,11 @@
   },
   {
     "branch": "card/pe-de-limo-1025"
+  },
+  {
+    "branch": "card/werewolf-player-cast-two-spells"
+  },
+  {
+    "branch": "card/sacrifice-it-prompts-its-controller"
   }
 ]
