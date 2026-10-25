@@ -22,22 +22,22 @@ use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityUseTally,
     ActivationRestriction, AdditionalCost, AggregateFunction, AttachmentReferent, AttackSubject,
     AttackedYouScope, AttackerBlockStatus, CardTypeSetSource, ChoiceType, CoinFlipResult,
-    CoinFlipRun, CombatHistoryScope, CommanderOwnership, Comparator, ContinuousModification,
-    ControllerRef, CountScope, CounterKindChooser, CounterKindDomain, CounterSourceRider,
-    DelayedTriggerCondition, DieRollModifier, DoublePTMode, Duration, EachDamageRecipient, Effect,
-    EffectOutcomeSignal, EffectScope, FilterProp, ForEachCategoryAction, GameRestriction,
-    LetterQuery, LibraryPosition, ManaProduction, MassLibraryShuffleMode, NameStickerSet,
-    NumberQuality, ObjectProperty, ObjectScope, ObjectSelectionCardinality,
-    ObjectSelectionEligibility, Parity, ParsedCondition, PerpetualModification, PlayerFilter,
-    PlayerRelation, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
-    ReplacementCondition, ReplacementDefinition, ReplacementMode, SeatDirection, SharedQuality,
-    SharedQualityRelation, SpeedDelta, SpellCastingOption, SpellCastingOptionKind,
-    SpellStackToGraveyardReplacement, StackAbilityKind, StaticCondition, StaticDefinition,
-    TapStateChange, TargetFilter, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter,
-    ZoneRef,
+    CoinFlipRun, CombatHistoryScope, CommanderOwnership, Comparator, ContinuousEffectOnset,
+    ContinuousModification, ControllerRef, CountScope, CounterKindChooser, CounterKindDomain,
+    CounterSourceRider, DelayedTriggerCondition, DieRollModifier, DoublePTMode, Duration,
+    EachDamageRecipient, Effect, EffectOutcomeSignal, EffectScope, FilterProp,
+    ForEachCategoryAction, GameRestriction, LetterQuery, LibraryPosition, ManaProduction,
+    MassLibraryShuffleMode, NameStickerSet, NumberQuality, ObjectProperty, ObjectScope,
+    ObjectSelectionCardinality, ObjectSelectionEligibility, Parity, ParsedCondition,
+    PerpetualModification, PlayerFilter, PlayerRelation, PlayerScope, PtStat, PtValue,
+    PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition, ReplacementDefinition,
+    ReplacementMode, SeatDirection, SharedQuality, SharedQualityRelation, SpeedDelta,
+    SpellCastingOption, SpellCastingOptionKind, SpellStackToGraveyardReplacement, StackAbilityKind,
+    StaticCondition, StaticDefinition, TapStateChange, TargetFilter, TriggerCondition,
+    TriggerDefinition, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::card::CardFace;
-use crate::types::card_type::CoreType;
+use crate::types::card_type::{CoreType, SubtypeSet};
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::events::ActivatedAbilityKind;
 use crate::types::keywords::{Keyword, ProtectionTarget};
@@ -777,6 +777,9 @@ fn fmt_target(filter: &TargetFilter) -> String {
             "controller of the object targeted by the triggering event".into()
         }
         TargetFilter::DefendingPlayer => "defending player".into(),
+        TargetFilter::AttackedPlayerOrPlaneswalker => {
+            "the player or planeswalker it's attacking".into()
+        }
         TargetFilter::ParentTarget => "parent target".into(),
         TargetFilter::ParentTargetSlot { index } => format!("parent target slot {index}"),
         TargetFilter::DeclaredPlayer { .. } => "declared player".to_string(),
@@ -989,6 +992,10 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             FilterProp::AttachedTo {
                 to: AttachmentReferent::DeclaredTarget { slot },
             } => parts.push(format!("attached to target #{slot}")),
+            // CR 701.3a: the filter-matched host axis — "attached to <host>".
+            FilterProp::AttachedTo {
+                to: AttachmentReferent::Host { filter },
+            } => parts.push(format!("attached to {}", fmt_target(filter))),
             FilterProp::Unpaired => parts.push("unpaired".into()),
             FilterProp::HasAttachment {
                 kind,
@@ -1129,6 +1136,8 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             }
             FilterProp::Suspected => parts.push("suspected".into()),
             FilterProp::Renowned => parts.push("renowned".into()),
+            // CR 722.3a
+            FilterProp::Prepared => parts.push("prepared".into()),
             // CR 701.15b/c
             FilterProp::Goaded => parts.push("goaded".into()),
             // CR 700.9
@@ -1869,15 +1878,38 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 fmt_characteristic_population_bounded(source)
             )
         }
-        QuantityRef::DistinctSubtypes { source, exclude } => {
-            let suffix = match exclude {
-                crate::types::ability::SubtypeExclusion::CreatureTypes => {
-                    " other than creature types"
-                }
-                crate::types::ability::SubtypeExclusion::None => "",
-            };
+        QuantityRef::DistinctSubtypes {
+            source,
+            exclude,
+            restrict,
+        } => {
             let scope_desc = fmt_characteristic_population_bounded(source);
-            format!("subtypes{suffix} among {scope_desc}")
+            // CR 205.3: the category axis renders its own noun — derived from
+            // the `SubtypeSet`, not a second table. Only Creature/Planeswalker
+            // are producible today; the rest still render sanely.
+            match restrict {
+                Some(set) => {
+                    let noun = match set {
+                        SubtypeSet::Creature => "creature",
+                        SubtypeSet::Land => "land",
+                        SubtypeSet::Artifact => "artifact",
+                        SubtypeSet::Enchantment => "enchantment",
+                        SubtypeSet::Planeswalker => "planeswalker",
+                        SubtypeSet::Spell => "spell",
+                        SubtypeSet::Battle => "battle",
+                    };
+                    format!("{noun} types among {scope_desc}")
+                }
+                None => {
+                    let suffix = match exclude {
+                        crate::types::ability::SubtypeExclusion::CreatureTypes => {
+                            " other than creature types"
+                        }
+                        crate::types::ability::SubtypeExclusion::None => "",
+                    };
+                    format!("subtypes{suffix} among {scope_desc}")
+                }
+            }
         }
         QuantityRef::CardsExiledBySource => "cards exiled with source".into(),
         QuantityRef::ExiledCardPower { index } => format!("power of exiled card {index}"),
@@ -4276,6 +4308,9 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
                 ));
             }
         }
+        Effect::ModifyAnnouncedX { modification } => {
+            d.push(("modifies X".into(), format!("{modification:?}")));
+        }
         Effect::Double {
             target_kind,
             target,
@@ -4550,6 +4585,13 @@ fn ability_details(def: &AbilityDefinition) -> Vec<(String, String)> {
     if let Some(zone) = &def.activation_zone {
         d.push(("activates from".into(), fmt_zone(zone)));
     }
+    // CR 611.2e: the parse-time onset is semantic (it decides when enter observers read an
+    // entrant), so a stamped `WithEntry` must be visible in the parse-diff signature.
+    // `WhenFollowed` is the default and emits nothing, so existing signatures stay byte-identical.
+    match def.entry_onset {
+        ContinuousEffectOnset::WithEntry => d.push(("entry onset".into(), "with entry".into())),
+        ContinuousEffectOnset::WhenFollowed => {}
+    }
     d
 }
 
@@ -4611,6 +4653,12 @@ fn trigger_details(trig: &TriggerDefinition) -> Vec<(String, String)> {
     }
     if let Some(cond) = &trig.condition {
         d.push(("condition".into(), fmt_trigger_condition(cond, &trig.mode)));
+    }
+    if let Some(condition) = &trig.attack_cost_condition {
+        d.push((
+            "attack cost condition".into(),
+            fmt_static_condition(condition),
+        ));
     }
     d
 }
@@ -4939,6 +4987,10 @@ fn fmt_trigger_condition(
             let parts: Vec<&str> = phases.iter().map(fmt_phase).collect();
             format!("cast during {}", parts.join(" or "))
         }
+        TC::CurrentPhaseIs { phases } => {
+            let parts: Vec<&str> = phases.iter().map(fmt_phase).collect();
+            format!("during {}", parts.join(" or "))
+        }
         TC::CastTimingPermission { .. } => "cast with timing permission".into(),
         TC::ManaColorSpent { color, minimum } => {
             format!("{}+ {} spent", minimum, fmt_mana_color_full(&color.color()))
@@ -5188,6 +5240,7 @@ fn fmt_static_condition(cond: &StaticCondition) -> String {
         }
         SC::SourceEnteredThisTurn => "source entered this turn".into(),
         SC::SourceHasDealtDamage => "source has dealt damage".into(),
+        SC::SourceExertedThisTurn => "source has been exerted this turn".into(),
         SC::WasCast { zone } => match zone {
             Some(z) => format!("cast from {}", fmt_zone(z)),
             None => "was cast".into(),
@@ -5554,6 +5607,11 @@ fn replacement_details(repl: &ReplacementDefinition) -> Vec<(String, String)> {
     if let Some(cref) = &repl.enters_under {
         d.push(("enters under".into(), format!("{cref:?}")));
     }
+    // CR 614.12a: project the entry-payment cap (Nameless Race) so a fix that
+    // only changes it cannot produce a byte-identical signature.
+    if let Some(max) = &repl.entry_payment_max {
+        d.push(("entry payment max".into(), format!("{max:?}")));
+    }
     if let Some(expiry) = &repl.expiry {
         d.push(("expiry".into(), format!("{expiry:?}")));
     }
@@ -5572,10 +5630,21 @@ fn keyword_label(kw: &Keyword) -> String {
         .unwrap_or_else(|| format!("{kw:?}"))
 }
 
+/// CR 702.16i: a PRINTED (face) color-set protection keyword is never expanded
+/// (only a continuous grant is, by the layer applier), so it protects from
+/// nothing. The single authority for `keyword_supported`, `keyword_gap_label` and
+/// the structural tag `extract_card_features` emits for the same face keyword;
+/// deliberately separate from `keyword_is_inert_protection_grant`, which must stay
+/// false for an `EachColor` inside a static's modifications.
+fn printed_color_set_protection_is_unexpanded(kw: &Keyword) -> bool {
+    matches!(kw, Keyword::Protection(ProtectionTarget::EachColor(_)))
+}
+
 fn keyword_supported(kw: &Keyword) -> bool {
     match kw {
         Keyword::Unknown(_) => false,
         Keyword::CumulativeUpkeep(cost) => cost.supports_cumulative_upkeep_payment(),
+        kw if printed_color_set_protection_is_unexpanded(kw) => false,
         _ => true,
     }
 }
@@ -5585,6 +5654,9 @@ fn keyword_gap_label(kw: &Keyword) -> Option<String> {
         Keyword::Unknown(s) => Some(format!("Keyword:{s}")),
         Keyword::CumulativeUpkeep(cost) if !cost.supports_cumulative_upkeep_payment() => {
             Some("Keyword:CumulativeUpkeepUnsupportedCost".to_string())
+        }
+        kw if printed_color_set_protection_is_unexpanded(kw) => {
+            Some("Keyword:ProtectionColorSetUnexpanded".to_string())
         }
         _ => None,
     }
@@ -9503,6 +9575,9 @@ enum StructuralFeature {
     /// The repo already documents this hazard class in `types/keywords.rs`'s
     /// `parse_protection_target_monocolored_is_quality_not_card_type`, which
     /// notes that such a grant "would do nothing".
+    ///
+    /// Also emitted for a PRINTED `Protection(EachColor(_))` face keyword, which
+    /// no layer pass expands (CR 702.16i), so it protects from nothing.
     InertProtectionQualityGrant,
     /// A counter's graveyard-exile rider (CR 608.2c + CR 614.1a) carries a tail
     /// the resolver drops (`effects::counter_exile_rider_runs_tail`). The card
@@ -9596,7 +9671,12 @@ fn extract_card_features(face: &CardFace, features: &mut HashMap<String, Feature
     // CR 702.16: the same inert-grant check for a PRINTED keyword line, which
     // lands on the face rather than inside a static's modifications.
     for keyword in &face.keywords {
-        if keyword_is_inert_protection_grant(keyword) {
+        // CR 702.16i: a printed color-set protection is never expanded (only a
+        // continuous grant is, by the layer applier), so as a face keyword it
+        // matches nothing and is as inert as an unsatisfiable card-type quality.
+        if keyword_is_inert_protection_grant(keyword)
+            || printed_color_set_protection_is_unexpanded(keyword)
+        {
             emit_structural(features, StructuralFeature::InertProtectionQualityGrant);
         }
     }
@@ -10062,6 +10142,9 @@ fn extract_trigger_features(
         emit_structural(features, StructuralFeature::TriggerCondition);
         extract_trigger_condition_features(condition, features);
     }
+    if let Some(condition) = &trigger.attack_cost_condition {
+        extract_static_condition_features(condition, features);
+    }
 }
 
 fn extract_effect_static_carrier_features(
@@ -10300,6 +10383,7 @@ fn extract_trigger_condition_features(
         | TriggerCondition::DefendingPlayerControlsNone { .. }
         | TriggerCondition::TributeNotPaid
         | TriggerCondition::CastDuringPhase { .. }
+        | TriggerCondition::CurrentPhaseIs { .. }
         | TriggerCondition::CastTimingPermission { .. }
         | TriggerCondition::ManaColorSpent { .. }
         | TriggerCondition::ManaSpentCondition { .. }
@@ -10429,6 +10513,9 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
             }
             EffectOutcomeSignal::Guessed { .. } => ("EffectOutcomeGuessed", Handled),
             EffectOutcomeSignal::RevealUntilMatched => ("EffectOutcomeRevealUntilMatched", Handled),
+            EffectOutcomeSignal::RepeatDirectiveReached => {
+                ("EffectOutcomeRepeatDirectiveReached", Handled)
+            }
         },
         AbilityCondition::EventOutcomeWon => ("EventOutcomeWon", Handled),
         AbilityCondition::CoinFlipOutcome { .. } => ("CoinFlipOutcome", Handled),
@@ -11005,6 +11092,7 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         }
         StaticCondition::SourceEnteredThisTurn => ("SourceEnteredThisTurn", Handled),
         StaticCondition::SourceHasDealtDamage => ("SourceHasDealtDamage", Handled),
+        StaticCondition::SourceExertedThisTurn => ("SourceExertedThisTurn", Handled),
         StaticCondition::WasCast { .. } => ("WasCast", Handled),
         StaticCondition::IsRingBearer => ("IsRingBearer", Handled),
         StaticCondition::RingLevelAtLeast { .. } => ("RingLevelAtLeast", Handled),
@@ -14281,6 +14369,107 @@ mod tests {
         );
     }
 
+    /// CR 702.16i: Commander's Plate's granted "protection from each color that's
+    /// not in your commander's color identity" is expanded by the layer applier,
+    /// so the card is not flagged inert; a CardType catch-all that names no card
+    /// type (Haktos-style) still is, and so is a PRINTED `EachColor` keyword,
+    /// which no layer pass would ever expand.
+    #[test]
+    fn commanders_plate_protection_grant_is_not_flagged_inert() {
+        use crate::types::ability::ContinuousModification;
+        use crate::types::keywords::{Keyword, ProtectionColorSet, ProtectionTarget};
+        use std::collections::HashMap;
+
+        const TAG: &str = "structural:inert_protection_quality_grant";
+        const PLATE: &str = "Equipped creature gets +3/+3 and has protection from each color that's not in your commander's color identity.\nEquip commander {3}\nEquip {5}";
+        let parsed = crate::parser::parse_oracle_text(
+            PLATE,
+            "Commander's Plate",
+            &["Equip".to_string()],
+            &["Artifact".to_string()],
+            &["Equipment".to_string()],
+        );
+        let mut plate = make_face();
+        plate.name = "Commander's Plate".to_string();
+        plate.oracle_text = Some(PLATE.to_string());
+        plate.abilities = parsed.abilities;
+        plate.triggers = parsed.triggers;
+        plate.static_abilities = parsed.statics;
+        plate.replacements = parsed.replacements;
+        plate.keywords = parsed.extracted_keywords;
+        // Reach guard: the grant really is a typed EachColor protection static.
+        assert!(
+            plate.static_abilities.iter().any(|stat| {
+                stat.modifications.iter().any(|m| {
+                    matches!(
+                        m,
+                        ContinuousModification::AddKeyword {
+                            keyword: Keyword::Protection(ProtectionTarget::EachColor(
+                                ProtectionColorSet::OutsideCommanderColorIdentity
+                            )),
+                        }
+                    )
+                })
+            }),
+            "Commander's Plate must parse to a typed EachColor protection grant"
+        );
+        let mut features = HashMap::new();
+        super::extract_card_features(&plate, &mut features);
+        assert!(
+            !features.contains_key(TAG),
+            "an expanded color-set protection grant must not be flagged inert"
+        );
+
+        // Sibling: an untyped CardType quality that names no card type is inert.
+        let mut haktos = make_face();
+        haktos.keywords = vec![Keyword::Protection(ProtectionTarget::CardType(
+            "each mana value other than the chosen number".to_string(),
+        ))];
+        let mut haktos_features = HashMap::new();
+        super::extract_card_features(&haktos, &mut haktos_features);
+        assert!(haktos_features.contains_key(TAG));
+
+        // Printed EachColor keyword: never expanded, so honestly flagged.
+        let mut printed = make_face();
+        printed.keywords = vec![Keyword::Protection(ProtectionTarget::EachColor(
+            ProtectionColorSet::OutsideCommanderColorIdentity,
+        ))];
+        let mut printed_features = HashMap::new();
+        super::extract_card_features(&printed, &mut printed_features);
+        assert!(printed_features.contains_key(TAG));
+        // Every coverage entry point agrees: the gap list and the parse details
+        // report the printed color-set keyword as unsupported too, while the Plate
+        // (whose set lives in a static grant, not on the face) has no gap and
+        // every parse item supported.
+        assert!(
+            super::card_face_gaps(&printed)
+                .iter()
+                .any(|gap| gap == "Keyword:ProtectionColorSetUnexpanded"),
+            "card_face_gaps must report the printed color-set keyword"
+        );
+        let trigger_registry = super::build_trigger_registry();
+        let static_registry = super::build_static_registry();
+        let printed_details =
+            super::build_parse_details(&printed, &trigger_registry, &static_registry);
+        assert!(
+            printed_details
+                .iter()
+                .any(|item| item.category == ParseCategory::Keyword && !item.supported),
+            "build_parse_details must mark the printed color-set keyword unsupported"
+        );
+        assert!(
+            super::card_face_gaps(&plate).is_empty(),
+            "an expanded color-set grant leaves the Plate with no coverage gap: {:?}",
+            super::card_face_gaps(&plate)
+        );
+        assert!(
+            super::build_parse_details(&plate, &trigger_registry, &static_registry)
+                .iter()
+                .all(|item| item.supported),
+            "every Plate parse item is supported"
+        );
+    }
+
     const TRANSCENDENT_DRAGON_ORACLE: &str = "Flash\nFlying\nWhen this creature enters, if you cast it, counter target spell. If that spell is countered this way, exile it instead of putting it into its owner's graveyard, then you may cast it without paying its mana cost.";
 
     /// A face built from `oracle` the way the export carries it: parsed with the
@@ -15292,6 +15481,51 @@ mod tests {
         );
     }
 
+    /// CR 611.2e: a stamped `WithEntry` onset reaches the parse-diff signature under its own
+    /// key; the `WhenFollowed` default emits nothing, so existing signatures stay byte-identical.
+    /// Reverting the `ability_details` push fails the first assertion.
+    #[test]
+    fn entry_onset_reaches_parse_details_only_when_with_entry() {
+        use crate::types::ability::{AbilityKind, ContinuousEffectOnset, Duration};
+
+        let details = |onset: ContinuousEffectOnset| -> Vec<(String, String)> {
+            let mut def = AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::GenericEffect {
+                    static_abilities: vec![],
+                    duration: None,
+                    target: None,
+                    end_cost: None,
+                },
+            );
+            def.duration = Some(Duration::UntilEndOfTurn);
+            def.entry_onset = onset;
+            build_test_ability_item(&def).details
+        };
+
+        let with_entry = details(ContinuousEffectOnset::WithEntry);
+        assert!(
+            with_entry
+                .iter()
+                .any(|(k, v)| k == "entry onset" && v == "with entry"),
+            "a WithEntry onset must render in the parse details: {with_entry:?}"
+        );
+        assert!(
+            with_entry.iter().any(|(k, _)| k == "duration"),
+            "the onset key must not collide with the duration key under the dedup: {with_entry:?}"
+        );
+
+        let when_followed = details(ContinuousEffectOnset::WhenFollowed);
+        assert!(
+            !when_followed.iter().any(|(k, _)| k == "entry onset"),
+            "the WhenFollowed default must emit no onset key: {when_followed:?}"
+        );
+        assert!(
+            when_followed.iter().any(|(k, _)| k == "duration"),
+            "reach guard: the default def still renders its duration: {when_followed:?}"
+        );
+    }
+
     /// #7406 — a trigger's `attack_target_filter` must reach the parse-diff
     /// signature.
     ///
@@ -15366,6 +15600,72 @@ mod tests {
             8,
             "every AttackTargetFilter variant must map to a distinct label: {labels:?}"
         );
+    }
+
+    #[test]
+    fn attack_cost_condition_reaches_parse_details() {
+        let oracle = "If this creature hasn't been exerted this turn, you may exert it as it attacks. When you do, untap all other creatures you control and after this phase, there is an additional combat phase. (An exerted creature won't untap during your next untap step.)";
+        let parsed = crate::parser::parse_oracle_text(
+            oracle,
+            "Combat Celebrant",
+            &[],
+            &["Creature".to_string()],
+            &[],
+        );
+        let mut face = CardFace {
+            name: "Combat Celebrant".into(),
+            oracle_text: Some(oracle.into()),
+            abilities: parsed.abilities,
+            triggers: parsed.triggers,
+            static_abilities: parsed.statics,
+            replacements: parsed.replacements,
+            keywords: parsed.extracted_keywords,
+            parse_warnings: parsed.parse_warnings,
+            ..Default::default()
+        };
+        assert_eq!(face.triggers.len(), 1);
+        assert!(face.triggers[0].is_attack_exert_permission());
+        assert!(face.triggers[0].execute.is_some());
+        assert!(face.triggers[0].condition.is_none());
+
+        let items = build_parse_details_for_face(&face);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].category, ParseCategory::Trigger);
+        assert!(items[0].is_fully_supported());
+        assert!(items[0].details.iter().any(|(key, value)| {
+            key == "attack cost condition" && value == "not (source has been exerted this turn)"
+        }));
+
+        face.triggers[0].condition = Some(crate::types::ability::TriggerCondition::LostLife);
+        for (condition, expected) in [
+            (
+                face.triggers[0].attack_cost_condition.clone(),
+                Some("not (source has been exerted this turn)"),
+            ),
+            (
+                Some(StaticCondition::SourceExertedThisTurn),
+                Some("source has been exerted this turn"),
+            ),
+            (None, None),
+        ] {
+            face.triggers[0].attack_cost_condition = condition;
+            let items = build_parse_details_for_face(&face);
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].category, ParseCategory::Trigger);
+            assert!(items[0].is_fully_supported());
+            let details = &items[0].details;
+            assert_eq!(
+                details
+                    .iter()
+                    .find(|(key, _)| key == "attack cost condition")
+                    .map(|(_, value)| value.as_str()),
+                expected,
+                "attack-cost polarity and absence must remain distinct: {details:?}"
+            );
+            assert!(details
+                .iter()
+                .any(|(key, value)| key == "condition" && value == "lost life this turn"));
+        }
     }
 
     /// Exact cardinality and counter-removal eligibility are semantic parser
@@ -17094,6 +17394,30 @@ have been revealed, Aggressive Detective deals 2 damage to each opponent.";
         assert!(!obj.has_unimplemented_mechanics());
         obj.keywords.push(Keyword::Unknown("Bogus".to_string()));
         assert!(obj.has_unimplemented_mechanics());
+    }
+
+    /// CR 603.10a + CR 704.5n: Rhuk's deferred dies leg must surface as an
+    /// engine-visible gap, not as a silently supported ordinary Attach — the
+    /// coverage authority reads the trigger's effect, never the PR prose.
+    #[test]
+    fn rhuk_dies_leg_reports_the_departure_attachment_gap() {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            "Trample, haste\nWhenever an equipped creature you control other than Rhuk attacks or dies, you may attach all Equipment attached to that creature to Rhuk.",
+            "Rhuk, Hexgold Nabber",
+            &["Trample".to_string(), "Haste".to_string()],
+            &["Legendary".to_string()],
+            &["Creature".to_string()],
+        );
+        let mut face = make_face();
+        face.name = "Rhuk, Hexgold Nabber".to_string();
+        face.abilities = parsed.abilities;
+        face.triggers = parsed.triggers;
+        let gaps = super::card_face_gaps(&face);
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.contains("departure_attachment_relation")),
+            "the deferred dies leg must be an engine-visible gap: {gaps:?}"
+        );
     }
 
     fn make_face() -> CardFace {
@@ -24512,6 +24836,19 @@ have been revealed, Aggressive Detective deals 2 damage to each opponent.";
         assert!(
             items.is_empty(),
             "modeled tree must emit no unsupported item"
+        );
+    }
+}
+
+#[cfg(test)]
+mod attacked_referent_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn attacked_referent_is_named_in_coverage_text() {
+        assert_eq!(
+            fmt_target(&TargetFilter::AttackedPlayerOrPlaneswalker),
+            "the player or planeswalker it's attacking"
         );
     }
 }
