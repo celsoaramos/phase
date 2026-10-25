@@ -277,5 +277,8 @@
   },
   {
     "branch": "card/reveal-cost-fail-closed-1025"
+  },
+  {
+    "branch": "card/paused-resolution-answer-observers"
   }
 ]
