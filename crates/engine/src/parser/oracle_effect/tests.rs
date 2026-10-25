@@ -86061,7 +86061,8 @@ fn repeat_process_directive_unconditional_cap_is_a_counted_repeat() {
 /// its loop predicate, and neither the bare directive nor "any number of times" is
 /// promoted to an unconditional fixed repeat. The bare directive is the structural
 /// `Bare` outcome (CR 608.2c: reached through its clause's gate); "any number of
-/// times" and "if you do" stay consume-only; "you may" stays the controller's choice.
+/// times" stays consume-only; "if you do" loops while the optional instruction was
+/// performed; "you may" stays the controller's choice.
 #[test]
 fn repeat_process_directive_conditional_or_uncapped_is_not_a_counted_repeat() {
     let mut ctx = ParseContext::default();
@@ -86076,18 +86077,22 @@ fn repeat_process_directive_conditional_or_uncapped_is_not_a_counted_repeat() {
         try_parse_repeat_process_directive("repeat this process", &mut ctx),
         Some(RepeatProcessOutcome::Bare)
     ));
-    for text in [
-        "repeat this process any number of times",
-        "if you do, repeat this process",
-    ] {
-        assert!(
-            matches!(
-                try_parse_repeat_process_directive(text, &mut ctx),
-                Some(RepeatProcessOutcome::ConsumeOnly)
-            ),
-            "{text}"
-        );
-    }
+    assert!(matches!(
+        try_parse_repeat_process_directive("repeat this process any number of times", &mut ctx),
+        Some(RepeatProcessOutcome::ConsumeOnly)
+    ));
+    // CR 608.2c: "If you do, repeat this process" (Insatiable Frugivore,
+    // Primal Surge) repeats only while the preceding optional instruction was
+    // performed — an uncapped loop gated on that outcome, never a fixed count.
+    assert!(matches!(
+        try_parse_repeat_process_directive("if you do, repeat this process", &mut ctx),
+        Some(RepeatProcessOutcome::Continuation(
+            RepeatContinuation::WhileCondition {
+                max_iterations: None,
+                ..
+            }
+        ))
+    ));
     assert!(matches!(
         try_parse_repeat_process_directive("you may repeat this process", &mut ctx),
         Some(RepeatProcessOutcome::Continuation(
