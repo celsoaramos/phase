@@ -633,7 +633,17 @@ pub fn resolve(
             filter,
             TargetFilter::ParentTarget | TargetFilter::ParentTargetSlot { .. }
         ) {
-            if let Some(scoped_player) = ability.scoped_player {
+            // CR 608.2d + CR 701.21a: a parser-named optional actor ("its
+            // controller may sacrifice it" — Star Athlete) IS the instructed
+            // player. It outranks the event-referent `scoped_player`, which an
+            // attack trigger stamps with a player of that event, not with the
+            // player the instruction names.
+            let named_actor = ability.optional_player.as_ref().and_then(|actor| {
+                crate::game::targeting::resolve_effect_player_ref(state, ability, actor)
+            });
+            if let Some(actor) = named_actor {
+                vec![actor]
+            } else if let Some(scoped_player) = ability.scoped_player {
                 vec![scoped_player]
             } else {
                 vec![obj.controller]

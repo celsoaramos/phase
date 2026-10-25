@@ -3325,6 +3325,23 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                     Some(group) => TargetFilter::DeclaredPlayer { group },
                     None => TargetFilter::Opponent,
                 });
+            } else if def.optional_for.is_none()
+                && def.optional_player.is_none()
+                && matches!(
+                    &*def.effect,
+                    Effect::Sacrifice {
+                        target: TargetFilter::ParentTarget | TargetFilter::ParentTargetSlot { .. },
+                        ..
+                    }
+                )
+                && super::subject::parent_target_controller_may_sacrifice(&fragment_lower)
+            {
+                // CR 608.2d + CR 701.21a: "its controller may sacrifice it" — the
+                // chosen object's controller announces the may and is the only
+                // player who can sacrifice it (Star Athlete). The effect node has
+                // no player slot, so the subject-anchored classifier below would
+                // read the OBJECT anaphor and leave the may with the controller.
+                def.optional_player = Some(TargetFilter::ParentTargetController);
             } else if def.optional_for.is_none() && def.optional_player.is_none() {
                 def.optional_player =
                     subject_anchored_optional_actor(&def, ActorBindingWindow::ThisResolution);

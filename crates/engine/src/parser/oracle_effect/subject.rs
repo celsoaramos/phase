@@ -142,6 +142,29 @@ pub(crate) fn targeted_opponent_may_player_action(lower: &str) -> bool {
     .is_ok()
 }
 
+/// CR 608.2d + CR 701.21a: true when `lower` begins with "its controller may
+/// sacrifice <that object>" — the optional sacrifice of an object an earlier
+/// instruction chose (Star Athlete: "choose up to one target nonland permanent.
+/// Its controller may sacrifice it."). The lowered `Sacrifice { ParentTarget }`
+/// carries no player slot, so the clause's own grammar is the only record that
+/// the may belongs to the chosen object's controller, not to the ability's
+/// controller. Read by the `optional_player` stamp in
+/// `assembly::assemble_effect_chain`.
+pub(crate) fn parent_target_controller_may_sacrifice(lower: &str) -> bool {
+    preceded(
+        tag::<_, _, OracleError<'_>>("its controller may sacrifice "),
+        alt((
+            tag("it"),
+            tag("that permanent"),
+            tag("that creature"),
+            tag("that artifact"),
+            tag("that enchantment"),
+        )),
+    )
+    .parse(lower)
+    .is_ok()
+}
+
 pub(super) fn try_parse_subject_predicate_ast(
     text: &str,
     ctx: &mut ParseContext,

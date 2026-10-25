@@ -1929,6 +1929,7 @@ mod slime_molding_x_token_pt;
 mod solitude_up_to_one_exile_lifegain_rider;
 mod speed_maxspeed_recursion;
 mod squirrel_perf_probe;
+mod star_athlete_decline_damage;
 mod stargaze_dynamic_keep;
 mod station_threshold_teardown_1134;
 mod std_bend_saddle_exchange_batch;
