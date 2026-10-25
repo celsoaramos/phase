@@ -857,9 +857,6 @@ impl EventObjectSnapshot {
             // Classify Unsupported so a future goaded event-subject filter fails the reach gate
             // LOUDLY rather than silently reading an ungoaded snapshot. Deferred follow-up
             // (option a): snapshot goaded onto EventObjectSnapshot + ZoneChangeRecord.
-            // CR 301.5: the host is a second live object read through a nested
-            // filter; the snapshot records attachments, not the host's state.
-            FilterProp::AttachedToMatching { .. } => Unsupported,
             FilterProp::Goaded
             // CR 722.3a: prepared is a designation on the LIVE permanent
             // (`GameObject::prepared`). The departure ledger carries it
@@ -892,6 +889,12 @@ impl EventObjectSnapshot {
             | FilterProp::AttachedTo { to: AttachmentReferent::Recipient }
             | FilterProp::AttachedTo { to: AttachmentReferent::Player { .. } }
             | FilterProp::AttachedTo { to: AttachmentReferent::DeclaredTarget { .. } }
+            // CR 701.3a: event snapshots carry no host relation, exactly as they
+            // carry none for the other four referents, so a `Host` filter must
+            // fail the reach gate LOUDLY rather than read an unhosted snapshot.
+            | FilterProp::AttachedTo {
+                to: AttachmentReferent::Host { .. },
+            }
             | FilterProp::Unpaired
             | FilterProp::OtherThanTriggerObject
             | FilterProp::MostPrevalentCreatureTypeIn { .. }

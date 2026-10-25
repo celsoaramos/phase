@@ -249,6 +249,11 @@ fn filter_prop_deps(prop: &FilterProp) -> RetargetDeps {
         FilterProp::AttachedTo { to } => match to {
             AttachmentReferent::DeclaredTarget { slot } => RetargetDeps::Slots(vec![*slot]),
             AttachmentReferent::Player { player } => controller_deps(player),
+            // CR 701.3a: the filter-matched host axis reads the parent referent
+            // (any announced position), not a numbered slot; the mass child that
+            // carries it owns no slot of its own, so no class card routes through
+            // this dependency — the conservative all-positions answer is exact.
+            AttachmentReferent::Host { .. } => RetargetDeps::AllPositions,
             AttachmentReferent::Source | AttachmentReferent::Recipient => RetargetDeps::Independent,
         },
         FilterProp::CombatRelation { subject, .. } => match subject {
@@ -281,8 +286,7 @@ fn filter_prop_deps(prop: &FilterProp) -> RetargetDeps {
         FilterProp::Not { prop } => filter_prop_deps(prop),
         FilterProp::DifferentNameFrom { filter }
         | FilterProp::TargetsOnly { filter }
-        | FilterProp::Targets { filter }
-        | FilterProp::AttachedToMatching { host: filter } => retarget_dependencies(filter),
+        | FilterProp::Targets { filter } => retarget_dependencies(filter),
         FilterProp::DistinctFrom { reference } => retarget_dependencies(reference),
         // CR 115.7e: a shared-quality or same-name read against another
         // object is not modeled precisely; it routes to the validator-checked
@@ -912,3 +916,26 @@ impl<'s> RetargetSearch<'s> {
 #[cfg(test)]
 #[path = "retarget_completion_tests.rs"]
 mod tests;
+
+/// CR 701.3a: P23 (retarget half) — the filter-matched host axis reads the
+/// parent referent, so a retarget completion compares all positions.
+#[cfg(test)]
+mod attached_set_retarget_tests {
+    use super::*;
+    use crate::types::ability::{AttachmentReferent, FilterProp, TargetFilter};
+
+    #[test]
+    fn p23_host_attachment_deps_are_all_positions() {
+        let prop = FilterProp::AttachedTo {
+            to: AttachmentReferent::Host {
+                filter: Box::new(TargetFilter::ParentTarget),
+            },
+        };
+        assert_eq!(filter_prop_deps(&prop), RetargetDeps::AllPositions);
+        assert!(!AttachmentReferent::Host {
+            filter: Box::new(TargetFilter::ParentTarget)
+        }
+        .reads_declared_slot());
+        assert!(AttachmentReferent::DeclaredTarget { slot: 0 }.reads_declared_slot());
+    }
+}
