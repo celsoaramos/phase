@@ -274,7 +274,7 @@ mod cruel_calculations_mill_count;
 mod crystalline_giant_random_counter_kind;
 mod culling_scales_lowest_mana_value_target;
 mod cultivate_split_destination;
-mod cultivator_colossus_repeat;
+mod if_you_do_repeat_process;
 mod culvert_ambusher_turn_face_up_force_block;
 mod cumber_stone_opponent_debuff;
 mod cunning_rhetoric_attacks_you_scope_4736;

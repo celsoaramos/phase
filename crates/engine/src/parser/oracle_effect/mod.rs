@@ -40477,21 +40477,9 @@ enum RepeatProcessOutcome {
 /// process's own "you may" (`OptionalEffectPerformed`), and the bare form is the
 /// structural `Bare` outcome (reached only through the gate of the comma-joined
 /// clause it trails).
-#[cfg(test)]
 fn try_parse_repeat_process_directive(
     text: &str,
     ctx: &mut ParseContext,
-) -> Option<RepeatProcessOutcome> {
-    try_parse_repeat_process_directive_inheriting(text, ctx, false)
-}
-
-/// As [`try_parse_repeat_process_directive`], with `inherited_if_you_do` set when
-/// the directive was coordinated with an "if you do"-gated instruction of the same
-/// sentence, so a bare "repeat this process" reads as "if you do, repeat …".
-fn try_parse_repeat_process_directive_inheriting(
-    text: &str,
-    ctx: &mut ParseContext,
-    inherited_if_you_do: bool,
 ) -> Option<RepeatProcessOutcome> {
     use crate::types::ability::RepeatContinuation;
 
@@ -40579,7 +40567,6 @@ fn try_parse_repeat_process_directive_inheriting(
     })?;
 
     let (cap, cap_token, you_may, if_you_do, more_times) = parsed_directive;
-    let if_you_do = if_you_do || (inherited_if_you_do && !you_may);
     if let Some(condition) = condition {
         return Some(RepeatProcessOutcome::Continuation(
             RepeatContinuation::WhileCondition {
@@ -43001,7 +42988,6 @@ fn parse_effect_chain_ir_body(
             head_carries_player_subject(head, ctx)
         }),
     );
-    let chunks = sequence::split_if_you_do_repeat_process_tail(chunks);
     // CR 611.2a + CR 608.2c: expand any chunk whose leading duration governs conjuncts the
     // single-clause parse discarded. The expanded conjuncts become ORDINARY chunks of THIS
     // chain, which is the only construction under which chain-level anaphor state
@@ -43936,25 +43922,10 @@ fn parse_effect_chain_ir_body(
         //     per-iteration controller decision (`ControllerChoice`).
         //   - "if you do, repeat this process" → `WhileCondition` on the
         //     process's own "you may" (`OptionalEffectPerformed`).
-        //   - bare "repeat this process" — recognized and consumed so the
-        //     directive doesn't leak an `Unimplemented` gap; sets no predicate.
-        // CR 608.2c + CR 118.12: a bare directive coordinated in the SAME sentence
-        // with an "if you do"-gated instruction ("If you do, draw a card and
-        // repeat this process" — split by `split_if_you_do_repeat_process_tail`)
-        // carries that gate too.
-        let inherits_if_you_do = chunk_idx
-            .checked_sub(1)
-            .and_then(|prev| chunks.get(prev))
-            .is_some_and(|prev| prev.boundary_after == Some(ClauseBoundary::Comma))
-            && builder.clauses_mut().last().is_some_and(|clause| {
-                clause
-                    .condition
-                    .as_ref()
-                    .is_some_and(AbilityCondition::is_optional_effect_performed)
-            });
-        if let Some(outcome) =
-            try_parse_repeat_process_directive_inheriting(normalized_text, ctx, inherits_if_you_do)
-        {
+        //   - bare "repeat this process" — the structural `Bare` outcome when it
+        //     trails a comma-joined clause (reached only through that clause's
+        //     gate); after a sentence break it is consumed without a predicate.
+        if let Some(outcome) = try_parse_repeat_process_directive(normalized_text, ctx) {
             match outcome {
                 RepeatProcessOutcome::Continuation(continuation) => {
                     pending_repeat_until = Some(continuation);
