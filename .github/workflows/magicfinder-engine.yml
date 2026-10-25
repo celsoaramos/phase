@@ -93,10 +93,25 @@ jobs:
           test -s client/public/card-data.json
       - name: Testes do motor (phase-engine)
         working-directory: phase
-        run: cargo test -p phase-engine --no-fail-fast
+        run: |
+          set -o pipefail
+          cargo test -p phase-engine --no-fail-fast 2>&1 | tee ../engine-tests.log
       - name: Testes da IA (phase-ai)
         working-directory: phase
-        run: cargo test -p phase-ai --no-fail-fast
+        run: |
+          set -o pipefail
+          cargo test -p phase-ai --no-fail-fast 2>&1 | tee ../ai-tests.log
+      # O log inteiro passa de 30 mil linhas e a API só entrega o fim: a falha de um
+      # teste do --lib ficava no meio, invisível. Repete aqui só o que falhou.
+      - name: Resumo das falhas
+        if: failure()
+        run: |
+          for f in engine-tests.log ai-tests.log; do
+            [ -f "$f" ] || continue
+            echo "===== $f"
+            grep -E '\.\.\. FAILED$|^test result: FAILED' "$f" | head -100 || true
+            awk '/^---- .* stdout ----$/{p=1; n=0} p{print; n++; if (n>40) p=0}' "$f" | head -600 || true
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: card-data
