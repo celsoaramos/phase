@@ -203,17 +203,14 @@ pub fn resolve(
         // which is what keeps "no target declared" and "the referent went stale"
         // from collapsing into the same OUTCOME even though they share this arm.
         [] => ability.source_id,
-        // CR 701.27a + CR 701.27c: a variable-count announced set ("transform any
-        // number of target …") transforms each chosen permanent; one that can't
-        // transform does nothing and never aborts the rest.
-        many => {
-            transform_each(state, many, events);
-            events.push(GameEvent::EffectResolved {
-                kind: EffectKind::Transform,
-                source_id: ability.source_id,
-                subject: None,
-            });
-            return Ok(());
+        // CR 115.1: two object targets are not a single-scope transform subject.
+        // The variable-count "transform any number of …" set is an untargeted
+        // resolution-time choice, applied by `transform_each` from the
+        // `EffectZoneChoice` handler, never an announced target list.
+        _ => {
+            return Err(EffectError::InvalidParam(
+                "transform expects exactly one object target".to_string(),
+            ))
         }
     };
 
@@ -234,8 +231,7 @@ pub fn resolve(
 /// CR 701.27a + CR 701.27c: transform each permanent of a chosen set. Only
 /// double-faced permanents can transform; any other (or one a "can't transform"
 /// effect stops) is a per-object no-op, so one failure never aborts the set.
-/// Shared by the announced multi-target set and the resolution-time
-/// `EffectZoneChoice` (`EffectKind::Transform`).
+/// Applied by the resolution-time `EffectZoneChoice` (`EffectKind::Transform`).
 pub(crate) fn transform_each(
     state: &mut GameState,
     chosen: &[crate::types::identifiers::ObjectId],

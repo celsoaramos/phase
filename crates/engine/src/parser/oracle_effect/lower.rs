@@ -8761,19 +8761,17 @@ pub(super) fn parse_each_of_up_to_damage_target<'a>(
 /// and collapse the count to a fixed 1 (issue #458).
 /// `put` is intentionally absent; see `REQUIRED_TARGET_COUNT_ONLY_VERBS`.
 const MULTI_TARGET_VERBS: &[&str] = &[
-    "exile",
-    "tap",
-    "untap",
-    "goad",
-    "detain",
-    "return",
-    "destroy",
-    "choose",
-    // CR 701.27a + CR 701.28a: "transform/convert any number of <permanents>"
-    // (Tovolar, Dire Overlord) chooses a set of permanents to transform.
-    "transform",
-    "convert",
+    "exile", "tap", "untap", "goad", "detain", "return", "destroy", "choose",
 ];
+
+/// CR 107.1c + CR 608.2d: verbs whose "any number of <permanents>" form is an
+/// UNTARGETED set chosen while the effect resolves ("transform any number of
+/// Human Werewolves you control" — Tovolar, Dire Overlord), and nothing more.
+/// They stay out of `MULTI_TARGET_VERBS`: a declared "up to one target …"
+/// transform keeps its single-target shape, because `transform_effect::resolve`
+/// reads an empty subject list as the printed self-transform and cannot tell a
+/// declined declared target from it (Waxing Moon, Attentive Skywarden).
+const UNTARGETED_CHOICE_ONLY_VERBS: &[&str] = &["transform", "convert"];
 
 /// CR 601.2c + CR 115.1a: Verbs admitted ONLY to the required announced-count
 /// extractors (`extract_exact_target_multi_target`,
@@ -9006,12 +9004,21 @@ pub(super) fn strip_any_number_quantifier(text: &str) -> (String, Option<MultiTa
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
     let verb = lower.split_whitespace().next().unwrap_or("");
-    if !MULTI_TARGET_VERBS.contains(&verb) {
+    let untargeted_only = UNTARGETED_CHOICE_ONLY_VERBS.contains(&verb);
+    if !MULTI_TARGET_VERBS.contains(&verb) && !untargeted_only {
         return (text.to_string(), None);
     }
 
     let verb_end = lower.find(' ').map(|i| i + 1).unwrap_or(0);
     let (verb_tp, after_verb_tp) = tp.split_at(verb_end);
+    if untargeted_only
+        && (tag::<_, _, OracleError<'_>>("any number of ")
+            .parse(after_verb_tp.lower)
+            .is_err()
+            || nom_primitives::scan_contains(after_verb_tp.lower, "target "))
+    {
+        return (text.to_string(), None);
+    }
 
     let (rest, spec) = strip_leading_quantifier(after_verb_tp.original);
     match spec {
