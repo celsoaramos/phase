@@ -9,7 +9,7 @@ use nom::Parser;
 use crate::types::ability::{
     ChosenCounterCountCondition, Comparator, CounterMoveSelection, CounterTransferMode,
     DoublePTMode, DoubleTarget, Effect, EventCounterReproductionCount, FilterProp, MultiTargetSpec,
-    ObjectScope, QuantityExpr, QuantityRef, TargetFilter,
+    ObjectScope, QuantityExpr, QuantityRef, TargetFilter, XModification,
 };
 use crate::types::counter::{parse_counter_type, CounterType};
 use crate::types::mana::ManaColor;
@@ -18,11 +18,13 @@ use super::super::oracle_nom::bridge::nom_on_lower;
 use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_nom::quantity as nom_quantity;
 use super::super::oracle_target::{
-    parse_target, parse_target_with_ctx, parse_type_phrase_folding,
-    parse_type_phrase_folding_with_ctx,
+    parse_target, parse_target_with_ctx, parse_type_phrase_folding_with_ctx,
 };
 use super::super::oracle_util::{parse_count_expr, parse_number};
-use super::lower::{parse_for_each_multiplier_prefix, strip_optional_target_prefix};
+use super::lower::{
+    parse_bounded_target_cardinality, parse_for_each_multiplier_prefix,
+    strip_optional_target_prefix,
+};
 use super::{resolve_it_pronoun, ParseContext};
 #[cfg(debug_assertions)]
 use crate::parser::oracle_ir::ast::assert_no_compound_remainder;
@@ -372,6 +374,28 @@ fn resolve_counter_placement_target<'a>(
     }) {
         let on_offset = lower.len() - after_target.len();
         (&text[on_offset..], Some(MultiTargetSpec::exact(count)))
+    } else if let Some((spec, after_bounded)) = nom_on_lower(on_rest, on_rest, |i| {
+        // CR 115.1a + CR 601.2c + CR 122.1: "[each of ]one or two target …" / "[each of ]one, two, or
+        // three target …" announce a bounded target set (Predictive
+        // Preparations). The stem recognition is `parse_bounded_target_cardinality`
+        // (lower.rs), the single authority shared with the damage grammar; the
+        // trailing `space1` + `peek("<article> target ")` leaves the "target …"
+        // span unconsumed for the downstream `parse_target_with_ctx` and declines
+        // article-less ("one or two creatures") and zero-space ("one or twotarget")
+        // text. min is 1, so CR 115.6 (zero-target legality) does not apply.
+        let (i, _) = opt(tag::<_, _, OracleError<'_>>("each of ")).parse(i)?;
+        let (after_stem, spec) = parse_bounded_target_cardinality(i)?;
+        let (after_ws, _) = space1::<_, OracleError<'_>>(after_stem)?;
+        peek(alt((
+            tag::<_, _, OracleError<'_>>("target "),
+            tag("other target "),
+            tag("another target "),
+        )))
+        .parse(after_ws)?;
+        Ok((after_ws, spec))
+    }) {
+        let on_offset = lower.len() - after_bounded.len();
+        (&text[on_offset..], Some(spec))
     } else {
         let on_offset = lower.len() - on_rest.len();
         (&text[on_offset..], None)
@@ -796,7 +820,7 @@ fn parse_counter_for_each_suffix(remainder: &str) -> Option<(QuantityExpr, &str)
 /// event-context amounts ("that much", "that many", "the result"). The
 /// equivalent token-creation and life-gain paths already fall back to
 /// `parse_event_context_quantity` after their primary quantity parse
-/// (`token.rs` count-expression resolution, `imperative.rs::parse_life_equal_quantity`);
+/// (`oracle_util::parse_equal_to_count`, the token and life count positions' chain);
 /// the counter path is the remaining gap, so it gets the same fallback here
 /// rather than leaking "the result" into the shared `parse_quantity_ref` leaf
 /// (which would break the `parse_cda_quantity` "returns None for the bare
@@ -1052,8 +1076,16 @@ pub(super) fn try_parse_remove_counter(lower: &str, ctx: &mut ParseContext) -> O
     } else if let Some(((), rest)) = nom_on_lower(after_remove, after_remove, |i| {
         value((), tag("up to ")).parse(i)
     }) {
-        let (n, r) = parse_number(rest.trim())?;
-        (QuantityExpr::Fixed { value: n as i32 }, r)
+        // CR 608.2d + CR 107.3a: "remove up to N [kind] counters" lets the
+        // controller choose, at resolution, how many (zero through N) and — for
+        // the untyped form — which kinds. The count is an effect quantity, so
+        // `parse_count_expr` keeps an announced X as `Variable("X")` (Hex
+        // Parasite's "{X}{B/P}: Remove up to X counters") instead of the X→0
+        // reading of `parse_number`. `UpTo` carries the "may remove fewer"
+        // grammar to `resolve_remove`, which caps the interactive selection at
+        // the resolved maximum (Glissa Sunslayer, Gremlin Mine, Render Inert).
+        let (max, r) = parse_count_expr(rest.trim())?;
+        (QuantityExpr::up_to(max), r)
     } else {
         let (n, r) = parse_number(after_remove)?;
         (QuantityExpr::Fixed { value: n as i32 }, r)
@@ -1088,8 +1120,10 @@ pub(super) fn try_parse_remove_counter(lower: &str, ctx: &mut ParseContext) -> O
     // MULTI-SOURCE choice. The single-source interactive path (Rhys, Tetravus)
     // cannot model "from among", so leave such cards Unimplemented (out of scope)
     // rather than silently collapsing them to a single-source removal (Galloping
-    // Lizrog, Eventide's Shadow). Scoped to the `UpTo` ("any number") branch so
-    // non-interactive removals are untouched.
+    // Lizrog, Eventide's Shadow, and the capped "remove up to three stun
+    // counters from among all permanents" of Sensational Spider-Man). Scoped to
+    // the `UpTo` ("any number" / "up to N") branches so non-interactive removals
+    // are untouched.
     if count.is_up_to()
         && nom_on_lower(target_text, target_text, |i| {
             value((), tag("among ")).parse(i)
@@ -1233,10 +1267,10 @@ fn resolve_counter_target(text: &str, ctx: &mut ParseContext) -> TargetFilter {
         // CR 608.2k + CR 301.5a: Trigger-context "that creature" → triggering source.
         return TargetFilter::TriggeringSource;
     }
-    // The fallback parses with a fresh `ParseContext` so it stays byte-for-byte
-    // equivalent to a bare `parse_target(text)` call — the shared `ctx` is read
-    // only by the anaphor guards above.
-    let (t, _rem) = parse_target(text);
+    // CR 608.2c: the fallback reads only the caller's player antecedents, so a
+    // "that player controls" suffix binds to the player the ability already
+    // named. Object anaphors are settled by the guards above, never here.
+    let (t, _rem) = ctx.with_player_antecedents(|scoped| parse_target_with_ctx(text, scoped));
     #[cfg(debug_assertions)]
     assert_no_compound_remainder(_rem, text);
     t
@@ -1337,7 +1371,8 @@ pub(super) fn try_parse_move_counters<'a>(
 
     // Compute byte offset into original `text` for parse_target.
     let offset_in_text = text.len() - after_on.len();
-    let (parsed_target, remainder) = parse_target(&text[offset_in_text..]);
+    let (parsed_target, remainder) =
+        parse_target_with_ctx(&text[offset_in_text..], &mut ctx.clone_player_antecedents());
     let target =
         counter_anaphor_created_token_binding(after_on.trim(), ctx).unwrap_or(parsed_target);
 
@@ -1576,8 +1611,24 @@ pub(super) fn try_parse_multiply_counter(lower: &str, ctx: &mut ParseContext) ->
 }
 
 /// CR 701.10: Dispatch "double the ..." to counter-doubling, life-doubling,
-/// mana-doubling, or P/T-doubling.
+/// mana-doubling, or P/T-doubling; CR 107.3e: "double the value of X" to the
+/// triggering spell's X.
 pub(super) fn try_parse_double_effect(lower: &str, ctx: &mut ParseContext) -> Option<Effect> {
+    // CR 107.3e: in a spell-cast trigger body, "the value of X" is the X of the
+    // spell that caused the trigger (the body's object anaphor is pinned to
+    // `TriggeringSource` only by a spell-cast head). Anywhere else nothing names
+    // whose X it is, so the clause stays an honest gap.
+    if all_consuming(tag::<_, _, OracleError<'_>>("double the value of x"))
+        .parse(lower)
+        .is_ok()
+    {
+        return Some(match ctx.object_pronoun_ref {
+            Some(TargetFilter::TriggeringSource) => Effect::ModifyAnnouncedX {
+                modification: XModification::DOUBLE,
+            },
+            _ => Effect::unimplemented("double_value_of_x_without_triggering_spell", lower),
+        });
+    }
     // CR 701.10e: "double the number of each kind of counter on ..." → all counter
     // kinds. The doubled amount is intrinsic to the resolver ("give as many of
     // those counters as already present"), never a `QuantityExpr` carrier.
@@ -1654,7 +1705,8 @@ pub(super) fn try_parse_double_effect(lower: &str, ctx: &mut ParseContext) -> Op
         if nom_on_lower(rest, rest, |i| value((), tag("target ")).parse(i)).is_some()
             && rest.contains("life total")
         {
-            let (target, _) = parse_target(rest);
+            let (target, _) =
+                ctx.with_player_antecedents(|scoped| parse_target_with_ctx(rest, scoped));
             return Some(Effect::Double {
                 target_kind: DoubleTarget::LifeTotal,
                 target,
@@ -1698,6 +1750,10 @@ fn parse_pt_multiplier_word(input: &str) -> OracleResult<'_, u32> {
 /// 1. "{mult} <target>'s power [and toughness]" (possessive, Bulk Up / Tifa).
 /// 2. "{mult} its power [and toughness]" (anaphoric "it").
 /// 3. "{mult} the power/toughness of <target|each filter>".
+///
+/// Every arm hands its unconsumed remainder to `finish_multiply_pt`, so a
+/// same-sentence tail the arm doesn't parse fails the clause closed instead of
+/// being dropped.
 pub(super) fn try_parse_multiply_pt_effect(lower: &str, ctx: &mut ParseContext) -> Option<Effect> {
     let (factor, after_word) = nom_on_lower(lower, lower, parse_pt_multiplier_word)?;
 
@@ -1726,10 +1782,11 @@ pub(super) fn try_parse_multiply_pt_effect(lower: &str, ctx: &mut ParseContext) 
         })
         .is_some();
         if !owned_by_sibling {
-            let (target, rem) = parse_target(after_word);
+            let (target, rem) =
+                parse_target_with_ctx(after_word, &mut ctx.clone_player_antecedents());
             if !matches!(target, TargetFilter::Any) {
                 let rem_lower = rem.to_lowercase();
-                let mode: Option<DoublePTMode> = nom_on_lower(&rem_lower, &rem_lower, |i| {
+                let mode = nom_on_lower(&rem_lower, &rem_lower, |i| {
                     alt((
                         value(
                             DoublePTMode::PowerAndToughness,
@@ -1739,14 +1796,17 @@ pub(super) fn try_parse_multiply_pt_effect(lower: &str, ctx: &mut ParseContext) 
                         value(DoublePTMode::Toughness, tag("'s toughness")),
                     ))
                     .parse(i)
-                })
-                .map(|(m, _)| m);
-                if let Some(mode) = mode {
-                    return Some(Effect::DoublePT {
-                        mode,
-                        target,
-                        factor,
-                    });
+                });
+                if let Some((mode, tail)) = mode {
+                    return Some(finish_multiply_pt(
+                        Effect::DoublePT {
+                            mode,
+                            target,
+                            factor,
+                        },
+                        tail,
+                        lower,
+                    ));
                 }
             }
         }
@@ -1756,21 +1816,24 @@ pub(super) fn try_parse_multiply_pt_effect(lower: &str, ctx: &mut ParseContext) 
     if let Some(((), rest)) =
         nom_on_lower(after_word, after_word, |i| value((), tag("its ")).parse(i))
     {
-        let mode: Option<DoublePTMode> = nom_on_lower(rest, rest, |i| {
+        let mode = nom_on_lower(rest, rest, |i| {
             alt((
                 value(DoublePTMode::PowerAndToughness, tag("power and toughness")),
                 value(DoublePTMode::Power, tag("power")),
                 value(DoublePTMode::Toughness, tag("toughness")),
             ))
             .parse(i)
-        })
-        .map(|(m, _)| m);
-        if let Some(mode) = mode {
-            return Some(Effect::DoublePT {
-                mode,
-                target: resolve_it_pronoun(ctx),
-                factor,
-            });
+        });
+        if let Some((mode, tail)) = mode {
+            return Some(finish_multiply_pt(
+                Effect::DoublePT {
+                    mode,
+                    target: resolve_it_pronoun(ctx),
+                    factor,
+                },
+                tail,
+                lower,
+            ));
         }
         return None;
     }
@@ -1796,24 +1859,49 @@ pub(super) fn try_parse_multiply_pt_effect(lower: &str, ctx: &mut ParseContext) 
     })
     .is_some()
     {
-        let (target, _) = parse_target(after_mode);
-        return Some(Effect::DoublePT {
-            mode,
-            target,
-            factor,
-        });
+        let (target, tail) =
+            ctx.with_player_antecedents(|scoped| parse_target_with_ctx(after_mode, scoped));
+        return Some(finish_multiply_pt(
+            Effect::DoublePT {
+                mode,
+                target,
+                factor,
+            },
+            tail,
+            lower,
+        ));
     }
 
     // "each creature you control" / "each other creature" / "each Dragon" → DoublePTAll
     let ((), filter_text) = nom_on_lower(after_mode, after_mode, |i| {
         value((), alt((tag("each "), tag("all ")))).parse(i)
     })?;
-    let (target, _) = parse_type_phrase_folding(filter_text);
-    Some(Effect::DoublePTAll {
-        mode,
-        target,
-        factor,
-    })
+    let (target, tail) = ctx
+        .with_player_antecedents(|scoped| parse_type_phrase_folding_with_ctx(filter_text, scoped));
+    Some(finish_multiply_pt(
+        Effect::DoublePTAll {
+            mode,
+            target,
+            factor,
+        },
+        tail,
+        lower,
+    ))
+}
+
+/// CR 608.2c: the instructions of an ability are all followed in the order
+/// written, so a multiply-P/T arm may only claim its clause when it consumed all
+/// of it. Any unparsed same-sentence tail ("double its power and toughness and
+/// this Saga gains hexproof") fails the whole clause closed as an explicit gap,
+/// rather than reporting the leading doubling as fully supported. Callers strip
+/// the clause's duration and repeat count ("until end of turn", "X times")
+/// before dispatch, so those never reach this check.
+fn finish_multiply_pt(effect: Effect, tail: &str, clause: &str) -> Effect {
+    if super::imperative::terminal_punctuation_only(tail) {
+        effect
+    } else {
+        Effect::unimplemented("multiply_pt_trailing_clause", clause)
+    }
 }
 
 /// Parse a mana color name from text like "red mana in your mana pool".
@@ -1828,6 +1916,7 @@ fn parse_mana_color_from_text(text: &str) -> Option<ManaColor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
     use crate::types::ability::TargetChoiceTiming;
     use crate::types::{ControllerRef, FilterProp, TypeFilter, TypedFilter};
 
@@ -2926,6 +3015,47 @@ mod tests {
         assert_eq!(factor, 3);
     }
 
+    /// CR 608.2c: every multiply-P/T arm (possessive target, anaphoric "its",
+    /// "the … of target", "the … of each") fails the clause closed when an
+    /// unparsed same-sentence tail follows, for both multiplier words. The
+    /// complete clause, with or without terminal punctuation, still parses.
+    #[test]
+    fn multiply_pt_trailing_tail_fails_closed_on_every_arm() {
+        let heads = [
+            "double target creature's power and toughness",
+            "double ~'s power",
+            "double its power and toughness",
+            "double its toughness",
+            "double the power and toughness of target creature you control",
+            "double the power of each creature you control",
+            "triple target creature's power and toughness",
+        ];
+        for head in heads {
+            for complete in [head.to_string(), format!("{head}.")] {
+                let effect = try_parse_multiply_pt_effect(&complete, &mut default_ctx());
+                assert!(
+                    matches!(
+                        effect,
+                        Some(Effect::DoublePT { .. } | Effect::DoublePTAll { .. })
+                    ),
+                    "reach: {complete:?} parses as a P/T multiply, got {effect:?}"
+                );
+            }
+            for tail in [" and ~ gains hexproof", " and ~ gains \"{t}: add {c}.\""] {
+                let clause = format!("{head}{tail}");
+                let effect = try_parse_multiply_pt_effect(&clause, &mut default_ctx());
+                assert_eq!(
+                    effect,
+                    Some(Effect::unimplemented(
+                        "multiply_pt_trailing_clause",
+                        clause.clone()
+                    )),
+                    "{clause:?} must fail closed"
+                );
+            }
+        }
+    }
+
     #[test]
     fn remove_counter_untyped_all() {
         // Vampire Hexmage: "remove all counters from target permanent"
@@ -2985,7 +3115,137 @@ mod tests {
             panic!("expected RemoveCounter, got {result:?}");
         };
         assert_eq!(counter_type, None);
-        assert_eq!(count, QuantityExpr::Fixed { value: 3 });
+        // CR 608.2d: "up to" is a resolution-time choice of fewer; the count is
+        // the cap, not a fixed removal.
+        assert_eq!(count, QuantityExpr::up_to(QuantityExpr::Fixed { value: 3 }));
+    }
+
+    /// CR 107.3a + CR 608.2d: "remove up to X counters" (Hex Parasite) keeps the
+    /// announced X as `Variable("X")` under the `UpTo` cap — not the X→0 reading
+    /// of a cost-position parser, and not a fixed count that drops "up to".
+    #[test]
+    fn remove_counter_up_to_x_keeps_the_variable_cap() {
+        let result = try_parse_remove_counter(
+            "remove up to x counters from target permanent",
+            &mut default_ctx(),
+        );
+        let Some(Effect::RemoveCounter {
+            counter_type,
+            count,
+            target,
+        }) = result
+        else {
+            panic!("expected RemoveCounter, got {result:?}");
+        };
+        assert_eq!(counter_type, None, "untyped: the controller chooses kinds");
+        assert_eq!(
+            count,
+            QuantityExpr::up_to(QuantityExpr::Ref {
+                qty: QuantityRef::Variable {
+                    name: "X".to_string()
+                }
+            })
+        );
+        assert!(matches!(target, TargetFilter::Typed(_)), "{target:?}");
+    }
+
+    /// CR 608.2d + CR 122.1: the typed form caps a single kind (Gremlin Mine:
+    /// "Remove up to four charge counters from target noncreature artifact").
+    #[test]
+    fn remove_counter_up_to_n_typed_caps_that_kind() {
+        let result = try_parse_remove_counter(
+            "remove up to four charge counters from target noncreature artifact",
+            &mut default_ctx(),
+        );
+        let Some(Effect::RemoveCounter {
+            counter_type,
+            count,
+            ..
+        }) = result
+        else {
+            panic!("expected RemoveCounter, got {result:?}");
+        };
+        assert_eq!(
+            counter_type,
+            Some(CounterType::Generic("charge".to_string()))
+        );
+        assert_eq!(count, QuantityExpr::up_to(QuantityExpr::Fixed { value: 4 }));
+    }
+
+    /// CR 608.2d: the capped "up to N ... from among <objects>" is the same
+    /// multi-source distribution as "any number ... from among", which the
+    /// single-source removal cannot model; it stays out of this builder. The
+    /// positive control is the single-source sibling of the same clause.
+    #[test]
+    fn remove_counter_up_to_n_from_among_is_not_a_single_source_removal() {
+        assert!(
+            try_parse_remove_counter(
+                "remove up to three stun counters from target permanent",
+                &mut default_ctx(),
+            )
+            .is_some(),
+            "reach guard: the single-source clause parses"
+        );
+        assert_eq!(
+            try_parse_remove_counter(
+                "remove up to three stun counters from among all permanents",
+                &mut default_ctx(),
+            ),
+            None
+        );
+    }
+
+    /// The full verbatim Hex Parasite line: the removal is capped at X and its
+    /// "for each counter removed this way" rider repeats once per counter the
+    /// removal actually removed (CR 608.2c).
+    #[test]
+    fn hex_parasite_parses_up_to_x_removal_with_a_per_counter_rider() {
+        let parsed = crate::parser::parse_oracle_text(
+            "{X}{B/P}: Remove up to X counters from target permanent. For each counter removed this way, this creature gets +1/+0 until end of turn. ({B/P} can be paid with either {B} or 2 life.)",
+            "Hex Parasite",
+            &[],
+            &["Artifact".to_string(), "Creature".to_string()],
+            &[],
+        );
+        let ability = parsed
+            .abilities
+            .iter()
+            .find(|a| matches!(a.effect.as_ref(), Effect::RemoveCounter { .. }))
+            .expect("the activated removal parses");
+        let Effect::RemoveCounter {
+            counter_type,
+            count,
+            ..
+        } = ability.effect.as_ref()
+        else {
+            unreachable!()
+        };
+        assert_eq!(*counter_type, None);
+        assert_eq!(
+            *count,
+            QuantityExpr::up_to(QuantityExpr::Ref {
+                qty: QuantityRef::Variable {
+                    name: "X".to_string()
+                }
+            })
+        );
+        let rider = ability
+            .sub_ability
+            .as_deref()
+            .expect("the per-counter rider is chained");
+        assert!(
+            matches!(rider.effect.as_ref(), Effect::Pump { .. }),
+            "{rider:?}"
+        );
+        assert!(
+            matches!(
+                rider.repeat_for,
+                Some(QuantityExpr::Ref {
+                    qty: QuantityRef::PreviousEffectAmount { .. }
+                })
+            ),
+            "{rider:?}"
+        );
     }
 
     /// CR 608.2k anaphor: "remove those counters" with no "from {target}"
@@ -4350,5 +4610,57 @@ mod tests {
             TargetFilter::SelfRef,
             "explicit 'this creature' after a token creator must stay SelfRef"
         );
+    }
+
+    fn target_player_scope_ctx() -> ParseContext {
+        ParseContext {
+            relative_player_scope: Some(ControllerRef::TargetPlayer),
+            ..ParseContext::default()
+        }
+    }
+
+    /// CR 608.2c: the counter-target fallback binds "that player" to the
+    /// caller's player antecedent instead of a fresh context's default.
+    #[test]
+    fn counter_target_fallback_binds_that_player_to_the_callers_antecedent() {
+        let filter = resolve_remove_counter_from_target(
+            "permanents that player controls",
+            &mut target_player_scope_ctx(),
+        );
+        let TargetFilter::Typed(typed) = filter else {
+            panic!("expected a typed permanent filter, got {filter:?}");
+        };
+        assert!(typed.type_filters.contains(&TypeFilter::Permanent));
+        assert_eq!(typed.controller, Some(ControllerRef::TargetPlayer));
+    }
+
+    /// CR 109.5: a seeded player antecedent never rebinds a literal "you".
+    #[test]
+    fn counter_target_fallback_keeps_you_under_a_seeded_scope() {
+        let filter = resolve_remove_counter_from_target(
+            "permanents you control",
+            &mut target_player_scope_ctx(),
+        );
+        let TargetFilter::Typed(typed) = filter else {
+            panic!("expected a typed permanent filter, got {filter:?}");
+        };
+        assert_eq!(typed.controller, Some(ControllerRef::You));
+    }
+
+    /// The counter-target fallback is a committed sub-parse, so its
+    /// `TargetFallback` diagnostic reaches the caller's context, once.
+    #[test]
+    fn counter_target_fallback_reports_its_diagnostic_to_the_caller() {
+        let expected = vec![OracleDiagnostic::TargetFallback {
+            context: "parse_target could not classify".into(),
+            text: "among all permanents".into(),
+            line_index: 0,
+        }];
+        let mut ctx = default_ctx();
+        let filter = resolve_remove_counter_from_target("among all permanents", &mut ctx);
+        assert_eq!(filter, TargetFilter::Any, "the fallback must fire");
+        assert_eq!(ctx.diagnostics, expected);
+        resolve_remove_counter_from_target("among all permanents", &mut ctx);
+        assert_eq!(ctx.diagnostics, expected, "push_diagnostic deduplicates");
     }
 }
