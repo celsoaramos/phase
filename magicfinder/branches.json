@@ -11,9 +11,6 @@
     "branch": "card/pelakka-predation"
   },
   {
-    "branch": "card/martyr-of-sands"
-  },
-  {
     "branch": "card/brave-the-elements"
   },
   {
@@ -277,5 +274,8 @@
   },
   {
     "branch": "card/gideon-blackblade-prevention-your-turn"
+  },
+  {
+    "branch": "card/reveal-cost-fail-closed-1025"
   }
 ]
