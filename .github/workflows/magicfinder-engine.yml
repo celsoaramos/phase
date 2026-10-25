@@ -13,6 +13,13 @@ name: MagicFinder — motor do fork
 on:
   schedule:
     - cron: '30 17 * * *'   # depois da janela de release deles (~14-15 UTC)
+  # Mesclar um PR que muda a lista de branches publica na hora (rotina de relatos de
+  # 4 h, 2026-10-25): sem isto o build esperava o agendado — o disparo manual pela
+  # integração do GitHub dá 403. A `concurrency` abaixo enfileira, não cancela.
+  push:
+    branches: [magicfinder-ci]
+    paths:
+      - 'magicfinder/branches.json'
   workflow_dispatch:
     inputs:
       force:
