@@ -481,3 +481,48 @@ fn tovolar_night_with_only_daybound_finishes_without_a_choice() {
         "Tovolar, the Midnight Scourge"
     );
 }
+
+/// Only an UNTARGETED "any number of" turns a transform into a resolution-time
+/// choice. "Transform up to one target …" keeps its single declared optional
+/// target and no multi-target spec (Waxing Moon, Attentive Skywarden): the
+/// resolver maps a declined declared target to the source, so a spec there
+/// would let a decline transform the wrong object.
+#[test]
+fn up_to_one_target_transform_keeps_its_single_declared_target() {
+    for (name, text, types) in [
+        (
+            "Waxing Moon",
+            "Transform up to one target Werewolf you control. Creatures you control gain trample until end of turn.",
+            &["Sorcery".to_string()][..],
+        ),
+        (
+            "Attentive Skywarden",
+            "Flying\nWhenever this creature deals combat damage to a player or battle, transform up to one target Incubator token you control.",
+            &["Creature".to_string()][..],
+        ),
+    ] {
+        let parsed = engine::parser::parse_oracle_text(text, name, &[], types, &[]);
+        let mut defs: Vec<&engine::types::ability::AbilityDefinition> = Vec::new();
+        for def in parsed
+            .abilities
+            .iter()
+            .chain(parsed.triggers.iter().filter_map(|t| t.execute.as_deref()))
+        {
+            let mut node = Some(def);
+            while let Some(d) = node {
+                defs.push(d);
+                node = d.sub_ability.as_deref();
+            }
+        }
+        let transform = defs
+            .into_iter()
+            .find(|d| matches!(&*d.effect, Effect::Transform { .. }))
+            .unwrap_or_else(|| panic!("{name}: no Transform node"));
+        assert_eq!(transform.multi_target, None, "{name}");
+        assert_ne!(
+            transform.target_choice_timing,
+            TargetChoiceTiming::Resolution,
+            "{name}"
+        );
+    }
+}
