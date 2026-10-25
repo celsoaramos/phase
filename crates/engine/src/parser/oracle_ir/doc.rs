@@ -366,6 +366,28 @@ pub(crate) struct RelationSynthesisIr {
     /// Kept even though lowering needs only the chooser item, so provenance is
     /// inspectable and a future consumer cannot rescan for a lookalike static.
     pub(crate) copy_static: OracleItemId,
+    /// What the synthesized replacement does with the chosen permanent.
+    #[serde(skip_serializing_if = "RelationSynthesisKind::is_copy_chosen_host")]
+    pub(crate) kind: RelationSynthesisKind,
+}
+
+/// The consumer a relation-proven as-enters permanent choice feeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub(crate) enum RelationSynthesisKind {
+    /// CR 707.2c: latch the chosen permanent's copiable values onto the Aura's
+    /// host (`Effect::ChoosePermanent`, Metamorphic Alteration).
+    #[default]
+    CopyChosenHost,
+    /// CR 607.2d: remember the chosen permanent on the entering object
+    /// (`ChooseObjectsIntoTrackedSet` → `RememberCard`) for a
+    /// `TargetFilter::ChosenCard` reader (Tyrannical Pitlord).
+    RememberChosenObject,
+}
+
+impl RelationSynthesisKind {
+    pub(crate) fn is_copy_chosen_host(&self) -> bool {
+        matches!(self, Self::CopyChosenHost)
+    }
 }
 
 /// The typed payload of a document item. Identity and provenance live on
@@ -1721,6 +1743,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 description: "As this enters, choose a permanent.".to_string(),
                 copy_static: OracleItemId(99),
+                kind: RelationSynthesisKind::CopyChosenHost,
             }),
         );
 

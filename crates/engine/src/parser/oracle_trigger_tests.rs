@@ -14015,22 +14015,40 @@ fn trigger_enchanted_opponent_draws_is_attached_to() {
     assert_eq!(def.valid_target, Some(TargetFilter::AttachedTo));
 }
 
-/// Containment guard: the "enchanted player/opponent" recognition lives ONLY
-/// in the draws path, so "Whenever enchanted player is dealt damage" (Grievous
-/// Wound) stays honestly `Unknown` rather than flipping to a parses-but-dead
-/// `DamageReceived` trigger with `valid_card = AttachedTo` (which the runtime
-/// rejects for player-recipient damage, so it would never fire).
+/// CR 120.1 + CR 303.4e: "Whenever enchanted player is dealt damage" (Grievous
+/// Wound) is a PLAYER-recipient damage trigger. The scope rides on the player
+/// axis (`valid_target = AttachedTo`), never on `valid_card` — the runtime
+/// rejects an object-scoped `valid_card` for player damage, so that shape would
+/// parse but never fire. "They" is the damaged player (`TriggeringPlayer`).
+/// End-to-end coverage: `tests/integration/pe_de_limo_cards.rs`.
 #[test]
-fn trigger_enchanted_player_is_dealt_damage_stays_unknown() {
+fn trigger_enchanted_player_is_dealt_damage_scopes_the_player_axis() {
     let def = parse_trigger_line(
         "Whenever enchanted player is dealt damage, they lose 2 life.",
         "Grievous Wound",
     );
+    assert_eq!(def.mode, TriggerMode::DamageReceived);
+    assert_eq!(def.valid_target, Some(TargetFilter::AttachedTo));
+    assert_eq!(def.valid_card, None, "never the object axis");
+    assert_eq!(def.damage_kind, DamageKindFilter::Any);
+    let effect = &def.execute.as_ref().expect("lowered body").effect;
     assert!(
-        matches!(def.mode, TriggerMode::Unknown(_)),
-        "expected Unknown, got {:?}",
-        def.mode
+        matches!(
+            effect.as_ref(),
+            Effect::LoseLife {
+                target: Some(TargetFilter::TriggeringPlayer),
+                ..
+            }
+        ),
+        "\"they\" is the damaged player, got {effect:?}"
     );
+
+    let combat = parse_trigger_line(
+        "Whenever enchanted player is dealt combat damage, they lose 2 life.",
+        "Test Aura",
+    );
+    assert_eq!(combat.mode, TriggerMode::DamageReceived);
+    assert_eq!(combat.damage_kind, DamageKindFilter::CombatOnly);
 }
 
 /// CR 603.4 + CR 102.1: "draws a card during their turn" — the trailing

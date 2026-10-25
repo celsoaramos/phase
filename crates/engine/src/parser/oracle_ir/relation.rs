@@ -173,6 +173,23 @@ pub(crate) enum LinkedChoiceKind {
         filter: TargetFilter,
         description: String,
     },
+    /// CR 607.2d + CR 614.12a: An as-enters permanent-object choice gap
+    /// (`chooser` — "As … enters, choose another creature you control") linked to
+    /// a static whose `affected` reads the remembered object
+    /// (`TargetFilter::ChosenCard` — "The chosen creature gets +3/+3 and has
+    /// flying", Tyrannical Pitlord). Finalization replaces the chooser in place
+    /// with a relation-synthesis payload that injects
+    /// `ChooseObjectsIntoTrackedSet` → `RememberCard`, so the choice is recorded
+    /// on the entering permanent as `ChosenAttribute::Card` — the durable form
+    /// the reader resolves against. Emitted only when such a reader exists, so a
+    /// chooser whose consumer reads the pick some other way (Dauntless
+    /// Bodyguard's activated ability) keeps its honest unsupported shape.
+    RememberChosenObjectHost {
+        chooser: OracleItemId,
+        reader: OracleItemId,
+        filter: TargetFilter,
+        description: String,
+    },
     /// CR 607.2d: A colour choice made on ONE ability of an object, read back by
     /// a `Protection(ChosenColor)` / `HexproofFrom(ChosenColor)` grant on ANOTHER
     /// ability of the same object. CR 607.2d: "If an object has an ability

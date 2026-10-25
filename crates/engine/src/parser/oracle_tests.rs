@@ -511,6 +511,7 @@ fn copy_chosen_host_relation_synthesizes_only_the_selected_source_and_preserves_
             filter: TargetFilter::Typed(filter),
             description,
             copy_static,
+            ..
         }) if filter == &TypedFilter::creature()
             && description == FIRST_CHOOSER
             && *copy_static == first_static_id

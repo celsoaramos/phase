@@ -1318,6 +1318,20 @@ fn parse_batch_creature_attack_subject(input: &str) -> OracleResult<'_, ()> {
 /// `parse_trigger_actor` with an `unwrap_or` fallback) so "a creature attacks
 /// enchanted player" is covered by the bare-verb form, exactly as the second
 /// branch of `condition_introduces_defending_player`.
+/// CR 120.3 + CR 303.4e: the passive damage condition whose recipient is the
+/// enchanted PLAYER ("whenever enchanted player is dealt [combat] damage").
+fn condition_introduces_damaged_enchanted_player(cond_lower: &str) -> bool {
+    preceded(
+        opt(alt((
+            tag::<_, _, OracleError<'_>>("whenever "),
+            tag("when "),
+        ))),
+        tag("enchanted player is dealt "),
+    )
+    .parse(cond_lower.trim_start())
+    .is_ok()
+}
+
 fn condition_introduces_enchanted_player(cond_lower: &str) -> bool {
     let mut remaining = cond_lower;
     while !remaining.is_empty() {
@@ -1568,6 +1582,11 @@ pub(crate) fn relative_player_scope_for_condition(cond_lower: &str) -> Option<Co
         Some(ControllerRef::TriggeringPlayer)
     } else if condition_introduces_damage_source_controller_player(cond_lower) {
         Some(ControllerRef::ParentTargetController)
+    } else if condition_introduces_damaged_enchanted_player(cond_lower) {
+        // CR 120.3 + CR 303.4e: "whenever enchanted player is dealt damage, they
+        // lose half their life" (Grievous Wound) — "they" is the damaged player,
+        // the same event player a damage-done trigger binds.
+        Some(ControllerRef::TriggeringPlayer)
     } else if condition_introduces_enchanted_player(cond_lower) {
         // "That player" after "attack enchanted player" is the defender captured
         // by the attack event, resolved via `TargetFilter::DefendingPlayer`
@@ -2360,7 +2379,16 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
             );
         }
     }
-    if modifiers.relative_player_scope == Some(ControllerRef::TargetPlayer) {
+    // CR 120.3 + CR 303.4e: a player-recipient damage trigger ("whenever
+    // enchanted player is dealt damage, they lose half their life" — Grievous
+    // Wound) binds "their" to the damaged player the same way: the resolver
+    // stamps `scoped_player` from any `DamageDealt` to a player
+    // (`stack::bind_resolving_ability_referents`).
+    let damaged_player_scope = modifiers.relative_player_scope
+        == Some(ControllerRef::TriggeringPlayer)
+        && def.mode == TriggerMode::DamageReceived;
+    if modifiers.relative_player_scope == Some(ControllerRef::TargetPlayer) || damaged_player_scope
+    {
         if let Some(ability) = execute.as_deref_mut() {
             crate::parser::oracle_effect::rewrite_event_player_quantity_refs_to_scoped(ability);
         }
@@ -20591,6 +20619,37 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
         def.mode = TriggerMode::DamageReceived;
         def.valid_target = Some(TargetFilter::Controller);
         return Some((TriggerMode::DamageReceived, def));
+    }
+
+    // CR 120.1 + CR 303.4e: "whenever enchanted player is dealt [combat] damage"
+    // (Grievous Wound). The recipient is a PLAYER, so the scope rides on
+    // `valid_target` (the player axis `damage_received_filters_match` consults
+    // for `TargetRef::Player`), never on `valid_card` — an object-scoped
+    // `valid_card = AttachedTo` is rejected for player damage and would parse
+    // but never fire. `AttachedTo` on the player axis resolves to the player
+    // the Aura is attached to (`player_matches_filter`), so the trigger stays
+    // inert while the Aura is unattached.
+    if let Ok((rest, ())) = preceded(
+        alt((tag::<_, _, OracleError<'_>>("whenever "), tag("when "))),
+        value((), tag("enchanted player is dealt ")),
+    )
+    .parse(lower)
+    {
+        let kind = alt((
+            value(
+                DamageKindFilter::CombatOnly,
+                all_consuming(tag::<_, _, OracleError<'_>>("combat damage")),
+            ),
+            value(DamageKindFilter::Any, all_consuming(tag("damage"))),
+        ))
+        .parse(rest);
+        if let Ok((_, damage_kind)) = kind {
+            let mut def = make_base();
+            def.mode = TriggerMode::DamageReceived;
+            def.damage_kind = damage_kind;
+            def.valid_target = Some(TargetFilter::AttachedTo);
+            return Some((TriggerMode::DamageReceived, def));
+        }
     }
 
     // CR 120.2b: "whenever an opponent is dealt noncombat damage"

@@ -89,8 +89,8 @@ use super::oracle_ir::diagnostic::OracleDiagnostic;
 use super::oracle_ir::doc::{
     stamp_printed_ability_slot, stamp_printed_trigger_slot, OracleDocBuilder, OracleDocIr,
     OracleItemId, OracleItemIr, OracleNodeIr, OracleSourceSpan, OracleUnitSource,
-    PrintedAbilityIndex, PrintedTriggerIndex, RelationSynthesisIr, SpellPayloadIr,
-    UnsupportedAbilityCategory, UnsupportedAbilityIr,
+    PrintedAbilityIndex, PrintedTriggerIndex, RelationSynthesisIr, RelationSynthesisKind,
+    SpellPayloadIr, UnsupportedAbilityCategory, UnsupportedAbilityIr,
 };
 use super::oracle_ir::effect_chain::{
     AbilityIr, AbilityRootTransform, AbilityShellIr, EffectChainIr, InjectedColorChoice,
@@ -1643,14 +1643,32 @@ fn apply_linked_color_choice_suppression(doc: &mut OracleDocIr, relations: &[Doc
 /// relation synthesis as a fresh item.
 fn finalize_relation_syntheses(doc: &mut OracleDocIr, relations: &[DocumentRelationIr]) {
     for relation in relations {
-        let DocumentRelationIr::LinkedChoice(LinkedChoiceKind::CopyChosenHost {
-            chooser,
-            copy_static,
-            filter,
-            description,
-        }) = relation
-        else {
-            continue;
+        let (chooser, copy_static, filter, description, kind) = match relation {
+            DocumentRelationIr::LinkedChoice(LinkedChoiceKind::CopyChosenHost {
+                chooser,
+                copy_static,
+                filter,
+                description,
+            }) => (
+                chooser,
+                copy_static,
+                filter,
+                description,
+                RelationSynthesisKind::CopyChosenHost,
+            ),
+            DocumentRelationIr::LinkedChoice(LinkedChoiceKind::RememberChosenObjectHost {
+                chooser,
+                reader,
+                filter,
+                description,
+            }) => (
+                chooser,
+                reader,
+                filter,
+                description,
+                RelationSynthesisKind::RememberChosenObject,
+            ),
+            _ => continue,
         };
         let Some(item) = doc.items.iter_mut().find(|item| item.id == *chooser) else {
             continue;
@@ -1665,6 +1683,7 @@ fn finalize_relation_syntheses(doc: &mut OracleDocIr, relations: &[DocumentRelat
             filter: filter.clone(),
             description: description.clone(),
             copy_static: *copy_static,
+            kind,
         });
     }
 }
@@ -1676,6 +1695,7 @@ fn detect_document_relations(items: &[OracleItemIr], types: &[String]) -> Vec<Do
     detect_linked_choice_type_statics(items, types, &mut relations);
     detect_linked_choice_persisted_player(items, &mut relations);
     detect_linked_choice_copy_chosen_host(items, &mut relations);
+    detect_linked_choice_remember_chosen_object(items, &mut relations);
     detect_etb_exile_ltb_return(items, &mut relations);
     detect_active_player_punisher(items, &mut relations);
     relations
@@ -2954,6 +2974,64 @@ fn detect_linked_choice_copy_chosen_host(
                 },
             ));
         }
+    }
+}
+
+/// CR 607.2d + CR 614.12a: pair an as-enters permanent-object choice gap with a
+/// static that reads the remembered object (`TargetFilter::ChosenCard`).
+/// Tyrannical Pitlord: "As ~ enters, choose another creature you control." +
+/// "The chosen creature gets +3/+3 and has flying." A chooser already claimed
+/// by `CopyChosenHost` is left alone — that relation owns the copy class.
+fn detect_linked_choice_remember_chosen_object(
+    items: &[OracleItemIr],
+    relations: &mut Vec<DocumentRelationIr>,
+) {
+    let claimed = relations.iter().any(|relation| {
+        matches!(
+            relation,
+            DocumentRelationIr::LinkedChoice(LinkedChoiceKind::CopyChosenHost { .. })
+        )
+    });
+    if claimed {
+        return;
+    }
+    let chooser = items.iter().find_map(as_enters_choose_permanent_gap_item);
+    let reader = items.iter().find(|item| {
+        item_static(item).is_some_and(|s| {
+            s.affected
+                .as_ref()
+                .is_some_and(filter_references_chosen_card)
+        })
+    });
+    if let (Some((chooser, filter, description)), Some(reader)) = (chooser, reader) {
+        // CR 608.2d: "you may choose" (Scheming Fence) is an optional choice; the
+        // synthesized selection is mandatory, so the optional form stays an
+        // honest gap rather than forcing a pick.
+        let optional = scan_at_word_boundaries(&description.to_lowercase(), |i| {
+            tag::<_, _, OracleError<'_>>("may choose").parse(i)
+        })
+        .is_some();
+        if chooser != reader.id && !optional {
+            relations.push(DocumentRelationIr::LinkedChoice(
+                LinkedChoiceKind::RememberChosenObjectHost {
+                    chooser,
+                    reader: reader.id,
+                    filter,
+                    description,
+                },
+            ));
+        }
+    }
+}
+
+/// Whether a filter reads the source's remembered object (`ChosenCard`).
+fn filter_references_chosen_card(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::ChosenCard => true,
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            filters.iter().any(filter_references_chosen_card)
+        }
+        _ => false,
     }
 }
 
@@ -4247,12 +4325,41 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
                 printed_ability_slot += 1;
             }
             OracleNodeIr::RelationSynthesis(synthesis) => {
-                let execute = AbilityDefinition::new(
-                    AbilityKind::Spell,
-                    Effect::ChoosePermanent {
-                        filter: synthesis.filter.clone(),
-                    },
-                );
+                let execute = match synthesis.kind {
+                    RelationSynthesisKind::CopyChosenHost => AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::ChoosePermanent {
+                            filter: synthesis.filter.clone(),
+                        },
+                    ),
+                    // CR 607.2d + CR 614.12a: the controller chooses one
+                    // permanent as the source enters (CR 609.3: none eligible →
+                    // nothing chosen), and the pick is remembered on the source
+                    // as `ChosenAttribute::Card` for the `ChosenCard` reader.
+                    RelationSynthesisKind::RememberChosenObject => AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::ChooseObjectsIntoTrackedSet {
+                            chooser: TargetFilter::Controller,
+                            filter: synthesis.filter.clone(),
+                            min: 1,
+                            max: Some(1),
+                            cardinality: Some(
+                                crate::types::ability::ObjectSelectionCardinality::Exactly {
+                                    count: 1,
+                                },
+                            ),
+                            eligibility: None,
+                        },
+                    )
+                    .sub_ability(AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::RememberCard {
+                            target: TargetFilter::TrackedSet {
+                                id: crate::types::identifiers::TrackedSetId(0),
+                            },
+                        },
+                    )),
+                };
                 result.replacements.push(
                     ReplacementDefinition::new(ReplacementEvent::Moved)
                         .execute(execute)

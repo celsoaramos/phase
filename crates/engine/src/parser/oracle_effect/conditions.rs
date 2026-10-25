@@ -8217,7 +8217,22 @@ fn parse_cost_paid_object_predicate(rest: &str) -> Option<CostPaidPredicate> {
     if let Some(prop) = parse_status_property_predicate(rest) {
         return Some(CostPaidPredicate::Property(prop));
     }
+    if let Some(prop) = parse_supertype_property_predicate(rest) {
+        return Some(CostPaidPredicate::Property(prop));
+    }
     parse_article_type_predicate(rest).map(CostPaidPredicate::TypeMatch)
+}
+
+/// CR 205.4a: a bare supertype predicate ("the sacrificed creature was
+/// legendary" — Nasty End). Supertypes are adjectives with no article, so the
+/// article-led type predicate never reaches them; they land on the same
+/// orthogonal `FilterProp` axis as the color and status predicates.
+fn parse_supertype_property_predicate(input: &str) -> Option<FilterProp> {
+    let trimmed = input.trim().trim_end_matches('.').trim();
+    let (rest, supertype) = parse_supertype_word(trimmed).ok()?;
+    rest.trim()
+        .is_empty()
+        .then_some(FilterProp::HasSupertype { value: supertype })
 }
 
 /// CR 701.60b: Parse a status-property predicate as a `FilterProp`. Currently

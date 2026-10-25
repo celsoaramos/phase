@@ -1561,6 +1561,18 @@ pub(crate) fn parse_static_line_inner(
         }
     }
 
+    // CR 607.2d + CR 613.1: "The chosen creature gets +N/+M and has <keyword>"
+    // (Tyrannical Pitlord) — the reader of an as-enters object choice. The
+    // affected object is the source's remembered `ChosenAttribute::Card`, read
+    // through the shared `ChosenCard` reader; the as-enters chooser is linked to
+    // it by `LinkedChoiceKind::RememberChosenObjectHost`.
+    if let Some(rest) = nom_tag_tp(&tp, "the chosen creature ") {
+        if let Some(def) = parse_continuous_gets_has(rest.original, TargetFilter::ChosenCard, &text)
+        {
+            return Some(def);
+        }
+    }
+
     // --- "Equipped creature gets +N/+M" ---
     if let Some(rest) = nom_tag_tp(&tp, "equipped creature ") {
         let filter =
