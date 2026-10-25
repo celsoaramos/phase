@@ -2096,6 +2096,9 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             format!("loyalty abilities activated this turn ({player:?})")
         }
         QuantityRef::SpellsCastLastTurn => "spells cast last turn".into(),
+        QuantityRef::MostSpellsCastByOnePlayerLastTurn => {
+            "most spells cast by one player last turn".into()
+        }
         QuantityRef::SpellsCastThisGame { scope, filter } => match (scope, filter) {
             (CountScope::Controller, None) => "spells you've cast this game".into(),
             (scope, None) => format!("spells cast this game ({scope:?})"),
@@ -10929,9 +10932,11 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         // CR 601.2i: the table-wide count of spells that became cast during the previous turn
         // (`turns::start_next_turn`'s snapshot). Only table-wide guards ('no spells were cast
         // last turn', 'two or more spells were cast last turn') lower to it. The per-player
-        // 'a player cast N or more spells last turn' is declined by the condition parser and
-        // fails closed as an `unparsed_condition` gap, so those faces never reach this arm.
+        // 'a player cast two or more spells last turn' lowers to the per-player snapshot below.
         QuantityRef::SpellsCastLastTurn => ("SpellsCastLastTurn", Handled),
+        QuantityRef::MostSpellsCastByOnePlayerLastTurn => {
+            ("MostSpellsCastByOnePlayerLastTurn", Handled)
+        }
         QuantityRef::SpellsCastThisGame { .. } => ("SpellsCastThisGame", Handled),
         QuantityRef::CounterAddedThisTurn { .. } => ("CounterAddedThisTurn", Handled),
         QuantityRef::CardsDiscardedThisTurn { .. } => ("CardsDiscardedThisTurn", Handled),
@@ -21780,15 +21785,12 @@ have been revealed, Aggressive Detective deals 2 damage to each opponent.";
     }
 
     /// CR 603.4: Gatstaf Howler's per-player "a player cast two or more spells
-    /// last turn" guard is not expressible by the table-wide
-    /// `SpellsCastLastTurn` count, so the face must be an honest unsupported
-    /// gap through production `analyze_coverage` — never a supported upkeep
-    /// transform with the guard dropped. Gatstaf Shepherd's table-wide "no
-    /// spells" face (the same card's other side) stays supported.
-    /// REVERT-PROBE: restore the per-player arm in `parse_spells_cast_last_turn`
-    /// → Howler hoists `SpellsCastLastTurn >= 2` and reports supported.
+    /// last turn" guard hoists against the per-player maximum
+    /// (`MostSpellsCastByOnePlayerLastTurn`), so the face is a supported upkeep
+    /// transform WITH its guard — never a transform with the guard dropped.
+    /// Gatstaf Shepherd's table-wide "no spells" face stays supported.
     #[test]
-    fn per_player_spells_cast_last_turn_face_is_unsupported() {
+    fn per_player_spells_cast_last_turn_face_is_supported_with_its_guard() {
         const GATSTAF_HOWLER_ORACLE: &str = "Intimidate (This creature can't be blocked except by artifact creatures and/or creatures that share a color with it.)\nAt the beginning of each upkeep, if a player cast two or more spells last turn, transform this creature.";
         let howler = counter_rider_face(
             "Gatstaf Howler",
@@ -21796,25 +21798,23 @@ have been revealed, Aggressive Detective deals 2 damage to each opponent.";
             &["Intimidate", "Transform"],
             &["Creature"],
         );
-        // Reach guard: the upkeep trigger itself parsed (the face is not red
-        // merely because the line was dropped), with no hoisted condition.
         assert_eq!(howler.triggers.len(), 1, "{:?}", howler.triggers);
         assert_eq!(howler.triggers[0].phase, Some(Phase::Upkeep));
-        let condition = howler.triggers[0].condition.clone();
+        assert_eq!(
+            howler.triggers[0].condition,
+            Some(TriggerCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::MostSpellsCastByOnePlayerLastTurn,
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 2 },
+            }),
+            "the per-player guard must hoist against the per-player maximum"
+        );
         let result = coverage_result_for_face(howler);
         assert!(
-            !result.supported,
-            "the per-player guard must leave the face unsupported (condition: {condition:?})"
-        );
-        assert_eq!(
-            condition, None,
-            "nothing may hoist from the per-player guard"
-        );
-        assert!(
-            gap_handlers(&result)
-                .iter()
-                .any(|handler| handler.contains("unparsed_condition")),
-            "the gap must be the dropped condition: {:?}",
+            result.supported,
+            "Gatstaf Howler: {:?}",
             gap_handlers(&result)
         );
 

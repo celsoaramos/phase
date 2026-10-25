@@ -4576,6 +4576,7 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         | QuantityRef::ManaSpentToCast { .. }
         | QuantityRef::PlayerActionsThisTurn { .. }
         | QuantityRef::SpellsCastLastTurn
+        | QuantityRef::MostSpellsCastByOnePlayerLastTurn
         | QuantityRef::SpellsCastThisGame { .. }
         | QuantityRef::TimesCostPaidThisResolution
         | QuantityRef::TokensCreatedThisTurn { .. }
@@ -4892,6 +4893,7 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
         | QuantityRef::DescendedThisTurn
         | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
         | QuantityRef::SpellsCastLastTurn
+        | QuantityRef::MostSpellsCastByOnePlayerLastTurn
         | QuantityRef::CardsDiscardedThisTurn { .. }
         | QuantityRef::PlayerActionsThisTurn { .. }
         | QuantityRef::DungeonsCompleted

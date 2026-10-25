@@ -1621,6 +1621,7 @@ mod vraska_betrayals_sting;
 mod vrestin_menoptra_leader_5949;
 mod waiting_for_actor_authority_census;
 mod ward_discard_cost_shapes;
+mod werewolf_per_player_spells_last_turn;
 mod ward_of_bones_relative_count_cast_prohibition;
 mod ward_of_bones_relative_count_land_prohibition;
 mod warning_source_shield_persists_across_damage_steps;

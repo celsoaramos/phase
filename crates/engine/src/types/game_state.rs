@@ -22665,6 +22665,12 @@ declare_game_state! {
     /// Used by werewolf "if no/two or more spells were cast last turn" conditions.
     #[serde(default)]
     pub spells_cast_last_turn: Option<u8>,
+    /// CR 603.4: Snapshot of the most spells any ONE player cast during the
+    /// previous turn (the longest `spells_cast_this_turn_by_player` history at
+    /// turn start). Backs the per-player werewolf guard "if a player cast two or
+    /// more spells last turn", which `spells_cast_last_turn` (table-wide) cannot.
+    #[serde(default)]
+    pub most_spells_cast_by_one_player_last_turn: Option<u8>,
 
     /// Objects whose casting/activation was cancelled this priority window.
     /// Prevents the AI from looping cast→cancel→recast on the same spell or ability.
@@ -31516,6 +31522,7 @@ impl GameState {
             day_night: None,
             spells_cast_this_turn: 0,
             spells_cast_last_turn: None,
+            most_spells_cast_by_one_player_last_turn: None,
             pending_trigger: None,
             pending_trigger_firing: None,
             pending_trigger_event_batch: Vec::new(),
@@ -34565,6 +34572,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         day_night: _,
         spells_cast_this_turn: _,
         spells_cast_last_turn: _,
+        most_spells_cast_by_one_player_last_turn: _,
         cancelled_casts: _,
         pending_activations: _,
         pending_trigger: _,
@@ -34943,6 +34951,8 @@ impl PartialEq for GameState {
             && self.day_night == other.day_night
             && self.spells_cast_this_turn == other.spells_cast_this_turn
             && self.spells_cast_last_turn == other.spells_cast_last_turn
+            && self.most_spells_cast_by_one_player_last_turn
+                == other.most_spells_cast_by_one_player_last_turn
             && self.pending_trigger == other.pending_trigger
             && self.pending_trigger_firing == other.pending_trigger_firing
             && self.pending_trigger_entry == other.pending_trigger_entry

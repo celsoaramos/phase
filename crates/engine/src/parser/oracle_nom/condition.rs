@@ -7793,8 +7793,8 @@ fn parse_spell_history_condition(input: &str) -> OracleResult<'_, StaticConditio
             make_quantity_comparison(QuantityRef::SpellsCastLastTurn, Comparator::EQ, 0),
             tag("no spells were cast last turn"),
         ),
-        // "two or more spells were cast last turn" (table-wide only; the
-        // per-player "a player cast N or more spells last turn" is declined)
+        // "two or more spells were cast last turn" (table-wide) / "a player
+        // cast two or more spells last turn" (per-player)
         parse_spells_cast_last_turn,
         parse_you_cast_both_spell_kinds_this_turn,
         // CR 702.185c: "a spell was warped this turn" — any player cast a spell
@@ -9352,20 +9352,25 @@ fn strip_spell_history_noun(type_text: &str) -> &str {
     type_text
 }
 
-/// CR 603.4: "two or more spells were cast last turn" — the table-wide count
-/// of spells cast during the previous turn (`QuantityRef::SpellsCastLastTurn`).
+/// CR 603.4: the werewolf "last turn" spell-count guards.
 ///
-/// The per-player wording "a player cast two or more spells last turn" is
-/// deliberately NOT recognized here: it is true only when a single player cast
-/// that many spells, which a table-wide total cannot express (two players
-/// casting one spell each would wrongly satisfy it). Declining leaves that
-/// guard unparsed, so the trigger fails closed as an `unparsed_condition` gap
-/// instead of lowering to the wrong count.
+/// - "two or more spells were cast last turn" — the table-wide count of spells
+///   cast during the previous turn (`QuantityRef::SpellsCastLastTurn`).
+/// - "a player cast two or more spells last turn" — true only when a SINGLE
+///   player cast that many (two players casting one spell each must not
+///   satisfy it), so it reads the per-player maximum
+///   (`QuantityRef::MostSpellsCastByOnePlayerLastTurn`), never the table total.
 fn parse_spells_cast_last_turn(input: &str) -> OracleResult<'_, StaticCondition> {
-    value(
-        make_quantity_ge(QuantityRef::SpellsCastLastTurn, 2),
-        tag("two or more spells were cast last turn"),
-    )
+    alt((
+        value(
+            make_quantity_ge(QuantityRef::SpellsCastLastTurn, 2),
+            tag("two or more spells were cast last turn"),
+        ),
+        value(
+            make_quantity_ge(QuantityRef::MostSpellsCastByOnePlayerLastTurn, 2),
+            tag("a player cast two or more spells last turn"),
+        ),
+    ))
     .parse(input)
 }
 

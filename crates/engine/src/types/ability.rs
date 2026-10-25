@@ -10549,6 +10549,12 @@ pub enum QuantityRef {
     /// CR 117.1: Number of spells cast last turn (by any player).
     /// Used for werewolf transform conditions.
     SpellsCastLastTurn,
+    /// CR 117.1 + CR 603.4: The most spells any single player cast during the
+    /// previous turn. Backs the per-player werewolf guard "if a player cast two
+    /// or more spells last turn" (Terror of Kruin Pass, Gatstaf Howler), which
+    /// the table-wide `SpellsCastLastTurn` total cannot express: two players
+    /// casting one spell each must NOT satisfy it.
+    MostSpellsCastByOnePlayerLastTurn,
     /// CR 117.1 + CR 601.2: Number of spells cast this game by players in
     /// `scope`, optionally filtered by spell characteristics (mirrors
     /// `SpellsCastThisTurn`).
@@ -10851,6 +10857,7 @@ impl QuantityRef {
             | QuantityRef::AttackedThisTurn { .. }
             | QuantityRef::DescendedThisTurn
             | QuantityRef::SpellsCastLastTurn
+            | QuantityRef::MostSpellsCastByOnePlayerLastTurn
             | QuantityRef::SpellsCastThisGame { .. }
             | QuantityRef::CounterAddedThisTurn { .. }
             | QuantityRef::DungeonsCompleted
@@ -11009,6 +11016,7 @@ impl QuantityRef {
             | QuantityRef::DescendedThisTurn
             | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
             | QuantityRef::SpellsCastLastTurn
+            | QuantityRef::MostSpellsCastByOnePlayerLastTurn
             | QuantityRef::CardsDiscardedThisTurn { .. }
             | QuantityRef::PlayerActionsThisTurn { .. }
             | QuantityRef::DungeonsCompleted
@@ -11115,6 +11123,7 @@ impl QuantityRef {
             | QuantityRef::AttackedThisTurn { .. }
             | QuantityRef::DescendedThisTurn
             | QuantityRef::SpellsCastLastTurn
+            | QuantityRef::MostSpellsCastByOnePlayerLastTurn
             | QuantityRef::SpellsCastThisGame { .. }
             | QuantityRef::CounterAddedThisTurn { .. }
             | QuantityRef::DungeonsCompleted

@@ -1658,6 +1658,17 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     state.planar_die_actions_this_turn.clear();
     // CR 603.4: Snapshot spell count for werewolf "last turn" conditions before resetting.
     state.spells_cast_last_turn = Some(state.spells_cast_this_turn);
+    // CR 603.4: per-player snapshot for "if a player cast two or more spells
+    // last turn" — read from the per-player cast history before it is cleared
+    // below.
+    state.most_spells_cast_by_one_player_last_turn = Some(
+        state
+            .spells_cast_this_turn_by_player
+            .values()
+            .map(|history| u8::try_from(history.len()).unwrap_or(u8::MAX))
+            .max()
+            .unwrap_or(0),
+    );
     // CR 500.1: Reset per-turn spell cast counters.
     state.spells_cast_this_turn = 0;
     // CR 700.13: crimes are a per-turn player record.

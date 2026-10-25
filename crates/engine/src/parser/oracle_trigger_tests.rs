@@ -38184,45 +38184,39 @@ fn unhoistable_leading_guard_lowered_to_a_back_reference_fails_closed() {
 }
 
 /// CR 603.4: "a player cast two or more spells last turn" (verbatim Gatstaf
-/// Howler back face) is true only when ONE player cast two or more spells. The
-/// table-wide `SpellsCastLastTurn` total cannot express that (two players
-/// casting one spell each would satisfy it), so the guard must not lower to it:
-/// the trigger fails closed as an `unparsed_condition` gap instead of firing on
-/// a wrong count.
-/// REVERT-PROBE: restore the per-player arm in `parse_spells_cast_last_turn` →
-/// the guard hoists as `SpellsCastLastTurn >= 2` and the body parses as a
-/// transform, so the `condition == None` and gap-kind assertions flip.
+/// Howler / Terror of Kruin Pass back face) is true only when ONE player cast
+/// two or more spells, so the guard hoists against the per-player maximum
+/// (`MostSpellsCastByOnePlayerLastTurn`), never the table-wide total — two
+/// players casting one spell each must not satisfy it.
 #[test]
-fn per_player_spells_cast_last_turn_guard_fails_the_trigger_closed() {
+fn per_player_spells_cast_last_turn_guard_hoists_as_per_player_max() {
     let def = parse_trigger_line(
         "At the beginning of each upkeep, if a player cast two or more spells last turn, transform this creature.",
         "Gatstaf Howler",
     );
 
-    // Reach guard: the upkeep trigger head was recognized, so the guard was
-    // examined in intervening-if position rather than the line being rejected.
     assert_eq!(def.mode, TriggerMode::Phase);
     assert_eq!(def.phase, Some(Phase::Upkeep));
     assert_eq!(
-        def.condition, None,
-        "the per-player guard must not hoist to a table-wide count"
+        def.condition,
+        Some(TriggerCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::MostSpellsCastByOnePlayerLastTurn,
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 2 },
+        }),
+        "the per-player guard must read the per-player maximum, not the table total"
     );
     let exec = def.execute.as_deref().expect("trigger execute body");
-    match &*exec.effect {
-        Effect::Unimplemented { name, description } => {
-            assert_eq!(name, ClauseGapKind::Condition.unimplemented_name());
-            assert!(
-                description
-                    .as_deref()
-                    .is_some_and(|text| text.contains("a player cast two or more spells")),
-                "the gap must carry the rejected guard: {description:?}"
-            );
-        }
-        other => panic!("the per-player guard must fail the trigger closed, got {other:?}"),
-    }
+    assert!(
+        !matches!(&*exec.effect, Effect::Unimplemented { .. }),
+        "the transform body must survive the hoist: {:?}",
+        exec.effect
+    );
 }
 
-/// Control for the per-player decline: the table-wide "no spells were cast last
+/// Control for the per-player guard: the table-wide "no spells were cast last
 /// turn" guard (verbatim Gatstaf Shepherd) still hoists as
 /// `SpellsCastLastTurn == 0`, with its transform body intact.
 #[test]

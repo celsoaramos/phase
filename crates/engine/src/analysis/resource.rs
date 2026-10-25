@@ -7985,6 +7985,7 @@ fn project_out_resources(state: &GameState) -> GameState {
     //     is caught by the board-equality or net-progress gates.
     s.spells_cast_this_turn = 0;
     s.spells_cast_last_turn = None;
+    s.most_spells_cast_by_one_player_last_turn = None;
     s.priority_pass_count = 0;
     // CR 602.5b: per-turn / per-game activation gates. These tallies are bumped for
     // EVERY activation (restrictions.rs record_ability_activation, unconditional), so
