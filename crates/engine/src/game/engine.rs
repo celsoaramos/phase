@@ -12318,6 +12318,9 @@ fn apply_non_priority_pass_action(
 ) -> Result<ActionResult, EngineError> {
     let mut triggers_processed_inline = false;
     let mut completed_resolution = None;
+    // CR 603.2 + CR 603.3b: set when a resolution-choice answer leaves its
+    // resolution paused at a further choice of that resolution.
+    let mut paused_resolution_answer = None;
     let skip_deferred_trigger_drain = false;
     let action_for_divergence = action.clone();
 
@@ -16062,6 +16065,7 @@ fn apply_non_priority_pass_action(
         }
         (waiting_for, action) if engine_resolution_choices::handles(waiting_for) => {
             let carrier = state.resolving_stack_entry.as_ref().map(|entry| entry.id);
+            let answer = engine_resolution_choices::PausedResolutionAnswer::begin(state, &events);
             match engine_resolution_choices::handle_resolution_choice(
                 state,
                 waiting_for.clone(),
@@ -16077,6 +16081,8 @@ fn apply_non_priority_pass_action(
                         && !triggers::is_pending_trigger_construction_active(state)
                     {
                         completed_resolution = carrier;
+                    } else if !matches!(waiting_for, WaitingFor::Priority { .. }) {
+                        paused_resolution_answer = Some(answer);
                     }
                     waiting_for
                 }
@@ -17147,6 +17153,25 @@ fn apply_non_priority_pass_action(
     {
         state.waiting_for = waiting_for.clone();
         return Ok(ActionResult::applied(events, waiting_for));
+    }
+
+    // CR 603.2 + CR 603.3b + CR 608.2c: an answer whose continuation stopped at
+    // the resolution's next choice (Thought Erasure's hand pick running on to
+    // its surveil) produced observable events — the discard, the surveil — that
+    // the post-action pipeline below never scans off Priority. Park their
+    // observers until the resolution reaches a genuine priority boundary.
+    if let Some(answer) = paused_resolution_answer {
+        if let Some(waiting_for) =
+            engine_resolution_choices::park_paused_resolution_answer_observers(
+                state,
+                &mut events,
+                answer,
+                &waiting_for,
+            )?
+        {
+            state.waiting_for = waiting_for.clone();
+            return Ok(ActionResult::applied(events, waiting_for));
+        }
     }
 
     // CR 704.3 / CR 800.4: SBAs may have ended the game during phase auto-advance (e.g.,

@@ -754,6 +754,67 @@ pub(super) fn park_cast_during_resolution_cast_observers(
     Ok(Some(settled))
 }
 
+/// Where a resolution-choice answer started, captured before its handler runs.
+///
+/// CR 603.2 + CR 603.3b: an answer can run the resolution's continuation on to
+/// a further choice of the same resolution (Thought Erasure: the hand pick runs
+/// the discard and the surveil, which stops at `SurveilChoice`). The reducer
+/// skips the post-action pipeline off Priority, so the events of that stretch
+/// are parked by [`park_paused_resolution_answer_observers`] instead.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PausedResolutionAnswer {
+    event_start: usize,
+    deferred_triggers_before: usize,
+}
+
+impl PausedResolutionAnswer {
+    pub(super) fn begin(state: &GameState, events: &[GameEvent]) -> Self {
+        Self {
+            event_start: events.len(),
+            deferred_triggers_before: state.deferred_triggers.len(),
+        }
+    }
+}
+
+/// CR 603.2 + CR 603.3b + CR 608.2c: abilities trigger when their event occurs,
+/// even while the resolution that produced it is paused at a further choice;
+/// they wait in `deferred_triggers` and go on the stack only when a player
+/// would next receive priority.
+///
+/// This is the generic seam for an answer that left its resolution paused at
+/// another resolution choice. It stands back when a handler already parked
+/// its own slice (the deferred queue grew during the answer — that handler's
+/// collector owns the action's observers), when a replacement pause owns the
+/// event (CR 616.1), and outside a resolving stack entry.
+pub(super) fn park_paused_resolution_answer_observers(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    answer: PausedResolutionAnswer,
+    waiting_for: &WaitingFor,
+) -> Result<Option<WaitingFor>, EngineError> {
+    if state.resolving_stack_entry.is_none()
+        || !handles(waiting_for)
+        || state.pending_replacement.is_some()
+        || state.deferred_triggers.len() != answer.deferred_triggers_before
+        || answer.event_start >= events.len()
+    {
+        return Ok(None);
+    }
+    // `run_post_action_pipeline_from` recognizes the paused resolution choice
+    // and parks the slice's observers instead of ordering them now (the same
+    // seam `park_cast_during_resolution_cast_observers` uses).
+    state.waiting_for = waiting_for.clone();
+    let settled = super::engine_priority::run_post_action_pipeline_from(
+        state,
+        events,
+        answer.event_start,
+        waiting_for,
+        false,
+        true,
+    )?;
+    Ok(Some(settled))
+}
+
 /// CR 603.2c: the not-yet-collected events of `events[start..end]`. A
 /// completion that resumes a parked counter-cost root before collecting has
 /// already had that root's announcement commit collect and claim them; every

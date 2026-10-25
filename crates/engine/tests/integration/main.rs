@@ -1559,6 +1559,7 @@ mod thickest_in_the_thicket_target_anaphor_8460;
 mod thor_god_of_thunder;
 mod thorna_and_twigtooth_shared_x_relay_6956;
 mod thought_distortion;
+mod thought_erasure_surveil_trigger;
 mod thoughtweft_trample_regression;
 mod thousand_moons_smithy;
 mod throne_of_eldraine_mana_riders;
