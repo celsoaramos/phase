@@ -315,3 +315,169 @@ fn tovolar_after_mayor_returns_to_human_night_falls_and_mayor_is_chosen() {
         "Mayor → Human (its own trigger) → chosen by Tovolar → Howlpack Alpha again"
     );
 }
+
+/// Start in P1's main phase and have P1 cast ONE spell, so the turn-change
+/// check keeps it day (a day turn whose active player cast no spells becomes
+/// night, CR 502.2) and night can only come from Tovolar's trigger.
+fn opponent_keeps_it_day(runner: &mut GameRunner, spell: ObjectId) {
+    runner.state_mut().day_night = Some(engine::types::game_state::DayNight::Day);
+    runner.state_mut().active_player = P1;
+    runner.state_mut().priority_player = P1;
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P1 };
+    runner.cast(spell).resolve();
+}
+
+/// Field report, third message (2026-10-25, v0.117.0-mf.1f13c283): "it becomes
+/// night — everything nightbound should transform, and I can't choose how many
+/// to transform". With Tovolar and Reckless Stormseeker (both daybound) the
+/// trigger asked for ONE target at stack time. Now: it becomes night, every
+/// daybound permanent transforms with it, and the "any number"
+/// choice is offered afterwards — only Human Werewolves still on their front
+/// face (here, Kruin Outlaw, which has no daybound) can be chosen.
+#[test]
+fn tovolar_night_flips_daybound_and_offers_only_remaining_human_werewolves() {
+    let mut scenario = GameScenario::new_n_player(2, 7);
+    scenario.at_phase(Phase::PreCombatMain);
+    for player in [P0, P1] {
+        for n in 0..4 {
+            scenario.add_card_to_library_top(player, &format!("Filler {n}"));
+        }
+    }
+    let tovolar = scenario
+        .add_creature_from_oracle(
+            P0,
+            "Tovolar, Dire Overlord",
+            3,
+            3,
+            &format!("Daybound\n{TOVOLAR_UPKEEP}"),
+        )
+        .with_subtypes(vec!["Human", "Werewolf"])
+        .id();
+    let stormseeker = scenario
+        .add_creature_from_oracle(P0, "Reckless Stormseeker", 3, 2, "Daybound")
+        .with_subtypes(vec!["Human", "Werewolf"])
+        .id();
+    let outlaw = scenario
+        .add_creature(P0, "Kruin Outlaw", 2, 2)
+        .with_subtypes(vec!["Human", "Rogue", "Werewolf"])
+        .id();
+    for _ in 0..2 {
+        scenario
+            .add_creature(P0, "Wolf", 2, 2)
+            .with_subtypes(vec!["Wolf"]);
+    }
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P1, "Spell A", true, "You gain 1 life.")
+        .id();
+    let mut runner = scenario.build();
+    for t in ["Human", "Werewolf", "Wolf", "Rogue"] {
+        runner.state_mut().all_creature_types.push(t.to_string());
+    }
+    for (id, back) in [
+        (tovolar, "Tovolar, the Midnight Scourge"),
+        (stormseeker, "Storm-Charged Slasher"),
+        (outlaw, "Terror of Kruin Pass"),
+    ] {
+        runner.state_mut().objects.get_mut(&id).unwrap().back_face = Some(werewolf_back(back));
+    }
+    opponent_keeps_it_day(&mut runner, spell);
+    assert_eq!(
+        runner.state().day_night,
+        Some(engine::types::game_state::DayNight::Day)
+    );
+
+    let (offered, _, min_count) = drive_to_transform_choice(&mut runner);
+    assert_eq!(
+        runner.state().day_night,
+        Some(engine::types::game_state::DayNight::Night),
+        "it becomes night before the choice"
+    );
+    let name = |runner: &GameRunner, id: ObjectId| runner.state().objects[&id].name.clone();
+    assert_eq!(name(&runner, tovolar), "Tovolar, the Midnight Scourge");
+    assert_eq!(name(&runner, stormseeker), "Storm-Charged Slasher");
+    assert_eq!(
+        offered,
+        vec![outlaw],
+        "only the Human Werewolf still on its front face"
+    );
+    assert_eq!(min_count, 0);
+
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![outlaw],
+        })
+        .expect("choose Kruin Outlaw");
+    assert_eq!(name(&runner, outlaw), "Terror of Kruin Pass");
+    assert_eq!(
+        name(&runner, tovolar),
+        "Tovolar, the Midnight Scourge",
+        "night didn't get undone"
+    );
+}
+
+/// No Human Werewolf left after night falls: the "any number" choice has
+/// nothing to offer and the trigger finishes without stalling.
+#[test]
+fn tovolar_night_with_only_daybound_finishes_without_a_choice() {
+    let mut scenario = GameScenario::new_n_player(2, 7);
+    scenario.at_phase(Phase::PreCombatMain);
+    for player in [P0, P1] {
+        for n in 0..4 {
+            scenario.add_card_to_library_top(player, &format!("Filler {n}"));
+        }
+    }
+    let tovolar = scenario
+        .add_creature_from_oracle(
+            P0,
+            "Tovolar, Dire Overlord",
+            3,
+            3,
+            &format!("Daybound\n{TOVOLAR_UPKEEP}"),
+        )
+        .with_subtypes(vec!["Human", "Werewolf"])
+        .id();
+    for _ in 0..2 {
+        scenario
+            .add_creature(P0, "Wolf", 2, 2)
+            .with_subtypes(vec!["Wolf"]);
+    }
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P1, "Spell A", true, "You gain 1 life.")
+        .id();
+    let mut runner = scenario.build();
+    for t in ["Human", "Werewolf", "Wolf"] {
+        runner.state_mut().all_creature_types.push(t.to_string());
+    }
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&tovolar)
+        .unwrap()
+        .back_face = Some(werewolf_back("Tovolar, the Midnight Scourge"));
+    runner.state_mut().day_night = Some(engine::types::game_state::DayNight::Day);
+
+    // Pass into P0's next upkeep; the trigger must resolve on its own.
+    let mut night = false;
+    for _ in 0..300 {
+        if runner.state().day_night == Some(engine::types::game_state::DayNight::Night)
+            && runner.state().stack.is_empty()
+        {
+            night = true;
+            break;
+        }
+        match runner.state().waiting_for.clone() {
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass");
+            }
+            WaitingFor::DeclareAttackers { .. } => {
+                runner.declare_attackers(&[]).expect("no attack");
+            }
+            other => panic!("unexpected wait (the empty choice must not stall): {other:?}"),
+        }
+    }
+    assert!(night, "Tovolar's trigger resolved and it became night");
+    assert_eq!(
+        runner.state().objects[&tovolar].name,
+        "Tovolar, the Midnight Scourge"
+    );
+}
