@@ -2567,9 +2567,16 @@ pub(super) fn target_choice_timing_for_parsed(
     }
     // CR 701.26a/b: only single-target tap/untap (legacy `Tap`/`Untap`) takes
     // the resolution-timing branch; the mass scope never declares multi-target.
+    // CR 701.27a + CR 608.2d: "transform any number of Human Werewolves you
+    // control" (Tovolar, Dire Overlord) is the same untargeted variable-count
+    // choice — made while the effect resolves, after the preceding "it becomes
+    // night" instruction, never announced as targets.
     if matches!(
         parsed.effect,
         Effect::SetTapState {
+            scope: EffectScope::Single,
+            ..
+        } | Effect::Transform {
             scope: EffectScope::Single,
             ..
         }
@@ -8754,7 +8761,18 @@ pub(super) fn parse_each_of_up_to_damage_target<'a>(
 /// and collapse the count to a fixed 1 (issue #458).
 /// `put` is intentionally absent; see `REQUIRED_TARGET_COUNT_ONLY_VERBS`.
 const MULTI_TARGET_VERBS: &[&str] = &[
-    "exile", "tap", "untap", "goad", "detain", "return", "destroy", "choose",
+    "exile",
+    "tap",
+    "untap",
+    "goad",
+    "detain",
+    "return",
+    "destroy",
+    "choose",
+    // CR 701.27a + CR 701.28a: "transform/convert any number of <permanents>"
+    // (Tovolar, Dire Overlord) chooses a set of permanents to transform.
+    "transform",
+    "convert",
 ];
 
 /// CR 601.2c + CR 115.1a: Verbs admitted ONLY to the required announced-count

@@ -7040,6 +7040,11 @@ pub(super) fn handle_resolution_choice(
                         }
                     }
                 }
+                // CR 701.27a + CR 608.2d: the resolution-time "transform any
+                // number of …" choice (Tovolar, Dire Overlord).
+                EffectKind::Transform => {
+                    effects::transform_effect::transform_each(state, &chosen, events);
+                }
                 EffectKind::Untap => {
                     for &card_id in &chosen {
                         match effects::tap_untap::process_one_untap(state, card_id, events) {

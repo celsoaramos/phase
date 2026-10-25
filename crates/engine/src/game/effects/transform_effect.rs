@@ -38,6 +38,18 @@ pub fn resolve(
         }
         EffectScope::Single => target.clone(),
     };
+    // CR 107.1c + CR 608.2d: "transform any number of Human Werewolves you
+    // control" (Tovolar, Dire Overlord) — an untargeted variable-count choice
+    // made while this effect resolves.
+    if super::tap_untap::prompt_resolution_battlefield_choice(
+        state,
+        ability,
+        &single_target,
+        EffectKind::Transform,
+        events,
+    ) {
+        return Ok(());
+    }
 
     // CR 201.5: "Text that refers to the object it's on by name means just that
     // particular object and not any other objects with that name." A printed
@@ -191,10 +203,17 @@ pub fn resolve(
         // which is what keeps "no target declared" and "the referent went stale"
         // from collapsing into the same OUTCOME even though they share this arm.
         [] => ability.source_id,
-        _ => {
-            return Err(EffectError::InvalidParam(
-                "transform expects exactly one object target".to_string(),
-            ))
+        // CR 701.27a + CR 701.27c: a variable-count announced set ("transform any
+        // number of target …") transforms each chosen permanent; one that can't
+        // transform does nothing and never aborts the rest.
+        many => {
+            transform_each(state, many, events);
+            events.push(GameEvent::EffectResolved {
+                kind: EffectKind::Transform,
+                source_id: ability.source_id,
+                subject: None,
+            });
+            return Ok(());
         }
     };
 
@@ -210,6 +229,27 @@ pub fn resolve(
     });
 
     Ok(())
+}
+
+/// CR 701.27a + CR 701.27c: transform each permanent of a chosen set. Only
+/// double-faced permanents can transform; any other (or one a "can't transform"
+/// effect stops) is a per-object no-op, so one failure never aborts the set.
+/// Shared by the announced multi-target set and the resolution-time
+/// `EffectZoneChoice` (`EffectKind::Transform`).
+pub(crate) fn transform_each(
+    state: &mut GameState,
+    chosen: &[crate::types::identifiers::ObjectId],
+    events: &mut Vec<GameEvent>,
+) {
+    for &object_id in chosen {
+        if state
+            .objects
+            .get(&object_id)
+            .is_some_and(is_double_faced_permanent)
+        {
+            let _ = transform_permanent(state, object_id, events);
+        }
+    }
 }
 
 /// CR 701.27f + CR 701.28e: A self-transform (or convert) instruction does

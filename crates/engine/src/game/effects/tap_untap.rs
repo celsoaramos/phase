@@ -160,7 +160,7 @@ fn resolve_single(
         TapStateChange::Tap => EffectKind::Tap,
         TapStateChange::Untap => EffectKind::Untap,
     };
-    if prompt_resolution_tap_untap_choice(state, ability, target, effect_kind, events) {
+    if prompt_resolution_battlefield_choice(state, ability, target, effect_kind, events) {
         return Ok(());
     }
     let target_ids = tap_untap_target_ids(state, ability, target);
@@ -290,7 +290,13 @@ pub(crate) fn process_one_untap(
     }
 }
 
-fn prompt_resolution_tap_untap_choice(
+/// CR 107.1c + CR 608.2d: an untargeted variable-count choice of battlefield
+/// permanents ("tap/untap/transform any number of <filter>") is made while the
+/// effect resolves. Parks the resolution on an `EffectZoneChoice` over the
+/// permanents matching `target`; the choice handler applies `effect_kind` to
+/// each chosen permanent. Returns `true` when the effect was handled here
+/// (prompt opened or vacuous no-op).
+pub(super) fn prompt_resolution_battlefield_choice(
     state: &mut GameState,
     ability: &ResolvedAbility,
     target: &TargetFilter,
@@ -1377,7 +1383,7 @@ mod tests {
         ability.chosen_x = None;
 
         let mut events = Vec::new();
-        let handled = prompt_resolution_tap_untap_choice(
+        let handled = prompt_resolution_battlefield_choice(
             &mut state,
             &ability,
             &target,
