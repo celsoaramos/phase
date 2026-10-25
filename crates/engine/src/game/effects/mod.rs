@@ -4990,6 +4990,9 @@ fn effect_enters_battlefield(effect: &Effect) -> bool {
         Effect::Encore => false,
         // not a co-entry ContinuationStep: it selects cards and moves nothing itself.
         Effect::ChooseFromZone { .. } => false,
+        // CR 707.12 (Garth One-Eye): the copy is created outside the battlefield
+        // (and then cast); it reaches no co-entry link.
+        Effect::CreateCardCopyByName { .. } => false,
         Effect::StartYourEngines { .. }
         | Effect::ChangeSpeed { .. }
         | Effect::DealDamage { .. }
