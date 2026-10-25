@@ -1,6 +1,6 @@
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_until};
-use nom::character::complete::multispace0;
+use nom::character::complete::{alpha1, multispace0};
 use nom::combinator::{all_consuming, eof, map, opt, peek, rest, value, verify};
 use nom::error::ParseError;
 use nom::multi::separated_list1;
@@ -1341,18 +1341,6 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
         };
     }
 
-    // "Reveal this card from your hand" — reveal self cost
-    if nom_on_lower(text, &lower, |i| {
-        value((), tag("reveal this card from your hand")).parse(i)
-    })
-    .is_some()
-    {
-        return AbilityCost::Reveal {
-            count: QuantityExpr::Fixed { value: 1 },
-            filter: None,
-        };
-    }
-
     // CR 701.20a + CR 107.3a: "Reveal <N|X> <card phrase> from your hand" — a
     // counted, typed reveal. X stays symbolic so the value announced while
     // casting or activating is the number revealed (Martyr cycle).
@@ -1362,20 +1350,64 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
         }
     }
 
-    // "Reveal a [Type] card from your hand" — fallback for reveal shapes the
-    // strict `parse_reveal_from_hand_cost_body` grammar declines (self-name
-    // reveals, trailing relative clauses such as "that share a color").
+    // CR 701.20a + CR 701.20b: the reveal-from-hand shapes the strict grammar
+    // above declines. Revealing a card as a cost shows it and it stays in hand;
+    // what this cost cannot represent FAILS CLOSED instead of dropping the
+    // clause and revealing one card of any kind — a clause after "from your
+    // hand" ("that share a color", Illuminated Folio) or a body that is neither
+    // the source itself nor "a [Type] card".
     if let Some(((), rest)) = nom_on_lower(text, &lower, |i| value((), tag("reveal ")).parse(i)) {
         let rest_lower = rest.to_lowercase();
-        if let Ok((_, (before, _))) = split_once_on(&rest_lower, "from your hand") {
-            let filter_raw = before.trim();
-            let filter_raw = strip_article(filter_raw, filter_raw);
+        let split = pair(
+            take_until::<_, _, E<'_>>(" from your hand"),
+            tag(" from your hand"),
+        )
+        .parse(rest_lower.as_str());
+        if let Ok((tail, (body, _))) = split {
+            let unimplemented = || AbilityCost::Unimplemented {
+                description: text.to_string(),
+            };
+            if all_consuming(multispace0::<_, E<'_>>)
+                .parse(tail.trim_end_matches('.'))
+                .is_err()
+            {
+                return unimplemented();
+            }
+            // Self-reveal ("~", "this creature", "this card"), mirroring the
+            // Sacrifice self arm; a granted body's by-name reference keeps its
+            // `GrantingObject` filter (CR 201.5a).
+            if let Ok((_, filter)) = all_consuming(alt((
+                parse_cost_self_reference,
+                value(TargetFilter::SelfRef, preceded(tag("this "), alpha1)),
+            )))
+            .parse(body)
+            {
+                return match filter {
+                    TargetFilter::SelfRef => AbilityCost::Reveal {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        filter: None,
+                    },
+                    other => AbilityCost::Reveal {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        filter: Some(other),
+                    },
+                };
+            }
+            // "Reveal a [Type] card from your hand" — one card of the type.
+            let Some(((), filter_raw)) = nom_on_lower(body, body, nom_primitives::parse_article)
+            else {
+                return unimplemented();
+            };
             let filter_raw = filter_raw
                 .strip_suffix(" card")
                 .or_else(|| filter_raw.strip_suffix(" cards"))
                 .unwrap_or(filter_raw)
                 .trim();
-            let (filter, _) = parse_target(&format!("target {filter_raw}"));
+            let phrase = format!("target {filter_raw}");
+            let (filter, remainder) = parse_target(&phrase);
+            if !remainder.trim().is_empty() {
+                return unimplemented();
+            }
             return AbilityCost::Reveal {
                 count: QuantityExpr::Fixed { value: 1 },
                 filter: Some(filter),
@@ -4825,6 +4857,51 @@ mod tests {
                 filter: None
             }
         );
+    }
+
+    /// CR 701.20a: revealing the source itself ("this creature", "~", "this card").
+    #[test]
+    fn cost_reveal_self_forms_from_hand() {
+        for text in [
+            "Reveal this creature from your hand",
+            "Reveal ~ from your hand",
+            "Reveal this card from your hand",
+        ] {
+            assert_eq!(
+                parse_oracle_cost(text),
+                AbilityCost::Reveal {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    filter: None,
+                },
+                "{text}"
+            );
+        }
+        assert_eq!(
+            parse_oracle_cost(&format!(
+                "Reveal {} from your hand",
+                crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER
+            )),
+            AbilityCost::Reveal {
+                count: QuantityExpr::Fixed { value: 1 },
+                filter: Some(TargetFilter::GrantingObject { bound: None }),
+            }
+        );
+    }
+
+    /// A reveal constraint the cost cannot represent fails closed instead of
+    /// dropping the clause (Illuminated Folio: "that share a color").
+    #[test]
+    fn cost_reveal_unrepresentable_forms_are_unimplemented() {
+        for text in [
+            "Reveal two cards from your hand that share a color",
+            "Reveal this creature card from your hand",
+        ] {
+            assert!(
+                matches!(parse_oracle_cost(text), AbilityCost::Unimplemented { .. }),
+                "{text} must be Unimplemented, got {:?}",
+                parse_oracle_cost(text)
+            );
+        }
     }
 
     /// CR 701.20a + CR 107.3a: the Martyr cycle's "Reveal X <color> cards
