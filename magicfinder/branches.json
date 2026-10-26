@@ -258,6 +258,9 @@
     "branch": "ai/bot-flags-1024"
   },
   {
+    "branch": "ai/energy-damage-target"
+  },
+  {
     "branch": "card/moonmist-other-than-types"
   },
   {
