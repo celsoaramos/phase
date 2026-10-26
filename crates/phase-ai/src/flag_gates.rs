@@ -1406,9 +1406,10 @@ mod tests {
     #[test]
     fn energy_amount_is_free_when_the_creature_is_in_combat_with_ours() {
         let (mut state, victim) = harnessed_board(20);
+        let card_id = CardId(state.next_object_id);
         let attacker = create_object(
             &mut state,
-            CardId(state.next_object_id),
+            card_id,
             P0,
             "Attacker".to_string(),
             Zone::Battlefield,
