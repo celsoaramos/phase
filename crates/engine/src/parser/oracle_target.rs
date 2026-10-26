@@ -6138,6 +6138,14 @@ pub(crate) fn distribute_core_type_to_or(filter: TargetFilter) -> TargetFilter {
 /// enchantment leg (which only wants `Non(Aura)`), silently narrowing Bello's
 /// enchantment conjunct to exclude non-Aura-non-Equipment enchantments the
 /// Oracle text never excludes.
+///
+/// Guarded also to a negation that QUALIFIES a type word: the first leg must
+/// name a positive type ("non-Lesson *instant*"). When the negation is the
+/// whole first disjunct ("noncreature or Dragon spell" — Firespitter Whelp),
+/// it is a sibling of the other legs, not a shared adjective: the phrase means
+/// "a noncreature spell or a Dragon spell" (CR 109.3), so a Dragon creature
+/// spell matches. Distributing there would make the Dragon leg "noncreature
+/// Dragon" and the trigger would never fire for a Dragon creature spell.
 pub(crate) fn distribute_neg_type_filters_to_or(filter: TargetFilter) -> TargetFilter {
     let TargetFilter::Or { mut filters } = filter else {
         return filter;
@@ -6147,6 +6155,12 @@ pub(crate) fn distribute_neg_type_filters_to_or(filter: TargetFilter) -> TargetF
         .first()
         .and_then(|f| {
             if let TargetFilter::Typed(TypedFilter { type_filters, .. }) = f {
+                let negation_qualifies_a_type = type_filters
+                    .iter()
+                    .any(|tf| !matches!(tf, TypeFilter::Any | TypeFilter::Non(_)));
+                if !negation_qualifies_a_type {
+                    return None;
+                }
                 Some(
                     type_filters
                         .iter()

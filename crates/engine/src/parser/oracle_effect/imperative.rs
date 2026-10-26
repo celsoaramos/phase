@@ -12023,6 +12023,20 @@ fn parse_pay_life_amount(rest: &str) -> Option<QuantityExpr> {
         }
     }
 
+    // CR 119.4 + CR 608.2h: "pay that much life" — the triggering event's
+    // amount (Niv-Mizzet, Ghost Counsel: "Whenever you gain life, you may pay
+    // that much life."). The demonstrative goes through the shared
+    // `parse_that_much_or_many` authority, so it binds to
+    // `EventContextAmount` exactly like "you gain/lose that much life".
+    if let Ok((_, qty)) = terminated(
+        crate::parser::oracle_nom::quantity::parse_that_much_or_many,
+        terminated(tag::<_, _, OracleError<'_>>(" life"), word_boundary),
+    )
+    .parse(rest)
+    {
+        return Some(QuantityExpr::Ref { qty });
+    }
+
     // CR 118.8: "pay N life" — literal amount via `parse_number` (digit words
     // or numerals, never "X" — handled above). Same word-boundary guard so
     // hypothetical phrases like "3 lifelink" cannot false-match.
