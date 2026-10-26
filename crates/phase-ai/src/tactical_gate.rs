@@ -2314,7 +2314,7 @@ fn is_proven_conditional_destroy_whiff(ctx: &PolicyContext<'_>) -> bool {
     let Some(nodes) = conditional_destroy_nodes(source) else {
         return false;
     };
-    let Some(filter) = extract_target_filter(&nodes[0].effect) else {
+    let Some(filter) = extract_target_filter(&nodes[0].node.effect) else {
         return false;
     };
     !ctx.has_legal_opponent_creature_target(filter, source.id, |id| {
@@ -2322,13 +2322,24 @@ fn is_proven_conditional_destroy_whiff(ctx: &PolicyContext<'_>) -> bool {
     }) && !caster_has_cast_payoff(ctx.state, *object_id)
 }
 
+/// One `Destroy` node of a Fatal Push-class chain, with the conditions of the
+/// condition-only frames it sits under (`gates`). Since v0.118.0 the revolt line
+/// lowers to a `NoOp` frame carrying the `ConditionInstead` revolt check, with
+/// "destroy that creature if it has mana value 4 or less" beneath it: that
+/// `Destroy` happens only when its own condition AND every gate above it hold.
+struct ConditionalDestroyNode<'a> {
+    node: &'a AbilityDefinition,
+    gates: Vec<&'a AbilityCondition>,
+}
+
 /// The chain (root, sub, else) of a Fatal Push-class spell, or `None` outside
 /// the class. Fail-open: modal spells, more than one spell ability, any node
-/// that is not a harmful creature-only `Destroy`, or no node whose condition
-/// reads the target keep the spell out.
+/// that is neither a harmful creature-only `Destroy` nor a condition-only frame
+/// below the root, or no node whose condition reads the target keep the spell
+/// out.
 fn conditional_destroy_nodes(
     source: &engine::game::game_object::GameObject,
-) -> Option<Vec<&AbilityDefinition>> {
+) -> Option<Vec<ConditionalDestroyNode<'_>>> {
     let mut spells = source
         .abilities
         .iter()
@@ -2337,13 +2348,25 @@ fn conditional_destroy_nodes(
     if spells.next().is_some() {
         return None;
     }
-    let mut nodes = Vec::new();
-    let mut pending = vec![root];
-    while let Some(node) = pending.pop() {
+    let mut nodes: Vec<ConditionalDestroyNode<'_>> = Vec::new();
+    let mut reads_target = false;
+    let mut pending = vec![(root, Vec::new())];
+    while let Some((node, gates)) = pending.pop() {
         if node.modal.is_some() || !node.mode_abilities.is_empty() {
             return None;
         }
+        reads_target |= node.condition.as_ref().is_some_and(condition_reads_target);
         let effect = node.effect.as_ref();
+        // CR 608.2c: a condition-only frame below the root ("Revolt — … instead
+        // if …") does nothing itself; it gates the instructions under it.
+        if matches!(effect, Effect::NoOp) && !nodes.is_empty() {
+            let condition = node.condition.as_ref()?;
+            let mut inner = gates.clone();
+            inner.push(condition);
+            pending.extend(node.sub_ability.as_deref().map(|sub| (sub, inner.clone())));
+            pending.extend(node.else_ability.as_deref().map(|other| (other, gates)));
+            continue;
+        }
         // The root picks the target; a sub/else leg may destroy "that
         // creature" (`ParentTarget`) — Fatal Push's revolt line.
         let destroys_the_target = match effect {
@@ -2360,14 +2383,15 @@ fn conditional_destroy_nodes(
         if !destroys_the_target {
             return None;
         }
-        nodes.push(node);
-        pending.extend(node.sub_ability.as_deref());
-        pending.extend(node.else_ability.as_deref());
+        pending.extend(node.sub_ability.as_deref().map(|sub| (sub, gates.clone())));
+        pending.extend(
+            node.else_ability
+                .as_deref()
+                .map(|other| (other, gates.clone())),
+        );
+        nodes.push(ConditionalDestroyNode { node, gates });
     }
-    nodes
-        .iter()
-        .any(|node| node.condition.as_ref().is_some_and(condition_reads_target))
-        .then_some(nodes)
+    reads_target.then_some(nodes)
 }
 
 fn condition_reads_target(condition: &AbilityCondition) -> bool {
@@ -2383,25 +2407,28 @@ fn condition_reads_target(condition: &AbilityCondition) -> bool {
 }
 
 /// Would some node of the chain destroy `target` if the spell resolved now?
-/// A node without a condition destroys unconditionally; an `else` leg counts
-/// as a possible destroy too (over-approximation = fail-open).
+/// A node destroys when its own condition (none = unconditional) and every
+/// gate above it hold; an `else` leg counts as a possible destroy too
+/// (over-approximation = fail-open).
 fn conditional_destroy_kills(
     state: &GameState,
     source: &engine::game::game_object::GameObject,
-    nodes: &[&AbilityDefinition],
+    nodes: &[ConditionalDestroyNode<'_>],
     target: ObjectId,
 ) -> bool {
-    nodes.iter().any(|node| {
-        let Some(condition) = node.condition.as_ref() else {
-            return true;
-        };
+    nodes.iter().any(|entry| {
         let resolved = engine::game::ability_utils::build_resolved_from_def_with_targets(
-            node,
+            entry.node,
             source.id,
             source.controller,
             vec![TargetRef::Object(target)],
         );
-        engine::game::effects::evaluate_condition(condition, state, &resolved)
+        entry
+            .gates
+            .iter()
+            .copied()
+            .chain(entry.node.condition.as_ref())
+            .all(|condition| engine::game::effects::evaluate_condition(condition, state, &resolved))
     })
 }
 
