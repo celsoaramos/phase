@@ -20,7 +20,9 @@
 //!
 //! * "pay any amount of {E}, deal that much damage to that creature" paid 1 of
 //!   12 energy into a 6-toughness creature (Harnessed Lightning) — the amount
-//!   prompt was answered by its minimum;
+//!   prompt was answered by its minimum. Since 26/10 the same spell is also
+//!   aimed at a creature it can kill, cast only when one exists, and pays
+//!   nothing into a creature that survives (or into the AI's own);
 //! * a creature Aura that only helps the enchanted creature (Rancor) cast with
 //!   no own creature on the board, so its only legal target was the opponent's;
 //! * "target creature gains haste until end of turn" activated every turn on a
@@ -59,6 +61,7 @@ pub(crate) fn rejects(ctx: &PolicyContext<'_>) -> bool {
                 || soft_counter_is_payable_at_cast(ctx)
                 || protection_spell_has_nothing_to_stop(ctx)
                 || boon_aura_reaches_only_foreign(ctx)
+                || energy_burn_has_nothing_to_kill(ctx)
         }
         GameAction::ChooseTarget {
             target: Some(target),
@@ -67,7 +70,7 @@ pub(crate) fn rejects(ctx: &PolicyContext<'_>) -> bool {
             targets.iter().any(|target| target_is_rejected(ctx, target))
         }
         GameAction::SelectCards { cards } => bounce_land_returns_itself(ctx, cards),
-        GameAction::SubmitPayAmount { amount } => energy_pay_amount_misses_lethal(ctx, *amount),
+        GameAction::SubmitPayAmount { amount } => energy_pay_amount_is_wasted(ctx, *amount),
         GameAction::ActivateAbility {
             source_id,
             ability_index,
@@ -82,6 +85,7 @@ fn target_is_rejected(ctx: &PolicyContext<'_>, target: &TargetRef) -> bool {
         || boon_aura_targets_opponent(ctx, target)
         || boon_aura_targets_foreign_creature(ctx, target)
         || haste_grant_target_needs_no_haste(ctx, target)
+        || energy_burn_target_misses_kill(ctx, target)
 }
 
 /// The instant/sorcery being cast and its root spell ability.
@@ -417,54 +421,177 @@ fn bounce_land_returns_itself(ctx: &PolicyContext<'_>, cards: &[ObjectId]) -> bo
 // "Pay any amount of {E}; deal that much damage" paid below lethal
 // ---------------------------------------------------------------------------
 
-/// The creature a resolving "pay any amount of {E}, ~ deals that much damage
-/// to that creature" chain is pointed at: a `PayCost(PayEnergy X)` step whose
-/// next step is `DealDamage(EventContextAmount)` at the chain root's target
-/// (Harnessed Lightning). `None` for every other shape.
-fn damage_per_energy_target(root: &ResolvedAbility) -> Option<TargetRef> {
-    let mut node = Some(root);
-    while let Some(ability) = node {
-        if let Effect::PayCost {
-            cost:
-                AbilityCost::PayEnergy {
-                    amount:
-                        QuantityExpr::Ref {
-                            qty: QuantityRef::Variable { .. },
-                        },
+/// `true` for the two steps that make "pay any amount of {E}, ~ deals that
+/// much damage to that creature": a `PayCost(PayEnergy X)` immediately followed
+/// by `DealDamage(EventContextAmount)` at the chain's target.
+fn is_energy_burn_payment(payment: &Effect, next: Option<&Effect>) -> bool {
+    matches!(
+        payment,
+        Effect::PayCost {
+            cost: AbilityCost::PayEnergy {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::Variable { .. },
                 },
+            },
             ..
-        } = &ability.effect
-        {
-            let next = ability.sub_ability.as_deref()?;
-            let Effect::DealDamage {
-                amount:
-                    QuantityExpr::Ref {
-                        qty: QuantityRef::EventContextAmount,
-                    },
-                target: TargetFilter::TriggeringSource,
-                ..
-            } = &next.effect
-            else {
-                return None;
-            };
-            return root
-                .targets
-                .first()
-                .or_else(|| root.context.chain_root_targets.first())
-                .cloned();
         }
-        node = ability.sub_ability.as_deref();
+    ) && matches!(
+        next,
+        Some(Effect::DealDamage {
+            amount: QuantityExpr::Ref {
+                qty: QuantityRef::EventContextAmount,
+            },
+            target: TargetFilter::TriggeringSource,
+            ..
+        })
+    )
+}
+
+/// CR 107.14 + CR 120.3: "you get {E}{E}{E}, then you may pay any amount of
+/// {E}. ~ deals that much damage to that creature" (Harnessed Lightning). Walks
+/// a chain of effects in resolution order and returns the energy the chain
+/// itself grants before the payment, or `None` when the chain has no such
+/// payment. Shared by the definition (cast) and resolved (target, payment)
+/// views of the same spell.
+fn energy_burn_grant<'a>(mut steps: impl Iterator<Item = &'a Effect>) -> Option<u32> {
+    let mut granted = 0u32;
+    let mut current = steps.next();
+    while let Some(effect) = current {
+        let next = steps.next();
+        if is_energy_burn_payment(effect, next) {
+            return Some(granted);
+        }
+        if let Effect::GainEnergy {
+            amount: QuantityExpr::Fixed { value },
+        } = effect
+        {
+            granted = granted.saturating_add(u32::try_from(*value).unwrap_or(0));
+        }
+        current = next;
     }
     None
 }
 
-/// CR 107.14 + CR 120.3: the amount paid IS the damage. Field report (24/10,
+fn resolved_chain(root: &ResolvedAbility) -> impl Iterator<Item = &Effect> {
+    std::iter::successors(Some(root), |ability| ability.sub_ability.as_deref())
+        .map(|ability| &ability.effect)
+}
+
+fn definition_chain(root: &AbilityDefinition) -> impl Iterator<Item = &Effect> {
+    std::iter::successors(Some(root), |ability| ability.sub_ability.as_deref())
+        .map(|ability| ability.effect.as_ref())
+}
+
+/// The creature a resolving energy-burn chain is pointed at (the chain root's
+/// target). `None` for every other shape.
+fn damage_per_energy_target(root: &ResolvedAbility) -> Option<TargetRef> {
+    energy_burn_grant(resolved_chain(root))?;
+    root.targets
+        .first()
+        .or_else(|| root.context.chain_root_targets.first())
+        .cloned()
+}
+
+/// What paying up to `budget` energy into `id` can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnergyBurnOutcome {
+    /// CR 704.5g: this much damage is lethal and within the budget.
+    Kills(u32),
+    /// The creature survives every affordable amount: indestructible
+    /// (CR 702.12b) or tougher than the budget.
+    Survives,
+    /// Not a creature on the battlefield, or already at lethal damage.
+    Unknown,
+}
+
+fn energy_burn_outcome(state: &GameState, id: ObjectId, budget: u32) -> EnergyBurnOutcome {
+    let Some(creature) = state.objects.get(&id) else {
+        return EnergyBurnOutcome::Unknown;
+    };
+    if creature.zone != Zone::Battlefield
+        || !creature.card_types.core_types.contains(&CoreType::Creature)
+    {
+        return EnergyBurnOutcome::Unknown;
+    }
+    // CR 702.12b: lethal damage doesn't destroy an indestructible creature.
+    if creature.has_keyword(&Keyword::Indestructible) {
+        return EnergyBurnOutcome::Survives;
+    }
+    let remaining = creature.toughness.unwrap_or(0) - creature.damage_marked as i32;
+    let Ok(lethal) = u32::try_from(remaining) else {
+        return EnergyBurnOutcome::Unknown;
+    };
+    if lethal == 0 {
+        EnergyBurnOutcome::Unknown
+    } else if lethal > budget {
+        EnergyBurnOutcome::Survives
+    } else {
+        EnergyBurnOutcome::Kills(lethal)
+    }
+}
+
+/// CR 510.1 + CR 120.6: `id` is blocking or blocked by a creature `ai`
+/// controls, so combat damage adds to whatever the spell deals — a
+/// non-lethal amount can still finish it.
+fn shares_combat_with(state: &GameState, ai: PlayerId, id: ObjectId) -> bool {
+    let Some(combat) = state.combat.as_ref() else {
+        return false;
+    };
+    let own = |other: &ObjectId| {
+        state
+            .objects
+            .get(other)
+            .is_some_and(|object| object.controller == ai)
+    };
+    combat
+        .blocker_assignments
+        .get(&id)
+        .is_some_and(|blockers| blockers.iter().any(own))
+        || combat
+            .blocker_to_attacker
+            .get(&id)
+            .is_some_and(|attackers| attackers.iter().any(own))
+}
+
+fn energy_of(state: &GameState, player: PlayerId) -> u32 {
+    state
+        .players
+        .iter()
+        .find(|candidate| candidate.id == player)
+        .map_or(0, |candidate| candidate.energy)
+}
+
+/// An opposing creature the energy-burn spell kills with `budget` energy.
+fn energy_burn_kills_opponent(
+    state: &GameState,
+    ai: PlayerId,
+    target: &TargetRef,
+    budget: u32,
+) -> bool {
+    let TargetRef::Object(id) = target else {
+        return false;
+    };
+    state
+        .objects
+        .get(id)
+        .is_some_and(|object| is_opponent(state, ai, object.controller))
+        && matches!(
+            energy_burn_outcome(state, *id, budget),
+            EnergyBurnOutcome::Kills(_)
+        )
+}
+
+/// CR 107.14 + CR 120.3: the amount paid IS the damage. Field reports (24/10,
 /// Kaladesh Energy challenger): Harnessed Lightning on an 18/6 with 12 energy
-/// in the pool, paid 1 — every amount was scored 0.1 apart and the prompt's
-/// default is its minimum. Rejected: any amount other than the lethal one,
-/// whenever lethal is within the legal range. Above the range (the creature
-/// cannot die) nothing is proven and the choice stays with scoring.
-fn energy_pay_amount_misses_lethal(ctx: &PolicyContext<'_>, amount: u32) -> bool {
+/// in the pool paid 1 — every amount was scored 0.1 apart and the prompt's
+/// default is its minimum. Rejected:
+/// * at an opposing creature that can die, any amount but the lethal one;
+/// * at an opposing creature that survives every affordable amount and isn't
+///   in combat with the AI's creatures, any amount above the minimum — the
+///   damage does nothing and the energy is gone;
+/// * at the AI's own creature, any amount above the minimum (the spell was
+///   cast for its energy; paying would only hurt the AI's creature).
+fn energy_pay_amount_is_wasted(ctx: &PolicyContext<'_>, amount: u32) -> bool {
     let WaitingFor::PayAmountChoice {
         player,
         resource: PayableResource::Energy,
@@ -498,21 +625,76 @@ fn energy_pay_amount_misses_lethal(ctx: &PolicyContext<'_>, amount: u32) -> bool
     let Some(creature) = ctx.state.objects.get(&target) else {
         return false;
     };
-    if creature.zone != Zone::Battlefield
-        || !creature.card_types.core_types.contains(&CoreType::Creature)
-        || creature.has_keyword(&Keyword::Indestructible)
-    {
+    if creature.controller == ctx.ai_player {
+        return amount > *min;
+    }
+    if !is_opponent(ctx.state, ctx.ai_player, creature.controller) {
         return false;
     }
-    let toughness = creature.toughness.unwrap_or(0) - creature.damage_marked as i32;
-    if toughness <= 0 {
+    match energy_burn_outcome(ctx.state, target, *max) {
+        EnergyBurnOutcome::Kills(lethal) if lethal >= *min => amount != lethal,
+        EnergyBurnOutcome::Survives if !shares_combat_with(ctx.state, ctx.ai_player, target) => {
+            amount > *min
+        }
+        _ => false,
+    }
+}
+
+/// CR 601.2c: the target is chosen before the spell's own energy arrives, so
+/// the budget is the pool plus what the chain grants. Rejected: a target the
+/// spell can't kill while another legal opposing creature would die.
+fn energy_burn_target_misses_kill(ctx: &PolicyContext<'_>, target: &TargetRef) -> bool {
+    let WaitingFor::TargetSelection {
+        pending_cast,
+        target_slots,
+        ..
+    } = &ctx.decision.waiting_for
+    else {
+        return false;
+    };
+    let ability = &pending_cast.ability;
+    if ability.controller != ctx.ai_player {
         return false;
     }
-    let lethal = toughness as u32;
-    if lethal < *min || lethal > *max {
+    let Some(granted) = energy_burn_grant(resolved_chain(ability)) else {
         return false;
-    }
-    amount != lethal
+    };
+    let budget = energy_of(ctx.state, ctx.ai_player).saturating_add(granted);
+    let kills = |candidate: &TargetRef| {
+        energy_burn_kills_opponent(ctx.state, ctx.ai_player, candidate, budget)
+    };
+    !kills(target)
+        && target_slots
+            .iter()
+            .flat_map(|slot| slot.legal_targets.iter())
+            .any(kills)
+}
+
+/// Harnessed Lightning is removal that also pays three energy. Cast with no
+/// opposing creature it can kill, the card buys three energy and nothing
+/// else. Rejected only when no legal opposing creature dies to the pool plus
+/// the spell's own energy and none is in combat with the AI's creatures.
+fn energy_burn_has_nothing_to_kill(ctx: &PolicyContext<'_>) -> bool {
+    let Some((source, root)) = cast_spell_definition(ctx) else {
+        return false;
+    };
+    let Some(granted) = energy_burn_grant(definition_chain(root)) else {
+        return false;
+    };
+    let filter = match root.effect.as_ref() {
+        Effect::TargetOnly { target } => target,
+        effect => match extract_target_filter(effect) {
+            Some(filter) => filter,
+            None => return false,
+        },
+    };
+    let budget = energy_of(ctx.state, ctx.ai_player).saturating_add(granted);
+    let legal = find_legal_targets(ctx.state, filter, ctx.ai_player, source.id);
+    !legal.iter().any(|target| {
+        energy_burn_kills_opponent(ctx.state, ctx.ai_player, target, budget)
+            || matches!(target, TargetRef::Object(id)
+                if shares_combat_with(ctx.state, ctx.ai_player, *id))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,19 +1298,35 @@ mod tests {
 
     const HARNESSED: &str = "Choose target creature. You get {E}{E}{E} (three energy counters), then you may pay any amount of {E}. Harnessed Lightning deals that much damage to that creature.";
 
-    /// Casts Harnessed Lightning (free) at a 3/`toughness` with 9 energy in
-    /// the pool (12 after the spell's own three) and runs to the pay prompt.
-    fn harnessed_board(toughness: i32) -> (GameState, ObjectId) {
+    /// Harnessed Lightning (free) in P0's hand, `energy` in P0's pool and the
+    /// given `(controller, toughness)` creatures (all 3-power) on the
+    /// battlefield, with P0 holding priority in the precombat main phase.
+    fn harnessed_runner(
+        creatures: &[(PlayerId, i32)],
+        energy: u32,
+    ) -> (GameRunner, ObjectId, Vec<ObjectId>) {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
-        let victim = scenario.add_vanilla(P1, 3, toughness);
+        let ids = creatures
+            .iter()
+            .map(|(controller, toughness)| scenario.add_vanilla(*controller, 3, *toughness))
+            .collect();
         let lightning = scenario
             .add_spell_to_hand_from_oracle(P0, "Harnessed Lightning", true, HARNESSED)
             .with_mana_cost(ManaCost::zero())
             .id();
         let mut runner = scenario.build();
-        runner.state_mut().players[0].energy = 9;
+        runner.state_mut().players[0].energy = energy;
         priority_to_p0(&mut runner, P0);
+        (runner, lightning, ids)
+    }
+
+    /// Casts Harnessed Lightning (free) at a 3/`toughness` controlled by
+    /// `owner` with 9 energy in the pool (12 after the spell's own three) and
+    /// runs to the pay prompt.
+    fn harnessed_board_at(owner: PlayerId, toughness: i32) -> (GameState, ObjectId) {
+        let (mut runner, lightning, ids) = harnessed_runner(&[(owner, toughness)], 9);
+        let victim = ids[0];
         let action = cast(runner.state(), lightning);
         runner.act(action).expect("cast Harnessed Lightning");
         if matches!(
@@ -1154,7 +1352,28 @@ mod tests {
                 _ => runner.pass_both_players(),
             }
         }
-        (runner.state().clone(), victim)
+        let state = runner.state().clone();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::PayAmountChoice { .. }),
+            "precondition: the spell asks how much energy to pay, got {:?}",
+            state.waiting_for
+        );
+        (state, victim)
+    }
+
+    fn harnessed_board(toughness: i32) -> (GameState, ObjectId) {
+        harnessed_board_at(P1, toughness)
+    }
+
+    fn pay_range(state: &GameState) -> (u32, u32) {
+        let WaitingFor::PayAmountChoice { min, max, .. } = &state.waiting_for else {
+            unreachable!("harnessed_board_at stops at the pay prompt");
+        };
+        (*min, *max)
+    }
+
+    fn pay(amount: u32) -> GameAction {
+        GameAction::SubmitPayAmount { amount }
     }
 
     /// Field report (24/10, Kaladesh Energy): 12 energy, an 18/6 as the
@@ -1162,27 +1381,134 @@ mod tests {
     #[test]
     fn rejects_energy_amount_that_does_not_kill() {
         let (state, _) = harnessed_board(6);
-        let WaitingFor::PayAmountChoice { min, max, .. } = &state.waiting_for else {
-            panic!(
-                "precondition: the spell asks how much energy to pay, got {:?}",
-                state.waiting_for
-            );
-        };
-        assert!(*min <= 6 && *max >= 6, "range {min}..={max}");
-        let pay = |amount| GameAction::SubmitPayAmount { amount };
+        let (min, max) = pay_range(&state);
+        assert!(min <= 6 && max >= 6, "range {min}..={max}");
         assert!(kept(&state, pay(6)), "lethal");
         assert!(!kept(&state, pay(1)), "one energy");
         assert!(!kept(&state, pay(0)), "nothing");
-        assert!(!kept(&state, pay(*max)), "everything");
+        assert!(!kept(&state, pay(max)), "everything");
+    }
+
+    /// A 20-toughness creature survives all 12 energy: paying any of it
+    /// destroys nothing, so the energy is kept.
+    #[test]
+    fn keeps_the_energy_when_the_creature_cannot_die() {
+        let (state, _) = harnessed_board(20);
+        let (min, max) = pay_range(&state);
+        assert_eq!(min, 0);
+        assert!(kept(&state, pay(0)), "keep the energy");
+        assert!(!kept(&state, pay(1)), "one energy");
+        assert!(!kept(&state, pay(max)), "everything");
+    }
+
+    /// CR 510.1 + CR 120.6: the same creature blocking the AI's attacker takes
+    /// combat damage too, so a partial payment can still finish it.
+    #[test]
+    fn energy_amount_is_free_when_the_creature_is_in_combat_with_ours() {
+        let (mut state, victim) = harnessed_board(20);
+        let attacker = create_object(
+            &mut state,
+            CardId(state.next_object_id),
+            P0,
+            "Attacker".to_string(),
+            Zone::Battlefield,
+        );
+        let mut combat = engine::game::combat::CombatState::default();
+        combat.blocker_to_attacker.insert(victim, vec![attacker]);
+        state.combat = Some(combat);
+        let (_, max) = pay_range(&state);
+        assert!(kept(&state, pay(0)));
+        assert!(kept(&state, pay(max)));
+    }
+
+    /// Cast at the AI's own creature (only for its energy), nothing is paid:
+    /// the damage would only hurt the AI.
+    #[test]
+    fn pays_nothing_into_its_own_creature() {
+        let (state, _) = harnessed_board_at(P0, 2);
+        assert!(kept(&state, pay(0)), "nothing");
+        assert!(
+            !kept(&state, pay(2)),
+            "the lethal amount into its own creature"
+        );
+    }
+
+    fn harnessed_targeting(
+        creatures: &[(PlayerId, i32)],
+        energy: u32,
+    ) -> (GameState, Vec<ObjectId>) {
+        let (mut runner, lightning, ids) = harnessed_runner(creatures, energy);
+        let action = cast(runner.state(), lightning);
+        runner.act(action).expect("cast Harnessed Lightning");
+        let state = runner.state().clone();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::TargetSelection { .. }),
+            "precondition: two or more legal targets, got {:?}",
+            state.waiting_for
+        );
+        (state, ids)
+    }
+
+    fn aim(id: ObjectId) -> GameAction {
+        GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(id)),
+        }
+    }
+
+    /// CR 601.2c: with no energy in the pool the budget is the spell's own
+    /// three — a 3/2 dies, a 3/20 doesn't. The unkillable target is rejected
+    /// while the killable one is legal.
+    #[test]
+    fn aims_at_the_creature_it_can_kill() {
+        let (state, ids) = harnessed_targeting(&[(P1, 2), (P1, 20)], 0);
+        assert!(kept(&state, aim(ids[0])), "the 3/2 dies to three energy");
+        assert!(!kept(&state, aim(ids[1])), "the 3/20 survives");
+    }
+
+    /// The spell's own three energy counts before the payment: with 3 in the
+    /// pool a 3/6 dies, so it stays a legal choice next to a 3/2.
+    #[test]
+    fn the_spells_own_energy_counts_toward_the_kill() {
+        let (state, ids) = harnessed_targeting(&[(P1, 2), (P1, 6)], 3);
+        assert!(kept(&state, aim(ids[0])));
+        assert!(kept(&state, aim(ids[1])));
+    }
+
+    /// Nothing dies: no target is preferred over another (the cast itself is
+    /// what the gate rejects).
+    #[test]
+    fn no_target_is_rejected_when_none_can_die() {
+        let (state, ids) = harnessed_targeting(&[(P1, 20), (P1, 30)], 0);
+        assert!(kept(&state, aim(ids[0])));
+        assert!(kept(&state, aim(ids[1])));
     }
 
     #[test]
-    fn energy_amount_is_free_when_the_creature_cannot_die() {
-        let (state, _) = harnessed_board(20);
-        if let WaitingFor::PayAmountChoice { max, .. } = &state.waiting_for {
-            assert!(kept(&state, GameAction::SubmitPayAmount { amount: 0 }));
-            assert!(kept(&state, GameAction::SubmitPayAmount { amount: *max }));
-        }
+    fn own_creature_is_not_aimed_at_while_an_opposing_one_dies() {
+        let (state, ids) = harnessed_targeting(&[(P0, 2), (P1, 2)], 0);
+        assert!(!kept(&state, aim(ids[0])), "own 3/2");
+        assert!(kept(&state, aim(ids[1])), "opposing 3/2");
+    }
+
+    fn harnessed_cast_kept(creatures: &[(PlayerId, i32)], energy: u32) -> bool {
+        let (runner, lightning, _) = harnessed_runner(creatures, energy);
+        kept(runner.state(), cast(runner.state(), lightning))
+    }
+
+    /// The card is removal: cast only when some opposing creature dies to the
+    /// pool plus the spell's own three energy.
+    #[test]
+    fn casts_only_with_an_opposing_creature_to_kill() {
+        assert!(harnessed_cast_kept(&[(P1, 3)], 0), "a 3/3 dies to three");
+        assert!(!harnessed_cast_kept(&[(P1, 20)], 0), "a 3/20 doesn't");
+        assert!(
+            harnessed_cast_kept(&[(P1, 20)], 17),
+            "17 + 3 kills the 3/20"
+        );
+        assert!(
+            !harnessed_cast_kept(&[(P0, 2)], 0),
+            "only its own creature: the card would buy three energy and nothing else"
+        );
     }
 
     // ── Rancor with no own creature ────────────────────────────────────────
