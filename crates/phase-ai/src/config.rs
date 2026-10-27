@@ -1352,6 +1352,11 @@ pub struct AiConfig {
     /// one (`combat_sim`). On for the tiers the MagicFinder table serves as
     /// "Difícil" (VeryHard) and above.
     pub combat_simulation: bool,
+    /// MagicFinder (2026-10-27): at a main-phase decision of its own turn, play
+    /// the best root actions out to the start of its next turn with the
+    /// heuristic AI on both seats and keep a line that clearly wins
+    /// (`turn_sim`). On for "Difícil" (VeryHard) and above.
+    pub turn_simulation: bool,
     pub search: SearchConfig,
     pub weights: EvalWeightSet,
     pub keyword_bonuses: KeywordBonuses,
@@ -1565,6 +1570,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
         play_lookahead,
         combat_lookahead,
         combat_simulation: difficulty >= AiDifficulty::VeryHard,
+        turn_simulation: difficulty >= AiDifficulty::VeryHard,
         search,
         weights: EvalWeightSet::learned(),
         keyword_bonuses: KeywordBonuses::default(),

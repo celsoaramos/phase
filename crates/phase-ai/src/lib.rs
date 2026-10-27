@@ -7,6 +7,7 @@ pub(crate) mod card_value;
 pub mod cast_facts;
 pub mod combat_ai;
 pub(crate) mod combat_sim;
+pub(crate) mod turn_sim;
 mod combat_tax;
 pub mod combo;
 pub mod config;

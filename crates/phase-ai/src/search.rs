@@ -271,6 +271,18 @@ pub fn choose_action_with_session(
     choose_action_with_session_inner(state, ai_player, config, rng, session, true, false).action
 }
 
+/// The chooser as a `turn_sim` playout uses it: no durable Pact route is armed
+/// (a playout's position is not the real one).
+pub(crate) fn choose_action_for_playout(
+    state: &GameState,
+    ai_player: PlayerId,
+    config: &AiConfig,
+    rng: &mut impl Rng,
+    session: &Arc<AiSession>,
+) -> Option<GameAction> {
+    choose_action_with_session_inner(state, ai_player, config, rng, session, false, false).action
+}
+
 /// Select once using the canonical chooser and retain an optional, read-only
 /// receipt of that same choice for the local WASM authority.
 pub fn choose_action_with_session_diagnostic(
@@ -2710,6 +2722,38 @@ fn score_candidates_for_root(
     session: &Arc<AiSession>,
     root: RootReuse<'_>,
 ) -> Vec<(GameAction, f64)> {
+    let scored = score_candidates_for_root_searched(state, ai_player, config, session, root);
+    if !config.turn_simulation || !crate::turn_sim::applies(state, ai_player) {
+        return scored;
+    }
+    let context = build_ai_context_with_session(state, ai_player, config, Arc::clone(session));
+    let weights = context.adjusted_weights.for_turn(state.turn_number);
+    let input = crate::turn_sim::TurnSimInput {
+        state,
+        player: ai_player,
+        config,
+        session,
+        weights,
+        deadline: match config.execution_mode {
+            crate::config::ExecutionMode::Measurement { .. } => None,
+            crate::config::ExecutionMode::Interactive => {
+                Some(engine::util::Deadline::after(TURN_SIM_BUDGET_MS))
+            }
+        },
+    };
+    crate::turn_sim::refine_root_turn(&input, scored, |action| {
+        priority_action_is_pass_or_mana(state, action)
+    })
+}
+
+/// [`score_candidates_for_root`] before the turn simulation looks further.
+fn score_candidates_for_root_searched(
+    state: &GameState,
+    ai_player: PlayerId,
+    config: &AiConfig,
+    session: &Arc<AiSession>,
+    root: RootReuse<'_>,
+) -> Vec<(GameAction, f64)> {
     // Attacker declarations are public-state tactical choices. Running K hidden
     // information samples cannot improve them, but would multiply the bounded
     // multiplayer comparison and make a singleton support drift.
@@ -4650,6 +4694,10 @@ pub(crate) fn deterministic_choice(
 /// Wall-clock guard for the combat replays in interactive play. Combat is the
 /// decision a person watches the AI take, so it gets more than a priority pass.
 const COMBAT_SIM_BUDGET_MS: u32 = 1200;
+
+/// Wall-clock guard for the turn playouts (`turn_sim`) in interactive play, on
+/// top of the root search. The owner's ceiling for a big decision is ~3 s.
+const TURN_SIM_BUDGET_MS: u32 = 1500;
 
 /// MagicFinder (2026-10-26): replay the heuristic's root combat declaration
 /// against a few alternatives through the reducer (`combat_sim`) and keep the
