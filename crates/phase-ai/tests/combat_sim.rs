@@ -125,13 +125,10 @@ fn chump_with_the_token_and_let_the_angel_eat_the_wolf() {
     let mut r = s.build();
     at_block(&mut r, &[rhino, wolf]);
 
-    let mut old = vec![(angel, rhino), (token, wolf)];
-    old.sort_unstable();
-    assert_eq!(
-        blocks_of(&choose(r.state(), false)),
-        old,
-        "heuristic: the 4/4 dies to the 5/5 and the wolf lives"
-    );
+    // On the bare tag the heuristic blocks angel → rhino, token → wolf (the
+    // 4/4 dies and the wolf lives). The fork's `ai/combat-block-choice`
+    // ("chump with the cheapest body") already fixes it, so in the published
+    // integration both answers agree; only the replay's answer is pinned here.
     let mut want = vec![(token, rhino), (angel, wolf)];
     want.sort_unstable();
     assert_eq!(blocks_of(&choose(r.state(), true)), want);
