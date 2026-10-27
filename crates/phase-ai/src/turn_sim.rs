@@ -45,7 +45,7 @@ use crate::session::AiSession;
 /// Root actions compared, the incumbent included (pass is always one of them).
 const MAX_LINES: usize = 5;
 /// Opponent worlds each line is played in.
-const WORLDS: u64 = 2;
+const WORLDS: u64 = 4;
 /// Engine dispatches one playout may take before it is dropped. A full turn of
 /// each side is typically 40–120.
 const MAX_STEPS: usize = 400;
