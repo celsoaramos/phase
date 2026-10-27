@@ -286,5 +286,8 @@
   },
   {
     "branch": "card/mf-relatos-20261026"
+  },
+  {
+    "branch": "ai/tap-state-branch"
   }
 ]
