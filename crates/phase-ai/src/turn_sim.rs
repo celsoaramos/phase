@@ -65,6 +65,18 @@ static DECISIONS: AtomicU64 = AtomicU64::new(0);
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
 static TOTAL_MICROS: AtomicU64 = AtomicU64::new(0);
 static MAX_MICROS: AtomicU64 = AtomicU64::new(0);
+static PLAYOUTS: AtomicU64 = AtomicU64::new(0);
+static PLAYOUTS_DROPPED: AtomicU64 = AtomicU64::new(0);
+static PLAYOUT_STEPS: AtomicU64 = AtomicU64::new(0);
+
+/// `(playouts run, playouts that could not finish, engine steps taken)`.
+pub fn playout_stats() -> (u64, u64, u64) {
+    (
+        PLAYOUTS.load(AtomicOrdering::Relaxed),
+        PLAYOUTS_DROPPED.load(AtomicOrdering::Relaxed),
+        PLAYOUT_STEPS.load(AtomicOrdering::Relaxed),
+    )
+}
 
 /// `(decisions measured, lines swapped, total µs, slowest decision µs)`.
 pub fn stats() -> (u64, u64, u64, u64) {
@@ -160,6 +172,23 @@ fn playout(
     seed: u64,
     deadline: Option<Deadline>,
 ) -> Option<GameState> {
+    PLAYOUTS.fetch_add(1, AtomicOrdering::Relaxed);
+    let end = playout_inner(world, player, first, policy, session, seed, deadline);
+    if end.is_none() {
+        PLAYOUTS_DROPPED.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    end
+}
+
+fn playout_inner(
+    world: &GameState,
+    player: PlayerId,
+    first: &GameAction,
+    policy: &AiConfig,
+    session: &Arc<AiSession>,
+    seed: u64,
+    deadline: Option<Deadline>,
+) -> Option<GameState> {
     let turn = world.turn_number;
     let mut state = world.clone();
     let actor = turn_control::authorized_submitter_for_player(&state, player);
@@ -176,6 +205,7 @@ fn playout(
             .waiting_for
             .acting_player()
             .or_else(|| state.waiting_for.acting_players().first().copied())?;
+        PLAYOUT_STEPS.fetch_add(1, AtomicOrdering::Relaxed);
         let action =
             crate::search::choose_action_for_playout(&state, owner, policy, &mut rng, session)?;
         let actor = turn_control::authorized_submitter_for_player(&state, owner);

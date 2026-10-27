@@ -8,7 +8,7 @@ pub mod cast_facts;
 pub mod combat_ai;
 pub(crate) mod combat_sim;
 pub(crate) mod turn_sim;
-pub use turn_sim::stats as turn_sim_stats;
+pub use turn_sim::{playout_stats as turn_sim_playout_stats, stats as turn_sim_stats};
 mod combat_tax;
 pub mod combo;
 pub mod config;
