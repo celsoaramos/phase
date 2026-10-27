@@ -1,0 +1,10 @@
+# nome | argumentos do ai-ladder (o banco de cartas é passado pelo workflow)
+# Rodada 26/10 (base v0.118.0 + ai/combat-search): "Robô forte contra gente", fases 1 e 2.
+# Todos os lados com det=4 = o que o navegador serve (IA justa). A/B no MESMO binário, sementes pareadas.
+# Fase 1 — combate que simula (csim=1, padrão do VeryHard nesta branch) × o heurístico de antes (csim=0).
+csim-mirrors | --a veryhard:wasm,det=4 --b veryhard:wasm,det=4,csim=0 --matchups blue-mirror,red-mirror,green-mirror,affinity-mirror,elves-mirror --games 40 --audit
+csim-metagame | --decks crates/phase-ai/duel_decks --a veryhard:wasm,det=4 --b veryhard:wasm,det=4,csim=0 --matchups selesnya-ouroboroid-vs-mono-red-prowess,mono-green-landfall-vs-izzet-delver,kaladesh-energy-vs-mono-white-equipment,boros-energy-vs-elves,mono-red-prowess-vs-izzet-delver --games 40 --audit
+# Atalho 2a — escolha gulosa (temp≈0) × o sorteio de hoje (temp 0,3). Os dois com csim=0 para isolar o efeito.
+greedy-mirrors | --a veryhard:wasm,det=4,csim=0,temp=0.02 --b veryhard:wasm,det=4,csim=0 --matchups blue-mirror,red-mirror,green-mirror,affinity-mirror,elves-mirror --games 40
+# Atalho 2b — busca mais funda (profundidade 3, 150 nós; no WASM hoje é 2 e 42) × a de hoje. csim=0 nos dois.
+deep-mirrors | --a veryhard:wasm,det=4,csim=0,depth=3,nodes=150 --b veryhard:wasm,det=4,csim=0 --matchups blue-mirror,red-mirror,green-mirror,affinity-mirror,elves-mirror --games 40

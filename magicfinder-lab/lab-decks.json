@@ -1,0 +1,51 @@
+{
+ "lab-blue": [
+  "26 Island",
+  "4 Counterspell",
+  "4 Mana Leak",
+  "2 Cancel",
+  "2 Negate",
+  "4 Unsummon",
+  "4 Divination",
+  "4 Opt",
+  "2 Think Twice",
+  "4 Air Elemental",
+  "2 Frost Titan",
+  "2 Mulldrifter"
+ ],
+ "lab-red": [
+  "20 Mountain",
+  "4 Goblin Guide",
+  "4 Monastery Swiftspear",
+  "4 Raging Goblin",
+  "4 Jackal Pup",
+  "4 Rift Bolt",
+  "4 Lightning Bolt",
+  "4 Shock",
+  "4 Searing Spear",
+  "4 Skullcrack",
+  "4 Rift Bolt"
+ ],
+ "lab-white": [
+  "20 Plains",
+  "4 Savannah Lions",
+  "4 Elite Vanguard",
+  "4 Soldier of the Pantheon",
+  "4 Thalia, Guardian of Thraben",
+  "4 Serra Angel",
+  "4 Benalish Marshal",
+  "4 Swords to Plowshares",
+  "4 Raise the Alarm",
+  "8 Glorious Anthem"
+ ],
+ "lab-green": [
+  "22 Forest",
+  "4 Llanowar Elves",
+  "4 Elvish Mystic",
+  "8 Grizzly Bears",
+  "8 Centaur Courser",
+  "4 Giant Growth",
+  "4 Rancor",
+  "6 Giant Growth"
+ ]
+}

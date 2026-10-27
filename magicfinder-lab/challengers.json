@@ -1,0 +1,74 @@
+{
+ "fury": [
+  "4 Monastery Swiftspear",
+  "4 Goblin Guide",
+  "4 Ghitu Lavarunner",
+  "4 Viashino Pyromancer",
+  "4 Firebrand Archer",
+  "4 Thermo-Alchemist",
+  "4 Lightning Bolt",
+  "4 Shock",
+  "4 Lava Spike",
+  "4 Chain Lightning",
+  "20 Mountain"
+ ],
+ "stomp": [
+  "4 Llanowar Elves",
+  "4 Elvish Mystic",
+  "4 Sylvan Ranger",
+  "4 Kalonian Tusker",
+  "4 Leatherback Baloth",
+  "4 Vastwood Gorger",
+  "4 Colossal Dreadmaw",
+  "4 Pelakka Wurm",
+  "4 Plummet",
+  "24 Forest"
+ ],
+ "night": [
+  "4 Child of Night",
+  "4 Vampire Interloper",
+  "4 Gifted Aetherborn",
+  "4 Vampire Nighthawk",
+  "4 Gravedigger",
+  "4 Sengir Vampire",
+  "4 Ravenous Chupacabra",
+  "4 Doom Blade",
+  "4 Murder",
+  "24 Swamp"
+ ],
+ "dawn": [
+  "4 Savannah Lions",
+  "4 Elite Vanguard",
+  "4 Youthful Knight",
+  "4 Attended Knight",
+  "4 Silverblade Paladin",
+  "4 Angel of Mercy",
+  "4 Serra Angel",
+  "4 Angelic Edict",
+  "4 Divine Verdict",
+  "24 Plains"
+ ],
+ "sky": [
+  "4 Faerie Miscreant",
+  "4 Welkin Tern",
+  "4 Cloudkin Seer",
+  "4 Man-o'-War",
+  "4 Phantom Warrior",
+  "4 Snapping Drake",
+  "4 Mist Raven",
+  "4 Air Elemental",
+  "4 Unsummon",
+  "24 Island"
+ ],
+ "kitchen": [
+  "4 Grizzly Bears",
+  "4 Runeclaw Bear",
+  "4 Nessian Courser",
+  "4 Giant Spider",
+  "4 Prized Unicorn",
+  "4 Craw Wurm",
+  "4 Alpha Tyrranax",
+  "4 Giant Growth",
+  "28 Forest"
+ ]
+}
