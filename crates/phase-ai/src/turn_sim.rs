@@ -49,6 +49,11 @@ const WORLDS: u64 = 4;
 /// Engine dispatches one playout may take before it is dropped. A full turn of
 /// each side is typically 40–120.
 const MAX_STEPS: usize = 400;
+/// Engine dispatches all the playouts of ONE decision may take together. This,
+/// not the wall clock, is what bounds the work in the lab, so the lab measures
+/// the same layer the browser runs; the incumbent is played first and always
+/// gets its share.
+const MAX_DECISION_STEPS: usize = 2_400;
 /// An alternative must beat the incumbent by this much on average (evaluation
 /// units: a point of life ~0.5, a 2/2 ~6). Below it the search's own answer
 /// stands — two heuristic playouts are not precise enough to overrule it on a
@@ -86,6 +91,21 @@ pub fn stats() -> (u64, u64, u64, u64) {
         TOTAL_MICROS.load(AtomicOrdering::Relaxed),
         MAX_MICROS.load(AtomicOrdering::Relaxed),
     )
+}
+
+struct Budget {
+    steps_left: usize,
+    deadline: Option<Deadline>,
+}
+
+impl Budget {
+    fn take(&mut self) -> bool {
+        if self.steps_left == 0 || self.deadline.is_some_and(|d| d.expired()) {
+            return false;
+        }
+        self.steps_left -= 1;
+        true
+    }
 }
 
 pub(crate) struct TurnSimInput<'a> {
@@ -170,10 +190,10 @@ fn playout(
     policy: &AiConfig,
     session: &Arc<AiSession>,
     seed: u64,
-    deadline: Option<Deadline>,
+    budget: &mut Budget,
 ) -> Option<GameState> {
     PLAYOUTS.fetch_add(1, AtomicOrdering::Relaxed);
-    let end = playout_inner(world, player, first, policy, session, seed, deadline);
+    let end = playout_inner(world, player, first, policy, session, seed, budget);
     if end.is_none() {
         PLAYOUTS_DROPPED.fetch_add(1, AtomicOrdering::Relaxed);
     }
@@ -187,7 +207,7 @@ fn playout_inner(
     policy: &AiConfig,
     session: &Arc<AiSession>,
     seed: u64,
-    deadline: Option<Deadline>,
+    budget: &mut Budget,
 ) -> Option<GameState> {
     let turn = world.turn_number;
     let mut state = world.clone();
@@ -198,7 +218,7 @@ fn playout_inner(
         if horizon(&state, player, turn) {
             return Some(state);
         }
-        if deadline.is_some_and(|d| d.expired()) {
+        if !budget.take() {
             return None;
         }
         let owner = state
@@ -264,6 +284,10 @@ fn measure_lines(
     // Playouts must not write the authoritative session (Pact routes, caches
     // keyed to the real position): they get their own copy.
     let session = Arc::new((**input.session).clone());
+    let mut budget = Budget {
+        steps_left: MAX_DECISION_STEPS,
+        deadline: input.deadline,
+    };
 
     let mut values: Vec<Option<Vec<f64>>> = Vec::with_capacity(lines.len());
     for line in &lines {
@@ -276,7 +300,7 @@ fn measure_lines(
                 &policy,
                 &session,
                 *seed,
-                input.deadline,
+                &mut budget,
             ) {
                 Some(end) => per_world.push(evaluate_state(&end, input.player, input.weights)),
                 None => break,
@@ -291,7 +315,7 @@ fn measure_lines(
         } else {
             values.push(Some(per_world));
         }
-        if input.deadline.is_some_and(|d| d.expired()) {
+        if budget.steps_left == 0 || input.deadline.is_some_and(|d| d.expired()) {
             break;
         }
     }
