@@ -34944,29 +34944,3 @@ fn ir_facade_demotes_a_refused_granter_name() {
         Effect::Unimplemented { name, .. } if name == "granter_reference_unreached"
     )));
 }
-
-// Dark Salvation (relato de campo 27/10/2026): "Target player creates X 2/2 black Zombie creature
-// tokens, then up to one target creature gets -1/-1 until end of turn for each Zombie that player
-// controls." O parser guardava só a 2ª oração, como um `Pump` com alvo jogador.
-#[test]
-fn dark_salvation_creates_tokens_then_pumps_target_creature() {
-    let r = parse(
-        "Target player creates X 2/2 black Zombie creature tokens, then up to one target creature gets -1/-1 until end of turn for each Zombie that player controls.",
-        "Dark Salvation",
-        &[],
-        &["Sorcery"],
-        &[],
-    );
-    let first = r.abilities.first().expect("spell ability");
-    assert!(
-        matches!(&*first.effect, Effect::Token { owner, .. } if matches!(owner, TargetFilter::Player)),
-        "first effect must be a Token owned by the target player, got {:?}",
-        first.effect
-    );
-    let sub = first.sub_ability.as_ref().expect("then-clause sub ability");
-    assert!(
-        matches!(&*sub.effect, Effect::Pump { .. }),
-        "sub effect must be a Pump, got {:?}",
-        sub.effect
-    );
-}

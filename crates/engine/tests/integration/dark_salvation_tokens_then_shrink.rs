@@ -8,6 +8,8 @@
 //! player"), não o controlador da mágica; X = 0 não cria nada nem encolhe nada.
 
 use engine::game::scenario::{GameScenario, P0, P1};
+use engine::parser::parse_oracle_text;
+use engine::types::ability::{Effect, TargetFilter};
 use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
@@ -116,4 +118,28 @@ fn x_zero_creates_nothing_and_shrinks_nothing() {
         .resolve();
     assert_eq!(zombies(outcome.state(), P0), 0);
     outcome.assert_power_toughness(victim, 4, 4);
+}
+
+/// A cadeia parseada é `Token` (dono = jogador alvo) seguido de `Pump` — as duas orações vivem.
+#[test]
+fn parses_to_token_then_pump_chain() {
+    let parsed = parse_oracle_text(
+        DARK_SALVATION,
+        "Dark Salvation",
+        &[],
+        &["Sorcery".to_owned()],
+        &[],
+    );
+    let first = parsed.abilities.first().expect("spell ability");
+    assert!(
+        matches!(&*first.effect, Effect::Token { owner, .. } if matches!(owner, TargetFilter::Player)),
+        "first effect must be a Token owned by the target player, got {:?}",
+        first.effect
+    );
+    let sub = first.sub_ability.as_ref().expect("then-clause sub ability");
+    assert!(
+        matches!(&*sub.effect, Effect::Pump { .. }),
+        "sub effect must be a Pump, got {:?}",
+        sub.effect
+    );
 }
