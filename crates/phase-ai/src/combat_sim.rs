@@ -154,6 +154,13 @@ fn advance(state: &mut GameState, turn: u32, stop_at_blocks: bool) -> Reached {
             WaitingFor::CombatTaxPayment { .. } => GameAction::PayCombatTax {
                 accept: pending_combat_tax_is_affordable(state),
             },
+            // CR 603.3b: simultaneous triggers go on the stack in an order their
+            // controller picks. Combat damage triggers (No Mercy, "whenever a
+            // creature dies") are what a combat is often decided by, so take the
+            // printed order instead of dropping the declaration.
+            WaitingFor::OrderTriggers { triggers, .. } => GameAction::OrderTriggers {
+                order: (0..triggers.len()).collect(),
+            },
             // CR 510.1c: an attacker blocked by two or more divides its damage.
             // Answer with the engine-issued Normal division, the same one the
             // AI's own fallback submits — without it every double block would

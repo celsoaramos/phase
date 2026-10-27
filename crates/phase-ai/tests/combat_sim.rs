@@ -264,7 +264,12 @@ fn flag_positions() {
             me.life,
             opp.life,
             if old == new { "(same)" } else { "CHANGED" },
-            raw["note"].as_str().unwrap_or("").chars().take(150).collect::<String>(),
+            raw["note"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(150)
+                .collect::<String>(),
             names(&old),
             names(&new),
         );
