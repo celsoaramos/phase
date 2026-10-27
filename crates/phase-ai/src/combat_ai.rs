@@ -2538,7 +2538,7 @@ fn race_clock(state: &GameState, attacker: PlayerId, defender: PlayerId) -> u32 
 /// growth that would otherwise be invisible to the snapshot heuristic.
 /// Creatures removed during projection fall back to the current state's
 /// power for a conservative read.
-fn crackback_damage(
+pub(crate) fn crackback_damage(
     state: &GameState,
     player: PlayerId,
     opponents: &[PlayerId],

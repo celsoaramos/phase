@@ -3522,6 +3522,21 @@ fn score_candidates_core_for_root(
             services.context.opponent_threat.as_ref(),
             Some(services.deadline),
         ) {
+            let action = if config.combat_simulation {
+                refine_root_combat(
+                    state,
+                    ai_player,
+                    config,
+                    session.as_ref(),
+                    services
+                        .context
+                        .adjusted_weights
+                        .for_turn(state.turn_number),
+                    action,
+                )
+            } else {
+                action
+            };
             return vec![(action, 1.0)];
         }
     }
@@ -4630,6 +4645,59 @@ pub(crate) fn deterministic_choice(
     }
 
     None
+}
+
+/// Wall-clock guard for the combat replays in interactive play. Combat is the
+/// decision a person watches the AI take, so it gets more than a priority pass.
+const COMBAT_SIM_BUDGET_MS: u32 = 1200;
+
+/// MagicFinder (2026-10-26): replay the heuristic's root combat declaration
+/// against a few alternatives through the reducer (`combat_sim`) and keep the
+/// best measured one. Only the root decision: rollouts keep the heuristic.
+fn refine_root_combat(
+    state: &GameState,
+    ai_player: PlayerId,
+    config: &AiConfig,
+    session: &AiSession,
+    weights: &crate::eval::EvalWeights,
+    action: GameAction,
+) -> GameAction {
+    let input = crate::combat_sim::CombatSimInput {
+        state,
+        player: ai_player,
+        weights,
+        deadline: match config.execution_mode {
+            crate::config::ExecutionMode::Measurement { .. } => None,
+            crate::config::ExecutionMode::Interactive => {
+                Some(engine::util::Deadline::after(COMBAT_SIM_BUDGET_MS))
+            }
+        },
+    };
+    match &action {
+        GameAction::DeclareAttackers { .. } => {
+            crate::combat_sim::refine_attack(&input, action, |attacks| {
+                validated_declare_attackers(state, ai_player, Some(session), attacks)
+            })
+        }
+        GameAction::DeclareBlockers { .. } => {
+            let default_features = crate::features::DeckFeatures::default();
+            let features = session
+                .features
+                .get(&ai_player)
+                .unwrap_or(&default_features);
+            crate::combat_sim::refine_block(&input, action, |assignments| {
+                let posture =
+                    crate::combat_tax::plan_block_tax(state, ai_player, features, assignments);
+                engine::game::combat::complete_blocker_proposal(
+                    state,
+                    ai_player,
+                    assignments,
+                    posture,
+                )
+            })
+        }
+        _ => action,
+    }
 }
 
 /// Handle combat decisions with an archetype-modulated profile.
