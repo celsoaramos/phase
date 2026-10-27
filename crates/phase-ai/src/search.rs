@@ -2734,9 +2734,11 @@ fn score_candidates_for_root(
         config,
         session,
         weights,
-        deadline: match config.execution_mode {
-            crate::config::ExecutionMode::Measurement { .. } => None,
-            crate::config::ExecutionMode::Interactive => {
+        deadline: match (config.execution_mode, config.turn_simulation_clock_ms) {
+            // The lab may impose a clock to stand in for the browser's.
+            (_, Some(ms)) => Some(engine::util::Deadline::after(ms)),
+            (crate::config::ExecutionMode::Measurement { .. }, None) => None,
+            (crate::config::ExecutionMode::Interactive, None) => {
                 Some(engine::util::Deadline::after(TURN_SIM_BUDGET_MS))
             }
         },

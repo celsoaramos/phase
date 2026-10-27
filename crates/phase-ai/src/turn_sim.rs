@@ -73,6 +73,16 @@ static MAX_MICROS: AtomicU64 = AtomicU64::new(0);
 static PLAYOUTS: AtomicU64 = AtomicU64::new(0);
 static PLAYOUTS_DROPPED: AtomicU64 = AtomicU64::new(0);
 static PLAYOUT_STEPS: AtomicU64 = AtomicU64::new(0);
+static UNMEASURED: AtomicU64 = AtomicU64::new(0);
+static OVER_1500_MS: AtomicU64 = AtomicU64::new(0);
+
+/// `(decisions whose incumbent could not be measured, decisions over 1.5 s)`.
+pub fn budget_stats() -> (u64, u64) {
+    (
+        UNMEASURED.load(AtomicOrdering::Relaxed),
+        OVER_1500_MS.load(AtomicOrdering::Relaxed),
+    )
+}
 
 /// `(playouts run, playouts that could not finish, engine steps taken)`.
 pub fn playout_stats() -> (u64, u64, u64) {
@@ -255,6 +265,9 @@ pub(crate) fn refine_root_turn(
     }
     TOTAL_MICROS.fetch_add(micros, AtomicOrdering::Relaxed);
     MAX_MICROS.fetch_max(micros, AtomicOrdering::Relaxed);
+    if micros > 1_500_000 {
+        OVER_1500_MS.fetch_add(1, AtomicOrdering::Relaxed);
+    }
     out
 }
 
@@ -310,6 +323,7 @@ fn measure_lines(
         if per_world.len() < worlds.len() {
             if values.is_empty() {
                 // The searched answer cannot be measured: leave the root alone.
+                UNMEASURED.fetch_add(1, AtomicOrdering::Relaxed);
                 return scored;
             }
             values.push(None);

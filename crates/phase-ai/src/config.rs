@@ -1362,6 +1362,10 @@ pub struct AiConfig {
     /// opponent's turn, and a projection per policy call per step is what made
     /// a single decision cost seconds.
     pub projections: bool,
+    /// Wall clock for the turn playouts even in measurement mode. `None` in
+    /// every preset; the lab sets it (`tsim_ms=`) to stand in for the slower
+    /// browser so it measures what the browser can actually finish.
+    pub turn_simulation_clock_ms: Option<u32>,
     pub search: SearchConfig,
     pub weights: EvalWeightSet,
     pub keyword_bonuses: KeywordBonuses,
@@ -1577,6 +1581,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
         combat_simulation: difficulty >= AiDifficulty::VeryHard,
         turn_simulation: difficulty >= AiDifficulty::VeryHard,
         projections: true,
+        turn_simulation_clock_ms: None,
         search,
         weights: EvalWeightSet::learned(),
         keyword_bonuses: KeywordBonuses::default(),
