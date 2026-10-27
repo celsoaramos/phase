@@ -1357,6 +1357,11 @@ pub struct AiConfig {
     /// heuristic AI on both seats and keep a line that clearly wins
     /// (`turn_sim`). On for "Difícil" (VeryHard) and above.
     pub turn_simulation: bool,
+    /// Whether policies may run uncached multi-turn projections at all. Off
+    /// only inside a `turn_sim` playout: the playout already plays the
+    /// opponent's turn, and a projection per policy call per step is what made
+    /// a single decision cost seconds.
+    pub projections: bool,
     pub search: SearchConfig,
     pub weights: EvalWeightSet,
     pub keyword_bonuses: KeywordBonuses,
@@ -1571,6 +1576,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
         combat_lookahead,
         combat_simulation: difficulty >= AiDifficulty::VeryHard,
         turn_simulation: difficulty >= AiDifficulty::VeryHard,
+        projections: true,
         search,
         weights: EvalWeightSet::learned(),
         keyword_bonuses: KeywordBonuses::default(),

@@ -178,6 +178,7 @@ fn playout_policy(config: &AiConfig, seed: u64) -> AiConfig {
     policy.search.determinization_samples = 0;
     policy.combat_simulation = false;
     policy.turn_simulation = false;
+    policy.projections = false;
     policy.into_measurement(seed)
 }
 
