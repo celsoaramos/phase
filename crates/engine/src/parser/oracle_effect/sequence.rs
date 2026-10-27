@@ -2321,6 +2321,7 @@ fn split_comma_clause_boundary(current: &str, remainder: &str) -> Option<(Clause
             || starts_you_control_subject_predicate(after_then_lower)
             || starts_with_damage_clause(after_then_lower)
             || starts_target_players_subject_clause(after_then_lower)
+            || starts_up_to_n_target_clause(after_then_lower)
         {
             return Some((ClauseBoundary::Then, whitespace_len + "then ".len()));
         }
@@ -2754,6 +2755,32 @@ fn starts_you_control_subject_predicate(s: &str) -> bool {
         tag("has "),
     ))
     .parse(predicate)
+    .is_ok()
+}
+
+/// CR 601.2c + CR 608.2c: True when `s` opens with an optional-count target phrase
+/// ("up to one target creature gets -1/-1 …", Dark Salvation: "Target player creates X
+/// 2/2 black Zombie creature tokens, then up to one target creature gets -1/-1 until end
+/// of turn for each Zombie that player controls."). A bare "target …" is already a clause
+/// starter; the "up to N" prefix hid the same shape, so the tail either vanished (no
+/// "for each") or swallowed the token clause before it (with "for each"). Only consulted
+/// at the ", then" boundary, where a fresh "up to N target …" is never a noun-phrase
+/// continuation of the prior conjunct.
+fn starts_up_to_n_target_clause(s: &str) -> bool {
+    preceded(
+        tag::<_, _, OracleError<'_>>("up to "),
+        preceded(
+            alt((
+                tag("one "),
+                tag("two "),
+                tag("three "),
+                tag("four "),
+                tag("five "),
+            )),
+            tag("target "),
+        ),
+    )
+    .parse(s)
     .is_ok()
 }
 

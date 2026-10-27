@@ -3903,8 +3903,17 @@ fn parse_for_each_clause_with_they_controller(
 }
 
 fn for_each_anaphor_context(ctx: &ParseContext, antecedents: &PlayerAntecedents) -> ParseContext {
+    // A chain-declared "that player" (Dark Salvation) travels as the declared scope; the
+    // iteration default (`ScopedPlayer`) is what "they" keeps, and `for_each_iteration`
+    // re-derives it from an empty `relative_player_scope`.
+    let declared = antecedents.declared_that_player.clone();
     ParseContext {
-        relative_player_scope: antecedents.third_person.clone(),
+        relative_player_scope: if declared.is_some() {
+            None
+        } else {
+            antecedents.third_person.clone()
+        },
+        declared_player_scope: declared,
         subject: ctx.subject.clone(),
         card_name: ctx.card_name.clone(),
         host_self_reference: ctx.host_self_reference.clone(),

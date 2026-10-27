@@ -36,9 +36,18 @@ impl PlayerAntecedents {
     /// iterating player unless the context already introduced one. Permanent
     /// seed: `ScopedPlayer` falls back to the source controller at runtime when
     /// no iteration is active. A chain-declared player is not an antecedent
-    /// here.
+    /// here — except for "that player" when no iteration scope is pinned: "for each
+    /// Zombie that player controls" after "Target player creates X Zombie tokens, then …"
+    /// (Dark Salvation) counts the TARGET player's Zombies. Read as `ScopedPlayer` it fell
+    /// back to the caster, and the -1/-1 never saw the opponent's tokens. "they" stays the
+    /// iterating player.
     pub(crate) fn for_each_iteration(ctx: &ParseContext) -> Self {
         PlayerAntecedents {
+            declared_that_player: ctx
+                .relative_player_scope
+                .is_none()
+                .then(|| ctx.declared_player_scope.clone())
+                .flatten(),
             third_person: ctx
                 .relative_player_scope
                 .clone()

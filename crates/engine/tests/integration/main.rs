@@ -315,6 +315,7 @@ mod dandan_zone_change_identity;
 mod daretti_emblem_simultaneous_death;
 mod dark_confidant_upkeep;
 mod dark_depths_thespian_stage;
+mod dark_salvation_tokens_then_shrink;
 mod darkness_crystal_exiled_with_activation_8164;
 mod dawnbreak_reclaimer;
 mod death_priest_myrkul_oxford_anthem;
