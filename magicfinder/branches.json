@@ -289,5 +289,8 @@
   },
   {
     "branch": "ai/tap-state-branch"
+  },
+  {
+    "branch": "ai/combat-search"
   }
 ]
