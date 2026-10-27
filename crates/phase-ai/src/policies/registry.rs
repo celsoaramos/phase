@@ -174,6 +174,9 @@ pub enum PolicyId {
     /// CR 205.3m: pick a creature type the AI actually has members of, instead
     /// of the alphabetically first option the engine offers.
     CreatureTypeChoice,
+    /// CR 701.26: "tap or untap target" — tap the opposing untapped creature,
+    /// untap our own tapped one, never the no-op or the harmful direction.
+    TapStateBranch,
     /// CR 601.2a + CR 601.2b: announce the graveyard permission whose
     /// commitments (slot, extra cost, counter) give up least.
     GraveyardAuthority,
@@ -184,9 +187,6 @@ pub enum PolicyId {
     /// CR 106.4: a ritual's mana empties at end of step/phase — don't cast one
     /// when nothing in reach can spend it in this window.
     RitualSink,
-    /// CR 701.26: "tap or untap target" — tap the opposing untapped creature,
-    /// untap our own tapped one, never the no-op or the harmful direction.
-    TapStateBranch,
 }
 
 /// Coarse routing kind for a candidate decision. Each policy declares which
@@ -451,10 +451,10 @@ impl Default for PolicyRegistry {
             Box::new(super::discard_payoff::DiscardPayoffPolicy),
             Box::new(super::vehicle_deployment::VehicleDeploymentPolicy),
             Box::new(CreatureTypeChoicePolicy),
+            Box::new(super::tap_state_branch::TapStateBranchPolicy),
             Box::new(GraveyardAuthorityPolicy),
             Box::new(super::pile_partition::PilePartitionPolicy),
             Box::new(super::ritual_sink::RitualSinkPolicy),
-            Box::new(super::tap_state_branch::TapStateBranchPolicy),
         ];
         Self::from_policies(policies)
     }
