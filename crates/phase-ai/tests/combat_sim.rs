@@ -184,3 +184,94 @@ fn lethal_alpha_is_never_second_guessed() {
     all.sort_unstable();
     assert_eq!(attackers_of(&choose(r.state(), true)), all);
 }
+
+/// Replays the "jogada ruim do robô" positions the MagicFinder table recorded
+/// (`npm run bot:flags -- --out <dir>` in the magic repo) through the root
+/// combat decision with the replay off and on. Not a gate — the positions live
+/// outside the repo — but the honest check that the replay answers the combat
+/// complaints people actually sent.
+///
+///   FLAG_DIR=<dir> cargo test -p phase-ai --test combat_sim flag_positions -- --ignored --nocapture
+#[test]
+#[ignore]
+fn flag_positions() {
+    use engine::types::game_state::PersistedGameState;
+    use engine::types::player::PlayerId;
+    let dir = std::env::var("FLAG_DIR").expect("FLAG_DIR");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("dir")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+    for path in files {
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let wait = raw["wait_type"].as_str().unwrap_or("");
+        if wait != "DeclareAttackers" && wait != "DeclareBlockers" {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let seat = PlayerId(raw["seat"].as_u64().unwrap_or(1) as u8);
+        let state = match serde_json::from_value::<PersistedGameState>(raw["state"].clone())
+            .map_err(|e| e.to_string())
+            .and_then(|p| p.into_game_state().map_err(|e| format!("{e:?}")))
+        {
+            Ok(state) => state,
+            Err(e) => {
+                println!("{name}: does not restore ({})", &e[..e.len().min(120)]);
+                continue;
+            }
+        };
+        let pick = |simulate: bool| {
+            let mut config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+            config.combat_simulation = simulate;
+            config.search.determinization_samples = 4;
+            let config = config.into_measurement(7);
+            let mut rng = SmallRng::seed_from_u64(7);
+            choose_action(&state, seat, &config, &mut rng)
+        };
+        let names = |action: &Option<GameAction>| -> String {
+            let n = |id: &ObjectId| {
+                state
+                    .objects
+                    .get(id)
+                    .map(|o| o.name.clone())
+                    .unwrap_or_else(|| format!("#{}", id.0))
+            };
+            match action {
+                Some(GameAction::DeclareAttackers { attacks, .. }) => {
+                    let v: Vec<String> = attacks.iter().map(|(id, _)| n(id)).collect();
+                    format!("attack [{}]", v.join(", "))
+                }
+                Some(GameAction::DeclareBlockers { assignments }) => {
+                    let v: Vec<String> = assignments
+                        .iter()
+                        .map(|(b, a)| format!("{} → {}", n(b), n(a)))
+                        .collect();
+                    format!("block [{}]", v.join(", "))
+                }
+                other => format!("{other:?}"),
+            }
+        };
+        let (old, new) = (pick(false), pick(true));
+        let me = &state.players[seat.0 as usize];
+        let opp = &state.players[1 - seat.0 as usize];
+        println!(
+            "{name} T{} life {}×{} {}\n  note: {}\n  before: {}\n  after:  {}",
+            state.turn_number,
+            me.life,
+            opp.life,
+            if old == new { "(same)" } else { "CHANGED" },
+            raw["note"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(150)
+                .collect::<String>(),
+            names(&old),
+            names(&new),
+        );
+    }
+}
