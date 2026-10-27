@@ -73,6 +73,7 @@ pub(crate) mod stack_awareness;
 pub(crate) mod strategy_helpers;
 mod sweeper_timing;
 mod synergy_casting;
+mod tap_state_branch;
 mod tempo_curve;
 mod tokens_wide;
 mod tribal_lord_priority;

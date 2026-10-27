@@ -184,6 +184,9 @@ pub enum PolicyId {
     /// CR 106.4: a ritual's mana empties at end of step/phase — don't cast one
     /// when nothing in reach can spend it in this window.
     RitualSink,
+    /// CR 701.26: "tap or untap target" — tap the opposing untapped creature,
+    /// untap our own tapped one, never the no-op or the harmful direction.
+    TapStateBranch,
 }
 
 /// Coarse routing kind for a candidate decision. Each policy declares which
@@ -451,6 +454,7 @@ impl Default for PolicyRegistry {
             Box::new(GraveyardAuthorityPolicy),
             Box::new(super::pile_partition::PilePartitionPolicy),
             Box::new(super::ritual_sink::RitualSinkPolicy),
+            Box::new(super::tap_state_branch::TapStateBranchPolicy),
         ];
         Self::from_policies(policies)
     }
