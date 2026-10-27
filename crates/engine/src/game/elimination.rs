@@ -1801,6 +1801,18 @@ fn finish_abandoned_source_bound_resolution_carrier(
             move_object_for_player_left_game(state, spell.id, leaver, events);
         }
     }
+    // CR 800.4a + CR 616.1: the departing player's prompt can sit under a
+    // replacement drain its own resolution raised (a damage or zone-change
+    // replacement paused mid-family). That drain belongs to the abandoned
+    // family: retire it first, the same way the parked-replacement teardown in
+    // `do_eliminate` does, or the carrier finds it on top and cannot clear its
+    // continuation.
+    if matches!(
+        state.resolution_stack.last(),
+        Some(crate::types::resolution::ResolutionFrame::PostReplacement(_))
+    ) {
+        super::replacement::abandon_post_replacement_continuation(state);
+    }
     crate::game::stack::abandon_active_resolution_carrier(
         state,
         crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
