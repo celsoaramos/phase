@@ -24,6 +24,7 @@
 //!   drops that line, and an unmeasurable incumbent leaves the root untouched.
 
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use engine::game::engine::apply_interaction_for_simulation;
@@ -57,6 +58,23 @@ pub(crate) const SWITCH_MARGIN: f64 = 2.0;
 const WORST_WORLD_SLACK: f64 = 6.0;
 /// `evaluate_state` returns ±10_000 for a decided game.
 const DECIDED: f64 = 9_000.0;
+
+/// Process-wide counters for the lab (`ai-ladder` prints them): decisions
+/// measured, lines swapped, and the time spent.
+static DECISIONS: AtomicU64 = AtomicU64::new(0);
+static SWITCHES: AtomicU64 = AtomicU64::new(0);
+static TOTAL_MICROS: AtomicU64 = AtomicU64::new(0);
+static MAX_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// `(decisions measured, lines swapped, total µs, slowest decision µs)`.
+pub fn stats() -> (u64, u64, u64, u64) {
+    (
+        DECISIONS.load(AtomicOrdering::Relaxed),
+        SWITCHES.load(AtomicOrdering::Relaxed),
+        TOTAL_MICROS.load(AtomicOrdering::Relaxed),
+        MAX_MICROS.load(AtomicOrdering::Relaxed),
+    )
+}
 
 pub(crate) struct TurnSimInput<'a> {
     pub state: &'a GameState,
@@ -176,6 +194,24 @@ pub(crate) fn refine_root_turn(
     if scored.len() < 2 || !applies(input.state, input.player) {
         return scored;
     }
+    let started = web_time::Instant::now();
+    let before = scored.len();
+    let out = measure_lines(input, scored, is_mana);
+    let micros = started.elapsed().as_micros() as u64;
+    DECISIONS.fetch_add(1, AtomicOrdering::Relaxed);
+    if out.len() == 1 && before > 1 {
+        SWITCHES.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    TOTAL_MICROS.fetch_add(micros, AtomicOrdering::Relaxed);
+    MAX_MICROS.fetch_max(micros, AtomicOrdering::Relaxed);
+    out
+}
+
+fn measure_lines(
+    input: &TurnSimInput<'_>,
+    scored: Vec<(GameAction, f64)>,
+    is_mana: impl Fn(&GameAction) -> bool,
+) -> Vec<(GameAction, f64)> {
     let lines = lines(&scored, is_mana);
     if lines.len() < 2 {
         return scored;
