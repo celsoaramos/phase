@@ -41,7 +41,7 @@ use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::util::Deadline;
 
-use crate::combat_ai::{choose_blockers_with_profile, crackback_damage};
+use crate::combat_ai::{choose_blockers_with_profile, crackback_damage, latent_blockers};
 use crate::config::AiProfile;
 use crate::eval::{evaluate_state, EvalWeights};
 
@@ -428,6 +428,12 @@ pub(crate) fn refine_attack(
     let GameAction::DeclareAttackers { attacks, .. } = &incumbent else {
         return incumbent;
     };
+    // CR 602.2: a land the defender can animate with open mana is a blocker the
+    // replay never sees — it only passes priority. The heuristic already counts
+    // those bodies (`latent_blockers`), so its answer stands.
+    if !latent_blockers(input.state, opponent).is_empty() {
+        return incumbent;
+    }
 
     let mut budget = Budget {
         replays: 0,
