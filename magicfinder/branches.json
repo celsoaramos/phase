@@ -295,5 +295,11 @@
   },
   {
     "branch": "card/dark-salvation-token-then-pump"
+  },
+  {
+    "branch": "card/elimination-under-post-replacement"
+  },
+  {
+    "branch": "ai/turn-search"
   }
 ]
