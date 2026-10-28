@@ -5651,6 +5651,11 @@ fn parse_creature_has_keyword(input: &str) -> OracleResult<'_, StaticCondition> 
         .parse()
         .map_err(|_| nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Fail)))?;
     let filter = add_filter_property(filter, FilterProp::WithKeyword { value: keyword });
+    // CR 109.4 + CR 400.1: "a creature you control" names a permanent; only the
+    // battlefield has controllers. `IsPresent` scans every object, so without the
+    // zone a creature card in the controller's library, hand or graveyard satisfied
+    // the gate and Odric granted every keyword with no other creature in play.
+    let filter = inject_battlefield_presence(filter);
     Ok((
         after_kw,
         StaticCondition::IsPresent {

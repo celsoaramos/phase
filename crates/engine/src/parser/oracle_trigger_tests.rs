@@ -33058,6 +33058,19 @@ fn parse_odric_current_errata_text_gates_all_thirteen_keywords() {
             Some(crate::types::ability::ControllerRef::You),
             "gate for {keyword:?} must be scoped to creatures you control"
         );
+        // CR 109.4 + CR 400.1: `IsPresent` scans every zone; without the
+        // battlefield scope a creature card in the library/hand/graveyard
+        // satisfies the gate and Odric grants every keyword alone.
+        assert!(
+            tf.properties.iter().any(|p| matches!(
+                p,
+                FilterProp::InZone {
+                    zone: crate::types::zones::Zone::Battlefield
+                }
+            )),
+            "gate for {keyword:?} must be battlefield-scoped, props: {:?}",
+            tf.properties
+        );
     }
 }
 

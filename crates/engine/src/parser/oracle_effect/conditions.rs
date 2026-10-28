@@ -6526,8 +6526,18 @@ pub(crate) fn ability_condition_to_static_condition(
                 QuantityExpr::Fixed { value: 1 },
             ) = (lhs, comparator, rhs)
             {
+                // CR 400.1: `ObjectCount` with no zone counts the battlefield
+                // (`resolve_quantity` defaults it), but `IsPresent` scans every
+                // object in every zone. Carry the implicit battlefield scope across
+                // the bridge, or a card in the library/hand/graveyard satisfies the
+                // presence gate (Odric, Lunarch Marshal granting all 13 keywords).
+                let filter = if filter.extract_zones().is_empty() {
+                    nom_condition::inject_battlefield_presence(filter.clone())
+                } else {
+                    filter.clone()
+                };
                 return Some(StaticCondition::IsPresent {
-                    filter: Some(filter.clone()),
+                    filter: Some(filter),
                 });
             }
             Some(StaticCondition::QuantityComparison {

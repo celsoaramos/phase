@@ -1284,6 +1284,7 @@ mod ob_nixilis_captive_kingpin_life_loss;
 mod obeka_splitter_additional_phases;
 mod object_growth_cover_blink_boards;
 mod obliterate_regression;
+mod odric_keyword_gate;
 mod officious_interrogation_bare_strive_surcharge;
 mod ogre_battlecaster_8775;
 mod ogre_marauder_defending_player_unless_sacrifice;
