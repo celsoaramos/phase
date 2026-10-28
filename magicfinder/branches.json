@@ -301,5 +301,8 @@
   },
   {
     "branch": "ai/turn-search"
+  },
+  {
+    "branch": "card/desecration-demon-any-opponent"
   }
 ]
