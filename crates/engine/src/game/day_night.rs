@@ -116,6 +116,46 @@ pub fn initialize_day_night(state: &mut GameState, events: &mut Vec<GameEvent>) 
     });
 }
 
+/// CR 702.145d + CR 702.145g: the designation a permanent entering with daybound
+/// or nightbound gives a game that is neither day nor night. Daybound makes it day;
+/// nightbound makes it night only when no daybound permanent is on the battlefield.
+pub fn initialize_day_night_for_entering(
+    state: &mut GameState,
+    object_id: crate::types::identifiers::ObjectId,
+    events: &mut Vec<GameEvent>,
+) {
+    if state.day_night.is_some() {
+        return;
+    }
+    let Some(obj) = state.objects.get(&object_id) else {
+        return;
+    };
+    let designation = if obj.has_keyword(&Keyword::Daybound) {
+        DayNight::Day
+    } else if obj.has_keyword(&Keyword::Nightbound) {
+        let daybound_present = state.battlefield.iter().any(|id| {
+            *id != object_id
+                && state
+                    .objects
+                    .get(id)
+                    .is_some_and(|o| o.has_keyword(&Keyword::Daybound))
+        });
+        if daybound_present {
+            DayNight::Day
+        } else {
+            DayNight::Night
+        }
+    } else {
+        return;
+    };
+    state.day_night = Some(designation);
+    // CR 731.1: the game gains its first designation — not a change of day/night.
+    events.push(GameEvent::DayNightChanged {
+        new_state: designation.as_str().to_string(),
+        previous: None,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

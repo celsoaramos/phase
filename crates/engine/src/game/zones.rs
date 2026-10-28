@@ -1781,6 +1781,14 @@ pub(crate) fn move_to_zone_with_entry_flags(
     // so the record reflects the face the object entered with. Skipped when
     // day/night is uninitialized.
     if to == Zone::Battlefield {
+        // CR 702.145d + CR 702.145g: a permanent with daybound makes it day when it is
+        // neither day nor night; one with nightbound makes it night, unless a daybound
+        // permanent is also on the battlefield. Without this nothing ever set the
+        // designation (only "it becomes day as this creature enters" cards like Gavony
+        // Dawnguard did), and a lone Brutal Cathar never transformed.
+        if state.day_night.is_none() {
+            super::day_night::initialize_day_night_for_entering(state, object_id, events);
+        }
         if let Some(designation) = state.day_night {
             let needs_transform =
                 state

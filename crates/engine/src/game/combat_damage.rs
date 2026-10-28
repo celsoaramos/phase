@@ -283,6 +283,7 @@ fn finish_combat_damage_sub_step(
             }
 
             // CR 510.4: SBAs and triggers run between first-strike and regular damage sub-steps.
+            let waiting_before = state.waiting_for.clone();
             process_combat_damage_triggers(state, damage_events, events, include_phase_event);
 
             // CR 510.4 + CR 603.3b: if the first-strike sub-step produced a same-
@@ -292,7 +293,7 @@ fn finish_combat_damage_sub_step(
             // combat-damage sub-step is resumed by the priority-pass completeness gate
             // in priority.rs, which re-enters this function once the order is submitted
             // and the resulting triggers resolve.
-            if let Some(waiting_for) = pending_combat_damage_waiting(state) {
+            if let Some(waiting_for) = pending_combat_damage_waiting(state, &waiting_before) {
                 return Some(waiting_for);
             }
 
@@ -325,8 +326,9 @@ fn finish_combat_damage_sub_step(
                 c.damage_step_index = None;
             }
 
+            let waiting_before = state.waiting_for.clone();
             process_combat_damage_triggers(state, damage_events, events, include_phase_event);
-            pending_combat_damage_waiting(state)
+            pending_combat_damage_waiting(state, &waiting_before)
         }
     }
 }
@@ -431,9 +433,33 @@ fn claim_combat_lifelink_batch_events_for_ordinary_collection(
 /// CR 603.3b / CR 704.3: trigger ordering and game-over results are completion
 /// states of the combat-damage resolver, so callers must receive them rather than
 /// replacing them with a fresh priority window.
-fn pending_combat_damage_waiting(state: &GameState) -> Option<WaitingFor> {
+///
+/// CR 704.3 + CR 616.1: the SBAs run here can also park on a player prompt — the
+/// ordering choice between two "would die" replacements (two Etching of Kumano),
+/// the CR 704.5j legend rule, the CR 903.9a commander zone choice, the CR 704.5w
+/// battle protector. Replacing that prompt with priority strands the parked event
+/// (`pending_replacement` stays set, so every later SBA pass is paused: no
+/// creature dies for the rest of the game and the turn can never end).
+/// Only a prompt those SBAs just raised counts: a batch resumed by the answer to
+/// its own CR 616.1 choice still reads that answered choice in `waiting_for`.
+fn pending_combat_damage_waiting(
+    state: &GameState,
+    waiting_before: &WaitingFor,
+) -> Option<WaitingFor> {
     match &state.waiting_for {
         WaitingFor::OrderTriggers { .. } | WaitingFor::GameOver { .. } => {
+            Some(state.waiting_for.clone())
+        }
+        WaitingFor::ReplacementChoice { .. }
+            if state.pending_replacement.is_some() && state.waiting_for != *waiting_before =>
+        {
+            Some(state.waiting_for.clone())
+        }
+        WaitingFor::ChooseLegend { .. }
+        | WaitingFor::CommanderZoneChoice { .. }
+        | WaitingFor::BattleProtectorChoice { .. }
+            if state.waiting_for != *waiting_before =>
+        {
             Some(state.waiting_for.clone())
         }
         _ => None,

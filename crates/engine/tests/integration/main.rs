@@ -1169,6 +1169,7 @@ mod memory_plunder_free_cast_2884;
 mod mercenaries_any_player_activate_prevention_scope;
 mod merieke_ri_berit_cant_regenerate;
 mod metamorphic_alteration;
+mod mf_relatos_1028;
 mod militant_angel_attacked_opponents;
 mod mill_double_redirect_choice_continuation;
 mod mill_rest_in_peace_redirect;
