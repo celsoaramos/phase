@@ -1,6 +1,7 @@
 use crate::game::ability_utils::build_resolved_from_def;
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::game_object::GameObject;
+use crate::game::game_object::ObjectIncarnationRefExt;
 use crate::game::targeting::{TriggeringActivation, TriggeringSpell};
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef, CopyRetargetPermission,
@@ -128,6 +129,8 @@ pub fn resolve(
         // copy of a spell cast as a prepare spell is itself a prepare spell;
         // `FilterProp::PrepareSpell` relies on this inheritance.
         let mut copy_obj = source_obj.clone();
+        // CR 123.1 + CR 707.2: stickers and their changes aren't copiable values.
+        crate::game::stickers::remove_stickers_from_copy(&mut copy_obj);
         copy_obj.id = copy_id;
         copy_obj.controller = copy_controller;
         // allow-raw-zone: spell-copy birth directly on stack has no from-zone event (CR 707.10).
@@ -2267,6 +2270,8 @@ mod tests {
                 owner: TargetFilter::Controller,
                 source_filter: None,
                 enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
                 tapped: false,
                 count: QuantityExpr::Ref {
                     qty: crate::types::ability::QuantityRef::AdditionalCostPaymentCount,
@@ -2620,6 +2625,8 @@ mod tests {
                 owner: TargetFilter::Controller,
                 attach_to: None,
                 enters_attacking: false,
+                attack_destination:
+                    crate::types::ability::TokenAttackDestination::ControllerChooses,
                 supertypes: vec![],
                 static_abilities: vec![],
                 enter_with_counters: vec![],
@@ -4496,6 +4503,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                intensity: 0,
             },
             incarnation: 0,
         });

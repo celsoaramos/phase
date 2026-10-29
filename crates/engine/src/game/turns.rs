@@ -335,11 +335,15 @@ pub(in crate::game) fn advance_phase_once(
         // the phase. Simple static-based skips (`StaticMode::SkipStep`) still
         // short-circuit at dedicated call sites (`step_skip`, for untap, upkeep
         // and draw); this path handles event-context-aware replacements.
+        // CR 508.8: a combat step with nothing attacking is skipped before it
+        // could begin, so it proposes no begin event.
         let proposed = ProposedEvent::begin_phase(state.active_player, next);
-        if matches!(
-            replacement::replace_event(state, proposed, events),
-            ReplacementResult::Prevented
-        ) {
+        if combat_step_skipped(state, next)
+            || matches!(
+                replacement::replace_event(state, proposed, events),
+                ReplacementResult::Prevented
+            )
+        {
             // CR 500.11: "To skip a step, phase, or turn is to proceed past it
             // as though it didn't exist." Advance `state.phase` past the skipped
             // phase so the next loop iteration computes the phase AFTER it, then
@@ -405,6 +409,11 @@ pub fn end_turn_to_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // is skipped, so we must expire the restriction here.
     state.current_combat_attacker_restriction = None;
     state.current_combat_attacker_restriction_source = None;
+    // CR 724.1d + CR 611.3a: the effect already cleared combat; live static
+    // conditions must observe that removal before cleanup begins.
+    if state.phase.is_combat() {
+        state.layers_dirty.mark_full();
+    }
     enter_phase(state, Phase::Cleanup, events, None);
 }
 
@@ -413,6 +422,9 @@ pub fn end_turn_to_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) {
 /// that skip directly out of combat use the same teardown authority.
 fn complete_end_combat_teardown(state: &mut GameState) {
     state.combat = None;
+    // CR 511.3 + CR 611.3a: removing combat membership changes live static
+    // conditions even when no transient continuous effect expires.
+    state.layers_dirty.mark_full();
     state.current_combat_attacker_restriction = None;
     state.current_combat_attacker_restriction_source = None;
     super::layers::prune_end_of_combat_effects(state);
@@ -471,9 +483,9 @@ fn discard_scheduled_units(state: &mut GameState) {
     state.extra_phase_resume.clear();
 }
 
-/// CR 508.8: Mark the end-of-combat step after no attackers remain, so the
-/// caller can skip the blockers and combat-damage steps through the ordinary
-/// phase interpreter.
+/// CR 508.8: Mark the end-of-combat step after no creature was declared as an
+/// attacker or put onto the battlefield attacking, so the caller can skip the
+/// blockers and combat-damage steps through the ordinary phase interpreter.
 pub(super) fn mark_empty_attackers_end_combat(state: &mut GameState, events: &mut Vec<GameEvent>) {
     state.phase = Phase::EndCombat;
     // CR 508.8 + CR 511.1: declare blockers and combat damage are skipped, but
@@ -484,6 +496,17 @@ pub(super) fn mark_empty_attackers_end_combat(state: &mut GameState, events: &mu
     });
 }
 
+/// CR 508.8: the declare blockers and combat damage steps are skipped when no
+/// creature was declared as an attacker or put onto the battlefield attacking
+/// this combat; every such creature is still listed or was removed. The
+/// beginning of combat step creates the combat state this reads.
+fn combat_step_skipped(state: &GameState, step: Phase) -> bool {
+    matches!(step, Phase::DeclareBlockers | Phase::CombatDamage)
+        && state.combat.as_ref().is_some_and(|combat| {
+            combat.attackers.is_empty() && combat.removed_attackers_this_combat.is_empty()
+        })
+}
+
 /// The declaration-continuation form of [`mark_empty_attackers_end_combat`].
 /// CR 508.8 skips only Declare Blockers and Combat Damage; the normal End
 /// Combat step still begins and must run its triggers and priority window.
@@ -491,6 +514,13 @@ pub(super) fn advance_after_empty_attackers(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
 ) -> WaitingFor {
+    // CR 508.2 + CR 508.8: abilities triggered at the beginning of this step resolve in it; the skip is decided when the step ends (`advance_phase_once`).
+    if !state.stack.is_empty() {
+        priority::reset_priority(state);
+        return WaitingFor::Priority {
+            player: state.active_player,
+        };
+    }
     mark_empty_attackers_end_combat(state, events);
     auto_advance(state, events)
 }
@@ -3907,6 +3937,15 @@ fn auto_advance_once(state: &mut GameState, events: &mut Vec<GameEvent>) -> Auto
             ));
         }
         Phase::DeclareBlockers => {
+            // CR 508.8: a caller that ran this arm after a skip leaves the step unentered.
+            if combat_step_skipped(state, Phase::DeclareBlockers) {
+                return match advance_phase_once(state, events) {
+                    AdvancePhaseOnce::Deferred => AutoAdvanceStep::Deferred,
+                    AdvancePhaseOnce::Entry(_) | AdvancePhaseOnce::Skipped => {
+                        AutoAdvanceStep::Continue
+                    }
+                };
+            }
             // CR 509.1: Defending player declares blockers as a turn-based action.
             super::combat::prune_attackers_not_in_play(state);
             let has_attackers = super::combat::has_attackers_in_play(state);
@@ -3921,13 +3960,24 @@ fn auto_advance_once(state: &mut GameState, events: &mut Vec<GameEvent>) -> Auto
                 return AutoAdvanceStep::waiting(
                     super::combat::build_declare_blockers_waiting_for(state, defending),
                 );
-            } else {
-                // CR 508.8: Declare blockers and combat damage steps are skipped if no attackers.
-                mark_empty_attackers_end_combat(state, events);
-                // Continue loop to process EndCombat
             }
+            // CR 508.8 + CR 509.2: a creature attacked this combat, so the step happens
+            // even with every attacker gone; nobody declares blockers and the active
+            // player receives priority.
+            return AutoAdvanceStep::waiting(WaitingFor::Priority {
+                player: state.active_player,
+            });
         }
         Phase::CombatDamage => {
+            // CR 508.8: a caller that ran this arm after a skip leaves the step unentered.
+            if combat_step_skipped(state, Phase::CombatDamage) {
+                return match advance_phase_once(state, events) {
+                    AdvancePhaseOnce::Deferred => AutoAdvanceStep::Deferred,
+                    AdvancePhaseOnce::Entry(_) | AdvancePhaseOnce::Skipped => {
+                        AutoAdvanceStep::Continue
+                    }
+                };
+            }
             // CR 510.1a + CR 613.4c: Combat damage equals a creature's power as determined
             // by the layer system (layer 7c applies P/T counters). Flush here so
             // combat_damage_amount reads evaluated power, not stale base power. commit_attackers
@@ -5070,7 +5120,9 @@ card into your hand at the beginning of your next end step.";
             runner.state(),
             &runner.state().objects[&source],
         ));
-        let mut trigger = TriggerDefinition::new(TriggerMode::ChangesController);
+        let mut trigger = TriggerDefinition::new(TriggerMode::ChangesController {
+            side: crate::types::triggers::ControlChangeSide::Loses,
+        });
         trigger.valid_card = Some(TargetFilter::SpecificObject { id: sword });
         trigger.execute = None;
         runner
