@@ -147,12 +147,13 @@ fn ai_gives_the_life_to_the_less_threatening_opponent() {
     let config = create_config(AiDifficulty::Medium, Platform::Native);
     let session = AiSession::arc_from_game(&state);
     for seed in SEEDS {
+        let contract = engine::ai_support::AiDecisionContract::issue(&state, P0);
         let selection = choose_action_with_session_diagnostic(
             &state,
-            P0,
             &config,
             &mut SmallRng::seed_from_u64(seed),
             &session,
+            &contract,
         );
         let receipt = selection.receipt.expect("diagnostic receipt");
         let top: Vec<&GameAction> = receipt
