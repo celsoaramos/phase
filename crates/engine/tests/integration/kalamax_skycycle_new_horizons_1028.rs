@@ -320,3 +320,160 @@ fn kalamax_gets_a_counter_for_each_copy_zada_makes() {
         "2 pelas cópias + 1 da cópia que mira o Kalamax"
     );
 }
+
+// ── 4. Sapling Nursery: a ficha Treefolk tem alcance e bloqueia voador ─────
+
+const SAPLING_NURSERY: &str = "Affinity for Forests (This spell costs {1} less to cast for each Forest you control.)\nLandfall — Whenever a land you control enters, create a 3/4 green Treefolk creature token with reach.\n{1}{G}, Exile this enchantment: Treefolk and Forests you control gain indestructible until end of turn.";
+
+#[test]
+fn sapling_nursery_treefolk_has_reach_and_blocks_a_flyer() {
+    use engine::types::keywords::Keyword;
+    let db = shared_card_db().expect("card db");
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    sc.add_enchantment_from_oracle(P0, "Sapling Nursery", SAPLING_NURSERY);
+    let land = sc.add_real_card(P0, "Forest", Zone::Hand, db);
+    let pixie = sc
+        .add_creature(P1, "Flying Witness", 1, 1)
+        .with_keyword(Keyword::Flying)
+        .id();
+    let mut r = build(sc);
+    let card_id = r.state().objects[&land].card_id;
+    r.act(GameAction::PlayLand {
+        object_id: land,
+        card_id,
+    })
+    .expect("play land");
+    r.advance_until_stack_empty();
+    let tokens: Vec<ObjectId> = r
+        .state()
+        .battlefield
+        .iter()
+        .copied()
+        .filter(|id| r.state().objects[id].name == "Treefolk")
+        .collect();
+    assert_eq!(tokens.len(), 1, "o landfall criou a ficha");
+    let token = tokens[0];
+    assert!(
+        r.state().objects[&token].has_keyword(&Keyword::Reach),
+        "a ficha 3/4 tem alcance"
+    );
+    assert!(
+        engine::game::combat::can_block_pair(r.state(), token, pixie),
+        "alcance bloqueia voador"
+    );
+}
+
+// ── 5. Tenth District Hero: "Collect evidence" exige cemitério ─────────────
+
+#[test]
+fn tenth_district_hero_collect_evidence_needs_graveyard_value() {
+    let db = shared_card_db().expect("card db");
+    let build_with = |graveyard: Option<&str>| {
+        let mut sc = GameScenario::new();
+        sc.at_phase(Phase::PreCombatMain);
+        let hero = sc.add_real_card(P0, "Tenth District Hero", Zone::Battlefield, db);
+        sc.add_real_card(P0, "Plains", Zone::Battlefield, db);
+        sc.add_real_card(P0, "Plains", Zone::Battlefield, db);
+        if let Some(name) = graveyard {
+            sc.add_real_card(P0, name, Zone::Graveyard, db);
+        }
+        (build(sc), hero)
+    };
+    let offered = |r: &GameRunner, hero: ObjectId| {
+        engine::ai_support::legal_actions(r.state()).iter().any(
+            |a| matches!(a, GameAction::ActivateAbility { source_id, .. } if *source_id == hero),
+        )
+    };
+    let (r, hero) = build_with(None);
+    assert!(
+        !offered(&r, hero),
+        "cemitério vazio: não há o que exilar para reunir provas 2"
+    );
+    // Grizzly Bears tem valor de mana 2: paga "Collect evidence 2".
+    let (r, hero) = build_with(Some("Grizzly Bears"));
+    assert!(
+        offered(&r, hero),
+        "com valor 2 no cemitério, a habilidade é oferecida"
+    );
+}
+
+// ── 6. Bloqueio da mesa do relato 94dcb4c4 ─────────────────────────────────
+
+/// A mesa do relato: seis atacantes do robô (um voador) contra Treefolk 3/4 com alcance,
+/// Llanowar Elves, Mightform Harmonizer e um Chocobo 12/13. Todo bloqueador pode bloquear
+/// todo atacante de chão, e o voador só por quem tem alcance.
+#[test]
+fn reported_board_block_targets() {
+    use engine::game::combat::AttackTarget;
+    use engine::types::keywords::Keyword;
+    let db = shared_card_db().expect("card db");
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let pixie = sc
+        .add_creature(P1, "Nurturing Pixie", 2, 2)
+        .with_keyword(Keyword::Flying)
+        .id();
+    let gearhulk = sc
+        .add_creature(P1, "Brightglass Gearhulk", 8, 8)
+        .with_keyword(Keyword::FirstStrike)
+        .with_keyword(Keyword::Trample)
+        .id();
+    let spider = sc
+        .add_creature(P1, "Spider Manifestation", 4, 4)
+        .with_keyword(Keyword::Reach)
+        .id();
+    let fungus = sc.add_creature(P1, "Insidious Fungus", 5, 6).id();
+    let cub = sc.add_real_card(P1, "Badgermole Cub", Zone::Battlefield, db);
+    let pollinator = sc.add_real_card(P1, "Gene Pollinator", Zone::Battlefield, db);
+    let treefolk: Vec<ObjectId> = (0..2)
+        .map(|_| {
+            sc.add_creature(P0, "Treefolk", 3, 4)
+                .with_keyword(Keyword::Reach)
+                .id()
+        })
+        .collect();
+    let elves = sc.add_real_card(P0, "Llanowar Elves", Zone::Battlefield, db);
+    let harmonizer = sc.add_real_card(P0, "Mightform Harmonizer", Zone::Battlefield, db);
+    let chocobo = sc.add_creature(P0, "Sazh's Chocobo", 12, 13).id();
+    let mut r = build(sc);
+    r.state_mut().active_player = P1;
+    r.advance_to_combat();
+    let attackers = [pixie, gearhulk, spider, fungus, cub, pollinator];
+    let attacks: Vec<_> = attackers
+        .iter()
+        .map(|&a| (a, AttackTarget::Player(P0)))
+        .collect();
+    r.declare_attackers(&attacks).expect("declare attackers");
+    for _ in 0..8 {
+        if matches!(r.state().waiting_for, WaitingFor::DeclareBlockers { .. }) {
+            break;
+        }
+        r.act(GameAction::PassPriority).expect("pass");
+    }
+    let WaitingFor::DeclareBlockers {
+        valid_blocker_ids,
+        valid_block_targets,
+        ..
+    } = r.state().waiting_for.clone()
+    else {
+        panic!("esperava DeclareBlockers, veio {:?}", r.state().waiting_for);
+    };
+    let ground = [gearhulk, spider, fungus, cub, pollinator];
+    for &b in treefolk.iter().chain([elves, harmonizer, chocobo].iter()) {
+        assert!(valid_blocker_ids.contains(&b), "{b:?} pode bloquear");
+        let targets = valid_block_targets.get(&b).cloned().unwrap_or_default();
+        for a in ground {
+            assert!(
+                targets.contains(&a),
+                "{b:?} deveria poder bloquear {a:?}: {targets:?}"
+            );
+        }
+    }
+    for &t in &treefolk {
+        assert!(
+            valid_block_targets[&t].contains(&pixie),
+            "alcance bloqueia o voador"
+        );
+    }
+}
