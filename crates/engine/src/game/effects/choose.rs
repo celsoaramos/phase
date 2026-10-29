@@ -176,7 +176,7 @@ pub(crate) fn resolve_random_in_chain(
         source.as_mut(),
         persist_player,
     ) {
-        if matches!(choice_type, ChoiceType::CardName) {
+        if matches!(choice_type, ChoiceType::CardName { .. }) {
             ability.update_trigger_source_context_through_chain(context);
         } else {
             ability.update_trigger_source_context_in_resolution_segment(context);
@@ -266,7 +266,7 @@ pub(crate) fn bind_named_choice(
             // announced while applying THIS effect", so a fresh naming replaces
             // the snapshot's earlier answers (a recast spell's prior casts).
             // The source object's own history is untouched (CR 607.2d readers).
-            if matches!(choice_type, ChoiceType::CardName) {
+            if matches!(choice_type, ChoiceType::CardName { .. }) {
                 context
                     .lki
                     .chosen_attributes

@@ -1369,7 +1369,7 @@ impl ChoiceType {
     /// dependent instruction ("discards a card with that name") reads it from
     /// the resolution's owned source context rather than the source's history.
     pub fn needs_choice_source_context(&self) -> bool {
-        matches!(self, Self::CardPredicateGuess { .. } | Self::CardName)
+        matches!(self, Self::CardPredicateGuess { .. } | Self::CardName { .. })
     }
 
     pub fn card_predicate_labels(options: &[CardPredicateChoice]) -> Vec<String> {
@@ -11145,6 +11145,7 @@ pub(crate) fn instruction_object_reach(effect: &Effect) -> InstructionObjectReac
         | Effect::CastCopyOfCard { .. }
         | Effect::CopyTokenOf { .. }
         | Effect::CreateTokenCopyFromPool { .. }
+        | Effect::CreateCardCopyByName { .. }
         | Effect::Myriad
         | Effect::Encore
         | Effect::CombineHost { .. }
@@ -11444,6 +11445,7 @@ pub(crate) fn battlefield_departure_slot(effect: &Effect) -> Option<&TargetFilte
         | Effect::CastCopyOfCard { .. }
         | Effect::CopyTokenOf { .. }
         | Effect::CreateTokenCopyFromPool { .. }
+        | Effect::CreateCardCopyByName { .. }
         | Effect::Myriad
         | Effect::Encore
         | Effect::CombineHost { .. }

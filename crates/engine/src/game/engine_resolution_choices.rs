@@ -8067,7 +8067,7 @@ pub(super) fn handle_resolution_choice(
             // CR 608.2d: a chosen card name is public information; surface it for
             // every naming (resolving instruction or as-enters choice) so the log
             // shows what was named.
-            if matches!(choice_type, ChoiceType::CardName) {
+            if matches!(choice_type, ChoiceType::CardName { .. }) {
                 events.push(GameEvent::CardNamed {
                     player_id: player,
                     source_id: source
@@ -8114,7 +8114,7 @@ pub(super) fn handle_resolution_choice(
             effects::choose::record_player_chosen_number(state, player, &choice_type, &choice);
             if let Some(context) = updated_context {
                 if let Some(frame) = state.active_ability_continuation_frame_mut() {
-                    if matches!(choice_type, ChoiceType::CardName) {
+                    if matches!(choice_type, ChoiceType::CardName { .. }) {
                         frame
                             .pending
                             .chain
