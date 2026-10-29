@@ -555,7 +555,7 @@ pub(crate) fn try_parse_impose_additional_cost(
 pub(crate) fn try_parse_cost_modification(
     text: &str,
     lower: &str,
-    casting_as_variant: Option<crate::types::game_state::CastingVariant>,
+    casting_as_variant: Option<crate::types::game_state_kinds::CastingVariant>,
 ) -> Option<StaticDefinition> {
     let original_text = text;
     let (cost_text, leading_gate) =
@@ -1827,6 +1827,7 @@ fn rebind_scoped_designation_anaphor(condition: &mut StaticCondition, antecedent
         | StaticCondition::ChosenColorIs { .. }
         | StaticCondition::ChosenLabelIs { .. }
         | StaticCondition::QuantityComparison { .. }
+        | StaticCondition::QuantityQuality { .. }
         | StaticCondition::HasMaxSpeed
         | StaticCondition::SpeedGE { .. }
         | StaticCondition::DayNightIs { .. }
@@ -1855,6 +1856,7 @@ fn rebind_scoped_designation_anaphor(condition: &mut StaticCondition, antecedent
         | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
         | StaticCondition::SourceEnteredThisTurn
         | StaticCondition::SourceHasDealtDamage
+        | StaticCondition::SourceExertedThisTurn
         | StaticCondition::WasCast { .. }
         | StaticCondition::IsRingBearer
         | StaticCondition::RingLevelAtLeast { .. }
