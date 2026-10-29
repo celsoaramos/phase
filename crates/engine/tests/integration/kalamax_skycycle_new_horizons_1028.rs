@@ -81,9 +81,8 @@ fn new_horizons_land_taps_for_two_mana() {
             _ => break,
         }
     }
-    assert_eq!(
+    assert!(
         r.state().objects[&aura].attached_to.is_some(),
-        true,
         "a aura está anexada"
     );
     assert_eq!(p1p1(&r, bears), 1, "o gatilho de entrada pôs o marcador");
