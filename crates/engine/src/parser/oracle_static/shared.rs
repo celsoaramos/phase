@@ -6,7 +6,7 @@ use super::prelude::*;
 #[allow(unused_imports)]
 use super::support::*;
 use nom::character::complete::anychar;
-use nom::combinator::{not, success, value};
+use nom::combinator::{map_opt, not, success, value};
 use nom::multi::many1;
 
 /// Whose spells and abilities a "can be the target of spells and abilities …
@@ -268,8 +268,9 @@ pub(crate) fn nom_tag_tp<'a>(tp: &TextPair<'a>, prefix: &str) -> Option<TextPair
 /// condition-vs-effect comma in an inverted `"As long as <cond>, <effect>"` line.
 ///
 /// Every alternative ends on a word boundary (trailing space or apostrophe) so
-/// `tag("it ")` does not accept `"its "`. The set is derived from the 134-row
-/// corpus of currently-affected cards in `client/public/card-data.json` and is
+/// `tag("it ")` does not accept arbitrary `"its "` tails. Possessive P/T
+/// subjects are admitted only with a complete power/toughness word. The set was
+/// derived from the 134-row corpus in `client/public/card-data.json` and is
 /// intentionally conservative: bare nouns/verbs that commonly appear inside
 /// condition clauses (e.g. `"creatures "`, `"lands "`, `"a "`) are omitted.
 pub(crate) fn parse_effect_subject_prefix(input: &str) -> OracleResult<'_, ()> {
@@ -287,6 +288,15 @@ pub(crate) fn parse_effect_subject_prefix(input: &str) -> OracleResult<'_, ()> {
                 tag("it deals "),
                 tag("it doesn't "),
             )),
+        ),
+        // Possessive self P/T subjects, without admitting condition-internal
+        // "its controller" or adjacent nouns such as "its powerful".
+        value(
+            (),
+            preceded(
+                tag("its "),
+                terminated(alt((tag("power"), tag("toughness"))), tag(" ")),
+            ),
         ),
         // Self-reference tilde token.
         value(
@@ -1032,6 +1042,7 @@ fn continuous_modification_dynamic_quantity_mut(
         | ContinuousModification::SetBasicLandType { .. }
         | ContinuousModification::SetChosenBasicLandType
         | ContinuousModification::SetChosenName
+        | ContinuousModification::SubstituteTextWord { .. }
         | ContinuousModification::RetainPrintedTriggerFromSource { .. }
         | ContinuousModification::RetainPrintedAbilityFromSource { .. }
         | ContinuousModification::RetainAllOtherAbilitiesFromSource
@@ -1080,8 +1091,16 @@ fn bind_anaphoric_counters(expr: &mut QuantityExpr, bound: ObjectScope) {
 /// multiple zones (Eminence: "in the command zone or on the battlefield").
 /// When ALL collected zones happen to be `Battlefield`, `active_zones` is left
 /// empty so the standard battlefield-default applies.
+///
+/// CR 113.6c: an ability that states which zones it doesn't function in
+/// functions everywhere except the specified zones, so a negated source-zone
+/// expression ("as long as ~ isn't on the battlefield") declares every zone in
+/// which the negation can hold, not the zones it names. A negation that also
+/// tests a non-zone leaf declares the conservative superset of zones the
+/// source's zone alone does not rule out; runtime condition evaluation then
+/// decides each zone. A negation whose truth never depends on the source's
+/// zone states no zones and keeps the battlefield default.
 pub(crate) fn populate_active_zones_from_condition(def: &mut StaticDefinition) {
-    use crate::types::zones::Zone;
     let mut zones: Vec<Zone> = Vec::new();
     if let Some(cond) = def.condition.as_ref() {
         collect_source_in_zones(cond, &mut zones);
@@ -1104,21 +1123,403 @@ pub(crate) fn populate_active_zones_from_condition(def: &mut StaticDefinition) {
     }
 }
 
+/// CR 113.6b + CR 113.6c: the zones a conditioned static functions in are every
+/// zone in which the source's zone alone does not make its condition false (a
+/// conservative superset); runtime evaluation of the full condition decides
+/// each one. A condition whose truth never depends on the source's zone states
+/// no zones, keeping the battlefield default. Zones the condition names come
+/// first, in written order ("in the command zone or on the battlefield"), then
+/// any other possible zone in `Zone::ALL` order.
 pub(crate) fn collect_source_in_zones(
     cond: &StaticCondition,
     out: &mut Vec<crate::types::zones::Zone>,
 ) {
-    match cond {
-        StaticCondition::SourceInZone { zone } if !out.contains(zone) => {
-            out.push(*zone);
+    let truths = Zone::ALL.map(|zone| (zone, source_zone_truth(cond, zone)));
+    if truths
+        .iter()
+        .all(|(_, truth)| *truth == SourceZoneTruth::Undetermined)
+    {
+        return;
+    }
+    let possible = |zone: Zone| {
+        truths
+            .iter()
+            .any(|(candidate, truth)| *candidate == zone && *truth != SourceZoneTruth::False)
+    };
+    let mut named = Vec::new();
+    collect_named_zones(cond, &mut named);
+    for zone in named.into_iter().chain(Zone::ALL) {
+        if possible(zone) && !out.contains(&zone) {
+            out.push(zone);
         }
-        StaticCondition::And { conditions } | StaticCondition::Or { conditions } => {
+    }
+}
+
+/// The zones a condition's source-zone tests name, in written order.
+fn collect_named_zones(cond: &StaticCondition, out: &mut Vec<Zone>) {
+    match ZoneConditionNode::of(cond) {
+        ZoneConditionNode::SourceInZone(zone) => out.push(zone),
+        ZoneConditionNode::SourceMatchesFilter(filter) => out.extend(filter.extract_zones()),
+        ZoneConditionNode::And(conditions) | ZoneConditionNode::Or(conditions) => {
             for c in conditions {
-                collect_source_in_zones(c, out);
+                collect_named_zones(c, out);
             }
         }
-        StaticCondition::Not { condition } => collect_source_in_zones(condition, out),
-        _ => {}
+        ZoneConditionNode::Not(condition) => collect_named_zones(condition, out),
+        ZoneConditionNode::NonZoneLeaf => {}
+    }
+}
+
+/// The structural role a `StaticCondition` node plays in zone inference
+/// (CR 113.6b / CR 113.6c): a test of the source's current zone, a source
+/// filter (which may constrain that zone), a connective, or a leaf that does
+/// not test the source's zone. [`ZoneConditionNode::of`] is the single
+/// exhaustive classification, so every new `StaticCondition` variant forces an
+/// explicit zone-inference decision.
+enum ZoneConditionNode<'a> {
+    SourceInZone(Zone),
+    SourceMatchesFilter(&'a TargetFilter),
+    And(&'a [StaticCondition]),
+    Or(&'a [StaticCondition]),
+    Not(&'a StaticCondition),
+    NonZoneLeaf,
+}
+
+impl<'a> ZoneConditionNode<'a> {
+    fn of(cond: &'a StaticCondition) -> Self {
+        match cond {
+            StaticCondition::SourceInZone { zone } => Self::SourceInZone(*zone),
+            StaticCondition::And { conditions } => Self::And(conditions),
+            StaticCondition::Or { conditions } => Self::Or(conditions),
+            StaticCondition::Not { condition } => Self::Not(condition),
+            StaticCondition::SourceMatchesFilter { filter } => Self::SourceMatchesFilter(filter),
+            // `WasCast { zone }` names the zone a spell was cast FROM, not the
+            // zone the source is in now; `RecipientMatchesFilter` and
+            // `TopOfLibraryMatches` filter other objects.
+            StaticCondition::DevotionGE { .. }
+            | StaticCondition::IsPresent { .. }
+            | StaticCondition::ChosenColorIs { .. }
+            | StaticCondition::ChosenLabelIs { .. }
+            | StaticCondition::QuantityComparison { .. }
+            | StaticCondition::QuantityQuality { .. }
+            | StaticCondition::HasMaxSpeed
+            | StaticCondition::SpeedGE { .. }
+            | StaticCondition::DayNightIs { .. }
+            | StaticCondition::HasCounters { .. }
+            | StaticCondition::CastVariantPaid { .. }
+            | StaticCondition::RecipientHasCounters { .. }
+            | StaticCondition::ClassLevelGE { .. }
+            | StaticCondition::DefendingPlayerControls { .. }
+            | StaticCondition::SourceAttackingAlone
+            | StaticCondition::SourceIsAttacking
+            | StaticCondition::SourceIsBlocking
+            | StaticCondition::SourceIsBlocked
+            | StaticCondition::IsMonarch { .. }
+            | StaticCondition::HasBoon { .. }
+            | StaticCondition::IsInitiative
+            | StaticCondition::NoMonarch
+            | StaticCondition::HasCityBlessing
+            | StaticCondition::HasEnduringStory
+            | StaticCondition::CompletedADungeon
+            | StaticCondition::WasStartingPlayer { .. }
+            | StaticCondition::SpellCastWithVariantThisTurn { .. }
+            | StaticCondition::AnyPlayerAttackedYouLastTurn { .. }
+            | StaticCondition::OpponentPoisonAtLeast { .. }
+            | StaticCondition::UnlessPay { .. }
+            | StaticCondition::Unrecognized { .. }
+            | StaticCondition::DuringYourTurn
+            | StaticCondition::FirstCombatPhaseOfTurn
+            | StaticCondition::DuringOpponentsTurn
+            | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
+            | StaticCondition::SourceEnteredThisTurn
+            | StaticCondition::SourceHasDealtDamage
+            | StaticCondition::WasCast { .. }
+            | StaticCondition::IsRingBearer
+            | StaticCondition::RingLevelAtLeast { .. }
+            | StaticCondition::ControlsCommander { .. }
+            | StaticCondition::SourceIsTapped
+            | StaticCondition::SourceExertedThisTurn
+            | StaticCondition::IsTapped { .. }
+            | StaticCondition::SourceIsFaceUp
+            | StaticCondition::SourceIsSaddled
+            | StaticCondition::SourceControllerEquals { .. }
+            | StaticCondition::SourceIsEquipped
+            | StaticCondition::SourceIsEnchanted
+            | StaticCondition::SourceIsMonstrous
+            | StaticCondition::SourceIsHarnessed
+            | StaticCondition::SourceAttachedToCreature
+            | StaticCondition::TopOfLibraryMatches { .. }
+            | StaticCondition::RecipientMatchesFilter { .. }
+            | StaticCondition::RecipientAttackingOwnerTarget { .. }
+            | StaticCondition::SourceIsPaired
+            | StaticCondition::EnchantedIsFaceDown
+            | StaticCondition::AdditionalCostPaid
+            | StaticCondition::CastingAsVariant { .. }
+            | StaticCondition::None => Self::NonZoneLeaf,
+        }
+    }
+}
+
+/// What the source's zone alone says about a condition, with three-valued
+/// (Kleene) connectives: definitely true, definitely false, or undetermined
+/// because the answer also depends on a leaf that does not test that zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceZoneTruth {
+    True,
+    False,
+    Undetermined,
+}
+
+impl SourceZoneTruth {
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::False, _) | (_, Self::False) => Self::False,
+            (Self::True, Self::True) => Self::True,
+            (Self::Undetermined, _) | (_, Self::Undetermined) => Self::Undetermined,
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        self.negate().and(other.negate()).negate()
+    }
+
+    fn negate(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Undetermined => Self::Undetermined,
+        }
+    }
+}
+
+/// CR 113.6b + CR 113.6c + CR 400.1: the truth of `cond` for a source in `zone`,
+/// as far as its source-zone tests decide it. An empty `And` is true and an
+/// empty `Or` is false (their identities).
+fn source_zone_truth(cond: &StaticCondition, zone: Zone) -> SourceZoneTruth {
+    match ZoneConditionNode::of(cond) {
+        ZoneConditionNode::SourceInZone(tested) if tested == zone => SourceZoneTruth::True,
+        ZoneConditionNode::SourceInZone(_) => SourceZoneTruth::False,
+        ZoneConditionNode::And(conditions) => {
+            conditions.iter().fold(SourceZoneTruth::True, |acc, c| {
+                acc.and(source_zone_truth(c, zone))
+            })
+        }
+        ZoneConditionNode::Or(conditions) => {
+            conditions.iter().fold(SourceZoneTruth::False, |acc, c| {
+                acc.or(source_zone_truth(c, zone))
+            })
+        }
+        ZoneConditionNode::Not(condition) => source_zone_truth(condition, zone).negate(),
+        ZoneConditionNode::SourceMatchesFilter(filter) => filter_zone_truth(filter, zone),
+        ZoneConditionNode::NonZoneLeaf => SourceZoneTruth::Undetermined,
+    }
+}
+
+/// CR 400.1: whether an object in `zone` has `prop`, as far as its zone decides
+/// it. `InZone` / `InAnyZone` are decided by the zone; `Not` and `AnyOf` compose
+/// three-valued; every other property is undetermined by the zone.
+fn prop_zone_truth(prop: &FilterProp, zone: Zone) -> SourceZoneTruth {
+    let decided = |holds: bool| {
+        if holds {
+            SourceZoneTruth::True
+        } else {
+            SourceZoneTruth::False
+        }
+    };
+    match prop {
+        FilterProp::InZone { zone: required } => decided(*required == zone),
+        FilterProp::InAnyZone { zones } => decided(zones.contains(&zone)),
+        FilterProp::Not { prop } => prop_zone_truth(prop, zone).negate(),
+        FilterProp::AnyOf { props } => props.iter().fold(SourceZoneTruth::False, |acc, p| {
+            acc.or(prop_zone_truth(p, zone))
+        }),
+        FilterProp::Token
+        | FilterProp::NonToken
+        | FilterProp::RepresentedByCard
+        | FilterProp::ControllerChoseLabel { .. }
+        | FilterProp::ControllerMatches { .. }
+        | FilterProp::WasPlayed
+        | FilterProp::Attacking { .. }
+        | FilterProp::Blocking
+        | FilterProp::BlockingSource
+        | FilterProp::CombatRelation { .. }
+        | FilterProp::BlockStatus { .. }
+        | FilterProp::AttackingAlone
+        | FilterProp::BlockingAlone
+        | FilterProp::Tapped
+        | FilterProp::Untapped
+        | FilterProp::IsSaddled
+        | FilterProp::SaddledSource
+        | FilterProp::CrewedThisTurn { .. }
+        | FilterProp::ConvokedSource
+        | FilterProp::ProtectorMatches { .. }
+        | FilterProp::HasHasteOrControlledSinceTurnBegan
+        | FilterProp::WithKeyword { .. }
+        | FilterProp::HasKeywordKind { .. }
+        | FilterProp::WithoutKeyword { .. }
+        | FilterProp::WithoutKeywordKind { .. }
+        | FilterProp::CanEnchant { .. }
+        | FilterProp::Counters { .. }
+        | FilterProp::Cmc { .. }
+        | FilterProp::ManaValueParity { .. }
+        | FilterProp::ManaCostIn { .. }
+        | FilterProp::Owned { .. }
+        | FilterProp::Foretold
+        | FilterProp::HasAdventure
+        | FilterProp::EnchantedBy
+        | FilterProp::EquippedBy
+        | FilterProp::AttachedTo { .. }
+        | FilterProp::HasAttachment { .. }
+        | FilterProp::HasAnyAttachmentOf { .. }
+        | FilterProp::Another
+        | FilterProp::Unpaired
+        | FilterProp::OtherThanTriggerObject
+        | FilterProp::HasColor { .. }
+        | FilterProp::PtComparison { .. }
+        | FilterProp::PowerGTSource
+        | FilterProp::ColorCount { .. }
+        | FilterProp::ManaSymbolCount { .. }
+        | FilterProp::HasSupertype { .. }
+        | FilterProp::IsChosenCreatureType
+        | FilterProp::MostPrevalentCreatureTypeIn { .. }
+        | FilterProp::IsChosenColor
+        | FilterProp::IsChosenCardType
+        | FilterProp::MatchesLastChosenCardPredicate
+        | FilterProp::HasSingleTarget
+        | FilterProp::Modal
+        | FilterProp::PrepareSpell
+        | FilterProp::NotColor { .. }
+        | FilterProp::NotSupertype { .. }
+        | FilterProp::Suspected
+        | FilterProp::Renowned
+        | FilterProp::Goaded
+        | FilterProp::Prepared
+        | FilterProp::ToughnessGTPower
+        | FilterProp::PowerExceedsBase
+        | FilterProp::InTrackedSet { .. }
+        | FilterProp::Modified
+        | FilterProp::Historic
+        | FilterProp::NotHistoric
+        | FilterProp::DifferentNameFrom { .. }
+        | FilterProp::DistinctFrom { .. }
+        | FilterProp::SharesQuality { .. }
+        | FilterProp::WasDealtDamageThisTurn
+        | FilterProp::DealtDamageThisTurn { .. }
+        | FilterProp::EnteredThisTurn
+        | FilterProp::ControlledContinuouslySinceTurnBegan
+        | FilterProp::ZoneChangedThisTurn { .. }
+        | FilterProp::AttackedThisTurn { .. }
+        | FilterProp::BlockedThisTurn
+        | FilterProp::AttackedOrBlockedThisTurn
+        | FilterProp::CountersPutOnThisTurn { .. }
+        | FilterProp::FaceDown
+        | FilterProp::Transformed
+        | FilterProp::TargetsOnly { .. }
+        | FilterProp::Targets { .. }
+        | FilterProp::CouldBeTargetedByTriggeringSpell
+        | FilterProp::HasXInManaCost
+        | FilterProp::HasXInActivationCost
+        | FilterProp::WasKicked
+        | FilterProp::HasManaAbility
+        | FilterProp::HasNoAbilities
+        | FilterProp::Named { .. }
+        | FilterProp::SameName
+        | FilterProp::SameNameAsParentTarget
+        | FilterProp::SameNameAsExiledBySource
+        | FilterProp::NameMatchesAnyPermanent { .. }
+        | FilterProp::IsCommander
+        | FilterProp::SharesCreatureTypeWithCommander
+        | FilterProp::Other { .. } => SourceZoneTruth::Undetermined,
+    }
+}
+
+/// CR 400.1: whether the source can match `filter` while in `zone`, as far as
+/// the filter's zone constraints decide it. A `FilterProp::InZone` /
+/// `InAnyZone` property (conjoined with the rest of a typed filter), a stack
+/// spell/ability reference, or an exiled-with-source reference rules out every other
+/// zone; anything else leaves the answer undetermined.
+fn filter_zone_truth(filter: &TargetFilter, zone: Zone) -> SourceZoneTruth {
+    let unless_required = |allowed: bool| {
+        if allowed {
+            SourceZoneTruth::Undetermined
+        } else {
+            SourceZoneTruth::False
+        }
+    };
+    match filter {
+        // A typed filter's properties are conjoined with its type and controller
+        // constraints, which the source's zone never decides.
+        TargetFilter::Typed(typed) => typed
+            .properties
+            .iter()
+            .fold(SourceZoneTruth::Undetermined, |acc, prop| {
+                acc.and(prop_zone_truth(prop, zone))
+            }),
+        TargetFilter::And { filters } => filters.iter().fold(SourceZoneTruth::True, |acc, f| {
+            acc.and(filter_zone_truth(f, zone))
+        }),
+        TargetFilter::Or { filters } => filters.iter().fold(SourceZoneTruth::False, |acc, f| {
+            acc.or(filter_zone_truth(f, zone))
+        }),
+        TargetFilter::Not { filter } => filter_zone_truth(filter, zone).negate(),
+        // CR 109.2: a stack spell/ability reference denotes an object on the stack.
+        TargetFilter::StackSpell | TargetFilter::StackAbility { .. } => {
+            unless_required(zone == Zone::Stack)
+        }
+        // CR 607.2a: the cards exiled with the source (mirrors `extract_in_zone`).
+        TargetFilter::ExiledBySource => unless_required(zone == Zone::Exile),
+        TargetFilter::None
+        | TargetFilter::Any
+        | TargetFilter::Player
+        | TargetFilter::Controller
+        | TargetFilter::SourceController
+        | TargetFilter::ControllerAndControlledPermanents { .. }
+        | TargetFilter::Opponent
+        | TargetFilter::SelfRef
+        | TargetFilter::GrantingObject { .. }
+        | TargetFilter::SourceOrPaired
+        | TargetFilter::SpecificObject { .. }
+        | TargetFilter::SpecificPlayer { .. }
+        | TargetFilter::PlayerWhoChoseLabel { .. }
+        | TargetFilter::PlayerMatching { .. }
+        | TargetFilter::Neighbor { .. }
+        | TargetFilter::ScopedPlayer
+        | TargetFilter::AttachedTo
+        | TargetFilter::LastCreated
+        | TargetFilter::LastRevealed
+        | TargetFilter::LastZoneChanged
+        | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
+        | TargetFilter::ChosenCard
+        | TargetFilter::ExiledCardByIndex { .. }
+        | TargetFilter::TrackedSet { .. }
+        | TargetFilter::TrackedSetFiltered { .. }
+        | TargetFilter::TriggeringSpellController
+        | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringPlayer
+        | TargetFilter::TriggeringSource
+        | TargetFilter::EventTarget
+        | TargetFilter::TriggeringSourceController
+        | TargetFilter::EventTargetController
+        | TargetFilter::ParentTarget
+        | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::DeclaredPlayer { .. }
+        | TargetFilter::ParentTargetController
+        | TargetFilter::ParentTargetOwner
+        | TargetFilter::SourceChosenPlayer
+        | TargetFilter::OriginalController
+        | TargetFilter::OriginalSource
+        | TargetFilter::PostReplacementSourceController
+        | TargetFilter::PostReplacementDamageSource
+        | TargetFilter::PostReplacementDamageTarget
+        | TargetFilter::PostReplacementDamageTargetOwner
+        | TargetFilter::DefendingPlayer
+        | TargetFilter::AttackedPlayerOrPlaneswalker
+        | TargetFilter::HasChosenName
+        | TargetFilter::ChosenDamageSource { .. }
+        | TargetFilter::Named { .. }
+        | TargetFilter::Owner
+        | TargetFilter::AllPlayers => SourceZoneTruth::Undetermined,
     }
 }
 
@@ -1575,7 +1976,7 @@ fn segment_is_back_referential_continuation(segment: &str) -> bool {
 /// inside a quoted granted ability or a mana symbol never ends a sentence. Each
 /// returned segment keeps its terminating period and is trimmed; empty segments
 /// are dropped.
-fn split_static_sentences(text: &str) -> Vec<String> {
+pub(crate) fn split_static_sentences(text: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut brace_depth = 0usize;
@@ -2958,6 +3359,12 @@ fn parse_static_line_multi_dispatch(text: &str) -> Vec<StaticDefinition> {
         ];
     }
 
+    // CR 101.2 + CR 121.3 + CR 119.7: "Players can't draw cards or gain life"
+    // (Mornsong Aria) — CantDraw plus CantGainLife for the same subject.
+    if let Some(defs) = parse_cant_draw_cards_or_gain_life(tp.lower, &stripped) {
+        return defs;
+    }
+
     // CR 104.2b + CR 104.3e + CR 810.8a: "<player-scope> can't lose/win the
     // game and <player-scope> can't win/lose the game" — one game-outcome-lock
     // static per conjunct, each with its own player scope (Platinum Angel
@@ -3568,6 +3975,12 @@ pub(crate) fn rebind_source_object_quantities_to_recipient(
             comparator,
             rhs: rebind_source_object_quantity_expr_to_recipient(rhs),
         },
+        StaticCondition::QuantityQuality { quantity, quality } => {
+            StaticCondition::QuantityQuality {
+                quantity: rebind_source_object_quantity_expr_to_recipient(quantity),
+                quality,
+            }
+        }
         StaticCondition::And { conditions } => StaticCondition::And {
             conditions: conditions
                 .into_iter()
@@ -5301,15 +5714,24 @@ fn parse_subtype_or_list_prefix_with_word_parser(
     }
 }
 
-/// Try to strip a leading "with [counter] counter(s) on it/them" clause from `text`,
-/// returning the `FilterProp` and the remaining text after the clause.
-/// CR 613.1 + CR 613.7: Used to parse conditional static keyword grants in layer 6.
-pub(crate) fn strip_counter_condition_prefix(text: &str) -> Option<(FilterProp, &str)> {
+/// Strip a leading "with <qualifier>" object qualifier sitting between a static's
+/// subject ("… creatures you control") and its predicate, returning the
+/// conjoined `FilterProp`s it denotes and the remaining text. Two forms:
+/// - CR 122.1: "with [counter] counter(s) on it/them" — one `Counters` prop via
+///   `parse_counter_suffix` (conditional anthems / keyword grants);
+/// - CR 208.4b: "with base power and toughness N/M" — two base-scope
+///   `PtComparison` props via `nom_filter::parse_with_base_pt_designation`
+///   (Andrios, Roaming Explorer: "tapped creatures you control with base power
+///   and toughness 4/3 have base power and toughness 16/9").
+pub(crate) fn strip_with_qualifier_prefix(text: &str) -> Option<(Vec<FilterProp>, &str)> {
     let lower = text.to_lowercase();
     nom_tag_lower(&lower, &lower, "with ")?;
     // parse_counter_suffix expects optional leading whitespace before "with"
-    let (prop, consumed) = parse_counter_suffix(&lower)?;
-    Some((prop, text[consumed..].trim_start()))
+    if let Some((prop, consumed)) = parse_counter_suffix(&lower) {
+        return Some((vec![prop], text[consumed..].trim_start()));
+    }
+    let (props, rest) = nom_on_lower(text, &lower, nom_filter::parse_with_base_pt_designation)?;
+    Some((Vec::from(props), rest.trim_start()))
 }
 
 pub(crate) fn parse_modified_creature_subject_filter(subject: &str) -> Option<TargetFilter> {
@@ -5588,32 +6010,59 @@ pub(crate) fn descriptor_is_supertype(descriptor: &str) -> bool {
 }
 
 /// Nom-backed helper: split a subject string into (descriptor_core, controller)
-/// by trying to parse a trailing controller suffix. Only accepts the controller
-/// scopes that this static subject seam can actually resolve:
+/// by trying to parse a trailing controller suffix. A present-tense direct
+/// projection of `nom_target::parse_controller_phrase` that only accepts the
+/// controller scopes this static subject seam can actually resolve:
 ///
 /// - `ControllerRef::You` — "you control"
 /// - `ControllerRef::Opponent` — "your opponents control" / "you don't control"
 /// - `ControllerRef::EnchantedPlayer` — "enchanted player controls" (CR 303.4b)
-///
-/// `TargetPlayer` and `DefendingPlayer` are deliberately excluded because this
-/// call site builds a continuous static `TargetFilter` with no companion
-/// target-player authority or combat context.
-///
-/// Uses nom `alt`/`tag`/`value` combinators so the phrase set is maintained
-/// alongside the shared grammar rather than as raw suffix literals.
 fn parse_static_controller_suffix(input: &str) -> OracleResult<'_, ControllerRef> {
-    alt((
-        value(ControllerRef::You, tag("you control")),
-        value(ControllerRef::Opponent, tag("your opponents control")),
-        value(ControllerRef::Opponent, tag("you don't control")),
+    map_opt(nom_target::parse_controller_phrase, |phrase| {
+        match (phrase.subject, phrase.tense) {
+            (
+                nom_target::ControllerSubject::Direct(controller),
+                nom_target::ControllerTense::Present,
+            ) => admits_static_subject_controller(&controller, phrase.form).then_some(controller),
+            (nom_target::ControllerSubject::Direct(_), nom_target::ControllerTense::Past)
+            | (nom_target::ControllerSubject::Anaphoric(_), _) => None,
+        }
+    })
+    .parse(input)
+}
+
+/// The direct controllers, by clause form, a static subject's controller
+/// suffix admits.
+fn admits_static_subject_controller(
+    controller: &ControllerRef,
+    form: nom_target::ControllerForm,
+) -> bool {
+    match controller {
         // CR 303.4b + CR 702.5a: "enchanted player controls" — the controller
         // scope is the player the source Aura is attached to.
-        value(
-            ControllerRef::EnchantedPlayer,
-            tag("enchanted player controls"),
-        ),
-    ))
-    .parse(input)
+        ControllerRef::You | ControllerRef::EnchantedPlayer => true,
+        // "your opponents control" / "you don't control"; "an opponent
+        // controls" is not admitted.
+        ControllerRef::Opponent => match form {
+            nom_target::ControllerForm::Plural | nom_target::ControllerForm::Negated => true,
+            nom_target::ControllerForm::Singular | nom_target::ControllerForm::Passive => false,
+        },
+        // `TargetPlayer` and `DefendingPlayer` are deliberately excluded because
+        // this call site builds a continuous static `TargetFilter` with no
+        // companion target-player authority or combat context.
+        ControllerRef::TargetPlayer | ControllerRef::DefendingPlayer => false,
+        ControllerRef::ScopedPlayer
+        | ControllerRef::TargetOpponent
+        | ControllerRef::ParentTargetController
+        | ControllerRef::EventTargetController
+        | ControllerRef::ParentTargetOwner
+        | ControllerRef::ChosenPlayer { .. }
+        | ControllerRef::SourceChosenPlayer
+        | ControllerRef::TriggeringPlayer
+        | ControllerRef::ActivePlayer
+        | ControllerRef::SpecificPlayer { .. }
+        | ControllerRef::DeclaredPlayer { .. } => false,
+    }
 }
 
 /// Strip a trailing controller suffix from a subject string using the
@@ -5848,20 +6297,25 @@ pub(crate) fn add_another_filter(filter: TargetFilter) -> TargetFilter {
     }
 }
 
-/// Add a single `FilterProp` to an existing `TargetFilter`.
-pub(crate) fn add_property(filter: TargetFilter, prop: FilterProp) -> TargetFilter {
+/// Add `FilterProp`s (conjoined) to an existing `TargetFilter`.
+pub(crate) fn add_properties(filter: TargetFilter, props: Vec<FilterProp>) -> TargetFilter {
     match filter {
         TargetFilter::Typed(mut typed) => {
-            typed.properties.push(prop);
+            typed.properties.extend(props);
             TargetFilter::Typed(typed)
         }
         other => TargetFilter::And {
             filters: vec![
                 other,
-                TargetFilter::Typed(TypedFilter::default().properties(vec![prop])),
+                TargetFilter::Typed(TypedFilter::default().properties(props)),
             ],
         },
     }
+}
+
+/// Add a single `FilterProp` to an existing `TargetFilter`.
+pub(crate) fn add_property(filter: TargetFilter, prop: FilterProp) -> TargetFilter {
+    add_properties(filter, vec![prop])
 }
 
 /// CR 109.5: True when `filter` is anchored to the source's controller via a

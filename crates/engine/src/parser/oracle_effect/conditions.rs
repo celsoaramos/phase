@@ -4,7 +4,7 @@ use crate::parser::oracle_nom::error::{oracle_err, OracleError, OracleResult};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case, take_until, take_while};
 use nom::character::complete::{char, multispace0, satisfy};
-use nom::combinator::{all_consuming, eof, map, opt, peek, recognize, value};
+use nom::combinator::{all_consuming, eof, map, opt, peek, recognize, value, verify};
 use nom::sequence::{delimited, preceded, terminated};
 use nom::Parser;
 
@@ -20,8 +20,10 @@ use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_nom::quantity as nom_quantity;
 use super::super::oracle_quantity::{canonicalize_quantity_ref, parse_cda_quantity};
 use super::super::oracle_target::{
-    parse_target, parse_type_phrase_folding, parse_zone_word, peek_zone_boundary,
-    slot_matches_anaphor, slot_zone_class, AnaphorNoun, AnaphorZoneClass,
+    parse_cost_paid_participle_object, parse_exile_cost_paid_object, parse_shared_quality,
+    parse_target, parse_type_phrase_folding, parse_type_phrase_folding_with_ctx,
+    parse_word_bounded, parse_zone_word, peek_zone_boundary, slot_matches_anaphor, slot_zone_class,
+    AnaphorNoun, AnaphorZoneClass,
 };
 use super::super::oracle_util::{parse_comparison_suffix, parse_subtype, TextPair};
 #[cfg(test)]
@@ -37,10 +39,10 @@ use crate::parser::oracle_ir::effect_chain::{
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, AbilityKind, AbilityUseTally, AdditionalCostOrigin,
     AttachCardinality, AttachSelection, CastManaObjectScope, CastManaSpentMetric, CastVariantPaid,
-    CoinFlipResult, Comparator, ControllerRef, CountScope, DamageChannel, DigSource, Duration,
-    Effect, EffectOutcomeSignal, FilterProp, GuessOutcome, ObjectScope, ParsedCondition,
-    PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, StaticCondition, TargetFilter,
-    TypeFilter, TypedFilter,
+    CoinFlipResult, Comparator, ControllerRef, CostCategory, CountScope, DamageChannel, DigSource,
+    Duration, Effect, EffectOutcomeSignal, FilterProp, GuessOutcome, ObjectScope, ParsedCondition,
+    PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, SharedQuality, SpentColor,
+    StaticCondition, TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
@@ -71,6 +73,22 @@ fn maybe_negate(cond: AbilityCondition, negated: bool) -> AbilityCondition {
 pub(crate) fn source_saddled_filter() -> TargetFilter {
     TargetFilter::Typed(TypedFilter {
         properties: vec![FilterProp::IsSaddled],
+        ..Default::default()
+    })
+}
+
+/// CR 722.3a: The runtime filter matching the prepared designation. Shared by
+/// the `parse_source_is_prepared` leaf (oracle_nom/condition.rs) and the
+/// trigger-side bridge, so both compose the same `SourceMatchesFilter {
+/// Typed([Prepared]) }` shape.
+///
+/// Property-only (empty `type_filters`): the designation is a permanent
+/// property, not a card-type fact. A prepared source that lost its creature
+/// type (One with the Stars) stays bound to "this creature" (CR 700.7), so a
+/// creature-type gate would misfire the negated intervening-if.
+pub(crate) fn prepared_source_filter() -> TargetFilter {
+    TargetFilter::Typed(TypedFilter {
+        properties: vec![FilterProp::Prepared],
         ..Default::default()
     })
 }
@@ -203,8 +221,35 @@ fn comma_inside_if_creature_subtype_list(lower: &str, comma_idx: usize) -> bool 
     // the span ends where `parse_type_phrase_folding` stops consuming type words.
     target_anaphoric_subtype_span(lower, after_prefix)
         .is_some_and(|(start, end)| (start..end).contains(&comma_idx))
+        // CR 205.3m + CR 608.2c: "if you control a Fish, Octopus, Otter, Seal,
+        // Serpent, or Whale, draw a card" (Unagi's Spray) — the same list commas
+        // inside a control-presence condition.
+        || controls_type_span(lower, after_prefix)
+            .is_some_and(|(start, end)| (start..end).contains(&comma_idx))
 }
 
+/// CR 205.3m: the byte span of a CLOSED subtype list ("a Fish, Octopus, …, or
+/// Whale") in a "<player> control(s) [a/an] <list>" presence condition, or
+/// `None` when the text is not this shape. A lexical span like
+/// [`target_anaphoric_subtype_span`]: it can only prevent a wrong comma split.
+/// Only a list of two or more legs closed by "or" counts, so the comma that ends
+/// a one-type condition ("If you control a creature, creatures you control gain
+/// …") is still the condition's boundary.
+fn controls_type_span(lower: &str, after_prefix: &str) -> Option<(usize, usize)> {
+    let (after_subject, _) = alt((
+        tag::<_, _, OracleError<'_>>("you control "),
+        tag("an opponent controls "),
+    ))
+    .parse(after_prefix)
+    .ok()?;
+    let (subtypes, consumed) =
+        crate::parser::oracle_target::parse_relative_subtype_list(after_subject)?;
+    if subtypes.len() < 2 {
+        return None;
+    }
+    let start = lower.len() - after_subject.len();
+    Some((start, start + consumed))
+}
 /// CR 205.3m: Find the byte span of the subtype-disjunction predicate in a
 /// target-anaphoric "<subject> is a <subtype list>" condition. Returns the
 /// `[start, end)` offsets (relative to `lower`) of the parsed type phrase, or
@@ -937,7 +982,30 @@ pub(super) fn strip_guess_outcome_conditional(text: &str) -> (Option<AbilityCond
 }
 
 pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityCondition>, String) {
+    let (condition, _head, remainder) = strip_if_you_do_conditional_with_head(text);
+    (condition, remainder)
+}
+
+/// [`strip_if_you_do_conditional`] plus the typed "… this way" head metadata
+/// (verb and occurrence) when the condition came from a zone-change head.
+pub(super) fn strip_if_you_do_conditional_with_head(
+    text: &str,
+) -> (
+    Option<AbilityCondition>,
+    Option<nom_condition::ThisWayHead>,
+    String,
+) {
     let lower = text.to_lowercase();
+
+    // CR 701.17c + CR 608.2c: "If two cards that share a card type were milled
+    // this way, <effect>" (The Tale of Tamiyo) gates on the cards the preceding
+    // mill moved. Delegates to the existing nom stripper so the gate is
+    // recognized in the general clause cascade, not only in the repeat
+    // directive's own chunk.
+    let (milled, milled_rest) = strip_milled_shared_quality_conditional(text);
+    if milled.is_some() {
+        return (milled, None, milled_rest);
+    }
 
     // CR 603.12 + CR 608.2c: strip a leading reflexive-conditional connector
     // ("if you do, ", "when you do, ", "if that player doesn't, ", ...) and
@@ -948,7 +1016,7 @@ pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityConditio
     if let Some((condition, rest)) = nom_on_lower(text, &lower, |input| {
         crate::parser::oracle_nom::condition::parse_reflexive_conditional_connector(input)
     }) {
-        return (Some(condition), rest.to_string());
+        return (Some(condition), None, rest.to_string());
     }
 
     // CR 400.7 + CR 608.2c + CR 303.4f + CR 301.5b: "if a[n] [type] (is|was)
@@ -959,143 +1027,195 @@ pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityConditio
     // the multi-word "put onto the battlefield" verb, with subtype filters
     // (Aura/Equipment/...) via `parse_type_phrase_folding`. Replaces the prior
     // hand-rolled past-tense / single-word / top-level-type-only matcher.
-    if let Ok((rest, _)) =
-        alt((tag::<_, _, OracleError<'_>>("if "), tag("when "))).parse(lower.as_str())
+    if let Ok((rest, connector)) = alt((
+        value(ThisWayConnector::If, tag::<_, _, OracleError<'_>>("if ")),
+        value(ThisWayConnector::When, tag("when ")),
+    ))
+    .parse(lower.as_str())
     {
-        use crate::parser::oracle_nom::condition as nom_cond;
-        // CR 400.7 + CR 608.2c: active-voice reflexive gates that resolve to a
-        // full `AbilityCondition` (not just a type filter). These run under BOTH
-        // "if" and "when" prefixes — "If you put an artifact onto the battlefield
-        // this way" (Oviya), "If you put a Town card into your hand this way"
-        // (Town Greeter), "If you control a Squirrel or returned a Squirrel card
-        // to your hand this way" (Cache Grab), "If you draw one or more cards
-        // this way" (Transcendent Archaic) — where previously only "when" reached
-        // the active combinators.
-        if let Ok((after_clause, condition)) =
-            nom_cond::parse_you_control_or_returned_this_way_condition(rest)
-                .or_else(|_| nom_cond::parse_you_put_into_hand_this_way_condition(rest))
-                .or_else(|_| nom_cond::parse_you_put_counters_on_type_this_way_condition(rest))
-                .or_else(|_| nom_cond::parse_you_draw_this_way_condition(rest))
-        {
-            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-            let offset = text.len() - body_lower.len();
-            return (Some(condition), text[offset..].to_string());
-        }
-        // CR 603.12 + CR 608.2c: active-voice "you put [type] onto the battlefield
-        // this way" — also hoisted to run under "if" (Oviya, Spelunking).
-        if let Ok((after_clause, (filter, _negated))) =
-            nom_cond::parse_you_put_onto_battlefield_this_way_clause(rest)
-        {
-            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-            let offset = text.len() - body_lower.len();
-            return (
-                Some(AbilityCondition::ZoneChangedThisWay {
-                    filter,
-                    destination: Some(Zone::Battlefield),
-                }),
-                text[offset..].to_string(),
-            );
-        }
-        // CR 608.2c + CR 701.25a: active-voice "you put [type] into your
-        // graveyard this way" — the condition following a preceding
-        // "surveil N" instruction (Chandra, Chill of Compliance; Enlightened
-        // Confidant). Runs under both prefixes for the same reason as the
-        // put-onto-battlefield sibling above. Unlike discard/sacrifice/exile
-        // below (cause-bound: the graveyard is inherent to the verb), a
-        // surveilled card's fate is a genuine choice, so this clause stays
-        // destination-bound like put-onto-battlefield — a redirect away from
-        // the graveyard as the card moves defeats it.
-        if let Ok((after_clause, (filter, _negated))) =
-            nom_cond::parse_you_put_into_graveyard_this_way_clause(rest)
-        {
-            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-            let offset = text.len() - body_lower.len();
-            return (
-                Some(AbilityCondition::ZoneChangedThisWay {
-                    filter,
-                    destination: Some(Zone::Graveyard),
-                }),
-                text[offset..].to_string(),
-            );
-        }
-        // CR 603.12 + CR 701.16a: active-voice "you exile[d] a[n] X this way,
-        // [body]" — the reflexive gate created by a preceding "exile [target]
-        // X" instruction. Runs under BOTH prefixes because the printed idiom
-        // appears in both tenses: past "If you exiled a card this way, …"
-        // (Ardyn, the Usurper's actual Oracle text, issue #5989) and present
-        // "When you exile a card this way, …". The exile's move into the
-        // (public, CR 400.2) exile zone publishes the card into
-        // `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
-        if let Ok((after_clause, (filter, _negated))) =
-            nom_cond::parse_you_exile_this_way_clause(rest)
-        {
-            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-            let offset = text.len() - body_lower.len();
-            return (
-                Some(AbilityCondition::ZoneChangedThisWay {
-                    filter,
-                    destination: None,
-                }),
-                text[offset..].to_string(),
-            );
-        }
-        if let Ok((after_clause, (filter, _negated, destination))) =
-            nom_cond::parse_zone_changed_this_way_clause(rest)
-        {
-            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-            let offset = text.len() - body_lower.len();
-            return (
-                Some(AbilityCondition::ZoneChangedThisWay {
-                    filter,
-                    destination,
-                }),
-                text[offset..].to_string(),
-            );
-        }
-        // CR 701.9a: "if/when you discard a[n] X this way, [body]" —
-        // the condition following a preceding "discard a card" instruction.
-        // Runs under BOTH prefixes, like the put-onto-battlefield
-        // and exile siblings above: "When you discard a card this way, ..."
-        // (Talion's Messenger, The Ancient One) and "If you discard a land
-        // card this way, ..." (Silvan Reveler, issue #8122) are the same
-        // resolution-local condition in the two connectors —
-        // nothing about the discard-then-back-reference shape is tied to
-        // "when" specifically. The discard's hand → graveyard move publishes
-        // the card into `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
-        if let Ok((after_clause, (filter, _negated))) =
-            crate::parser::oracle_nom::condition::parse_you_discard_this_way_clause(rest)
-        {
-            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-            let offset = text.len() - body_lower.len();
-            return (
-                Some(AbilityCondition::ZoneChangedThisWay {
-                    filter,
-                    destination: None,
-                }),
-                text[offset..].to_string(),
-            );
-        }
-        // CR 701.21a: "if/when you sacrifice one or more X this
-        // way, [body]" — the condition following a preceding "sacrifice
-        // [quantifier] X" instruction (Nyssa of Traken). Runs under both
-        // prefixes for the same reason as the discard sibling above. The
-        // sacrifice's battlefield → graveyard move publishes the permanents
-        // into `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
-        if let Ok((after_clause, (filter, _negated))) =
-            crate::parser::oracle_nom::condition::parse_you_sacrifice_this_way_clause(rest)
-        {
-            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-            let offset = text.len() - body_lower.len();
-            return (
-                Some(AbilityCondition::ZoneChangedThisWay {
-                    filter,
-                    destination: None,
-                }),
-                text[offset..].to_string(),
-            );
+        if let (Some(condition), head, body) = strip_this_way_head(text, rest) {
+            return (Some(connector.gate(condition)), head, body);
         }
     }
-    (None, text.to_string())
+    (None, None, text.to_string())
+}
+
+/// The connector word in front of a "… this way" head.
+#[derive(Clone, Copy)]
+enum ThisWayConnector {
+    If,
+    When,
+}
+
+impl ThisWayConnector {
+    /// CR 603.12: "when [something happens] this way" creates a reflexive
+    /// triggered ability whose trigger event is the zone change the head names,
+    /// so a zone-change head under "when" becomes the `WhenYouDo` creation gate
+    /// guarded by that zone change (its targets are chosen as the reflexive
+    /// ability is put on the stack, CR 603.3d). Under "if" the head is an
+    /// ordinary resolution-time condition (CR 608.2c). The non-zone-change
+    /// heads keep their condition unchanged under either connector.
+    fn gate(self, condition: AbilityCondition) -> AbilityCondition {
+        match (self, &condition) {
+            (ThisWayConnector::When, AbilityCondition::ZoneChangedThisWay { .. }) => {
+                AbilityCondition::when_you_do_with_guard(condition)
+            }
+            (ThisWayConnector::When | ThisWayConnector::If, _) => condition,
+        }
+    }
+}
+
+/// CR 400.7 + CR 608.2c: the "… this way" head after its connector word: the
+/// condition it names and the body text after it.
+fn strip_this_way_head(
+    text: &str,
+    rest: &str,
+) -> (
+    Option<AbilityCondition>,
+    Option<nom_condition::ThisWayHead>,
+    String,
+) {
+    use crate::parser::oracle_nom::condition as nom_cond;
+    // CR 400.7 + CR 608.2c: active-voice reflexive gates that resolve to a
+    // full `AbilityCondition` (not just a type filter). These run under BOTH
+    // "if" and "when" prefixes — "If you put an artifact onto the battlefield
+    // this way" (Oviya), "If you put a Town card into your hand this way"
+    // (Town Greeter), "If you control a Squirrel or returned a Squirrel card
+    // to your hand this way" (Cache Grab), "If you draw one or more cards
+    // this way" (Transcendent Archaic) — where previously only "when" reached
+    // the active combinators.
+    if let Ok((after_clause, condition)) =
+        nom_cond::parse_you_control_or_returned_this_way_condition(rest)
+            .or_else(|_| nom_cond::parse_you_put_into_hand_this_way_condition(rest))
+            .or_else(|_| nom_cond::parse_you_put_counters_on_type_this_way_condition(rest))
+            .or_else(|_| nom_cond::parse_you_draw_this_way_condition(rest))
+    {
+        let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+        let offset = text.len() - body_lower.len();
+        return (Some(condition), None, text[offset..].to_string());
+    }
+    // CR 603.12 + CR 608.2c: active-voice "you put [type] onto the battlefield
+    // this way" — also hoisted to run under "if" (Oviya, Spelunking).
+    if let Ok((after_clause, (filter, _negated, head))) =
+        nom_cond::parse_you_put_onto_battlefield_this_way_head(rest)
+    {
+        let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+        let offset = text.len() - body_lower.len();
+        return (
+            Some(AbilityCondition::ZoneChangedThisWay {
+                filter,
+                destination: Some(Zone::Battlefield),
+            }),
+            Some(head),
+            text[offset..].to_string(),
+        );
+    }
+    // CR 608.2c + CR 701.25a: active-voice "you put [type] into your
+    // graveyard this way" — the condition following a preceding
+    // "surveil N" instruction (Chandra, Chill of Compliance; Enlightened
+    // Confidant). Runs under both prefixes for the same reason as the
+    // put-onto-battlefield sibling above. Unlike discard/sacrifice/exile
+    // below (cause-bound: the graveyard is inherent to the verb), a
+    // surveilled card's fate is a genuine choice, so this clause stays
+    // destination-bound like put-onto-battlefield — a redirect away from
+    // the graveyard as the card moves defeats it.
+    if let Ok((after_clause, (filter, _negated, head))) =
+        nom_cond::parse_you_put_into_graveyard_this_way_head(rest)
+    {
+        let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+        let offset = text.len() - body_lower.len();
+        return (
+            Some(AbilityCondition::ZoneChangedThisWay {
+                filter,
+                destination: Some(Zone::Graveyard),
+            }),
+            Some(head),
+            text[offset..].to_string(),
+        );
+    }
+    // CR 603.12 + CR 701.13a: active-voice "you exile[d] a[n] X this way,
+    // [body]" — the gate on a preceding "exile [target] X" instruction. The
+    // printed idiom appears in both tenses: past "If you exiled a card this
+    // way, …" (Ardyn, the Usurper, issue #5989) and present "When you exile a
+    // card this way, …" (Cait Sith, Fortune Teller); the connector decides
+    // whether it is a resolution-time condition or a reflexive trigger
+    // (`ThisWayConnector::gate`). The exile's move into the
+    // (public, CR 400.2) exile zone publishes the card into
+    // `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
+    if let Ok((after_clause, (filter, _negated, head))) =
+        nom_cond::parse_you_exile_this_way_head(rest)
+    {
+        let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+        let offset = text.len() - body_lower.len();
+        return (
+            Some(AbilityCondition::ZoneChangedThisWay {
+                filter,
+                destination: None,
+            }),
+            Some(head),
+            text[offset..].to_string(),
+        );
+    }
+    if let Ok((after_clause, (filter, _negated, destination, head))) =
+        nom_cond::parse_zone_changed_this_way_head_scoped(
+            rest,
+            nom_cond::ThisWayVerbScope::AnyZoneChange,
+        )
+    {
+        let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+        let offset = text.len() - body_lower.len();
+        return (
+            Some(AbilityCondition::ZoneChangedThisWay {
+                filter,
+                destination,
+            }),
+            Some(head),
+            text[offset..].to_string(),
+        );
+    }
+    // CR 701.9a: "if/when you discard a[n] X this way, [body]" —
+    // the gate on a preceding "discard a card" instruction. Both connectors
+    // print it: "When you discard a card this way, ..." (Talion's Messenger,
+    // The Ancient One) is a CR 603.12 reflexive trigger, while "If you discard
+    // a land card this way, ..." (Silvan Reveler, issue #8122) is a CR 608.2c
+    // resolution-time condition (`ThisWayConnector::gate`). Both read the same
+    // zone change: the discard's hand → graveyard move publishes
+    // the card into `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
+    if let Ok((after_clause, (filter, _negated, head))) =
+        nom_cond::parse_you_discard_this_way_head(rest)
+    {
+        let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+        let offset = text.len() - body_lower.len();
+        return (
+            Some(AbilityCondition::ZoneChangedThisWay {
+                filter,
+                destination: None,
+            }),
+            Some(head),
+            text[offset..].to_string(),
+        );
+    }
+    // CR 701.21a: "if/when you sacrifice one or more X this
+    // way, [body]" — the condition following a preceding "sacrifice
+    // [quantifier] X" instruction (Nyssa of Traken). Runs under both
+    // prefixes for the same reason as the discard sibling above. The
+    // sacrifice's battlefield → graveyard move publishes the permanents
+    // into `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
+    if let Ok((after_clause, (filter, _negated, head))) =
+        nom_cond::parse_you_sacrifice_this_way_head(rest)
+    {
+        let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+        let offset = text.len() - body_lower.len();
+        return (
+            Some(AbilityCondition::ZoneChangedThisWay {
+                filter,
+                destination: None,
+            }),
+            Some(head),
+            text[offset..].to_string(),
+        );
+    }
+    (None, None, text.to_string())
 }
 
 /// CR 603.12 + CR 603.4 + CR 608.2a: A reflexive connector can introduce a
@@ -1118,10 +1238,14 @@ pub(super) enum ReflexiveConditionalStrip {
         /// parser apply the same route-specific binding guard it applies to a
         /// leading general conditional.
         guard_route: Option<LeadingConditionRoute>,
+        /// The typed "? this way" head (verb, occurrence) when `condition`
+        /// came from a zone-change head; the reflexive support check reads it.
+        zone_change_head: Option<nom_condition::ThisWayHead>,
         remainder: String,
     },
     DeferredWhenYouDoGuard {
         condition: AbilityCondition,
+        zone_change_head: Option<nom_condition::ThisWayHead>,
         remainder: String,
     },
 }
@@ -1130,11 +1254,12 @@ pub(super) fn strip_if_you_do_conditional_with_context(
     text: &str,
     ctx: &mut ParseContext,
 ) -> ReflexiveConditionalStrip {
-    let (condition, remainder) = strip_if_you_do_conditional(text);
+    let (condition, zone_change_head, remainder) = strip_if_you_do_conditional_with_head(text);
     let Some(condition) = condition else {
         return ReflexiveConditionalStrip::Parsed {
             condition: None,
             guard_route: None,
+            zone_change_head,
             remainder,
         };
     };
@@ -1142,15 +1267,30 @@ pub(super) fn strip_if_you_do_conditional_with_context(
         return ReflexiveConditionalStrip::Parsed {
             condition: Some(condition),
             guard_route: None,
+            zone_change_head,
             remainder,
         };
     }
 
     let (guard, body) = strip_routed_leading_general_conditional(&remainder, ctx);
     match guard {
+        // CR 603.12 + CR 603.4: a zone-change guard ("When you do, if a card was
+        // exiled this way, …") on a reflexive would share the root with the
+        // zone-change trigger EVENT of a "When … this way" head, and the runtime
+        // settles every such root member at creation as that event. The role is
+        // not representable, so keep it distinguishable and let the chain
+        // parser fail it closed with the other unparsed reflexive guards.
+        Some((guard, _)) if guard.has_root_zone_changed_this_way() => {
+            ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
+                condition,
+                zone_change_head,
+                remainder,
+            }
+        }
         Some((guard, route)) => ReflexiveConditionalStrip::Parsed {
             condition: Some(condition.with_when_you_do_guard(guard)),
             guard_route: Some(route),
+            zone_change_head,
             remainder: body,
         },
         // A syntactically present leading guard must never be treated like an
@@ -1160,12 +1300,14 @@ pub(super) fn strip_if_you_do_conditional_with_context(
         None if split_leading_conditional(&remainder).is_some() => {
             ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
                 condition,
+                zone_change_head,
                 remainder,
             }
         }
         None => ReflexiveConditionalStrip::Parsed {
             condition: Some(condition),
             guard_route: None,
+            zone_change_head,
             remainder,
         },
     }
@@ -1502,6 +1644,61 @@ pub(super) fn card_type_condition_as_target_match(
     })
 }
 
+/// CR 614.1c + CR 614.12: an anaphoric "if it's a <type>" gate on an "enters with …
+/// counters" rider names the characteristics of the permanent an earlier instruction
+/// moved onto the battlefield, as it would exist there — the gate the "if a <type>
+/// enters this way" voice already expresses. Several types ("if it's an artifact or
+/// creature") → an any-of gate (CR 614.1c + CR 614.12), matching the condition's
+/// any-of reading. `None` for any other condition (no type, an additional or subtype
+/// filter, a negation), which stays a later gate.
+pub(super) fn card_type_condition_as_entry_this_way(
+    cond: &AbilityCondition,
+) -> Option<AbilityCondition> {
+    let AbilityCondition::RevealedHasCardType {
+        card_types,
+        additional_filter: None,
+        subtype_filter: None,
+    } = cond
+    else {
+        return None;
+    };
+    let type_filter = match card_types.as_slice() {
+        [] => return None,
+        [core] => core_type_to_type_filter(*core),
+        types => TypeFilter::AnyOf(
+            types
+                .iter()
+                .copied()
+                .map(core_type_to_type_filter)
+                .collect(),
+        ),
+    };
+    Some(AbilityCondition::ZoneChangedThisWay {
+        filter: TargetFilter::Typed(TypedFilter::new(type_filter)),
+        destination: Some(Zone::Battlefield),
+    })
+}
+
+/// CR 614.1c + CR 614.12: the typed entry gate for an anaphoric entry-counter rider —
+/// `Some` exactly when `body` is the singular-subject rider (all-consuming, optional
+/// final ".") and `cond` converts through `card_type_condition_as_entry_this_way`.
+/// The distributive plural subject ("each of them enters with …") is not admitted:
+/// no printed rider gates it in a form this conversion represents (Semester's End's
+/// compound creature/planeswalker rider is not consumed whole), so it stays a later gate.
+pub(super) fn anaphoric_entry_counter_gate(
+    cond: &AbilityCondition,
+    body: &str,
+) -> Option<AbilityCondition> {
+    nom_parse_lower(&body.trim().to_lowercase(), |i| {
+        all_consuming(terminated(
+            super::parse_single_moved_object_enters_with_counters,
+            opt(tag(".")),
+        ))
+        .parse(i)
+    })?;
+    card_type_condition_as_entry_this_way(cond)
+}
+
 /// CR 701.20a: `"If a[n] <types> card [<property>] is revealed this way, …"` —
 /// gates a sub_ability on the card the preceding look/reveal step produced.
 /// CR 701.20a ("To reveal a card, show that card to all players…") is the
@@ -1771,7 +1968,10 @@ fn parse_its_a_card_type_gate_body<'a>(
     // with TargetMatchesFilter (the same condition variant the sibling MV arms use).
     if type_word == "permanent" {
         let (mut filter, leftover) =
-            crate::parser::oracle_target::parse_type_phrase_folding("permanent card");
+            crate::parser::oracle_target::parse_type_phrase_folding_with_ctx(
+                "permanent card",
+                &mut ctx.clone_player_antecedents(),
+            );
         if !matches!(filter, TargetFilter::Any) && leftover.trim().is_empty() {
             let (after_type, chosen_type) = if let Ok((rest_after_chosen, _)) =
                 tag::<_, _, OracleError<'_>>(" of the chosen type").parse(after_type)
@@ -1962,6 +2162,11 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
     if let Some((condition, remainder)) = parse_if_exiled_card_type_conditional(text) {
         return (Some(condition), remainder);
     }
+    if let Some((condition_text, remainder)) = split_leading_conditional(text) {
+        if let Some(condition) = parse_target_color_condition_text(&condition_text) {
+            return (Some(condition), remainder);
+        }
+    }
     let lower = text.to_lowercase();
     let rest = alt((
         tag::<_, _, OracleError<'_>>("if it's a "),
@@ -1985,6 +2190,40 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
     let remainder = remainder_after_optional_comma(after_type);
     let offset = text.len() - remainder.len();
     (Some(condition), text[offset..].to_string())
+}
+
+/// CR 608.2c + CR 205.3: "the revealed [<core type>] card was a[n] <subtype>"
+/// — a past-tense subtype gate on the card a preceding reveal instruction
+/// revealed (Goblin Charbelcher: "If the revealed land card was a Mountain, …").
+/// The optional core-type word is the printed noun restating the reveal's own
+/// until-filter; it is carried as `card_types` so the gate fails closed for a
+/// revealed card of a different type. Lowers to the `RevealedHasCardType`
+/// subtype axis that the "it's a <type> card" family already uses.
+fn parse_revealed_card_was_subtype(input: &str) -> OracleResult<'_, AbilityCondition> {
+    let (input, _) = tag::<_, _, OracleError<'_>>("the revealed ").parse(input)?;
+    let (input, card_type) =
+        opt(terminated(nom_primitives::parse_core_type, tag(" "))).parse(input)?;
+    let (input, _) = tag("card was ").parse(input)?;
+    let (input, _) = alt((tag("an "), tag("a "))).parse(input)?;
+    let (subtype, consumed) = parse_subtype(input).ok_or_else(|| oracle_err(input))?;
+    let (input, _) = eof(&input[consumed..])?;
+    Ok((
+        input,
+        AbilityCondition::RevealedHasCardType {
+            card_types: card_type.into_iter().collect(),
+            additional_filter: None,
+            subtype_filter: Some(Box::new(TargetFilter::Typed(
+                TypedFilter::default().subtype(subtype),
+            ))),
+        },
+    ))
+}
+
+fn parse_revealed_card_was_subtype_condition_text(text: &str) -> Option<AbilityCondition> {
+    nom_parse_lower(
+        text.trim().trim_end_matches('.'),
+        parse_revealed_card_was_subtype,
+    )
 }
 
 fn parse_its_a_type_condition(
@@ -2021,16 +2260,24 @@ fn parse_target_color_condition(
 ) -> super::super::oracle_nom::error::OracleResult<'_, AbilityCondition> {
     let (rest, _) = parse_target_anaphoric_subject(input)?;
     let (rest, (negated, use_lki)) = parse_target_anaphoric_tense_polarity(rest)?;
+    let (rest, _) = opt(tag("a ")).parse(rest)?;
     let (rest, first_color) = nom_primitives::parse_color(rest)?;
     // CR 105.2: Disjunctive color condition — "white or blue" etc.
     let (rest, second_color) =
         opt(preceded(tag(" or "), nom_primitives::parse_color)).parse(rest)?;
+    // CR 105.2 + CR 205.2a: "a green creature" combines a color predicate
+    // with the creature card type on the same anaphoric object.
+    let (rest, creature_only) =
+        map(opt(tag(" creature")), |suffix| suffix.is_some()).parse(rest)?;
     let mut filters: Vec<_> = std::iter::once(first_color)
         .chain(second_color)
         .map(|color| {
-            TargetFilter::Typed(
-                TypedFilter::default().properties(vec![FilterProp::HasColor { color }]),
-            )
+            let mut typed = TypedFilter::default();
+            if creature_only {
+                typed.type_filters.push(TypeFilter::Creature);
+            }
+            typed.properties.push(FilterProp::HasColor { color });
+            TargetFilter::Typed(typed)
         })
         .collect();
     let filter = if filters.len() > 1 {
@@ -2466,7 +2713,7 @@ fn parse_target_anaphoric_tense_polarity(
 
 fn parse_target_color_condition_text(text: &str) -> Option<AbilityCondition> {
     let lower = text.trim().trim_end_matches('.').to_ascii_lowercase();
-    let parsed = all_consuming(parse_target_color_condition)
+    let parsed = all_consuming(preceded(opt(tag("if ")), parse_target_color_condition))
         .parse(lower.as_str())
         .ok()
         .map(|(_, condition)| condition);
@@ -2954,7 +3201,8 @@ pub(super) fn strip_property_conditional(
     ] {
         if let Some((before, after)) = tp.rsplit_around(pattern) {
             let type_text = after.lower.trim_end_matches('.').trim();
-            let (filter, leftover) = parse_type_phrase_folding(type_text);
+            let (filter, leftover) =
+                parse_type_phrase_folding_with_ctx(type_text, &mut ctx.clone_player_antecedents());
             if !matches!(filter, TargetFilter::Any) && leftover.trim().is_empty() {
                 return (
                     Some(AbilityCondition::TargetMatchesFilter {
@@ -3047,7 +3295,9 @@ pub(super) fn strip_player_property_superlative_conditional(
     let lhs = QuantityExpr::Ref {
         qty: nom_quantity::player_property_quantity(
             lhs_property,
-            PlayerScope::ParentObjectTargetController,
+            PlayerScope::ParentObjectTarget {
+                possession: crate::types::ability::PossessionAxis::Controller,
+            },
         ),
     };
     let rhs = QuantityExpr::Ref {
@@ -3055,7 +3305,9 @@ pub(super) fn strip_player_property_superlative_conditional(
             lhs_property,
             PlayerScope::AllPlayers {
                 aggregate,
-                exclude: Some(Box::new(PlayerScope::ParentObjectTargetController)),
+                exclude: Some(Box::new(PlayerScope::ParentObjectTarget {
+                    possession: crate::types::ability::PossessionAxis::Controller,
+                })),
             },
         ),
     };
@@ -3827,6 +4079,199 @@ pub(super) fn strip_superlative_target_conditional(
     (None, text.to_string())
 }
 
+/// CR 608.2c + CR 202.3: Strip a trailing "<instruction> if it has the same
+/// <quality> as <object>" rider (Counterbalance, Hisoka, Minamo Sensei) into
+/// `AbilityCondition::ObjectsShareQuality`. A sibling of the spell-target
+/// gates: it runs under a reflexive "If you do" connector, and "it" names the
+/// object the gated instruction acts on. Only single-object references are
+/// owned ("the revealed card", a cost-paid object); existential references
+/// ("as a permanent", "as a card in your graveyard") are a different
+/// condition and are left untouched.
+pub(super) fn strip_same_quality_as_conditional(
+    text: &str,
+    ctx: &ParseContext,
+) -> (Option<AbilityCondition>, String) {
+    let lower = text.to_lowercase();
+    let Some(if_pos) = find_trailing_condition_start(&lower) else {
+        return (None, text.to_string());
+    };
+    let Ok((_, (quality, reference))) = all_consuming(terminated(
+        |i| parse_same_quality_as_predicate(i, ctx),
+        (opt(tag(".")), multispace0),
+    ))
+    .parse(&lower[if_pos + " if ".len()..]) else {
+        return (None, text.to_string());
+    };
+    let body = text[..if_pos].trim();
+    let Some(subject) = trailing_rider_subject(body, ctx) else {
+        return (None, text.to_string());
+    };
+    (
+        Some(AbilityCondition::ObjectsShareQuality {
+            subject,
+            reference,
+            quality,
+        }),
+        body.to_string(),
+    )
+}
+
+/// CR 608.2c + CR 202.3: "it has the same <quality> as <object>" — the
+/// predicate of a trailing same-quality rider.
+fn parse_same_quality_as_predicate<'a>(
+    input: &'a str,
+    ctx: &ParseContext,
+) -> OracleResult<'a, (SharedQuality, TargetFilter)> {
+    let (rest, _) = parse_word_bounded(input, "it")?;
+    let (rest, _) = tag(" has the same ").parse(rest)?;
+    let (rest, quality) = verify(parse_shared_quality, quality_reads_as_the_same).parse(rest)?;
+    let (rest, _) = tag(" as ").parse(rest)?;
+    let (rest, reference) = parse_same_quality_reference(rest, ctx)?;
+    Ok((rest, (quality, reference)))
+}
+
+/// CR 201.2a + CR 202.3 + CR 208.1: qualities Oracle text compares with "has
+/// the same <quality> as" — each names one value per object (two objects have
+/// the same name when they have a name in common). Multi-valued qualities
+/// (color, types) are compared with "shares" wording instead.
+fn quality_reads_as_the_same(quality: &SharedQuality) -> bool {
+    match quality {
+        SharedQuality::Name
+        | SharedQuality::ManaValue
+        | SharedQuality::Power
+        | SharedQuality::Toughness
+        | SharedQuality::TotalPowerToughness => true,
+        SharedQuality::CreatureType
+        | SharedQuality::Color
+        | SharedQuality::CardType
+        | SharedQuality::PermanentType
+        | SharedQuality::LandType => false,
+    }
+}
+
+/// CR 701.20a + CR 608.2k: the closed set of single-object references a
+/// same-quality rider compares against. "the revealed card" is the card the
+/// ability revealed earlier (`LastRevealed`). A cost participle is the object
+/// paid for this ability's cost (`CostPaidObject`) only when the ability's
+/// cost has that participle's action: "the discarded card" / "the sacrificed
+/// creature" need a discard / sacrifice cost
+/// (`ParseContext::current_ability_cost_components`), "the exiled card" a
+/// non-self exile cost. Without such a cost the participle names an effect's
+/// action and is declined; a triggered ability has no cost, so cost
+/// participles are declined there too. A participle is also declined when any
+/// other cost payment could write the cost-paid object (see
+/// [`is_sole_slot_binding_cost_kind`]). Any other phrase ("that card", "a
+/// permanent") is not owned.
+fn parse_same_quality_reference<'a>(
+    input: &'a str,
+    ctx: &ParseContext,
+) -> OracleResult<'a, TargetFilter> {
+    let cost_paid_reference = |i: &'a str| -> OracleResult<'a, TargetFilter> {
+        if ctx.in_trigger {
+            return Err(oracle_err(i));
+        }
+        value(
+            TargetFilter::CostPaidObject,
+            verify(
+                alt((
+                    parse_cost_paid_participle_object,
+                    value(CostCategory::ExilesCards, |i| {
+                        parse_exile_cost_paid_object(i, ctx)
+                    }),
+                )),
+                // Typed `CostCategory` comparison, not text dispatch.
+                |kind| is_sole_slot_binding_cost_kind(*kind, ctx),
+            ),
+        )
+        .parse(i)
+    };
+    alt((
+        value(TargetFilter::LastRevealed, tag("the revealed card")),
+        cost_paid_reference,
+    ))
+    .parse(input)
+}
+
+/// CR 608.2k: whether this ability's cost has exactly one slot-binding payment
+/// component and that component is of kind `kind`, so a cost participle naming
+/// that kind has exactly one referent. Each paid component that references an
+/// object overwrites the single cost-paid slot, so the count is over payment
+/// components (`ParseContext::current_ability_cost_components`), not over the
+/// deduplicated category set: "Sacrifice a creature, Sacrifice an enchantment"
+/// is two sacrifice payments and "the sacrificed creature" is ambiguous. A
+/// component is slot-binding when any of its categories is, as classified by
+/// [`cost_category_binds_cost_paid_object`]; the sole slot-binding component
+/// must have no slot-binding category other than `kind` (a behold-and-exile
+/// cost is one component that both reveals and exiles). A `OneOf` contributes
+/// every branch's components, so a "discard or sacrifice" choice is two
+/// slot-binding components. Any other shape is ambiguous and is declined (fail
+/// closed).
+fn is_sole_slot_binding_cost_kind(kind: CostCategory, ctx: &ParseContext) -> bool {
+    let binds = |category: &CostCategory| cost_category_binds_cost_paid_object(*category);
+    let mut slot_binding_components = ctx
+        .current_ability_cost_components
+        .iter()
+        .filter(|component| component.iter().any(binds));
+    match (
+        slot_binding_components.next(),
+        slot_binding_components.next(),
+    ) {
+        (Some(component), None) => component
+            .iter()
+            .filter(|category| binds(category))
+            .all(|category| *category == kind),
+        _ => false,
+    }
+}
+
+/// CR 608.2k: whether paying a cost of this category can bind (write) the
+/// ability's cost-paid object. `TargetFilter::CostPaidObject` resolves from a
+/// single cost-paid slot that each object-referencing cost payment overwrites,
+/// so a cost participle has one referent only when no other such payment can
+/// write that slot. Only the categories that move or reference no object are
+/// not slot-binding; every other category, including self-referential costs
+/// (exile-self within `ExilesCards`) and costs whose payment shape is unknown
+/// here (`KeywordCost`), is treated as binding on purpose, so an ambiguous
+/// reference stays an honest unsupported clause rather than resolving wrong.
+/// Exhaustive match with no wildcard arm, so a new category must be classified.
+fn cost_category_binds_cost_paid_object(category: CostCategory) -> bool {
+    match category {
+        CostCategory::ManaOnly
+        | CostCategory::TapsSelf
+        | CostCategory::UntapsSelf
+        | CostCategory::PaysLife
+        | CostCategory::PaysLoyalty
+        | CostCategory::PaysEnergy
+        | CostCategory::PaysSpeed => false,
+        CostCategory::SacrificesPermanent
+        | CostCategory::Discards
+        | CostCategory::ExilesCards
+        | CostCategory::TapsOtherCreatures
+        | CostCategory::RemovesCounters
+        | CostCategory::ReturnsToHand
+        | CostCategory::Unattaches
+        | CostCategory::Mills
+        | CostCategory::PutsCounters
+        | CostCategory::Reveals
+        | CostCategory::Exerts
+        | CostCategory::KeywordCost => true,
+    }
+}
+
+/// CR 608.2c: "it" in a trailing rider names the object the gated instruction
+/// acts on — its single-object anaphor verbatim ("that spell" → the trigger's
+/// spell), or the instruction's declared target (`ParentTarget`). `None` when
+/// the instruction acts on no single object.
+fn trailing_rider_subject(effect_text: &str, ctx: &ParseContext) -> Option<TargetFilter> {
+    match effect_target_filter(effect_text, ctx)? {
+        filter if super::subject::is_single_object_ref(&filter) => Some(filter),
+        filter if !filter.is_context_ref() && !matches!(filter, TargetFilter::Any) => {
+            Some(TargetFilter::ParentTarget)
+        }
+        _ => None,
+    }
+}
+
 /// Parse the body of a leading mana-value conditional — "`<N>` or less/greater, [effect]" —
 /// and compute the body offset into `original`. `use_lki` is threaded into the constructed
 /// `TargetMatchesFilter` condition: past-tense ("was") callers pass `true` (CR 400.7 — LKI
@@ -4291,6 +4736,10 @@ pub(super) fn strip_routed_suffix_conditional(
         effect_prefix.to_string()
     };
 
+    if let Some(cond) = parse_target_color_condition_text(condition_core) {
+        return (general(cond), effect_text);
+    }
+
     if let Some(cond) = parse_its_a_type_condition(condition_core, ctx) {
         return (general(cond), effect_text);
     }
@@ -4347,11 +4796,15 @@ pub(super) fn strip_routed_suffix_conditional(
 /// filter is a player-chosen target (not a context reference or the untyped
 /// `Any` fallback). Parses on a throwaway context so the caller's is untouched.
 fn effect_has_declared_target(effect_text: &str, ctx: &ParseContext) -> bool {
-    let clause = parse_effect_clause_inner(effect_text, &mut ctx.clone_throwaway());
-    clause
-        .effect
-        .target_filter()
+    effect_target_filter(effect_text, ctx)
         .is_some_and(|filter| !filter.is_context_ref() && !matches!(filter, TargetFilter::Any))
+}
+
+/// The typed target filter of the effect `effect_text` lowers to, parsed on a
+/// throwaway context so the caller's is untouched.
+fn effect_target_filter(effect_text: &str, ctx: &ParseContext) -> Option<TargetFilter> {
+    let clause = parse_effect_clause_inner(effect_text, &mut ctx.clone_throwaway());
+    clause.effect.target_filter().cloned()
 }
 
 pub(super) fn parse_quantity_comparison(text: &str) -> Option<(Comparator, QuantityExpr)> {
@@ -4625,6 +5078,7 @@ pub(super) fn reads_cast_time_snapshot(condition: &AbilityCondition) -> bool {
         | AbilityCondition::CastVariantPaid { .. }
         | AbilityCondition::CastVariantPaidInstead { .. }
         | AbilityCondition::QuantityCheck { .. }
+        | AbilityCondition::QuantityQuality { .. }
         | AbilityCondition::PreviousEffectAmount { .. }
         | AbilityCondition::CompletedDungeon { .. }
         | AbilityCondition::TargetHasKeywordInstead { .. }
@@ -4693,6 +5147,10 @@ pub(super) fn parse_condition_text(text: &str) -> Option<AbilityCondition> {
     }
 
     if let Some(condition) = parse_target_color_condition_text(text) {
+        return Some(condition);
+    }
+
+    if let Some(condition) = parse_revealed_card_was_subtype_condition_text(text) {
         return Some(condition);
     }
 
@@ -4978,14 +5436,15 @@ fn parse_cast_during_phase_condition(
 
 /// CR 500.1 + CR 505.1 + CR 505.1a: Map a phase/step *name phrase* to the
 /// concrete `Phase` set it denotes. Shared by the casting-time
-/// `parse_cast_during_phase_condition` and the resolution-time
-/// `parse_current_phase_condition`. NON-`all_consuming` by design — callers
+/// `parse_cast_during_phase_condition`, the resolution-time
+/// `parse_current_phase_condition`, and the activation during-gate in
+/// `oracle.rs` (`parse_activation_during_gate`). NON-`all_consuming` by design — callers
 /// wrap with `all_consuming` (or `preceded`) and own any trailing text. The
 /// `alt` ordering is load-bearing: the grouped "main phase" (both main phases,
 /// CR 505.1/505.1a) is tried before the "precombat"/"postcombat" refinements,
 /// and "end of combat step" before "end step", so the longest/grouped phrase
-/// wins.
-fn parse_phase_name_set(
+/// wins; likewise "upkeep step" is tried before the bare "upkeep" spelling.
+pub(crate) fn parse_phase_name_set(
     input: &str,
 ) -> super::super::oracle_nom::error::OracleResult<'_, Vec<Phase>> {
     alt((
@@ -4995,7 +5454,10 @@ fn parse_phase_name_set(
         ),
         value(vec![Phase::PreCombatMain], tag("precombat main phase")),
         value(vec![Phase::PostCombatMain], tag("postcombat main phase")),
-        value(vec![Phase::Upkeep], tag("upkeep")),
+        value(
+            vec![Phase::Upkeep],
+            alt((tag("upkeep step"), tag("upkeep"))),
+        ),
         value(vec![Phase::Draw], tag("draw step")),
         value(vec![Phase::BeginCombat], tag("beginning of combat step")),
         value(vec![Phase::DeclareAttackers], tag("declare attackers step")),
@@ -5074,12 +5536,18 @@ fn parse_symbolic_mana_color_spent_condition(
     let (rest, _) = parse_spent_to_cast_tail(rest)?;
     let condition = if counts.len() == 1 {
         let (color, minimum) = counts[0];
-        AbilityCondition::ManaColorSpent { color, minimum }
+        AbilityCondition::ManaColorSpent {
+            color: SpentColor::ManaSymbol { color },
+            minimum,
+        }
     } else {
         AbilityCondition::And {
             conditions: counts
                 .into_iter()
-                .map(|(color, minimum)| AbilityCondition::ManaColorSpent { color, minimum })
+                .map(|(color, minimum)| AbilityCondition::ManaColorSpent {
+                    color: SpentColor::ManaSymbol { color },
+                    minimum,
+                })
                 .collect(),
         }
     };
@@ -5087,7 +5555,8 @@ fn parse_symbolic_mana_color_spent_condition(
 }
 
 /// CR 106.3 + CR 601.2h: legacy leading-word form, "at least N <color> mana was
-/// spent to cast <self>" → `AbilityCondition::ManaColorSpent`.
+/// spent to cast <self>" → `AbilityCondition::ManaColorSpent` with a
+/// `SpentColor::ColorWord` color (CR 612.2).
 ///
 /// SHADOWED, kept as a fallback only. `parse_mana_color_spent_condition_text`
 /// has exactly one caller (`parse_condition_text`), and every non-test caller of
@@ -5101,8 +5570,7 @@ fn parse_symbolic_mana_color_spent_condition(
 /// `ManaColorSpent` cannot express.
 ///
 /// `parse_symbolic_mana_color_spent_condition` above is NOT shadowed — the
-/// `{W}{W}` symbolic form has no `parse_inner_condition` grammar and stays live
-/// for 22 cards.
+/// `{W}{W}` symbolic form has no `parse_inner_condition` grammar and stays live.
 fn parse_word_mana_color_spent_condition(
     input: &str,
 ) -> super::super::oracle_nom::error::OracleResult<'_, AbilityCondition> {
@@ -5112,7 +5580,13 @@ fn parse_word_mana_color_spent_condition(
     let (rest, color) = nom_primitives::parse_color(rest)?;
     let (rest, _) = tag(" mana").parse(rest)?;
     let (rest, _) = parse_spent_to_cast_tail(rest)?;
-    Ok((rest, AbilityCondition::ManaColorSpent { color, minimum }))
+    Ok((
+        rest,
+        AbilityCondition::ManaColorSpent {
+            color: SpentColor::ColorWord { color },
+            minimum,
+        },
+    ))
 }
 
 fn parse_spent_to_cast_tail(input: &str) -> super::super::oracle_nom::error::OracleResult<'_, ()> {
@@ -5359,7 +5833,8 @@ pub(crate) fn lower_instead_condition(
     cond_text: &str,
     ctx: &mut ParseContext,
 ) -> Option<AbilityCondition> {
-    try_nom_condition_as_ability_condition(cond_text, ctx)
+    parse_target_color_condition_text(cond_text)
+        .or_else(|| try_nom_condition_as_ability_condition(cond_text, ctx))
         .or_else(|| parse_condition_text_in(cond_text, ctx))
         .or_else(|| parse_control_count_as_ability_condition(cond_text))
 }
@@ -5417,10 +5892,12 @@ fn build_instead_def(
 
     let instead_def =
         super::parse_child_ability_with_parent_target(&effect_text, kind, parent_target_available);
-    let mut result = instead_def;
-    result.condition = Some(AbilityCondition::ConditionInstead {
-        inner: Box::new(condition),
-    });
+    let mut result = super::instead_override_definition(
+        instead_def,
+        AbilityCondition::ConditionInstead {
+            inner: Box::new(condition),
+        },
+    );
     if result
         .condition
         .as_ref()
@@ -5822,6 +6299,9 @@ pub(crate) fn static_condition_to_ability_condition(
 ) -> Option<AbilityCondition> {
     match sc {
         StaticCondition::DuringYourTurn => Some(AbilityCondition::IsYourTurn),
+        // CR 500.8 + CR 506.1 + CR 608.2c: the shared phase-occurrence gate
+        // bridges 1:1 (the possessive composition arrives as an `And`).
+        StaticCondition::FirstCombatPhaseOfTurn => Some(AbilityCondition::FirstCombatPhaseOfTurn),
         StaticCondition::QuantityComparison {
             lhs,
             comparator,
@@ -5831,6 +6311,17 @@ pub(crate) fn static_condition_to_ability_condition(
             comparator: *comparator,
             rhs: rhs.clone(),
         }),
+        // CR 608.2h: 1:1 bridge, never None — a caller that drops a None lowers
+        // the effect to unconditional (see
+        // delayed_trigger_intervening_if_retains_the_commander_control_gate).
+        // `Not` over this variant goes through the generic `other =>` arm of the
+        // `Not` sub-match, giving `AbilityCondition::Not { QuantityQuality }`.
+        StaticCondition::QuantityQuality { quantity, quality } => {
+            Some(AbilityCondition::QuantityQuality {
+                quantity: quantity.clone(),
+                quality: *quality,
+            })
+        }
         StaticCondition::HasMaxSpeed => Some(AbilityCondition::HasMaxSpeed),
         // CR 103.1: Starting-player status — 1:1 bridge (same `controller` field).
         StaticCondition::WasStartingPlayer { controller } => {
@@ -5854,6 +6345,11 @@ pub(crate) fn static_condition_to_ability_condition(
             player: PlayerScope::Controller,
         } => Some(AbilityCondition::IsMonarch),
         StaticCondition::IsMonarch { .. } => None,
+        // Digital-only Alchemy (no CR entry): no `AbilityCondition` boon
+        // variant exists — "if you have a boon" is printed only as a
+        // trigger intervening-if (Underbridge Warlock), which bridges to
+        // `TriggerCondition::HasBoon` instead.
+        StaticCondition::HasBoon { .. } => None,
         StaticCondition::IsInitiative => Some(AbilityCondition::IsInitiative),
         StaticCondition::HasCityBlessing => Some(AbilityCondition::HasCityBlessing),
         // CR 702.195b: The enduring story designation is available to effects.
@@ -6152,6 +6648,7 @@ pub(crate) fn static_condition_to_ability_condition(
         // (`AbilityCondition`) equivalent. `Not(SourceHasDealtDamage)` is handled by
         // the inner Not sub-match's `_ => None` arm above.
         | StaticCondition::SourceHasDealtDamage
+        | StaticCondition::SourceExertedThisTurn
         // CR 110.5b + CR 611.2b: `IsTapped { scope }` is a duration-only
         // target-relative tap condition (Zygon Infiltrator's copy duration), not
         // an effect-resolution gate — no `AbilityCondition` equivalent.
@@ -6254,6 +6751,12 @@ pub(crate) fn ability_condition_to_static_condition(
                 lhs: lhs.clone(),
                 comparator: *comparator,
                 rhs: rhs.clone(),
+            })
+        }
+        AbilityCondition::QuantityQuality { quantity, quality } => {
+            Some(StaticCondition::QuantityQuality {
+                quantity: quantity.clone(),
+                quality: *quality,
             })
         }
         AbilityCondition::Not { condition } => Some(StaticCondition::Not {
@@ -6989,12 +7492,12 @@ fn try_unrouted_nom_condition_tail(text: &str, ctx: &mut ParseContext) -> Option
         return Some(AbilityCondition::DayNightIsNeither);
     }
 
-    if tag::<_, _, OracleError<'_>>("it's the first combat phase of the turn")
-        .parse(lower.as_str())
-        .is_ok()
-    {
-        return Some(AbilityCondition::FirstCombatPhaseOfTurn);
-    }
+    // CR 500.8 + CR 506.1 + CR 109.5 + CR 608.2c: "it's the first combat phase
+    // of [the|your] turn" is recognized by the shared `parse_inner_condition`
+    // authority (`parse_first_combat_phase_of_turn`) and lowered through the
+    // generic fallback below, which requires the whole condition to be
+    // consumed. The possessive axis composes `IsYourTurn` there (CR 109.5), so
+    // no effect-local arm is needed.
 
     // CR 500.8 + CR 513.1: "it's the first end step of the turn" — end-step
     // sibling of the combat-phase gate above (Y'shtola Rhul's loop guard).
@@ -7078,9 +7581,24 @@ fn try_unrouted_nom_condition_tail(text: &str, ctx: &mut ParseContext) -> Option
     // is repopulated per-effect, so after the preceding effect resolves it holds
     // exactly that effect's zone changes; `Not { ZoneChangedThisWay { Any } }` is
     // true iff that effect moved nothing — i.e. "you can't".
-    if alt((tag::<_, _, OracleError<'_>>("you can't"), tag("you cannot")))
-        .parse(lower.as_str())
-        .is_ok()
+    // The instruction's actor may be named in the third person ("if they can't,
+    // you draw a card" — Brain Pry); that reads the same outcome. The third-person
+    // form must be the whole condition so "they can't block" is not swallowed.
+    if alt((
+        value(
+            (),
+            alt((tag::<_, _, OracleError<'_>>("you can't"), tag("you cannot"))),
+        ),
+        value(
+            (),
+            all_consuming(terminated(
+                alt((tag("they can't"), tag("they cannot"))),
+                (multispace0, opt(char('.'))),
+            )),
+        ),
+    ))
+    .parse(lower.as_str())
+    .is_ok()
     {
         return Some(AbilityCondition::Not {
             condition: Box::new(AbilityCondition::ZoneChangedThisWay {
@@ -7198,7 +7716,10 @@ fn try_unrouted_nom_condition_tail(text: &str, ctx: &mut ParseContext) -> Option
                 .trim_end_matches(" card")
                 .trim();
             let (filter, leftover) =
-                crate::parser::oracle_target::parse_type_phrase_folding(type_text);
+                crate::parser::oracle_target::parse_type_phrase_folding_with_ctx(
+                    type_text,
+                    &mut ctx.clone_player_antecedents(),
+                );
             if !matches!(filter, TargetFilter::Any) && leftover.trim().is_empty() {
                 return Some(maybe_negate(
                     AbilityCondition::TargetMatchesFilter {
@@ -7285,7 +7806,10 @@ fn try_unrouted_nom_condition_tail(text: &str, ctx: &mut ParseContext) -> Option
         // in lockstep with strip_card_type_conditional's "permanent" arm.
         if rest == "permanent" {
             let (filter, leftover) =
-                crate::parser::oracle_target::parse_type_phrase_folding("permanent card");
+                crate::parser::oracle_target::parse_type_phrase_folding_with_ctx(
+                    "permanent card",
+                    &mut ctx.clone_player_antecedents(),
+                );
             if !matches!(filter, TargetFilter::Any) && leftover.trim().is_empty() {
                 return Some(maybe_negate(
                     AbilityCondition::TargetMatchesFilter {
@@ -7370,7 +7894,10 @@ fn try_unrouted_nom_condition_tail(text: &str, ctx: &mut ParseContext) -> Option
         // with empty leftover). Those belong to RevealedHasCardType, not the
         // present-target TargetMatchesFilter, so this arm fires only when the parsed
         // filter genuinely references a CR 205.3 subtype.
-        let (filter, leftover) = crate::parser::oracle_target::parse_type_phrase_folding(rest);
+        let (filter, leftover) = crate::parser::oracle_target::parse_type_phrase_folding_with_ctx(
+            rest,
+            &mut ctx.clone_player_antecedents(),
+        );
         if let TargetFilter::Typed(typed) = &filter {
             if leftover.trim().is_empty()
                 && typed
@@ -8274,7 +8801,10 @@ fn parse_objects_share_quality_reference<'a>(
             &text[offset..],
         ));
     }
-    let (filter, rest) = crate::parser::oracle_target::parse_target(text);
+    let (filter, rest) = crate::parser::oracle_target::parse_target_with_ctx(
+        text,
+        &mut ctx.clone_player_antecedents(),
+    );
     if matches!(filter, TargetFilter::Any) {
         return None;
     }
@@ -8995,10 +9525,67 @@ mod tests {
     use crate::parser::oracle_nom::condition::parse_inner_condition;
     use crate::parser::parse_oracle_text;
     use crate::types::ability::{
-        AggregateFunction, CardTypeSetSource, CommanderOwnership, PlayerFilter, SharedQuality,
-        SharedQualityRelation,
+        AggregateFunction, CardTypeSetSource, CommanderOwnership, CostCategory, PlayerFilter,
+        SharedQuality, SharedQualityRelation,
     };
     use crate::types::counter::{CounterMatch, CounterType};
+
+    /// CR 608.2h: the static→ability bridge maps `QuantityQuality` 1:1 and never
+    /// returns `None` for it — a dropped `None` would lower the effect to
+    /// unconditional. Negation and conjunction ride the generic arms.
+    #[test]
+    fn quantity_quality_bridges_to_ability_condition_and_back() {
+        use crate::types::ability::NumberQuality;
+        let quantity = QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::You)),
+            },
+        };
+        let affirmative = StaticCondition::QuantityQuality {
+            quantity: quantity.clone(),
+            quality: NumberQuality::Prime,
+        };
+        let ability_affirmative = AbilityCondition::QuantityQuality {
+            quantity: quantity.clone(),
+            quality: NumberQuality::Prime,
+        };
+        assert_eq!(
+            static_condition_to_ability_condition(&affirmative, &mut ParseContext::default()),
+            Some(ability_affirmative.clone())
+        );
+
+        let negated = StaticCondition::Not {
+            condition: Box::new(affirmative.clone()),
+        };
+        let ability_negated = AbilityCondition::Not {
+            condition: Box::new(ability_affirmative.clone()),
+        };
+        assert_eq!(
+            static_condition_to_ability_condition(&negated, &mut ParseContext::default()),
+            Some(ability_negated.clone()),
+            "Not(QuantityQuality) bridges structurally, never to None"
+        );
+
+        let conjunction = StaticCondition::And {
+            conditions: vec![affirmative.clone(), StaticCondition::DuringYourTurn],
+        };
+        assert_eq!(
+            static_condition_to_ability_condition(&conjunction, &mut ParseContext::default()),
+            Some(AbilityCondition::And {
+                conditions: vec![ability_affirmative.clone(), AbilityCondition::IsYourTurn],
+            })
+        );
+
+        // Reverse bridge round-trips both forms back to the static input.
+        assert_eq!(
+            ability_condition_to_static_condition(&ability_affirmative),
+            Some(affirmative)
+        );
+        assert_eq!(
+            ability_condition_to_static_condition(&ability_negated),
+            Some(negated)
+        );
+    }
 
     /// SHAPE: both adapters preserve the complete owner-relative negative predicate.
     /// CR 109.5 + CR 400.3: an owner's private zone must belong to the live controller.
@@ -9631,6 +10218,13 @@ mod tests {
             parse("it's your end step"),
             Some(your_phase(vec![Phase::End])),
         );
+        // The "upkeep step" spelling (shared with the activation during-gate)
+        // denotes the same step as the bare "upkeep" spelling (CR 503.1).
+        assert_eq!(
+            parse("it isn't your upkeep step"),
+            parse("it isn't your upkeep"),
+        );
+        assert!(parse("it isn't your upkeep step").is_some());
 
         // Negative: an unrelated condition must NOT be captured by this arm.
         assert_ne!(
@@ -10359,6 +10953,7 @@ mod tests {
         let ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
             condition,
             remainder,
+            ..
         } = stripped
         else {
             panic!("an unsupported guard must stay distinct from a bare reflexive marker");
@@ -10375,6 +10970,7 @@ mod tests {
         let ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
             condition,
             remainder,
+            ..
         } = stripped
         else {
             panic!("the specialized card-type guard must remain available to its ordered parser");
@@ -10469,12 +11065,16 @@ mod tests {
             "when you put one or more equipment onto the battlefield this way, you may attach one of them to a samurai you control",
         );
         assert_eq!(body, "you may attach one of them to a samurai you control");
+        // CR 603.12: "When … this way" is a reflexive trigger: the `WhenYouDo`
+        // creation gate carrying the zone change as its event.
+        let condition = condition.expect("the when-head yields a condition");
+        assert!(condition.has_when_you_do_marker(), "{condition:?}");
         let Some(AbilityCondition::ZoneChangedThisWay {
             filter,
             destination: Some(Zone::Battlefield),
-        }) = condition
+        }) = condition.zone_changed_this_way_head().cloned()
         else {
-            panic!("expected ZoneChangedThisWay condition, got {condition:?}");
+            panic!("expected ZoneChangedThisWay event, got {condition:?}");
         };
         match filter {
             TargetFilter::Typed(TypedFilter { type_filters, .. }) => {
@@ -10563,12 +11163,16 @@ mod tests {
             "when you discard a card this way, target player mills cards equal to its mana value",
         );
         assert_eq!(body, "target player mills cards equal to its mana value");
+        // CR 603.12: "When … this way" is a reflexive trigger: the `WhenYouDo`
+        // creation gate carrying the zone change as its event.
+        let condition = condition.expect("the when-head yields a condition");
+        assert!(condition.has_when_you_do_marker(), "{condition:?}");
         let Some(AbilityCondition::ZoneChangedThisWay {
             filter,
             destination: None,
-        }) = condition
+        }) = condition.zone_changed_this_way_head().cloned()
         else {
-            panic!("expected ZoneChangedThisWay condition, got {condition:?}");
+            panic!("expected ZoneChangedThisWay event, got {condition:?}");
         };
         match filter {
             TargetFilter::Typed(TypedFilter { type_filters, .. }) => {
@@ -10645,6 +11249,23 @@ mod tests {
                 "expected Not {{ ZoneChangedThisWay {{ Any }} }} for {text:?}",
             );
         }
+    }
+
+    #[test]
+    fn if_they_cant_matches_only_the_whole_condition() {
+        // CR 608.2c: third-person "they can't" reads the preceding instruction's
+        // outcome like "you can't" — but only as the whole condition.
+        assert!(
+            try_nom_condition_as_ability_condition("they can't", &mut ParseContext::default())
+                .is_some()
+        );
+        assert_eq!(
+            try_nom_condition_as_ability_condition(
+                "they can't block",
+                &mut ParseContext::default()
+            ),
+            None
+        );
     }
 
     #[test]
@@ -10763,6 +11384,24 @@ mod tests {
             "expected Red color filter, got {:?}",
             filter.properties
         );
+    }
+
+    #[test]
+    fn green_creature_instead_gate_checks_parent_target_type_and_color() {
+        let (condition, body) = strip_card_type_conditional(
+            "If it's a green creature, prevent the next 2 damage instead.",
+        );
+        assert_eq!(body, "prevent the next 2 damage instead.");
+        let Some(AbilityCondition::TargetMatchesFilter { filter, .. }) = condition else {
+            panic!("expected target-relative color and type condition, got {condition:?}");
+        };
+        let TargetFilter::Typed(filter) = filter else {
+            panic!("expected typed target filter, got {filter:?}");
+        };
+        assert!(filter.type_filters.contains(&TypeFilter::Creature));
+        assert!(filter.properties.contains(&FilterProp::HasColor {
+            color: ManaColor::Green
+        }));
     }
 
     #[test]
@@ -11117,6 +11756,475 @@ mod tests {
         );
     }
 
+    /// CR 608.2c + CR 202.3 + CR 201.2a + CR 208.1: the trailing same-quality
+    /// rider lowers to `ObjectsShareQuality` across the quality axis (name, mana
+    /// value, power, toughness) and the reference axis ("the revealed card" →
+    /// `LastRevealed`; a cost participle → `CostPaidObject`). "it" is the
+    /// instruction's declared target (`ParentTarget`).
+    #[test]
+    fn strip_same_quality_as_conditional_covers_quality_and_reference_axes() {
+        // Each cost participle is read under an activated ability whose only
+        // slot-binding cost payment is that participle's kind, so the
+        // reference is unambiguous (see the ambiguous-cost test below).
+        let cost_ctx = |components: Vec<Vec<CostCategory>>| ParseContext {
+            current_ability_cost_components: components,
+            ..Default::default()
+        };
+        let reference_rows = [
+            (
+                "the revealed card",
+                TargetFilter::LastRevealed,
+                ParseContext::default(),
+            ),
+            (
+                "the discarded card",
+                TargetFilter::CostPaidObject,
+                cost_ctx(vec![
+                    vec![CostCategory::ManaOnly],
+                    vec![CostCategory::Discards],
+                ]),
+            ),
+            (
+                "the sacrificed creature",
+                TargetFilter::CostPaidObject,
+                cost_ctx(vec![
+                    vec![CostCategory::ManaOnly],
+                    vec![CostCategory::SacrificesPermanent],
+                ]),
+            ),
+        ];
+        for (quality_text, quality) in [
+            ("name", SharedQuality::Name),
+            ("mana value", SharedQuality::ManaValue),
+            ("power", SharedQuality::Power),
+            ("toughness", SharedQuality::Toughness),
+        ] {
+            for (reference_text, reference, ctx) in &reference_rows {
+                let text = format!(
+                    "Counter target spell if it has the same {quality_text} as {reference_text}."
+                );
+                let (condition, body) = strip_same_quality_as_conditional(&text, ctx);
+                assert_eq!(body, "Counter target spell", "{text}");
+                assert_eq!(
+                    condition,
+                    Some(AbilityCondition::ObjectsShareQuality {
+                        subject: TargetFilter::ParentTarget,
+                        reference: reference.clone(),
+                        quality: quality.clone(),
+                    }),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    /// CR 608.2k: "the exiled card" names the cost-paid object only when the
+    /// ability has an exile cost. Reach guard for the no-exile-cost decline.
+    /// The context is a lone non-self exile cost ("Exile a card from your
+    /// graveyard"): one `ExilesCards` payment component plus its source zone.
+    #[test]
+    fn strip_same_quality_as_conditional_exiled_card_with_exile_cost() {
+        let ctx = ParseContext {
+            current_ability_cost_components: vec![vec![CostCategory::ExilesCards]],
+            current_ability_exile_cost_zone: Some(Zone::Graveyard),
+            ..Default::default()
+        };
+        let (condition, body) = strip_same_quality_as_conditional(
+            "Counter target spell if it has the same mana value as the exiled card.",
+            &ctx,
+        );
+        assert_eq!(body, "Counter target spell");
+        assert_eq!(
+            condition,
+            Some(AbilityCondition::ObjectsShareQuality {
+                subject: TargetFilter::ParentTarget,
+                reference: TargetFilter::CostPaidObject,
+                quality: SharedQuality::ManaValue,
+            })
+        );
+    }
+
+    /// CR 608.2k: a cost participle is claimed only when the ability's cost has
+    /// exactly one slot-binding payment component and it is the participle's
+    /// kind. `CostPaidObject` reads one cost-paid slot that every
+    /// object-referencing cost payment (sacrifice, exile, reveal, remove
+    /// counters, ...) overwrites, so with another such payment beside it —
+    /// even a second payment of the same kind ("Sacrifice a creature,
+    /// Sacrifice an enchantment") — the reference is ambiguous and the rider is
+    /// declined, text unchanged. A `OneOf` choice contributes every branch's
+    /// payments ("discard or sacrifice"; a branch that sacrifices twice), and
+    /// one component with two slot-binding kinds (behold-and-exile) is
+    /// ambiguous too, so both are declined. Costs that reference no object (mana, tap self, life) do not make it
+    /// ambiguous. Each decline is paired with the same participle claimed
+    /// under a cost with one payment of its own kind, and "the revealed card"
+    /// stays claimed under every ambiguous context.
+    #[test]
+    fn strip_same_quality_as_conditional_ambiguous_cost_paid_reference_declines() {
+        let cost_ctx =
+            |components: Vec<Vec<CostCategory>>, exile_cost_zone: Option<Zone>| ParseContext {
+                current_ability_cost_components: components,
+                current_ability_exile_cost_zone: exile_cost_zone,
+                ..Default::default()
+            };
+        let rider = |reference_text: &str| {
+            format!("Counter target spell if it has the same mana value as {reference_text}.")
+        };
+        let claimed = Some(AbilityCondition::ObjectsShareQuality {
+            subject: TargetFilter::ParentTarget,
+            reference: TargetFilter::CostPaidObject,
+            quality: SharedQuality::ManaValue,
+        });
+
+        let discard_and_sacrifice = cost_ctx(
+            vec![
+                vec![CostCategory::ManaOnly],
+                vec![CostCategory::Discards],
+                vec![CostCategory::SacrificesPermanent],
+            ],
+            None,
+        );
+        let discard_and_exile = cost_ctx(
+            vec![
+                vec![CostCategory::Discards],
+                vec![CostCategory::ExilesCards],
+            ],
+            Some(Zone::Graveyard),
+        );
+        let discard_and_reveal = cost_ctx(
+            vec![
+                vec![CostCategory::ManaOnly],
+                vec![CostCategory::Discards],
+                vec![CostCategory::Reveals],
+            ],
+            None,
+        );
+        let discard_and_remove_counters = cost_ctx(
+            vec![
+                vec![CostCategory::Discards],
+                vec![CostCategory::RemovesCounters],
+            ],
+            None,
+        );
+        // An exile-self cost is `ExilesCards` with no non-self exile zone: it
+        // still binds the slot beside a discard, and it is not an exile cost
+        // "the exiled card" can name.
+        let discard_and_exile_self = cost_ctx(
+            vec![
+                vec![CostCategory::ExilesCards],
+                vec![CostCategory::Discards],
+            ],
+            None,
+        );
+        // Two payments of the same kind: `AbilityCost::categories()` collapses
+        // them to one category, but each payment overwrites the one cost-paid
+        // slot, so the participle has two candidate referents.
+        let two_discards = cost_ctx(
+            vec![vec![CostCategory::Discards], vec![CostCategory::Discards]],
+            None,
+        );
+        let two_sacrifices = cost_ctx(
+            vec![
+                vec![CostCategory::ManaOnly],
+                vec![CostCategory::SacrificesPermanent],
+                vec![CostCategory::SacrificesPermanent],
+            ],
+            None,
+        );
+        // Two exile payments, at least one non-self (an exile-self cost beside
+        // "Exile a card from your graveyard", or two graveyard exiles).
+        let two_exiles = cost_ctx(
+            vec![
+                vec![CostCategory::ExilesCards],
+                vec![CostCategory::ExilesCards],
+            ],
+            Some(Zone::Graveyard),
+        );
+        // "Discard a card or sacrifice a creature": a `OneOf` contributes each
+        // branch's payment, since either may be the one paid.
+        let discard_or_sacrifice = cost_ctx(
+            vec![
+                vec![CostCategory::Discards],
+                vec![CostCategory::SacrificesPermanent],
+            ],
+            None,
+        );
+        // "Sacrifice a creature, Sacrifice an artifact or {R}, {T}": the
+        // sacrifice branch pays two sacrifices into the one cost-paid slot.
+        let two_sacrifices_or_mana = cost_ctx(
+            vec![
+                vec![CostCategory::SacrificesPermanent],
+                vec![CostCategory::SacrificesPermanent],
+                vec![CostCategory::ManaOnly],
+                vec![CostCategory::TapsSelf],
+            ],
+            None,
+        );
+        // One payment component with two slot-binding kinds (a behold cost
+        // that exiles the beheld card both reveals and exiles).
+        let reveal_and_exile_component = cost_ctx(
+            vec![vec![CostCategory::Reveals, CostCategory::ExilesCards]],
+            Some(Zone::Graveyard),
+        );
+        let ambiguous = [
+            &discard_and_sacrifice,
+            &discard_and_exile,
+            &discard_and_reveal,
+            &discard_and_remove_counters,
+            &discard_and_exile_self,
+            &two_discards,
+            &two_sacrifices,
+            &two_exiles,
+            &discard_or_sacrifice,
+            &two_sacrifices_or_mana,
+            &reveal_and_exile_component,
+        ];
+        let declined = [
+            ("the discarded card", &discard_and_sacrifice),
+            ("the sacrificed creature", &discard_and_sacrifice),
+            ("the discarded card", &discard_and_exile),
+            ("the exiled card", &discard_and_exile),
+            ("the discarded card", &discard_and_reveal),
+            ("the discarded card", &discard_and_remove_counters),
+            ("the discarded card", &discard_and_exile_self),
+            ("the exiled card", &discard_and_exile_self),
+            ("the discarded card", &two_discards),
+            ("the sacrificed creature", &two_sacrifices),
+            ("the exiled card", &two_exiles),
+            ("the discarded card", &discard_or_sacrifice),
+            ("the sacrificed creature", &discard_or_sacrifice),
+            ("the sacrificed creature", &two_sacrifices_or_mana),
+            ("the exiled card", &reveal_and_exile_component),
+        ];
+        for (reference_text, ctx) in declined {
+            let text = rider(reference_text);
+            let (condition, body) = strip_same_quality_as_conditional(&text, ctx);
+            assert_eq!(condition, None, "{text} under an ambiguous cost");
+            assert_eq!(body, text);
+        }
+
+        // Reach guards: the same predicate is claimed under these contexts
+        // when its reference is not a cost participle.
+        for ctx in ambiguous {
+            let (condition, body) =
+                strip_same_quality_as_conditional(&rider("the revealed card"), ctx);
+            assert_eq!(body, "Counter target spell");
+            assert_eq!(
+                condition,
+                Some(AbilityCondition::ObjectsShareQuality {
+                    subject: TargetFilter::ParentTarget,
+                    reference: TargetFilter::LastRevealed,
+                    quality: SharedQuality::ManaValue,
+                })
+            );
+        }
+
+        // Paired positives: each participle under a cost with exactly one
+        // slot-binding payment, of its own kind. Each differs from a
+        // same-kind decline above only in the number of such payments.
+        let unambiguous = [
+            (
+                "the discarded card",
+                cost_ctx(
+                    vec![vec![CostCategory::ManaOnly], vec![CostCategory::Discards]],
+                    None,
+                ),
+            ),
+            (
+                "the discarded card",
+                cost_ctx(vec![vec![CostCategory::Discards]], None),
+            ),
+            (
+                "the sacrificed creature",
+                cost_ctx(
+                    vec![
+                        vec![CostCategory::ManaOnly],
+                        vec![CostCategory::SacrificesPermanent],
+                    ],
+                    None,
+                ),
+            ),
+            (
+                "the exiled card",
+                cost_ctx(vec![vec![CostCategory::ExilesCards]], Some(Zone::Graveyard)),
+            ),
+            (
+                "the discarded card",
+                cost_ctx(
+                    vec![
+                        vec![CostCategory::TapsSelf],
+                        vec![CostCategory::PaysLife],
+                        vec![CostCategory::Discards],
+                    ],
+                    None,
+                ),
+            ),
+            // "Pay {3} or discard a card": the `OneOf`'s other branch pays
+            // only mana, so the discard is the one slot-binding payment.
+            (
+                "the discarded card",
+                cost_ctx(
+                    vec![vec![CostCategory::Discards], vec![CostCategory::ManaOnly]],
+                    None,
+                ),
+            ),
+            // "Sacrifice a creature or {R}, {T}": one sacrifice across the
+            // branches, the pair of `two_sacrifices_or_mana` above.
+            (
+                "the sacrificed creature",
+                cost_ctx(
+                    vec![
+                        vec![CostCategory::SacrificesPermanent],
+                        vec![CostCategory::ManaOnly],
+                        vec![CostCategory::TapsSelf],
+                    ],
+                    None,
+                ),
+            ),
+        ];
+        for (reference_text, ctx) in &unambiguous {
+            let text = rider(reference_text);
+            let (condition, body) = strip_same_quality_as_conditional(&text, ctx);
+            assert_eq!(body, "Counter target spell", "{text}");
+            assert_eq!(condition, claimed, "{text}");
+        }
+    }
+
+    /// CR 608.2k + CR 701.9a + CR 701.21a: "the discarded card" / "the
+    /// sacrificed creature" name the cost-paid object only when the enclosing
+    /// ability's cost discards / sacrifices. With a mana-only cost ("{2}{U}:
+    /// Discard a card, then counter target spell if …") the participle is an
+    /// effect's action and the rider is declined, text unchanged; a cost with
+    /// the other participle's category does not bind it either. The claimed
+    /// rows (the participle's own category in scope) are the reach guards for
+    /// the declines: the sentence and every other context field are identical.
+    #[test]
+    fn strip_same_quality_as_conditional_cost_participles_need_their_cost() {
+        for (reference_text, category, other_category) in [
+            (
+                "the discarded card",
+                CostCategory::Discards,
+                CostCategory::SacrificesPermanent,
+            ),
+            (
+                "the sacrificed creature",
+                CostCategory::SacrificesPermanent,
+                CostCategory::Discards,
+            ),
+        ] {
+            let text =
+                format!("Counter target spell if it has the same mana value as {reference_text}.");
+            let cost_ctx = |components: Vec<Vec<CostCategory>>| ParseContext {
+                current_ability_cost_components: components,
+                ..Default::default()
+            };
+
+            let (condition, body) = strip_same_quality_as_conditional(
+                &text,
+                &cost_ctx(vec![vec![CostCategory::ManaOnly], vec![category]]),
+            );
+            assert_eq!(body, "Counter target spell", "{text}");
+            assert_eq!(
+                condition,
+                Some(AbilityCondition::ObjectsShareQuality {
+                    subject: TargetFilter::ParentTarget,
+                    reference: TargetFilter::CostPaidObject,
+                    quality: SharedQuality::ManaValue,
+                }),
+                "{text}"
+            );
+
+            for declining_ctx in [
+                ParseContext::default(),
+                cost_ctx(vec![vec![CostCategory::ManaOnly]]),
+                cost_ctx(vec![vec![CostCategory::ManaOnly], vec![other_category]]),
+            ] {
+                let (condition, body) = strip_same_quality_as_conditional(&text, &declining_ctx);
+                assert_eq!(
+                    condition, None,
+                    "{text} under {:?}",
+                    declining_ctx.current_ability_cost_components
+                );
+                assert_eq!(body, text);
+            }
+        }
+    }
+
+    /// The stripper declines every shape outside the single-object class and
+    /// returns the text unchanged. Each decline is paired with a positive
+    /// sibling that differs only in the declined axis.
+    #[test]
+    fn strip_same_quality_as_conditional_declines_outside_the_class() {
+        let default_ctx = ParseContext::default();
+        // In a trigger even a discard category in scope does not make "the
+        // discarded card" a cost participle: `in_trigger` alone declines it.
+        let trigger_ctx = ParseContext {
+            in_trigger: true,
+            current_ability_cost_components: vec![vec![CostCategory::Discards]],
+            ..Default::default()
+        };
+        let declined: [(&str, &ParseContext); 6] = [
+            // Multi-valued quality: compared with "shares", not "has the same".
+            (
+                "Counter target spell if it has the same color as the revealed card.",
+                &default_ctx,
+            ),
+            // Existential reference (Retraced Image, verbatim).
+            (
+                "Reveal a card in your hand, then put that card onto the battlefield if it has the same name as a permanent.",
+                &default_ctx,
+            ),
+            // Jester's Scepter's effect (verbatim): "that card" is not owned.
+            (
+                "Counter target spell if it has the same name as that card.",
+                &default_ctx,
+            ),
+            // A triggered ability has no cost to have discarded a card for.
+            (
+                "Counter target spell if it has the same mana value as the discarded card.",
+                &trigger_ctx,
+            ),
+            // "exiled" is an effect participle without an exile cost.
+            (
+                "Counter target spell if it has the same mana value as the exiled card.",
+                &default_ctx,
+            ),
+            // No object for "it".
+            (
+                "Draw a card if it has the same name as the revealed card.",
+                &default_ctx,
+            ),
+        ];
+        for (text, ctx) in declined {
+            let (condition, body) = strip_same_quality_as_conditional(text, ctx);
+            assert_eq!(condition, None, "{text}");
+            assert_eq!(body, text, "{text}");
+        }
+
+        // Positive siblings (reach guards): the same predicate with "the
+        // revealed card" is claimed under both contexts, so each decline above
+        // is decided by its declined axis, not an upstream short-circuit.
+        for ctx in [&default_ctx, &trigger_ctx] {
+            for quality_text in ["name", "mana value"] {
+                let text = format!(
+                    "Counter target spell if it has the same {quality_text} as the revealed card."
+                );
+                let (condition, body) = strip_same_quality_as_conditional(&text, ctx);
+                assert!(
+                    matches!(
+                        condition,
+                        Some(AbilityCondition::ObjectsShareQuality {
+                            subject: TargetFilter::ParentTarget,
+                            reference: TargetFilter::LastRevealed,
+                            ..
+                        })
+                    ),
+                    "{text}: {condition:?}"
+                );
+                assert_eq!(body, "Counter target spell", "{text}");
+            }
+        }
+    }
+
     #[test]
     fn strip_superlative_target_conditional_plural_subject() {
         use crate::types::ability::{AggregateFunction, ObjectProperty};
@@ -11197,7 +12305,9 @@ mod tests {
         assert_eq!(
             condition,
             Some(AbilityCondition::ManaColorSpent {
-                color: ManaColor::Black,
+                color: SpentColor::ManaSymbol {
+                    color: ManaColor::Black
+                },
                 minimum: 1,
             })
         );
@@ -11211,13 +12321,54 @@ mod tests {
             panic!("expected And condition");
         };
         assert!(conditions.contains(&AbilityCondition::ManaColorSpent {
-            color: ManaColor::White,
+            color: SpentColor::ManaSymbol {
+                color: ManaColor::White
+            },
             minimum: 1,
         }));
         assert!(conditions.contains(&AbilityCondition::ManaColorSpent {
-            color: ManaColor::Black,
+            color: SpentColor::ManaSymbol {
+                color: ManaColor::Black
+            },
             minimum: 1,
         }));
+    }
+
+    /// CR 612.2 + CR 107.4: each emitter records how its color was written.
+    #[test]
+    fn mana_color_spent_emitters_record_word_versus_symbol() {
+        let symbol = |color| SpentColor::ManaSymbol { color };
+        let spent = |color, minimum| AbilityCondition::ManaColorSpent { color, minimum };
+
+        let (rest, parsed) =
+            parse_symbolic_mana_color_spent_condition("{g}{g} was spent to cast ~")
+                .expect("the symbolic parser accepts {G}{G}");
+        assert_eq!(rest, "");
+        assert_eq!(parsed, spent(symbol(ManaColor::Green), 2));
+
+        let (rest, parsed) =
+            parse_word_mana_color_spent_condition("at least three red mana was spent to cast ~")
+                .expect("the shadowed word parser accepts the Adamant phrasing");
+        assert_eq!(rest, "");
+        assert_eq!(
+            parsed,
+            spent(
+                SpentColor::ColorWord {
+                    color: ManaColor::Red
+                },
+                3
+            )
+        );
+
+        assert_eq!(
+            parse_condition_text("{G}{U} was spent to cast this spell"),
+            Some(AbilityCondition::And {
+                conditions: vec![
+                    spent(symbol(ManaColor::Green), 1),
+                    spent(symbol(ManaColor::Blue), 1),
+                ],
+            })
+        );
     }
 
     #[test]
@@ -13675,5 +14826,72 @@ mod tests {
             })
             .collect();
         assert_eq!(colors, ManaColor::ALL.to_vec());
+    }
+
+    /// CR 614.1c + CR 614.12 (V-L6): only a single-core-type, unqualified,
+    /// affirmative "if it's a <type>" gate converts to the entry-this-way gate.
+    #[test]
+    fn card_type_condition_as_entry_this_way_cases() {
+        let revealed = |card_types: Vec<CoreType>| AbilityCondition::RevealedHasCardType {
+            card_types,
+            additional_filter: None,
+            subtype_filter: None,
+        };
+        assert_eq!(
+            card_type_condition_as_entry_this_way(&revealed(vec![CoreType::Creature])),
+            Some(AbilityCondition::ZoneChangedThisWay {
+                filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
+                destination: Some(Zone::Battlefield),
+            })
+        );
+        assert_eq!(
+            card_type_condition_as_entry_this_way(&AbilityCondition::RevealedHasCardType {
+                card_types: vec![CoreType::Creature],
+                additional_filter: Some(FilterProp::Token),
+                subtype_filter: None,
+            }),
+            None
+        );
+        assert_eq!(
+            card_type_condition_as_entry_this_way(&AbilityCondition::RevealedHasCardType {
+                card_types: vec![CoreType::Creature],
+                additional_filter: None,
+                subtype_filter: Some(Box::new(TargetFilter::Typed(TypedFilter::new(
+                    TypeFilter::Subtype("Hero".to_string()),
+                )))),
+            }),
+            None
+        );
+        // CR 614.1c + CR 614.12: several types fold into an any-of entry gate.
+        assert_eq!(
+            card_type_condition_as_entry_this_way(&revealed(vec![
+                CoreType::Artifact,
+                CoreType::Creature
+            ])),
+            Some(AbilityCondition::ZoneChangedThisWay {
+                filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::AnyOf(vec![
+                    TypeFilter::Artifact,
+                    TypeFilter::Creature,
+                ]))),
+                destination: Some(Zone::Battlefield),
+            })
+        );
+        assert_eq!(
+            card_type_condition_as_entry_this_way(&revealed(vec![])),
+            None
+        );
+        assert_eq!(
+            card_type_condition_as_entry_this_way(&AbilityCondition::Not {
+                condition: Box::new(revealed(vec![CoreType::Creature])),
+            }),
+            None
+        );
+        assert_eq!(
+            card_type_condition_as_entry_this_way(&AbilityCondition::ZoneChangedThisWay {
+                filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
+                destination: Some(Zone::Battlefield),
+            }),
+            None
+        );
     }
 }

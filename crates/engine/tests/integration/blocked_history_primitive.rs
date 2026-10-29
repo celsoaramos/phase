@@ -12,6 +12,7 @@ use engine::game::combat::{AttackTarget, BlockHistoryPair};
 use engine::game::filter::{
     matches_target_filter, matches_target_filter_on_zone_change_record, FilterContext,
 };
+use engine::game::game_object::ObjectIncarnationRefExt;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
     CombatHistoryScope, CombatRelation, CombatRelationSubject, FilterProp, TargetFilter,
@@ -920,6 +921,7 @@ fn an_activated_ability_finds_its_stamped_incarnation_not_the_live_object() {
         .act(GameAction::ActivateAbility {
             source_id: blocker,
             ability_index: 0,
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         })
         .expect("activating the blocker's {0} ability must succeed");
 

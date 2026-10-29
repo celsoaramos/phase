@@ -7,8 +7,8 @@
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{alphanumeric1, space1};
-use nom::combinator::{map, not, opt, peek, value};
-use nom::sequence::{preceded, terminated};
+use nom::combinator::{map, not, opt, value};
+use nom::sequence::preceded;
 use nom::Parser;
 
 use super::error::OracleResult;
@@ -17,15 +17,18 @@ use super::primitives::{
 };
 use super::quantity::{parse_quantity_expr_number, parse_quantity_ref};
 use crate::types::ability::{
-    AggregateFunction, AttackerBlockStatus, Comparator, ControllerRef, FilterProp, ObjectProperty,
-    PtStat, PtValueScope, QuantityExpr, SourceExclusion,
+    AggregateFunction, Comparator, FilterProp, ObjectProperty, PtStat, PtValueScope, QuantityExpr,
+    SourceExclusion,
 };
 use crate::types::card_type::CoreType;
 #[cfg(test)]
 use crate::types::counter::CounterType;
 use crate::types::counter::{parse_counter_type, CounterMatch};
-use crate::types::mana::ManaColor;
 use crate::types::zones::Zone;
+
+pub use crate::types::text_grammar::{
+    parse_color_property, parse_property_filter, parse_zone_filter,
+};
 
 /// CR 201.2 + CR 201.2a: "not named <name>" — a NAME predicate, lowered to
 /// `Not(Named)`. It's never a self-exclusion (`Another`): a different object
@@ -60,30 +63,6 @@ pub(crate) fn parse_not_named_suffix(input: &str) -> OracleResult<'_, FilterProp
             }),
         },
     ))
-}
-/// Parse a zone filter phrase from Oracle text.
-///
-/// Matches "on the battlefield", "in your graveyard", "in your hand",
-/// "in exile", "in your library", and opponent-scoped variants.
-pub fn parse_zone_filter(input: &str) -> OracleResult<'_, Zone> {
-    alt((
-        value(Zone::Battlefield, tag("on the battlefield")),
-        value(Zone::Graveyard, tag("in your graveyard")),
-        value(Zone::Graveyard, tag("in a graveyard")),
-        value(Zone::Graveyard, tag("in their graveyard")),
-        value(Zone::Hand, tag("in your hand")),
-        value(Zone::Hand, tag("in a player's hand")),
-        value(Zone::Hand, tag("from your hand")),
-        value(Zone::Exile, tag("in exile")),
-        value(Zone::Exile, tag("from exile")),
-        value(Zone::Library, tag("in your library")),
-        value(Zone::Library, tag("from your library")),
-        value(Zone::Stack, tag("on the stack")),
-        value(Zone::Graveyard, tag("from your graveyard")),
-        value(Zone::Graveyard, tag("from a graveyard")),
-        value(Zone::Library, tag("of your library")),
-    ))
-    .parse(input)
 }
 
 /// Parse an origin-zone qualifier for ChangesZone triggers — the "from <zone>"
@@ -130,113 +109,71 @@ pub fn parse_zone_word(input: &str) -> OracleResult<'_, Zone> {
     .parse(input)
 }
 
-/// Parse a zone owner/controller qualifier following a zone filter.
-///
-/// Matches "you control", "an opponent controls", "your opponents control",
-/// "you don't control", "target player controls", "defending player controls".
-pub fn parse_zone_controller(input: &str) -> OracleResult<'_, ControllerRef> {
-    alt((
-        value(ControllerRef::You, tag("you control")),
-        value(ControllerRef::Opponent, tag("an opponent controls")),
-        value(ControllerRef::Opponent, tag("your opponents control")),
-        value(ControllerRef::Opponent, tag("you don't control")),
-        // CR 109.4 + CR 115.1: "target player controls" — the filter controller
-        // is the player chosen as a target of the enclosing ability. The
-        // consumer must surface a companion TargetFilter::Player target slot
-        // (see `collect_target_slots` in `game/ability_utils.rs`) so the player
-        // is selected as part of target declaration.
-        value(ControllerRef::TargetPlayer, tag("target player controls")),
-        // CR 109.4 + CR 102.2 / CR 102.3: "target opponent controls" — filter
-        // controller is the opponent chosen as a target. Consumer surfaces an
-        // opponent-only companion slot (see `companion_target_player_legal_targets`
-        // in `game/ability_utils.rs`). Runtime read identical to TargetPlayer.
-        value(
-            ControllerRef::TargetOpponent,
-            tag("target opponent controls"),
-        ),
-        // CR 508.5 / CR 508.5a: "defending player controls" — the controller
-        // scope is the defending player (or that player's planeswalker
-        // controller / battle protector) the attacking creature is attacking.
-        // Resolved per attacker at runtime by
-        // `combat::defending_player_for_attacker`. Shares no prefix with the
-        // arms above, so dispatch order is not load-bearing.
-        value(
-            ControllerRef::DefendingPlayer,
-            tag("defending player controls"),
-        ),
-        // CR 303.4b + CR 702.5a: "enchanted player controls" — the controller
-        // scope is the player the source Aura is attached to. Resolved at
-        // runtime by reading `source.attached_to.as_player()`. Powers the
-        // Curse cycle (Trespasser's Curse, Curse of Clinging Webs, etc.).
-        value(
-            ControllerRef::EnchantedPlayer,
-            tag("enchanted player controls"),
-        ),
-        // CR 102.1: "the active player controls" — the turn player. Shares no
-        // prefix with the arms above, so dispatch order is not load-bearing.
-        value(
-            ControllerRef::ActivePlayer,
-            tag("the active player controls"),
-        ),
-    ))
-    .parse(input)
-}
-
-/// Parse a property filter from Oracle text.
-///
-/// Matches object property keywords: "tapped", "untapped", "attacking",
-/// "blocking", "token", "face down", "nontoken", "enchanted", "equipped".
-pub fn parse_property_filter(input: &str) -> OracleResult<'_, FilterProp> {
-    alt((
-        value(FilterProp::Tapped, tag("tapped")),
-        value(FilterProp::Untapped, tag("untapped")),
-        // CR 702.171b: "saddled Mount/creature" selector.
-        value(FilterProp::IsSaddled, tag("saddled")),
-        value(FilterProp::Attacking { defender: None }, tag("attacking")),
-        value(FilterProp::Blocking, tag("blocking")),
-        value(FilterProp::Token, tag("token")),
-        value(FilterProp::NonToken, tag("nontoken")),
-        value(FilterProp::FaceDown, tag("face down")),
-        // CR 701.27g: "transformed permanent"/"transformed creature" selector.
-        value(FilterProp::Transformed, tag("transformed")),
-        value(
-            FilterProp::BlockStatus {
-                status: AttackerBlockStatus::Unblocked,
-            },
-            tag("unblocked"),
-        ),
-        // CR 509.1h: "blocked" as a prefix adjective; postfix "blocked by"/"blocked this
-        // turn" are handled elsewhere and must not be consumed here.
-        value(
-            FilterProp::BlockStatus {
-                status: AttackerBlockStatus::Blocked,
-            },
-            terminated(
-                tag("blocked"),
-                peek(preceded(tag(" "), not(alt((tag("by"), tag("this turn")))))),
-            ),
-        ),
-        value(FilterProp::Suspected, tag("suspected")),
-        value(FilterProp::Renowned, tag("renowned")),
-        // CR 701.15b/c: standalone "goaded" designation property token.
-        value(FilterProp::Goaded, tag("goaded")),
-        value(FilterProp::EnchantedBy, tag("enchanted")),
-        value(FilterProp::EquippedBy, tag("equipped")),
-        parse_color_property,
-        value(
-            FilterProp::EnteredThisTurn,
-            tag("entered the battlefield this turn"),
-        ),
-    ))
-    .parse(input)
-}
-
 /// Parse a "with [property]" clause from Oracle text.
 ///
 /// Matches "with flying", "with power 3 or greater", "with a +1/+1 counter",
 /// "with defender", etc. Returns the FilterProp extracted from the clause.
 pub fn parse_with_property(input: &str) -> OracleResult<'_, FilterProp> {
     preceded((tag("with"), space1), parse_with_inner).parse(input)
+}
+
+/// Parse one "with <property>" clause into the conjoined `FilterProp`s it
+/// denotes. Most clauses denote a single property (delegates to
+/// [`parse_with_property`]); the base-P/T designation "with base power and
+/// toughness N/M" denotes two (CR 208.4b), so callers that accumulate a
+/// property list use this entry and `extend` with the result.
+pub fn parse_with_properties(input: &str) -> OracleResult<'_, Vec<FilterProp>> {
+    alt((
+        map(parse_with_base_pt_designation, Vec::from),
+        map(parse_with_property, |prop| vec![prop]),
+    ))
+    .parse(input)
+}
+
+/// "with base power and toughness N/M" — see [`parse_base_pt_designation`].
+pub fn parse_with_base_pt_designation(input: &str) -> OracleResult<'_, [FilterProp; 2]> {
+    preceded((tag("with"), space1), parse_base_pt_designation).parse(input)
+}
+
+/// CR 208.4 + CR 208.4b: "base power and toughness N/M" used as an OBJECT FILTER
+/// ("a creature you control with base power and toughness 2/2" — Duskana, the
+/// Rage Mother; "other creatures you control with base power and toughness 1/1"
+/// — Bess, Soul Nourisher; "tapped creatures you control with base power and
+/// toughness 4/3" — Andrios, Roaming Explorer). Per CR 208.4b the check sees the
+/// creature's P/T after characteristic-defining abilities (CR 613.4a) and
+/// setting effects (CR 613.4b) but ignores counters and modifying effects
+/// (CR 613.4c) — i.e. `PtValueScope::Base`.
+///
+/// Lowers to two exact base-scope comparisons, one per characteristic — the same
+/// two-prop conjunction the leading "N/M creature" designation emits for current
+/// P/T (`oracle_target::parse_leading_pt_designation`). The enclosing
+/// `TypedFilter.properties` list conjoins them, so no conjunction variant exists.
+///
+/// This is the FILTER form only. The P/T-SETTING form ("becomes/is a <type> with
+/// base power and toughness N/M") is owned by the animation and type-change
+/// parsers, which split on that phrase before any type phrase sees it. Distinct
+/// from [`parse_pt_comparison`]: a designation has no comparator tail and
+/// denotes two props.
+fn parse_base_pt_designation(input: &str) -> OracleResult<'_, [FilterProp; 2]> {
+    let (input, _) = tag("base power and toughness ").parse(input)?;
+    let (input, power) = parse_quantity_expr_number(input)?;
+    let (input, _) = tag("/").parse(input)?;
+    let (input, toughness) = parse_quantity_expr_number(input)?;
+    // Word boundary: "2/2s" or any alphanumeric continuation is not a designation.
+    let (input, _) = not(alphanumeric1).parse(input)?;
+    let exact_base = |stat, value| FilterProp::PtComparison {
+        stat,
+        scope: PtValueScope::Base,
+        comparator: Comparator::EQ,
+        value,
+    };
+    Ok((
+        input,
+        [
+            exact_base(PtStat::Power, power),
+            exact_base(PtStat::Toughness, toughness),
+        ],
+    ))
 }
 
 /// CR 113.1 + CR 113.3: an object with none of the four ability categories
@@ -285,6 +222,9 @@ fn parse_with_inner(input: &str) -> OracleResult<'_, FilterProp> {
 /// - comparison tail: either the postfix `N or less` / `N or greater` form, or
 ///   the infix `less than [or equal to] N` / `greater than [or equal to] N`
 ///   form (resolving to LE/GE with an `Offset` for strict `<`/`>`).
+///
+/// The conjunctive designation "base power and toughness N/M" is not a
+/// comparison and is parsed by [`parse_base_pt_designation`].
 pub fn parse_pt_comparison(input: &str) -> OracleResult<'_, FilterProp> {
     // Optional distributive "each " qualifier (no semantic effect).
     let (input, _) = opt(tag("each ")).parse(input)?;
@@ -506,51 +446,6 @@ fn parse_with_counter_property(input: &str) -> OracleResult<'_, FilterProp> {
             count: QuantityExpr::Fixed { value: 1 },
         },
     ))
-}
-
-/// Parse a color-as-property from Oracle text: "white", "blue", "black", "red", "green",
-/// "colorless", "monocolored", "multicolored".
-/// Returns a `FilterProp` for the color match.
-pub fn parse_color_property(input: &str) -> OracleResult<'_, FilterProp> {
-    alt((
-        map(tag("white"), |_| FilterProp::HasColor {
-            color: ManaColor::White,
-        }),
-        map(tag("blue"), |_| FilterProp::HasColor {
-            color: ManaColor::Blue,
-        }),
-        map(tag("black"), |_| FilterProp::HasColor {
-            color: ManaColor::Black,
-        }),
-        map(tag("red"), |_| FilterProp::HasColor {
-            color: ManaColor::Red,
-        }),
-        map(tag("green"), |_| FilterProp::HasColor {
-            color: ManaColor::Green,
-        }),
-        value(
-            FilterProp::ColorCount {
-                comparator: Comparator::EQ,
-                count: 0,
-            },
-            tag("colorless"),
-        ),
-        value(
-            FilterProp::ColorCount {
-                comparator: Comparator::EQ,
-                count: 1,
-            },
-            tag("monocolored"),
-        ),
-        value(
-            FilterProp::ColorCount {
-                comparator: Comparator::GE,
-                count: 2,
-            },
-            tag("multicolored"),
-        ),
-    ))
-    .parse(input)
 }
 
 /// CR 105.4: the trailing "of the color of your choice" object-filter
@@ -775,6 +670,7 @@ pub fn parse_controlled_permanents_conjunct(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::mana::ManaColor;
 
     /// CR 614.1a + CR 109.1: the single authority must cover every plural noun
     /// BOTH former copies knew, and must carry the "other" article rather than
@@ -1102,6 +998,102 @@ mod tests {
         );
     }
 
+    /// The two exact base-scope props a "base power and toughness N/M"
+    /// designation lowers to (CR 208.4b).
+    fn exact_base_pt(power: QuantityExpr, toughness: QuantityExpr) -> [FilterProp; 2] {
+        [
+            FilterProp::PtComparison {
+                stat: PtStat::Power,
+                scope: PtValueScope::Base,
+                comparator: Comparator::EQ,
+                value: power,
+            },
+            FilterProp::PtComparison {
+                stat: PtStat::Toughness,
+                scope: PtValueScope::Base,
+                comparator: Comparator::EQ,
+                value: toughness,
+            },
+        ]
+    }
+
+    /// CR 208.4b: the base-P/T designation lowers to one exact base-scope prop
+    /// per characteristic, for symmetric (Duskana 2/2) and asymmetric
+    /// (Andrios 4/3) values, and leaves the following predicate unconsumed.
+    #[test]
+    fn parse_base_pt_designation_symmetric_and_asymmetric() {
+        let (rest, props) = parse_base_pt_designation("base power and toughness 2/2").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            props,
+            exact_base_pt(
+                QuantityExpr::Fixed { value: 2 },
+                QuantityExpr::Fixed { value: 2 }
+            )
+        );
+
+        let (rest, props) = parse_with_base_pt_designation(
+            "with base power and toughness 4/3 have base power and toughness 16/9",
+        )
+        .unwrap();
+        assert_eq!(rest, " have base power and toughness 16/9");
+        assert_eq!(
+            props,
+            exact_base_pt(
+                QuantityExpr::Fixed { value: 4 },
+                QuantityExpr::Fixed { value: 3 }
+            )
+        );
+    }
+
+    /// CR 107.3: an X designation keeps X as a variable on both stats.
+    #[test]
+    fn parse_base_pt_designation_x() {
+        let x = || QuantityExpr::Ref {
+            qty: crate::types::ability::QuantityRef::Variable {
+                name: "X".to_string(),
+            },
+        };
+        let (rest, props) = parse_base_pt_designation("base power and toughness x/x").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(props, exact_base_pt(x(), x()));
+    }
+
+    /// The designation must not swallow the P/T-setting "each equal to" form,
+    /// an alphanumeric continuation, or the single-stat comparison.
+    #[test]
+    fn parse_base_pt_designation_rejects_non_designations() {
+        // Positive reach-guard: the well-formed designation parses.
+        assert!(parse_base_pt_designation("base power and toughness 1/1").is_ok());
+
+        assert!(parse_base_pt_designation(
+            "base power and toughness each equal to the number of creatures you control"
+        )
+        .is_err());
+        assert!(parse_base_pt_designation("base power and toughness 2/2s").is_err());
+        assert!(parse_with_base_pt_designation("with base power 2").is_err());
+    }
+
+    /// `parse_with_properties` returns both props for the designation and the
+    /// single existing prop for every other "with" clause.
+    #[test]
+    fn parse_with_properties_arity() {
+        let (rest, props) = parse_with_properties("with base power and toughness 1/1").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            props,
+            Vec::from(exact_base_pt(
+                QuantityExpr::Fixed { value: 1 },
+                QuantityExpr::Fixed { value: 1 }
+            ))
+        );
+
+        let (rest, props) = parse_with_properties("with base power 1").unwrap();
+        assert_eq!(rest, "");
+        let (_, single) = parse_with_property("with base power 1").unwrap();
+        assert_eq!(props, vec![single]);
+    }
+
     #[test]
     fn test_parse_pt_comparison_each_with_qualifier() {
         // The distributive "each with" qualifier is consumed; the emitted prop
@@ -1290,33 +1282,6 @@ mod tests {
             }
             _ => panic!("expected Counters"),
         }
-    }
-
-    #[test]
-    fn test_parse_zone_controller() {
-        let (rest, c) = parse_zone_controller("you control forever").unwrap();
-        assert_eq!(c, ControllerRef::You);
-        assert_eq!(rest, " forever");
-
-        let (rest2, c2) = parse_zone_controller("you don't control").unwrap();
-        assert_eq!(c2, ControllerRef::Opponent);
-        assert_eq!(rest2, "");
-    }
-
-    // CR 508.5 / CR 508.5a: "defending player controls" scopes the filter
-    // controller to the defending player for attack-trigger targets (Kogla,
-    // The Tarrasque, ~42 cards). Class-level combinator behavior, not one card.
-    #[test]
-    fn test_parse_zone_controller_defending_player() {
-        let (rest, c) = parse_zone_controller("defending player controls").unwrap();
-        assert_eq!(c, ControllerRef::DefendingPlayer);
-        assert_eq!(rest, "");
-
-        // Remainder preservation: the new arm consumes only the qualifier and
-        // does not over-consume trailing text.
-        let (rest2, c2) = parse_zone_controller("defending player controls and ").unwrap();
-        assert_eq!(c2, ControllerRef::DefendingPlayer);
-        assert_eq!(rest2, " and ");
     }
 
     #[test]
