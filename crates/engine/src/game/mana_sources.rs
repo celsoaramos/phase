@@ -668,6 +668,10 @@ fn manual_selection_for_option(
         // inert while `output` is deferred and canonicalizes all planner rows.
         selection.mana_type = ManaType::Colorless;
         selection.output = ManaSourceOutput::DeferredColorChoice { quantity };
+        // An "N mana of any one color" row carries `[color; N]` as its
+        // combination (`emit_source_rows`); the deferred choice names no color,
+        // so drop it too or each color row stays a distinct selection.
+        selection.atomic_combination = None;
     }
     Some(selection)
 }
