@@ -1097,6 +1097,20 @@ impl<'a> ClientGameStateRef<'a> {
         Self::from_projection(state, Cow::Owned(projection), viewer)
     }
 
+    /// [`Self::wrap`] for a seated viewer with an explicit hand-disclosure
+    /// choice (the local "Show AI Hand" toggle). The engine decides whether the
+    /// viewer may receive it; an unauthorized request yields the rules projection.
+    pub fn wrap_with_hand_disclosure(
+        state: &'a GameState,
+        viewer: PlayerId,
+        disclosure: crate::game::visibility::HandDisclosure,
+    ) -> Self {
+        let projection = crate::game::visibility::filter_state_for_viewer_with_hand_disclosure(
+            state, viewer, disclosure,
+        );
+        Self::from_projection(state, Cow::Owned(projection), Some(viewer))
+    }
+
     /// Wrap a viewer-filtered state while deriving rules-authoritative fields
     /// from the pre-filter state. Filtering may redact control/session records;
     /// it must not change who can submit the current decision.
@@ -2203,7 +2217,7 @@ fn debug_library_cards(state: &GameState, viewer: Option<PlayerId>) -> Vec<Debug
     let Some(viewer) = viewer else {
         return Vec::new();
     };
-    if !state.debug_mode || !state.debug_permitted.contains(&viewer) {
+    if !crate::game::visibility::viewer_has_debug_identity_access(state, viewer) {
         return Vec::new();
     }
     let mut cards = state
@@ -3071,6 +3085,7 @@ fn zone_label(zone: Option<Zone>) -> &'static str {
 mod tests {
     use super::*;
     use crate::game::combat::CombatState;
+    use crate::game::game_object::ObjectIncarnationRefExt;
     use crate::game::triggers::{PendingTrigger, PendingTriggerContext};
     use crate::game::zones::create_object;
     use crate::types::ability::{
@@ -5197,6 +5212,7 @@ mod tests {
             .act(GameAction::ActivateAbility {
                 source_id: source,
                 ability_index: second,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             })
             .expect("activate the second ability");
 
@@ -5569,6 +5585,7 @@ mod tests {
                 recorded_turn_number: 0,
                 is_suspected: false,
                 was_prepared: false,
+                departure: crate::types::game_state::ZoneDeparture::Moved,
             }),
         };
         let ability = ResolvedAbility::new(
@@ -8275,6 +8292,7 @@ mod tests {
             ability_cost: None,
             activation_cost_snapshot: None,
             unavailable_modes: Vec::new(),
+            activation_payment_mode: crate::types::game_state::CastPaymentMode::Auto,
         };
 
         let trusted = serde_json::to_value(&state).expect("serialize trusted state");
