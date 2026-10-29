@@ -1008,6 +1008,12 @@ fn filterprop_reads_only_candidate_fp(p: &FilterProp) -> bool {
         | FilterProp::AttachedTo { to: AttachmentReferent::Player { .. } }
         // CR 601.2c: reads the declared target slot's object — another object by id.
         | FilterProp::AttachedTo { to: AttachmentReferent::DeclaredTarget { .. } }
+        // CR 701.3a + CR 603.7c: the filter-matched host axis resolves a live
+        // host SET (the resolving chain's targets, the creation snapshot, or the
+        // trigger event) — not the candidate fingerprint.
+        | FilterProp::AttachedTo {
+            to: AttachmentReferent::Host { .. },
+        }
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::HasKeywordKind { .. }
@@ -1540,6 +1546,7 @@ fn legality_equivalence_key(
 mod tests {
     use super::*;
     use crate::ai_support::{candidate_actions, structurally_valid_named_choice_answer as hatch};
+    use crate::game::game_object::ObjectIncarnationRefExt;
     use crate::game::layers::evaluate_layers;
     use crate::game::scenario::GameScenario;
     use crate::types::game_state::{ActivationTargetSelection, TransientContinuousEffectBindings};
