@@ -10972,7 +10972,7 @@ pub(crate) fn instruction_object_reach(effect: &Effect) -> InstructionObjectReac
             target,
             cant_regenerate: _,
         }
-        | Effect::Regenerate { target }
+        | Effect::Regenerate { target, scope: _ }
         | Effect::RemoveAllDamage { target }
         | Effect::TargetOnly { target }
         | Effect::GainControl { target }
