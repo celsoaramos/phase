@@ -29703,14 +29703,19 @@ fn lower_subject_predicate_ast_body(
             if let Some(wrapped) = wrap_target_subject_damage(clause.clone(), &subject) {
                 return wrapped;
             }
-            // CR 608.2c + CR 109.4 + CR 701.16a + CR 701.53a: Investigate and
-            // Incubate have no player slot for `inject_subject_target` to stamp
-            // the subject onto. An explicit non-caster subject ("That player
-            // investigates" / "Its controller incubates") must therefore become
-            // a pending `player_scope`, so the effect-chain loop resolves the
-            // fieldless effect as the anchored player. A bare predicate retains
-            // `affected == SelfRef`/`Controller` and the caster default.
-            if matches!(clause.effect, Effect::Investigate | Effect::Incubate { .. }) {
+            // CR 608.2c + CR 109.4 + CR 701.16a + CR 701.53a + CR 701.62a:
+            // Investigate, Incubate and Manifest Dread have no player slot for
+            // `inject_subject_target` to stamp the subject onto. An explicit
+            // non-caster subject ("That player investigates" / "Its controller
+            // incubates" / Unwanted Remake's "Its controller manifests dread")
+            // must therefore become a pending `player_scope`, so the effect-chain
+            // loop resolves the fieldless effect as the anchored player. A bare
+            // predicate retains `affected == SelfRef`/`Controller` and the
+            // caster default.
+            if matches!(
+                clause.effect,
+                Effect::Investigate | Effect::Incubate { .. } | Effect::ManifestDread
+            ) {
                 if let Some(scope) = player_scope_from_parent_target_subject(&affected) {
                     ctx.pending_player_scope = Some(scope);
                 }
