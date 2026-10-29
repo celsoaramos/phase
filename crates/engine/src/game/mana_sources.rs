@@ -3529,6 +3529,29 @@ fn emit_source_rows(
         {
             Vec::new()
         }
+        // CR 106.1 + CR 605.3b: "Add N mana of any one color" (New Horizons'
+        // granted "{T}: Add two mana of any one color", Gilded Lotus' three)
+        // yields N units of the ONE chosen color in a single activation. Each
+        // color row carries the whole output as its atomic combination, as the
+        // fixed multi-mana arm above does; a bare row reads as ONE unit, and the
+        // planner then declared a two-mana spell unpayable from that land alone.
+        ManaProduction::AnyOneColor { .. }
+        | ManaProduction::AnyOneColorAmongPermanents { .. }
+        | ManaProduction::OpponentLandColors { .. }
+        | ManaProduction::AnyTypeProduceableBy { .. }
+        | ManaProduction::AnyInCommandersColorIdentity { .. } => {
+            let resolved =
+                super::ability_utils::build_resolved_from_def(ability, object_id, controller);
+            let count = resolved_production_count(produced, state, &resolved) as usize;
+            mana_options_from_production(state, controller, object_id, produced)
+                .into_iter()
+                .map(|mana_type| SourceRow {
+                    mana_type,
+                    atomic_combination: (count > 1).then(|| vec![mana_type; count]),
+                    restrictions: concrete_restrictions.clone(),
+                })
+                .collect()
+        }
         _ => mana_options_from_production(state, controller, object_id, produced)
             .into_iter()
             .map(|mana_type| SourceRow {

@@ -15811,10 +15811,25 @@ pub(crate) fn production_override_for_option(
     // portion so the land's ability does not over-produce — the aura bonus is
     // resolved separately via `state.pending_taps_for_mana_overrides`.
     let aura_count = option.taps_for_mana_overrides.len();
+    // CR 106.1: an "N mana of any one color" row carries N copies of its color
+    // as the combination (`emit_source_rows`), but the ability still asks for
+    // ONE color choice — it is dispatched below as `SingleColor`, never as a
+    // filter-land `Combination`.
+    let one_color_choice = matches!(
+        &*ability_def.effect,
+        Effect::Mana {
+            produced: crate::types::ability::ManaProduction::AnyOneColor { .. }
+                | crate::types::ability::ManaProduction::AnyOneColorAmongPermanents { .. }
+                | crate::types::ability::ManaProduction::OpponentLandColors { .. }
+                | crate::types::ability::ManaProduction::AnyTypeProduceableBy { .. }
+                | crate::types::ability::ManaProduction::AnyInCommandersColorIdentity { .. },
+            ..
+        }
+    );
     if let Some(combo) = option.atomic_combination.as_ref() {
         let land_end = combo.len().saturating_sub(aura_count);
         let land_combo = &combo[..land_end];
-        if land_combo.len() > 1 {
+        if land_combo.len() > 1 && !one_color_choice {
             return Some(crate::types::game_state::ProductionOverride::Combination(
                 land_combo.to_vec(),
             ));

@@ -1102,6 +1102,7 @@ mod json_smoke_test;
 mod judgment_bolt_where_x_damage_runtime;
 mod kaho_minamo_historian_linked_exile;
 mod kaito_integration;
+mod kalamax_skycycle_new_horizons_1028;
 mod kamigawa_flip_cards;
 mod karazikar_attack_scope_7189;
 mod kashi_tribe_damage_tap_freeze;

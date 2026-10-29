@@ -295,7 +295,26 @@ pub fn resolve(
         let owned =
             crate::game::announcement_triggers::take_inline_trigger_span(state, events, copied_at);
         if !owned.is_empty() {
-            crate::game::triggers::collect_triggers_into_deferred(state, &[spell_copied]);
+            crate::game::triggers::collect_triggers_into_deferred(
+                state,
+                std::slice::from_ref(&spell_copied),
+            );
+            // CR 603.2c: this occurrence was collected here; claim it so the
+            // post-action scan does not collect it a second time. Without the
+            // claim, a copy made mid-resolution with no retarget pause (Zada,
+            // Hedron Grinder's per-creature copies) fired every copy observer
+            // twice — Kalamax, the Stormsire got two counters per copy.
+            let occurrence = events[..copied_at]
+                .iter()
+                .filter(|event| **event == spell_copied)
+                .count();
+            state.consumed_before_priority_trigger_events.push(
+                crate::game::triggers::ConsumedTriggerEventOccurrence {
+                    event: spell_copied,
+                    occurrence,
+                    scope: crate::game::triggers::ConsumedTriggerEventScope::OrdinaryCollectorsOnly,
+                },
+            );
         }
     }
 

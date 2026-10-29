@@ -8925,12 +8925,30 @@ fn strip_bounded_targets_placeholder(text: &str) -> Option<(&str, MultiTargetSpe
 
 /// CR 115.1d: "one or two target X" / "one, two, or three target X" before a
 /// targeted phrase (Electrolyze: "among one or two target creatures and/or
-/// players").
+/// players"). The count may also precede "other target" / "another target"
+/// (Cloudspire Skycycle: "among one or two other target Vehicles and/or
+/// creatures you control"); only the count is consumed there, so the
+/// `other`/`another` exclusion still reaches `parse_target`. Without that arm
+/// the cardinality was lost and the announced targets no longer matched the
+/// distribution (CR 601.2d: each chosen target gets at least one).
 fn strip_bounded_target_prefix(text: &str) -> Option<(&str, MultiTargetSpec)> {
     let lower = text.to_ascii_lowercase();
     for &(stem, min, max) in BOUNDED_TARGET_CARDINALITIES {
         if let Ok((rest, _)) =
             (tag::<_, _, OracleError<'_>>(stem), tag(" target ")).parse(lower.as_str())
+        {
+            let consumed = lower.len() - rest.len();
+            return Some((
+                text[consumed..].trim_start(),
+                MultiTargetSpec::fixed(min, max),
+            ));
+        }
+        if let Ok((rest, _)) = (
+            tag::<_, _, OracleError<'_>>(stem),
+            tag(" "),
+            peek(alt((tag("other target "), tag("another target ")))),
+        )
+            .parse(lower.as_str())
         {
             let consumed = lower.len() - rest.len();
             return Some((
