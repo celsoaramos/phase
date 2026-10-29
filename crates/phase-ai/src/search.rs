@@ -14,6 +14,8 @@ use engine::ai_support::{
     retarget_actions, root_may_yield_adverse_exchange, targeted_exchange_verdict,
     validated_candidate_actions_for_semantic_owner, AiDecisionContract, TargetedExchangeVerdict,
 };
+use engine::game::cost_payability::AbilityCostPayability;
+use engine::game::game_object::ObjectIncarnationRefExt;
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, ContinuousModification, Duration, Effect, ResolvedAbility,
     StaticDefinition, TargetFilter, TargetRef,
@@ -93,7 +95,7 @@ fn first_serum_powder_in_hand(
 /// turn (e.g. 10 counters → 10 pings). None of the registered duel-suite
 /// decks contain such cards; if one is added, revisit this cap or replace
 /// it with structural "source-state-unchanged" detection.
-const MAX_ACTIVATIONS_PER_SOURCE_PER_TURN: u32 = 4;
+pub(crate) const MAX_ACTIVATIONS_PER_SOURCE_PER_TURN: u32 = 4;
 
 /// CR 117.1 + Whitemane Lion loop mitigation (issue #563): AI safety cap on
 /// the number of times the same card can be CAST in a single turn by the AI.
@@ -257,7 +259,8 @@ pub fn choose_action(
     rng: &mut impl Rng,
 ) -> Option<GameAction> {
     let session = AiSession::arc_from_game(state);
-    choose_action_with_session_inner(state, ai_player, config, rng, &session, false, false).action
+    let contract = issue_chooser_contract(state, ai_player);
+    choose_action_with_session_inner(state, config, rng, &session, &contract, false, false).action
 }
 
 /// Choose the best action using a caller-owned per-game session cache.
@@ -268,19 +271,53 @@ pub fn choose_action_with_session(
     rng: &mut impl Rng,
     session: &Arc<AiSession>,
 ) -> Option<GameAction> {
-    choose_action_with_session_inner(state, ai_player, config, rng, session, true, false).action
+    let contract = issue_chooser_contract(state, ai_player);
+    choose_action_with_session_inner(state, config, rng, session, &contract, true, false).action
 }
 
-/// Select once using the canonical chooser and retain an optional, read-only
-/// receipt of that same choice for the local WASM authority.
-pub fn choose_action_with_session_diagnostic(
+/// [`choose_action_with_session`] for a caller that already holds the decision
+/// contract issued for this exact state, as the AI action driver does to
+/// validate the chosen action. The candidate domain is then enumerated once per
+/// decision rather than once by the caller and again by the chooser. The seat
+/// deciding is the contract's semantic owner.
+pub fn choose_action_with_issued_contract(
     state: &GameState,
-    ai_player: PlayerId,
     config: &AiConfig,
     rng: &mut impl Rng,
     session: &Arc<AiSession>,
+    contract: &AiDecisionContract,
+) -> Option<GameAction> {
+    debug_assert_eq!(
+        contract.state_revision, state.state_revision,
+        "the decision contract must be issued for the state being decided"
+    );
+    choose_action_with_session_inner(state, config, rng, session, contract, true, false).action
+}
+
+/// Select once using the canonical chooser, from the decision contract the
+/// caller issued for this exact state, and retain an optional, read-only
+/// receipt of that same choice for the local WASM authority. The seat deciding
+/// is the contract's semantic owner.
+pub fn choose_action_with_session_diagnostic(
+    state: &GameState,
+    config: &AiConfig,
+    rng: &mut impl Rng,
+    session: &Arc<AiSession>,
+    contract: &AiDecisionContract,
 ) -> AiDecisionSelection {
-    choose_action_with_session_inner(state, ai_player, config, rng, session, true, true)
+    debug_assert_eq!(
+        contract.state_revision, state.state_revision,
+        "the decision contract must be issued for the state being decided"
+    );
+    choose_action_with_session_inner(state, config, rng, session, contract, true, true)
+}
+
+/// The decision contract for an entry point whose caller supplied none. Split
+/// out so tests can witness how often the chooser issues one itself.
+fn issue_chooser_contract(state: &GameState, ai_player: PlayerId) -> AiDecisionContract {
+    #[cfg(test)]
+    CHOOSER_CONTRACT_ISSUES.with(|count| count.set(count.get() + 1));
+    AiDecisionContract::issue(state, ai_player)
 }
 
 #[derive(Clone, Debug)]
@@ -289,27 +326,28 @@ pub struct AiDecisionSelection {
     pub receipt: Option<crate::decision_receipt::AiDecisionDiagnosticReceipt>,
 }
 
-/// The one decision routine behind every `choose_action*` entry point: issue
-/// the engine's decision contract for `ai_player`, answer the prompts that need
-/// no search directly, and otherwise score the issued candidates and pick one.
-/// The contract issued here and the outcome of the priority shortcut are handed
-/// to the scorer so it does not derive them a second time for the same state.
+/// The one decision routine behind every `choose_action*` entry point: given
+/// the engine's decision contract issued for this state, answer the prompts
+/// that need no search directly for the contract's semantic owner, and
+/// otherwise score the issued candidates and pick one. The contract and the
+/// outcome of the priority shortcut are handed to the scorer so it does not
+/// derive them a second time for the same state.
 fn choose_action_with_session_inner(
     state: &GameState,
-    ai_player: PlayerId,
     config: &AiConfig,
     rng: &mut impl Rng,
     session: &Arc<AiSession>,
+    contract: &AiDecisionContract,
     durable_pact_routes: bool,
     diagnostics: bool,
 ) -> AiDecisionSelection {
-    let contract = AiDecisionContract::issue(state, ai_player);
+    let ai_player = contract.semantic_owner;
     let direct = |action: Option<GameAction>| AiDecisionSelection {
         receipt: diagnostics
             .then(|| {
-                action.as_ref().map(|action| {
-                    crate::decision_receipt::direct_receipt(&contract, action.clone())
-                })
+                action
+                    .as_ref()
+                    .map(|action| crate::decision_receipt::direct_receipt(contract, action.clone()))
             })
             .flatten(),
         action,
@@ -393,7 +431,7 @@ fn choose_action_with_session_inner(
             issued_domain()
                 .into_iter()
                 .find(|action| matches!(action, GameAction::ChooseTarget { .. }))
-                .or_else(|| fallback_action(state, config, &contract))
+                .or_else(|| fallback_action(state, config, contract))
                 .and_then(&bind_specialist),
         );
     }
@@ -512,17 +550,28 @@ fn choose_action_with_session_inner(
     // Answer its finite engine-issued consent domain directly so tactical
     // scoring cannot randomly select Decline when Grant is available.
     if matches!(state.waiting_for, WaitingFor::ResolveAllConsent { .. }) {
-        return direct(fallback_action(state, config, &contract).and_then(&bind_specialist));
+        return direct(fallback_action(state, config, contract).and_then(&bind_specialist));
     }
 
-    let fast_priority = fast_priority_action(state, ai_player, config, session);
-    // Only an absent shortcut is reusable: a present one may be filtered out or
-    // followed by session writes below, so the scorer recomputes it.
-    let priority_shortcut = match &fast_priority {
+    // One decision, one lethal-reach certification: decided here for the
+    // whole ensemble, inside its information model and its shared budget, and
+    // never again by the scorer below or by any sampled world it runs.
+    let ensemble_deadline = ensemble_deadline(config);
+    let root_domain = RootPriorityDomain::new(state, ai_player);
+    let root_answer =
+        certified_lethal_action(config, ensemble_deadline, &root_domain, Some(contract))
+            .or_else(|| fast_priority_action(&root_domain, config, session, Some(contract)));
+    // Only an absent answer is reusable. `None` means certification declined
+    // and then the priority shortcut ran last on this state and found nothing
+    // (certification takes no session, so it cannot change what the shortcut
+    // reads). A present answer may be filtered out or followed by session
+    // writes below, and a certified one never ran the shortcut at all, so the
+    // scorer recomputes it.
+    let priority_shortcut = match &root_answer {
         None => RootPriorityShortcut::KnownAbsent,
         Some(_) => RootPriorityShortcut::Recompute,
     };
-    if let Some(action) = fast_priority
+    if let Some(action) = root_answer
         .filter(|action| durable_pact_routes || !is_certified_pact_root(state, ai_player, action))
     {
         if durable_pact_routes {
@@ -539,13 +588,13 @@ fn choose_action_with_session_inner(
         }
     }
 
-    let mut scored = score_candidates_for_root(
-        state,
-        ai_player,
+    let mut scored = score_candidates_uncertified(
+        &root_domain,
         config,
         session,
+        ensemble_deadline,
         RootReuse::FromChooser {
-            contract: &contract,
+            contract,
             priority_shortcut,
         },
     );
@@ -558,7 +607,7 @@ fn choose_action_with_session_inner(
         // No valid candidates from search — fall back to a safe escape action
         // so the game never deadlocks waiting for the AI.
         return direct(
-            fallback_action(state, config, &contract)
+            fallback_action(state, config, contract)
                 .filter(|action| root_action_is_allowed(state, ai_player, action))
                 .filter(|action| {
                     durable_pact_routes || !is_certified_pact_root(state, ai_player, action)
@@ -589,7 +638,7 @@ fn choose_action_with_session_inner(
             .then(|| {
                 action.as_ref().map(|selected| {
                     crate::decision_receipt::ranked_receipt(
-                        &contract,
+                        contract,
                         &scored,
                         selected_index,
                         config.temperature,
@@ -653,12 +702,46 @@ fn random_card_predicate_guess(
     Some(action)
 }
 
-fn fast_priority_action(
-    state: &GameState,
+/// The AI's root priority domain under the pre-cast exchange gate
+/// (`flat_priority_actions` + [`root_action_is_allowed`]) for one decision
+/// state, computed at most once and only when something asks for it. Building
+/// it is a full legal-action generation with its affordability probes, so the
+/// decision's lethal-reach certification, its priority shortcuts and the
+/// scorer it falls through to all read this one copy.
+pub(crate) struct RootPriorityDomain<'a> {
+    state: &'a GameState,
     ai_player: PlayerId,
+    actions: std::cell::OnceCell<Vec<GameAction>>,
+}
+
+impl<'a> RootPriorityDomain<'a> {
+    pub(crate) fn new(state: &'a GameState, ai_player: PlayerId) -> Self {
+        Self {
+            state,
+            ai_player,
+            actions: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn actions(&self) -> &[GameAction] {
+        self.actions.get_or_init(|| {
+            #[cfg(test)]
+            ROOT_DOMAIN_BUILDS.with(|count| count.set(count.get() + 1));
+            engine::ai_support::flat_priority_actions(self.state)
+                .into_iter()
+                .filter(|action| root_action_is_allowed(self.state, self.ai_player, action))
+                .collect()
+        })
+    }
+}
+
+fn fast_priority_action(
+    domain: &RootPriorityDomain<'_>,
     config: &AiConfig,
     session: &Arc<AiSession>,
+    issued: Option<&AiDecisionContract>,
 ) -> Option<GameAction> {
+    let (state, ai_player) = (domain.state, domain.ai_player);
     let WaitingFor::Priority { player } = state.waiting_for else {
         return None;
     };
@@ -671,14 +754,240 @@ fn fast_priority_action(
             .then_some(GameAction::PassPriority);
     }
 
-    let actions: Vec<_> = engine::ai_support::flat_priority_actions(state)
-        .into_iter()
-        .filter(|action| root_action_is_allowed(state, ai_player, action))
-        .collect();
-    let action = low_value_priority_pass_from_actions(state, ai_player, &actions).or_else(|| {
-        large_board_main_phase_fast_action_from_actions(state, ai_player, &actions, config, session)
+    // While the engine's pass authority holds, the issued contract holds every
+    // action the validated list below can, `PassPriority` included: a priority
+    // prompt's candidates all belong to the priority player, validation admits
+    // the pass whenever `pass_priority_structurally_legal` holds
+    // (`structurally_valid_pass_priority`), and validation and
+    // `root_action_is_allowed` otherwise only remove actions. The low-value
+    // rule passes only when every action qualifies, so a pass it finds over the
+    // issued actions is the pass it finds over the validated ones, without
+    // enumerating them a second time. Without that authority (a CR 723.5
+    // submitter mismatch, a CR 732.2c divergence obligation, or a parked cost
+    // resume) validation may drop the pass, so the validated list decides.
+    let pass_authority = engine::game::priority::pass_priority_structurally_legal(state, ai_player);
+    let issued_pass = issued.filter(|_| pass_authority).and_then(|contract| {
+        let issued_actions: Vec<GameAction> = contract
+            .candidates
+            .iter()
+            .map(|candidate| &candidate.action)
+            .filter(|action| !action.is_mana_ability())
+            .cloned()
+            .collect();
+        low_value_priority_pass_from_actions(state, ai_player, &issued_actions)
     });
+
+    let action = issued_pass.or_else(|| {
+        #[cfg(test)]
+        FAST_PRIORITY_DOMAIN_VALIDATIONS.with(|count| count.set(count.get() + 1));
+        let actions = domain.actions();
+        low_value_priority_pass_from_actions(state, ai_player, actions).or_else(|| {
+            large_board_main_phase_fast_action_from_actions(
+                state, ai_player, actions, config, session,
+            )
+        })
+    });
+    // One fetch-then-cast filter covers both answers.
     action.filter(|_| !has_certified_fetch_then_cast_route(state, ai_player))
+}
+
+/// The certified lethal-reach answer to the AI's decision — the next step of a
+/// lethal line at priority, or the mode/X/target that keeps one alive at the
+/// line's own prompt — or `None`.
+///
+/// This is the ONLY entry to certification from the search, and it runs once
+/// per decision at the ensemble boundary (`choose_action` and
+/// [`score_candidates_with_session`], which the scored and parallel-worker
+/// entry points share). It is deliberately absent from
+/// `fast_priority_action` / `score_candidates_core`, which run once per sampled
+/// world: certification already covers every sampled world itself. With
+/// determinization enabled its sampled worlds share `deadline` with the
+/// scoring ensemble that follows, so the decision's single wall-clock ceiling
+/// stays authoritative.
+fn certified_lethal_action(
+    config: &AiConfig,
+    deadline: engine::util::Deadline,
+    domain: &RootPriorityDomain<'_>,
+    issued: Option<&AiDecisionContract>,
+) -> Option<GameAction> {
+    let (state, ai_player) = (domain.state, domain.ai_player);
+    if !config.play_lookahead {
+        return None;
+    }
+    match state.waiting_for {
+        WaitingFor::Priority { player } if player == ai_player => {
+            // On an empty stack a line opens with a non-mana cast or
+            // activation (`reach_sources`), and the validated domain only
+            // removes issued actions. An issued contract holding none has no
+            // line to certify, so the domain is never built for it.
+            if state.stack.is_empty()
+                && issued.is_some_and(|contract| {
+                    !contract.candidates.iter().any(|candidate| {
+                        matches!(
+                            candidate.action,
+                            GameAction::CastSpell { .. } | GameAction::ActivateAbility { .. }
+                        ) && !candidate.action.is_mana_ability()
+                    })
+                })
+            {
+                return None;
+            }
+            certified_lethal_priority_action(state, ai_player, config, domain.actions(), deadline)
+        }
+        _ => certified_lethal_prompt_action(state, ai_player, config, deadline),
+    }
+}
+
+/// The next step of a reducer-certified lethal line from this priority
+/// decision, certified inside the information model the search uses.
+///
+/// CR 400.2: with determinization enabled (`K > 0`), the certification never
+/// reads the opponent's real hidden hand or library — it runs on each of the
+/// same K sampled worlds the scoring ensemble uses, and a step is taken only
+/// when every sample certifies it. With `K == 0` (every shipped preset) it runs
+/// on the state itself, as the search does.
+pub(crate) fn certified_lethal_priority_action(
+    state: &GameState,
+    ai_player: PlayerId,
+    config: &AiConfig,
+    actions: &[GameAction],
+    deadline: engine::util::Deadline,
+) -> Option<GameAction> {
+    // `allowed` is the world's priority domain already under the pre-cast
+    // exchange gate; the loop guards are applied here.
+    let lethal_in = |world: &GameState, allowed: &[GameAction]| {
+        #[cfg(test)]
+        CERTIFICATION_RUNS.with(|runs| runs.set(runs.get() + 1));
+        let issued: Vec<_> = allowed
+            .iter()
+            .filter(|action| priority_action_is_allowed_by_loop_guards(world, ai_player, action))
+            .cloned()
+            .collect();
+        let admission = |state: &GameState, action: &GameAction| {
+            root_action_is_admitted(state, ai_player, action)
+        };
+        crate::reach::lethal_priority_action(world, ai_player, &issued, &admission)
+    };
+    let k = config.search.determinization_samples;
+    if k == 0 {
+        return lethal_in(state, actions);
+    }
+    agreed_across_samples(state, ai_player, k, deadline, |sample| {
+        let allowed: Vec<_> = engine::ai_support::flat_priority_actions(sample)
+            .into_iter()
+            .filter(|action| root_action_is_allowed(sample, ai_player, action))
+            .collect();
+        lethal_in(sample, &allowed)
+    })
+    // The AI's own zones are identical in every sample, so its step is one
+    // the real state issues too; bind it to the real payload.
+    .and_then(|action| crate::reach::issued_counterpart(actions, &action))
+}
+
+/// The answer to the AI's own cast prompt (mode, X, or target) that keeps a
+/// certified lethal line alive, decided inside the same information model as
+/// [`certified_lethal_priority_action`].
+fn certified_lethal_prompt_action(
+    state: &GameState,
+    ai_player: PlayerId,
+    config: &AiConfig,
+    deadline: engine::util::Deadline,
+) -> Option<GameAction> {
+    if !config.play_lookahead
+        || !crate::reach::prompt_could_finish(state, ai_player)
+        || !matches!(
+            engine::ai_support::classify_payment_continuation(state),
+            engine::ai_support::PaymentContinuationState::NotAffiliated
+        )
+    {
+        return None;
+    }
+    let answer_in = |world: &GameState| {
+        let issued: Vec<GameAction> = AiDecisionContract::issue(world, ai_player)
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.action)
+            .collect();
+        let admission = |state: &GameState, action: &GameAction| {
+            root_action_is_admitted(state, ai_player, action)
+        };
+        crate::reach::lethal_prompt_action(world, ai_player, &issued, &admission)
+    };
+    match config.search.determinization_samples {
+        0 => answer_in(state),
+        k => agreed_across_samples(state, ai_player, k, deadline, answer_in),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test witness: how many worlds the search has run lethal-reach priority
+    /// certification in, on this thread.
+    pub(crate) static CERTIFICATION_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Test witness: how many root priority domains have been enumerated on
+    /// this thread.
+    pub(crate) static ROOT_DOMAIN_BUILDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// CR 400.2: the action `decide` takes in every one of the `k` determinized
+/// worlds, or `None` when any world declines or two worlds disagree — a
+/// certificate that holds only in some plausible worlds is not one the AI can
+/// act on without reading the real hidden zones.
+pub(crate) fn agreed_across_samples(
+    state: &GameState,
+    ai_player: PlayerId,
+    k: u32,
+    deadline: engine::util::Deadline,
+    decide: impl Fn(&GameState) -> Option<GameAction>,
+) -> Option<GameAction> {
+    let mut agreed: Option<GameAction> = None;
+    for sample in determinized_samples(state, ai_player, k) {
+        // The decision's shared wall-clock ceiling: a certificate that could
+        // not cover every world in budget is not one to act on.
+        if deadline.expired() {
+            return None;
+        }
+        let action = decide(&sample)?;
+        // A world whose certificate completed past the ceiling was not
+        // covered in budget either.
+        if deadline.expired() {
+            return None;
+        }
+        match &agreed {
+            Some(previous) if *previous != action => return None,
+            Some(_) => {}
+            None => agreed = Some(action),
+        }
+    }
+    agreed
+}
+
+/// The `K` determinized opponent-hidden-zone worlds the scoring ensemble
+/// averages over, in sample order. Seeded from the position, so every caller
+/// sees the same K worlds for the same decision.
+fn determinized_samples(
+    state: &GameState,
+    ai_player: PlayerId,
+    k: u32,
+) -> impl Iterator<Item = GameState> + '_ {
+    // Seed: fixed across K for a given (position, game, worker); per-sample split
+    // by index. `state.rng.clone()` keeps `&state` immutable (RNG purity via
+    // clone). Native runs diverge via distinct `rng_seed`; WASM workers diverge
+    // via the per-worker `state.rng` re-seed.
+    let base_seed = crate::planner::quick_state_hash(state)
+        .wrapping_add(state.rng_seed)
+        .wrapping_add(
+            state
+                .rng
+                .clone()
+                .draw(engine::types::game_state::RandomDraw::Outcome)
+                .next_u64(),
+        );
+    (0..k).map(move |i| {
+        let seed = base_seed.wrapping_add(crate::determinize::splitmix64(i as u64));
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+        crate::determinize::determinize_opponents(state, ai_player, &mut rng)
+    })
 }
 
 /// Keep the direct priority shortcuts under the pre-cast exchange gate. The
@@ -714,6 +1023,19 @@ fn root_action_is_allowed(state: &GameState, ai_player: PlayerId, action: &GameA
         // No exact authority is fail-open; the engine preview never authorizes
         // a rejection from a reconstructed actor/owner pair.
         .unwrap_or(true)
+}
+
+/// The full admission rule for an engine-issued root priority action: the
+/// targeted-exchange gate plus the AI loop guards. Shared with the lethal-reach
+/// search so a line priced in a simulated state never relies on an action the
+/// real decision boundary would refuse.
+pub(crate) fn root_action_is_admitted(
+    state: &GameState,
+    ai_player: PlayerId,
+    action: &GameAction,
+) -> bool {
+    root_action_is_allowed(state, ai_player, action)
+        && priority_action_is_allowed_by_loop_guards(state, ai_player, action)
 }
 
 fn large_board_main_phase_has_no_development_sources(
@@ -2436,7 +2758,7 @@ pub fn fallback_action(
             ..
         } => issued_selection(contract),
         WaitingFor::PayCost {
-            resume: CostResume::Resolution,
+            resume: CostResume::Resolution | CostResume::TurnFaceUp { .. },
             ..
         } => issued(|action| matches!(action, GameAction::SelectCards { .. })),
 
@@ -2561,7 +2883,7 @@ pub fn score_candidates(
 /// the authoritative session through its next upkeep. Pool workers deserialize
 /// independent state copies and cannot return that session capability with a
 /// score vector, so decline the entire parallel path when one is available.
-/// The caller then uses [`choose_action_with_session`] on the authoritative
+/// The caller then uses [`choose_action_with_issued_contract`] on the authoritative
 /// worker, which performs proposal drafting and route arming atomically with
 /// root selection.
 pub fn score_candidates_for_parallel_worker(
@@ -2655,7 +2977,33 @@ pub(crate) fn score_candidates_with_session(
     config: &AiConfig,
     session: &Arc<AiSession>,
 ) -> Vec<(GameAction, f64)> {
-    score_candidates_for_root(state, ai_player, config, session, RootReuse::Fresh)
+    // A certified lethal line — its next step at priority, or the mode, X, and
+    // target that keep it lethal at its prompts — outranks every candidate
+    // scored in isolation. Decided once for the whole ensemble, inside its
+    // information model and its shared budget.
+    let deadline = ensemble_deadline(config);
+    let root_domain = RootPriorityDomain::new(state, ai_player);
+    if let Some(action) = certified_lethal_action(config, deadline, &root_domain, None) {
+        return vec![(action, 1.0)];
+    }
+    score_candidates_uncertified(&root_domain, config, session, deadline, RootReuse::Fresh)
+}
+
+/// The ensemble's ONE shared wall-clock ceiling across all K sequential
+/// samples (bounds AGGREGATE latency ~time_budget_ms, not K x budget), created
+/// before the decision's lethal-reach certification so that certification
+/// spends from the same budget. Measurement mode is bounded by node cap only —
+/// mirrors `PlannerServices::with_deadline`, so `cargo ai-gate` stays
+/// deterministic and K-bounded solely by nodes. Without determinization there
+/// is no shared ensemble budget: each search builds its own deadline.
+fn ensemble_deadline(config: &AiConfig) -> engine::util::Deadline {
+    if config.search.determinization_samples == 0 || config.execution_mode.is_measurement() {
+        return engine::util::Deadline::none();
+    }
+    match config.search.time_budget_ms {
+        Some(ms) => engine::util::Deadline::after(ms),
+        None => engine::util::Deadline::none(),
+    }
 }
 
 /// Whether the chooser already knows the priority shortcut is unavailable at
@@ -2677,87 +3025,77 @@ enum RootReuse<'c> {
     /// Nothing; the scorer derives the decision contract and the priority
     /// shortcut from the state it is given.
     Fresh,
-    /// The chooser's own results. `contract` must have been issued for exactly
-    /// the `state` and `ai_player` the scorer is called with, and
-    /// `priority_shortcut` must describe that same state.
+    /// What the chooser holds about the root. `contract` must have been
+    /// issued for exactly the `state` and `ai_player` the scorer is called
+    /// with, and `priority_shortcut` must describe that same state.
     FromChooser {
-        /// The decision contract the chooser issued for this state and player.
+        /// The decision contract the chooser decides from (issued by it or by
+        /// its caller) for this state and player.
         contract: &'c AiDecisionContract,
         /// What the chooser learned from the priority shortcut.
         priority_shortcut: RootPriorityShortcut,
     },
 }
 
+impl<'c> RootReuse<'c> {
+    /// The decision contract the chooser issued for the root, if it supplied one.
+    fn issued_contract(self) -> Option<&'c AiDecisionContract> {
+        match self {
+            RootReuse::Fresh => None,
+            RootReuse::FromChooser { contract, .. } => Some(contract),
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
+    /// Times a chooser entry point issued the decision contract itself.
+    static CHOOSER_CONTRACT_ISSUES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Times the scorer core derived the root decision contract itself.
     static ROOT_CONTRACT_ISSUES_IN_CORE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Times the scorer core ran the priority shortcut itself.
     static ROOT_FAST_PRIORITY_RERUNS_IN_CORE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Times the priority shortcut read the validated flat priority actions
+    /// (building them unless the decision's certification already had).
+    static FAST_PRIORITY_DOMAIN_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Times the fetch-then-cast route check computed the validated domain.
     static FETCH_ROUTE_DOMAIN_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Times Pact drafting computed the validated domain.
     static PACT_DRAFT_DOMAIN_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// [`score_candidates_with_session`] with the caller's knowledge of the root.
-/// `root` is forwarded only to the searches that run on `state` itself; every
-/// determinized sample is a different state and is scored `Fresh`.
-fn score_candidates_for_root(
-    state: &GameState,
-    ai_player: PlayerId,
+/// [`score_candidates_with_session`] after its lethal-reach certification has
+/// declined: shortcuts and scoring only, per sampled world when K > 0.
+/// `root_domain` is the decision state's own priority domain and `root` the
+/// caller's knowledge of that state; both are forwarded only to the search that
+/// runs on the decision state itself, while every determinized sample is a
+/// different state that builds its own domain and is scored `Fresh`.
+fn score_candidates_uncertified(
+    root_domain: &RootPriorityDomain<'_>,
     config: &AiConfig,
     session: &Arc<AiSession>,
+    deadline: engine::util::Deadline,
     root: RootReuse<'_>,
 ) -> Vec<(GameAction, f64)> {
+    let (state, ai_player) = (root_domain.state, root_domain.ai_player);
     // Attacker declarations are public-state tactical choices. Running K hidden
     // information samples cannot improve them, but would multiply the bounded
     // multiplayer comparison and make a singleton support drift.
     if matches!(state.waiting_for, WaitingFor::DeclareAttackers { .. }) {
-        return score_candidates_core_for_root(state, ai_player, config, session, None, root);
+        return score_candidates_core_for_root(root_domain, config, session, None, root);
     }
     let k = config.search.determinization_samples;
     if k == 0 {
         // Unchanged path: no determinization, no shared-deadline override.
-        return score_candidates_core_for_root(state, ai_player, config, session, None, root);
+        return score_candidates_core_for_root(root_domain, config, session, None, root);
     }
-
-    // ONE shared wall-clock ceiling across all K sequential samples (bounds
-    // AGGREGATE latency ~time_budget_ms, not K x budget). Measurement mode is
-    // bounded by node cap only — mirrors `PlannerServices::with_deadline`, so
-    // `cargo ai-gate` stays deterministic and K-bounded solely by nodes.
-    let deadline = if config.execution_mode.is_measurement() {
-        engine::util::Deadline::none()
-    } else {
-        match config.search.time_budget_ms {
-            Some(ms) => engine::util::Deadline::after(ms),
-            None => engine::util::Deadline::none(),
-        }
-    };
-
-    // Seed: fixed across K for a given (position, game, worker); per-sample split
-    // by index. `state.rng.clone()` keeps `&state` immutable (RNG purity via
-    // clone). Native runs diverge via distinct `rng_seed`; WASM workers diverge
-    // via the per-worker `state.rng` re-seed.
-    let base_seed = crate::planner::quick_state_hash(state)
-        .wrapping_add(state.rng_seed)
-        .wrapping_add(
-            state
-                .rng
-                .clone()
-                .draw(engine::types::game_state::RandomDraw::Outcome)
-                .next_u64(),
-        );
 
     let mut acc: Vec<(GameAction, f64)> = Vec::new();
     let mut positions: std::collections::HashMap<GameActionKey, usize> =
         std::collections::HashMap::new();
     let mut counts: std::collections::HashMap<GameActionKey, usize> =
         std::collections::HashMap::new();
-    for i in 0..k {
-        let seed = base_seed.wrapping_add(crate::determinize::splitmix64(i as u64));
-        let mut rng = ChaCha20Rng::seed_from_u64(seed);
-        let sampled = crate::determinize::determinize_opponents(state, ai_player, &mut rng);
+    for sampled in determinized_samples(state, ai_player, k) {
         let scored = score_candidates_core(&sampled, ai_player, config, session, Some(deadline));
         merge_into(&mut acc, &mut positions, &mut counts, scored);
     }
@@ -3394,8 +3732,7 @@ fn score_candidates_core(
     deadline_override: Option<engine::util::Deadline>,
 ) -> Vec<(GameAction, f64)> {
     score_candidates_core_for_root(
-        state,
-        ai_player,
+        &RootPriorityDomain::new(state, ai_player),
         config,
         session,
         deadline_override,
@@ -3422,18 +3759,19 @@ fn root_issued_candidates(
     }
 }
 
-/// [`score_candidates_core`] with the caller's knowledge of the root. Under
-/// [`RootReuse::FromChooser`] the contract's candidates stand in for a second
-/// contract issue, and a priority shortcut the chooser found absent is not run
-/// again; everything else is identical to the `Fresh` path.
+/// [`score_candidates_core`] over a decision state whose priority domain may
+/// already have been built for this decision, with the caller's knowledge of
+/// the root. Under [`RootReuse::FromChooser`] the contract's candidates stand
+/// in for a second contract issue, and a priority shortcut the chooser found
+/// absent is not run again; everything else is identical to the `Fresh` path.
 fn score_candidates_core_for_root(
-    state: &GameState,
-    ai_player: PlayerId,
+    domain: &RootPriorityDomain<'_>,
     config: &AiConfig,
     session: &Arc<AiSession>,
     deadline_override: Option<engine::util::Deadline>,
     root: RootReuse<'_>,
 ) -> Vec<(GameAction, f64)> {
+    let (state, ai_player) = (domain.state, domain.ai_player);
     // The scored/parallel-worker path bypasses `choose_action_with_session_inner`.
     // Preserve Resolve All's user-proposed shortcut semantics here as well: Grant
     // is chosen from the engine-issued consent domain without tactical scoring.
@@ -3473,7 +3811,9 @@ fn score_candidates_core_for_root(
         } => {
             #[cfg(test)]
             ROOT_FAST_PRIORITY_RERUNS_IN_CORE.with(|count| count.set(count.get() + 1));
-            if let Some(action) = fast_priority_action(state, ai_player, config, session) {
+            if let Some(action) =
+                fast_priority_action(domain, config, session, root.issued_contract())
+            {
                 return vec![(action, 1.0)];
             }
         }
@@ -3713,7 +4053,11 @@ fn run_iterative_deepening(
                 completed = false;
                 break;
             }
-            let score = if let Some((child, sim)) = services.successor_edge(
+            let score = if r.score == f64::NEG_INFINITY {
+                // A policy Reject: `continuation + score * tactical_weight` is −∞
+                // for every finite continuation, so the simulation cannot change it.
+                f64::NEG_INFINITY
+            } else if let Some((child, sim)) = services.successor_edge(
                 Some(root),
                 state,
                 &r.candidate,
@@ -7071,10 +7415,10 @@ mod tests {
             let session = AiSession::arc_from_game(runner.state());
             let selection = choose_action_with_session_diagnostic(
                 runner.state(),
-                P0,
                 &config,
                 &mut SmallRng::seed_from_u64(9943),
                 &session,
+                &engine::ai_support::AiDecisionContract::issue(runner.state(), P0),
             );
             let receipt = selection.receipt.expect("scored payment receipt");
             assert_eq!(receipt.status, AiDecisionReceiptStatus::Ranked);
@@ -7254,10 +7598,10 @@ mod tests {
                     assert!(matches!(answer, Some(GameAction::PayUnlessCost { .. })));
                     let selection = choose_action_with_session_diagnostic(
                         runner.state(),
-                        P0,
                         &config,
                         &mut SmallRng::seed_from_u64(7),
                         &AiSession::arc_from_game(runner.state()),
+                        &engine::ai_support::AiDecisionContract::issue(runner.state(), P0),
                     );
                     assert_eq!(
                         selection.receipt.expect("ordinary scored counter").status,
@@ -8609,6 +8953,230 @@ mod tests {
         );
     }
 
+    /// Production declaration path: a lone 2/2 facing a 2-loyalty planeswalker
+    /// attacks the planeswalker, not the player (no race, no blockers).
+    #[test]
+    fn root_attack_declaration_kills_lone_planeswalker() {
+        let mut state = GameState::new(engine::types::format::FormatConfig::standard(), 2, 42);
+        state.turn_number = 2;
+        state.phase = Phase::DeclareAttackers;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        let attacker = add_creature(&mut state, PlayerId(0), 2, 2);
+        let pw_card = CardId(state.next_object_id);
+        let pw = create_object(
+            &mut state,
+            pw_card,
+            PlayerId(1),
+            "Planeswalker".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&pw).unwrap();
+        obj.card_types.core_types.push(CoreType::Planeswalker);
+        obj.loyalty = Some(2);
+        obj.entered_battlefield_turn = Some(1);
+        state.waiting_for = engine::game::combat::build_declare_attackers_waiting_for(&state);
+        let config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(17);
+        let session = AiSession::arc_from_game(&state);
+        let root = score_candidates_core(&state, PlayerId(0), &config, &session, None);
+        assert!(
+            matches!(
+                root.as_slice(),
+                [(GameAction::DeclareAttackers { attacks, .. }, 1.0)]
+                    if attacks.iter().any(|(id, t)| *id == attacker
+                        && *t == engine::game::combat::AttackTarget::Planeswalker(pw))
+            ),
+            "got {root:?}"
+        );
+    }
+
+    fn add_planeswalker(state: &mut GameState, owner: PlayerId, loyalty: u32) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(state.next_object_id),
+            owner,
+            "Planeswalker".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Planeswalker);
+        obj.loyalty = Some(loyalty);
+        obj.entered_battlefield_turn = Some(1);
+        id
+    }
+
+    /// Root-scored attack declaration for player 0 on a prepared board.
+    fn root_attacks(mut state: GameState) -> Vec<(ObjectId, engine::game::combat::AttackTarget)> {
+        state.turn_number = 2;
+        state.phase = Phase::DeclareAttackers;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = engine::game::combat::build_declare_attackers_waiting_for(&state);
+        let config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(17);
+        let session = AiSession::arc_from_game(&state);
+        let root = score_candidates_core(&state, PlayerId(0), &config, &session, None);
+        match root.as_slice() {
+            [(GameAction::DeclareAttackers { attacks, .. }, _)] => attacks.clone(),
+            other => panic!("expected one DeclareAttackers candidate, got {other:?}"),
+        }
+    }
+
+    /// Production declaration path: an untapped blocker that stops the lone
+    /// attacker means the planeswalker cannot be killed, so the attacker is not
+    /// sent at it (CR 509.1b: the defender chooses blocks).
+    #[test]
+    fn root_attack_declaration_skips_planeswalker_behind_blocker() {
+        let mut state = GameState::new(engine::types::format::FormatConfig::standard(), 2, 42);
+        let attacker = add_creature(&mut state, PlayerId(0), 2, 2);
+        add_creature(&mut state, PlayerId(1), 0, 4);
+        let pw = add_planeswalker(&mut state, PlayerId(1), 2);
+        let attacks = root_attacks(state);
+        assert!(
+            attacks.iter().any(|(id, t)| *id == attacker
+                && *t == engine::game::combat::AttackTarget::Player(PlayerId(1))),
+            "attacker must still attack the player: {attacks:?}"
+        );
+        assert!(
+            attacks.iter().all(|(id, t)| {
+                *id != attacker || *t != engine::game::combat::AttackTarget::Planeswalker(pw)
+            }),
+            "got {attacks:?}"
+        );
+    }
+
+    /// Production declaration path: with two equal-loyalty planeswalkers the
+    /// one carrying loyalty abilities is attacked, in either insertion order.
+    #[test]
+    fn root_attack_declaration_picks_planeswalker_with_abilities_in_both_orders() {
+        use engine::types::ability::{
+            AbilityCost, AbilityDefinition, AbilityKind, QuantityExpr, TargetFilter,
+        };
+        for engine_first in [true, false] {
+            let mut state = GameState::new(engine::types::format::FormatConfig::standard(), 2, 42);
+            let attacker = add_creature(&mut state, PlayerId(0), 5, 5);
+            let (engine_pw, _bare) = if engine_first {
+                let e = add_planeswalker(&mut state, PlayerId(1), 3);
+                (e, add_planeswalker(&mut state, PlayerId(1), 3))
+            } else {
+                let b = add_planeswalker(&mut state, PlayerId(1), 3);
+                (add_planeswalker(&mut state, PlayerId(1), 3), b)
+            };
+            for amount in [1, -2] {
+                let mut ability = AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                );
+                ability.cost = Some(AbilityCost::Loyalty { amount });
+                std::sync::Arc::make_mut(&mut state.objects.get_mut(&engine_pw).unwrap().abilities)
+                    .push(ability);
+            }
+            let attacks = root_attacks(state);
+            assert!(
+                attacks.iter().any(|(id, t)| *id == attacker
+                    && *t == engine::game::combat::AttackTarget::Planeswalker(engine_pw)),
+                "engine_first={engine_first}: got {attacks:?}"
+            );
+        }
+    }
+
+    /// Production declaration path, mixed blocked/unblocked: a flyer the lone
+    /// blocker cannot stop kills the planeswalker, while the ground attacker the
+    /// blocker stops is not counted toward the kill.
+    #[test]
+    fn root_attack_declaration_counts_only_unblocked_attackers_toward_kill() {
+        let mut state = GameState::new(engine::types::format::FormatConfig::standard(), 2, 42);
+        let flyer = add_creature(&mut state, PlayerId(0), 2, 2);
+        state
+            .objects
+            .get_mut(&flyer)
+            .unwrap()
+            .keywords
+            .push(Keyword::Flying);
+        let ground = add_creature(&mut state, PlayerId(0), 3, 3);
+        add_creature(&mut state, PlayerId(1), 0, 6);
+        let pw = add_planeswalker(&mut state, PlayerId(1), 2);
+        let attacks = root_attacks(state);
+        assert!(
+            attacks.iter().any(|(id, t)| *id == flyer
+                && *t == engine::game::combat::AttackTarget::Planeswalker(pw)),
+            "got {attacks:?}"
+        );
+        assert!(
+            attacks.iter().any(|(id, t)| *id == ground
+                && *t == engine::game::combat::AttackTarget::Player(PlayerId(1))),
+            "blocked ground attacker must still attack the player: {attacks:?}"
+        );
+        assert!(
+            attacks.iter().all(|(id, t)| {
+                *id != ground || *t != engine::game::combat::AttackTarget::Planeswalker(pw)
+            }),
+            "blocked ground attacker must not be sent at the planeswalker: {attacks:?}"
+        );
+    }
+
+    /// Production declaration path: while in Race objective, a kill that empties
+    /// face damage from all damaging attackers is ineligible even if blocked
+    /// attackers also swing. Here the 2/2 flyer connects while the 3/3 ground
+    /// attacker is absorbed by a 0/6 blocker; diverting the flyer to the planeswalker
+    /// would leave zero damage connecting to the player being raced.
+    #[test]
+    fn root_attack_declaration_race_guard_keeps_connecting_attacker_on_player() {
+        let mut state = GameState::new(engine::types::format::FormatConfig::standard(), 2, 42);
+        state.players[0].life = 12;
+        state.players[1].life = 20;
+        let flyer = add_creature(&mut state, PlayerId(0), 2, 2);
+        state
+            .objects
+            .get_mut(&flyer)
+            .unwrap()
+            .keywords
+            .push(Keyword::Flying);
+        let ground = add_creature(&mut state, PlayerId(0), 3, 3);
+        let blocker = add_creature(&mut state, PlayerId(1), 0, 6);
+        let pw = add_planeswalker(&mut state, PlayerId(1), 2);
+
+        let config = create_config(AiDifficulty::Hard, Platform::Native);
+        assert_eq!(
+            crate::combat_ai::determine_attack_objective(
+                &state,
+                PlayerId(0),
+                &[PlayerId(1)],
+                &[flyer, ground],
+                &[blocker],
+                &config.profile,
+            ),
+            crate::combat_ai::CombatObjective::Race,
+            "board fixture must actually select CombatObjective::Race"
+        );
+
+        let attacks = root_attacks(state);
+        assert!(
+            attacks.iter().any(|(id, t)| *id == flyer
+                && *t == engine::game::combat::AttackTarget::Player(PlayerId(1))),
+            "connecting flyer must stay on player while racing: {attacks:?}"
+        );
+        assert!(
+            attacks.iter().any(|(id, t)| *id == ground
+                && *t == engine::game::combat::AttackTarget::Player(PlayerId(1))),
+            "blocked ground attacker must still attack player: {attacks:?}"
+        );
+        assert!(
+            attacks.iter().all(|(id, t)| {
+                *id != flyer || *t != engine::game::combat::AttackTarget::Planeswalker(pw)
+            }),
+            "connecting flyer must not be diverted to planeswalker: {attacks:?}"
+        );
+        assert!(
+            attacks.iter().all(|(id, t)| {
+                *id != ground || *t != engine::game::combat::AttackTarget::Planeswalker(pw)
+            }),
+            "blocked ground attacker must not be sent at planeswalker: {attacks:?}"
+        );
+    }
+
     #[test]
     fn root_combat_comparison_requires_context_but_root_scoring_reaches_it() {
         let (state, attacker) = free_for_all_attacker_root(false);
@@ -9232,6 +9800,50 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(1);
         let action = choose_action(&state, PlayerId(0), &config, &mut rng);
         assert_eq!(action, Some(GameAction::PassPriority));
+    }
+
+    /// The AI action driver issues the decision contract to validate its
+    /// choice and hands that same contract to the chooser, so one decision
+    /// enumerates the candidate domain once. Fails on revert of the driver's
+    /// `choose_action_with_issued_contract` call.
+    #[test]
+    fn ai_action_driver_decides_from_the_contract_it_issued() {
+        let config = create_config(AiDifficulty::Medium, Platform::Native);
+        let ai_players = std::collections::HashSet::from([PlayerId(0)]);
+        let ai_configs = std::collections::HashMap::from([(PlayerId(0), config.clone())]);
+        let mut rng = SmallRng::seed_from_u64(1);
+
+        let mut state = make_state();
+        let session = AiSession::arc_from_game(&state);
+        CHOOSER_CONTRACT_ISSUES.with(|count| count.set(0));
+        let result = match crate::auto_play::run_ai_action(
+            &mut state,
+            &ai_players,
+            &ai_configs,
+            &mut rng,
+            &session,
+        ) {
+            std::ops::ControlFlow::Continue(result) => result,
+            std::ops::ControlFlow::Break(stop) => {
+                panic!("reach-guard: the driver must decide and apply an action, stopped: {stop:?}")
+            }
+        };
+        assert_eq!(result.action, GameAction::PassPriority);
+        assert_eq!(
+            CHOOSER_CONTRACT_ISSUES.with(std::cell::Cell::get),
+            0,
+            "the chooser must decide from the driver's contract, not issue its own"
+        );
+
+        // Positive reach-guard: an entry point whose caller holds no contract
+        // issues exactly one.
+        let state = make_state();
+        CHOOSER_CONTRACT_ISSUES.with(|count| count.set(0));
+        assert_eq!(
+            choose_action_with_session(&state, PlayerId(0), &config, &mut rng, &session),
+            Some(GameAction::PassPriority)
+        );
+        assert_eq!(CHOOSER_CONTRACT_ISSUES.with(std::cell::Cell::get), 1);
     }
 
     #[test]
@@ -12493,8 +13105,13 @@ mod tests {
         let config = create_config(AiDifficulty::Hard, Platform::Native);
         let session = AiSession::arc_from_game(&state);
         let mut rng = SmallRng::seed_from_u64(42);
-        let selection =
-            choose_action_with_session_diagnostic(&state, PlayerId(0), &config, &mut rng, &session);
+        let selection = choose_action_with_session_diagnostic(
+            &state,
+            &config,
+            &mut rng,
+            &session,
+            &engine::ai_support::AiDecisionContract::issue(&state, PlayerId(0)),
+        );
         let receipt = selection
             .receipt
             .expect("target selection is a ranked decision");
@@ -12561,8 +13178,13 @@ mod tests {
         let config = create_config(AiDifficulty::Hard, Platform::Native);
         let session = AiSession::arc_from_game(&state);
         let mut rng = SmallRng::seed_from_u64(42);
-        let selection =
-            choose_action_with_session_diagnostic(&state, PlayerId(0), &config, &mut rng, &session);
+        let selection = choose_action_with_session_diagnostic(
+            &state,
+            &config,
+            &mut rng,
+            &session,
+            &engine::ai_support::AiDecisionContract::issue(&state, PlayerId(0)),
+        );
         let receipt = selection
             .receipt
             .expect("target selection is a ranked decision");
@@ -12623,10 +13245,10 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(42);
         let selection = choose_action_with_session_diagnostic(
             &target_state,
-            PlayerId(0),
             &config,
             &mut rng,
             &session,
+            &engine::ai_support::AiDecisionContract::issue(&target_state, PlayerId(0)),
         );
         let receipt = selection
             .receipt
@@ -13107,7 +13729,9 @@ mod tests {
     /// only uniquely-named cards.
     #[test]
     fn gifts_ungiven_search_choice_returns_quickly_with_distinct_names() {
-        use engine::types::ability::{SearchSelectionConstraint, SharedQuality};
+        use engine::types::ability::{
+            SearchSelectionConstraint, SharedQuality, SharedQualityRelation,
+        };
         use std::time::Instant;
 
         let mut state = make_state();
@@ -13143,8 +13767,9 @@ mod tests {
             reveal: true,
             up_to: true,
             allows_partial_find: false,
-            constraint: SearchSelectionConstraint::DistinctQualities {
+            constraint: SearchSelectionConstraint::SharesQualities {
                 qualities: vec![SharedQuality::Name],
+                relation: SharedQualityRelation::DoesNotShare,
             },
             ordering_hint: Default::default(),
             split: None,
@@ -14855,6 +15480,39 @@ mod tests {
                 .all(|ply| ply.iter().all(Option::is_none)),
             "no cutoffs => killer table stays empty"
         );
+    }
+
+    /// #9716: a root candidate a policy rejected (score −∞) keeps its −∞ score
+    /// without a successor simulation — `continuation + score * tactical_weight`
+    /// is −∞ for every finite continuation. Fails on revert of the rejected arm
+    /// in `run_iterative_deepening`.
+    #[test]
+    fn rejected_root_candidate_is_not_simulated() {
+        let state = searchable_state();
+        let mut config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
+        config.search.planner_mode = PlannerMode::BeamOnly; // rung 0 only
+        let (_, cast) = pass_and_first_cast(&state);
+
+        // Reach-guard: the same candidate with a finite score is simulated.
+        let mut services =
+            PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+        let ranked = vec![RankedCandidate::new(cast.clone(), 0.0)];
+        let _ = run_iterative_deepening(&state, ranked, 0.1, &config, &mut services);
+        assert!(
+            services.memo_witness.successor_simulations > 0,
+            "reach-guard: a scored candidate reaches its successor simulation"
+        );
+
+        let mut services =
+            PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+        let ranked = vec![RankedCandidate::new(cast.clone(), f64::NEG_INFINITY)];
+        let out = run_iterative_deepening(&state, ranked, 0.1, &config, &mut services);
+        assert_eq!(
+            services.memo_witness.successor_simulations + services.memo_witness.successor_hits,
+            0,
+            "a rejected candidate must not request a successor"
+        );
+        assert_eq!(out, vec![(cast.action, f64::NEG_INFINITY)]);
     }
 
     // V6: the rung witness records completion + node usage for every executed rung.
@@ -18379,7 +19037,13 @@ one on the bottom of your library.";
         let config = root_reuse_config();
         let session = AiSession::arc_from_game(&state);
         assert!(
-            fast_priority_action(&state, PlayerId(0), &config, &session).is_none(),
+            fast_priority_action(
+                &RootPriorityDomain::new(&state, PlayerId(0)),
+                &config,
+                &session,
+                None
+            )
+            .is_none(),
             "fixture: the priority shortcut is absent, so the decision is scored"
         );
 
@@ -18392,6 +19056,318 @@ one on the bottom of your library.";
             root_witnesses(),
             (0, 0),
             "the scorer must reuse the chooser's contract and shortcut result"
+        );
+    }
+
+    /// A forced pass is answered from the chooser's issued contract: the
+    /// priority shortcut does not enumerate and validate the flat priority
+    /// actions a second time. Fails on revert of the issued-contract check.
+    #[test]
+    fn priority_shortcut_passes_from_the_issued_contract_without_revalidating() {
+        let state = make_state();
+        let config = create_config(AiDifficulty::Medium, Platform::Native);
+        let session = AiSession::arc_from_game(&state);
+        let contract = AiDecisionContract::issue(&state, PlayerId(0));
+
+        FAST_PRIORITY_DOMAIN_VALIDATIONS.with(|count| count.set(0));
+        assert_eq!(
+            fast_priority_action(
+                &RootPriorityDomain::new(&state, PlayerId(0)),
+                &config,
+                &session,
+                Some(&contract)
+            ),
+            Some(GameAction::PassPriority)
+        );
+        assert_eq!(
+            FAST_PRIORITY_DOMAIN_VALIDATIONS.with(std::cell::Cell::get),
+            0,
+            "a pass found over the issued contract must not re-enumerate the domain"
+        );
+
+        // Reach-guard and equivalence: without a contract the same pass comes
+        // from the validated list.
+        FAST_PRIORITY_DOMAIN_VALIDATIONS.with(|count| count.set(0));
+        assert_eq!(
+            fast_priority_action(
+                &RootPriorityDomain::new(&state, PlayerId(0)),
+                &config,
+                &session,
+                None
+            ),
+            Some(GameAction::PassPriority)
+        );
+        assert_eq!(
+            FAST_PRIORITY_DOMAIN_VALIDATIONS.with(std::cell::Cell::get),
+            1
+        );
+    }
+
+    /// Without the engine's pass authority the validated list may drop
+    /// `PassPriority`, so an issued contract must not answer the pass. This test
+    /// builds the parked cost resume case;
+    /// `priority_shortcut_never_passes_through_a_divergence_obligation` covers
+    /// the CR 732.2c divergence obligation, and a CR 723.5 submitter mismatch is
+    /// the third case. Fails on revert of the pass-authority guard.
+    #[test]
+    fn priority_shortcut_without_pass_authority_defers_to_the_validated_list() {
+        let mut state = make_state();
+        state.pending_cost_move_resume =
+            Some(engine::types::game_state::PendingCostMoveResume::Foretell {
+                player: PlayerId(0),
+                object_id: engine::types::identifiers::ObjectId(1),
+                cost: engine::types::mana::ManaCost::NoCost,
+                turn_foretold: 1,
+            });
+        assert!(
+            !engine::game::priority::pass_priority_structurally_legal(&state, PlayerId(0)),
+            "reach-guard: the parked resume withholds the pass authority"
+        );
+        let config = create_config(AiDifficulty::Medium, Platform::Native);
+        let session = AiSession::arc_from_game(&state);
+        let contract = AiDecisionContract::issue(&state, PlayerId(0));
+
+        FAST_PRIORITY_DOMAIN_VALIDATIONS.with(|count| count.set(0));
+        assert_eq!(
+            fast_priority_action(
+                &RootPriorityDomain::new(&state, PlayerId(0)),
+                &config,
+                &session,
+                Some(&contract)
+            ),
+            fast_priority_action(
+                &RootPriorityDomain::new(&state, PlayerId(0)),
+                &config,
+                &session,
+                None
+            ),
+        );
+        assert_eq!(
+            FAST_PRIORITY_DOMAIN_VALIDATIONS.with(std::cell::Cell::get),
+            2,
+            "both calls must reach the validated list"
+        );
+    }
+
+    /// P1 at priority under a CR 732.2c divergence obligation: P0 casts Chain of
+    /// Smog with Witherbloom Apprentice in play, proposes the pre-cast copy
+    /// shortcut, and P1 shortens it at P1's breakpoint.
+    fn divergence_latched_priority_state() -> GameState {
+        use std::path::Path;
+
+        use engine::database::card_db::CardDatabase;
+        use engine::game::scenario::{GameScenario, P0, P1};
+        use engine::game::scenario_db::GameScenarioDbExt;
+        use engine::types::actions::PrecastCopyShortcutResponse;
+        use engine::types::game_state::CastPaymentMode;
+        use engine::types::zones::Zone;
+
+        const CHAIN_OF_SMOG: &str =
+            "Target player discards two cards. That player may copy this spell and may choose a new target for that copy.";
+
+        let db = CardDatabase::from_mtgjson(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/mtgjson/test_fixture.json"),
+        )
+        .expect("test fixture must contain Witherbloom Apprentice");
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_real_card(P0, "Witherbloom Apprentice", Zone::Battlefield, &db);
+        let chain = scenario
+            .add_spell_to_hand_from_oracle(P0, "Chain of Smog", false, CHAIN_OF_SMOG)
+            .id();
+        let mut runner = scenario.build();
+        let card_id = runner.state().objects[&chain].card_id;
+        runner
+            .act(GameAction::CastSpell {
+                object_id: chain,
+                card_id,
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            })
+            .expect("Chain enters the normal target-selection pipeline");
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(engine::types::ability::TargetRef::Player(P0)),
+            })
+            .expect("Chain can target its caster");
+        let WaitingFor::PrecastCopyShortcutOffer { epoch, .. } = runner.state().waiting_for else {
+            panic!(
+                "expected the pre-cast offer, got {:?}",
+                runner.state().waiting_for
+            );
+        };
+        runner
+            .act(GameAction::PrecastCopyShortcut {
+                epoch,
+                response: PrecastCopyShortcutResponse::Propose { route_id: epoch },
+            })
+            .expect("P0 proposes the route");
+        let breakpoint_id = match &runner.state().waiting_for {
+            WaitingFor::RespondToPrecastCopyShortcut {
+                player,
+                breakpoint_ids,
+                ..
+            } if *player == P1 => *breakpoint_ids.first().expect("P1 is issued a breakpoint"),
+            other => panic!("expected P1's shortcut response, got {other:?}"),
+        };
+        runner
+            .act(GameAction::PrecastCopyShortcut {
+                epoch,
+                response: PrecastCopyShortcutResponse::Shorten { breakpoint_id },
+            })
+            .expect("P1 shortens at its breakpoint");
+        assert!(
+            matches!(runner.state().waiting_for, WaitingFor::Priority { player } if player == P1),
+            "expected P1's priority window, got {:?}",
+            runner.state().waiting_for
+        );
+        runner.state().clone()
+    }
+
+    /// CR 732.2c: the player who shortened a pre-cast copy shortcut must diverge,
+    /// so the reducer rejects their pass and the validated list omits it, while
+    /// the issued contract still carries `PassPriority`. Answering the low-value
+    /// pass from the contract would propose an illegal action. Fails on revert of
+    /// the pass-authority guard.
+    #[test]
+    fn priority_shortcut_never_passes_through_a_divergence_obligation() {
+        let state = divergence_latched_priority_state();
+        let p1 = PlayerId(1);
+        assert!(
+            !engine::game::priority::pass_priority_structurally_legal(&state, p1),
+            "reach-guard: the divergence obligation withholds the pass authority"
+        );
+        assert!(
+            !engine::ai_support::legal_actions(&state).contains(&GameAction::PassPriority),
+            "reach-guard: the validated domain omits the pass"
+        );
+        let contract = AiDecisionContract::issue(&state, p1);
+        assert!(
+            contract
+                .candidates
+                .iter()
+                .any(|candidate| matches!(candidate.action, GameAction::PassPriority)),
+            "reach-guard: the issued contract still carries the pass"
+        );
+        let config = create_config(AiDifficulty::Medium, Platform::Native);
+        let session = AiSession::arc_from_game(&state);
+
+        let answer = fast_priority_action(
+            &RootPriorityDomain::new(&state, p1),
+            &config,
+            &session,
+            Some(&contract),
+        );
+        assert_eq!(
+            answer,
+            fast_priority_action(
+                &RootPriorityDomain::new(&state, p1),
+                &config,
+                &session,
+                None
+            )
+        );
+        assert_ne!(answer, Some(GameAction::PassPriority));
+    }
+
+    /// The chooser hands its issued contract to the priority shortcut, so a
+    /// forced pass is decided without re-enumerating the priority domain.
+    /// Fails if the chooser's call site stops passing the contract.
+    #[test]
+    fn chooser_answers_a_forced_pass_without_revalidating() {
+        let state = make_state();
+        let config = create_config(AiDifficulty::Medium, Platform::Native);
+
+        assert!(config.play_lookahead, "reach-guard: certification runs");
+        FAST_PRIORITY_DOMAIN_VALIDATIONS.with(|count| count.set(0));
+        ROOT_DOMAIN_BUILDS.with(|count| count.set(0));
+        assert_eq!(
+            choose_action(
+                &state,
+                PlayerId(0),
+                &config,
+                &mut SmallRng::seed_from_u64(1)
+            ),
+            Some(GameAction::PassPriority)
+        );
+        assert_eq!(
+            FAST_PRIORITY_DOMAIN_VALIDATIONS.with(std::cell::Cell::get),
+            0
+        );
+        assert_eq!(
+            ROOT_DOMAIN_BUILDS.with(std::cell::Cell::get),
+            0,
+            "certification must not enumerate a forced pass's domain"
+        );
+    }
+
+    /// The scorer core reuses the chooser's contract when it reruns the
+    /// priority shortcut. Fails if the scorer's call site stops passing it.
+    #[test]
+    fn scorer_reruns_the_priority_shortcut_from_the_chooser_contract() {
+        let state = make_state();
+        let config = create_config(AiDifficulty::Medium, Platform::Native);
+        let session = AiSession::arc_from_game(&state);
+        let contract = AiDecisionContract::issue(&state, PlayerId(0));
+
+        FAST_PRIORITY_DOMAIN_VALIDATIONS.with(|count| count.set(0));
+        let scored = score_candidates_core_for_root(
+            &RootPriorityDomain::new(&state, PlayerId(0)),
+            &config,
+            &session,
+            None,
+            RootReuse::FromChooser {
+                contract: &contract,
+                priority_shortcut: RootPriorityShortcut::Recompute,
+            },
+        );
+        assert!(
+            scored
+                .iter()
+                .any(|(action, _)| matches!(action, GameAction::PassPriority)),
+            "reach-guard: the forced pass is scored: {scored:?}"
+        );
+        assert_eq!(
+            FAST_PRIORITY_DOMAIN_VALIDATIONS.with(std::cell::Cell::get),
+            0
+        );
+    }
+
+    /// An issued contract holding a real choice leaves the decision to the
+    /// validated list, with the same answer as having no contract.
+    #[test]
+    fn priority_shortcut_with_an_issued_choice_falls_through_to_the_validated_list() {
+        let state = searchable_state();
+        let config = root_reuse_config();
+        let session = AiSession::arc_from_game(&state);
+        let contract = AiDecisionContract::issue(&state, PlayerId(0));
+        assert!(
+            contract
+                .candidates
+                .iter()
+                .any(|candidate| matches!(candidate.action, GameAction::CastSpell { .. })),
+            "fixture: the contract issues a cast"
+        );
+
+        FAST_PRIORITY_DOMAIN_VALIDATIONS.with(|count| count.set(0));
+        assert_eq!(
+            fast_priority_action(
+                &RootPriorityDomain::new(&state, PlayerId(0)),
+                &config,
+                &session,
+                Some(&contract)
+            ),
+            fast_priority_action(
+                &RootPriorityDomain::new(&state, PlayerId(0)),
+                &config,
+                &session,
+                None
+            ),
+        );
+        assert_eq!(
+            FAST_PRIORITY_DOMAIN_VALIDATIONS.with(std::cell::Cell::get),
+            2,
+            "both calls must reach the validated list"
         );
     }
 
@@ -18424,8 +19400,7 @@ one on the bottom of your library.";
         let contract = AiDecisionContract::issue(&state, PlayerId(0));
         reset_root_witnesses();
         let recomputed = score_candidates_core_for_root(
-            &state,
-            PlayerId(0),
+            &RootPriorityDomain::new(&state, PlayerId(0)),
             &config,
             &session,
             None,
@@ -18451,11 +19426,11 @@ one on the bottom of your library.";
         ] {
             let score = |root: RootReuse<'_>| {
                 let session = AiSession::arc_from_game(&state);
-                score_bits(&score_candidates_for_root(
-                    &state,
-                    PlayerId(0),
+                score_bits(&score_candidates_uncertified(
+                    &RootPriorityDomain::new(&state, PlayerId(0)),
                     &config,
                     &session,
+                    ensemble_deadline(&config),
                     root,
                 ))
             };
@@ -18468,7 +19443,13 @@ one on the bottom of your library.";
 
             let session = AiSession::arc_from_game(&state);
             assert!(
-                fast_priority_action(&state, PlayerId(0), &config, &session).is_none(),
+                fast_priority_action(
+                    &RootPriorityDomain::new(&state, PlayerId(0)),
+                    &config,
+                    &session,
+                    None
+                )
+                .is_none(),
                 "{name}: the absent shortcut is what the chooser would report"
             );
             let contract = AiDecisionContract::issue(&state, PlayerId(0));
