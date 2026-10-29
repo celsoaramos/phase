@@ -276,6 +276,10 @@ pub struct CurrentTerminalDelivery {
     pub delivery_id: TerminalDeliveryId,
     pub credential: TerminalCredential,
     pub display: TerminalMatchDisplay,
+    /// Recipient-filtered final Full state with its server-derived projection.
+    /// Raw JSON preserves object-key order across durable delivery retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_view: Option<Box<serde_json::value::RawValue>>,
 }
 
 /// Bootstrap proof held by a reconnecting player before the regular Full
@@ -1617,9 +1621,21 @@ mod tests {
                     reason: "Match conceded".to_string(),
                     ranked_result: None,
                 },
+                final_view: Some(
+                    serde_json::value::RawValue::from_string(
+                        r#"{"turn_number":7,"derived":{"unique_authorized_submitter":1}}"#
+                            .to_string(),
+                    )
+                    .unwrap(),
+                ),
             }),
         };
         let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""terminalRevision":9"#));
+        assert!(json.contains(r#""deliveryId":"delivery-0""#));
+        assert!(json.contains(
+            r#""finalView":{"turn_number":7,"derived":{"unique_authorized_submitter":1}}"#
+        ));
         let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
         match parsed {
             ServerMessage::TerminalBootstrapResult {
@@ -1628,6 +1644,10 @@ mod tests {
                 assert_eq!(delivery.key.generation, 4);
                 assert_eq!(delivery.terminal_revision, 9);
                 assert_eq!(delivery.delivery_id.0, "delivery-0");
+                assert_eq!(
+                    delivery.final_view.as_ref().unwrap().get(),
+                    r#"{"turn_number":7,"derived":{"unique_authorized_submitter":1}}"#
+                );
             }
             _ => panic!("wrong variant"),
         }
@@ -3110,6 +3130,8 @@ mod tests {
         let pool = vec![first_pull.clone(), second_pull.clone()];
         let pool_groups = DraftPoolGroups::from_pool(&pool, &DraftSource::single_set("TST"));
         let view = DraftPlayerView {
+            flow: draft_core::types::DraftFlow::LegacyBarrier,
+            fifo: None,
             status: DraftStatus::Deckbuilding,
             kind: DraftKind::Sealed,
             source: DraftSourceView::Set {
@@ -3164,6 +3186,9 @@ mod tests {
         };
         let msg = ServerMessage::DraftStateUpdate { view: view.clone() };
         let json = serde_json::to_string(&msg).unwrap();
+        let shape: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(shape["data"]["view"].get("flow").is_none());
+        assert!(shape["data"]["view"].get("fifo").is_none());
         let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
         match parsed {
             ServerMessage::DraftStateUpdate { view: v } => {
@@ -3427,6 +3452,8 @@ mod tests {
         use draft_core::view::{DraftSourceView, SetLayoutView, SpectatorDraftView};
 
         let view = SpectatorDraftView {
+            flow: DraftFlow::LegacyBarrier,
+            fifo: None,
             status: DraftStatus::Drafting,
             kind: DraftKind::Premier,
             source: DraftSourceView::Set {
@@ -3462,6 +3489,9 @@ mod tests {
         };
         let msg = ServerMessage::DraftSpectatorView { view };
         let json = serde_json::to_string(&msg).unwrap();
+        let shape: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(shape["data"]["view"].get("flow").is_none());
+        assert!(shape["data"]["view"].get("fifo").is_none());
         let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
         match parsed {
             ServerMessage::DraftSpectatorView { view: v } => {
@@ -3757,13 +3787,9 @@ mod tests {
     /// The preceding v88 bump gave `WaitingFor::DeclareBlockers` its
     /// `block_capacities` (CR 509.1a + CR 101.1).
     ///
-    /// The name embeds the numeral deliberately: `assert_eq!(PROTOCOL_VERSION,
-    /// <n>)` under a function named for `<n-1>` is green, so
-    /// `check-protocol-version.mjs` requires the current numeral in this name
-    /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_159_for_coin_flip_runs() {
-        assert_eq!(PROTOCOL_VERSION, 159);
+    fn protocol_version_is_owned_by_broker() {
+        assert_eq!(PROTOCOL_VERSION, lobby_broker::PROTOCOL_VERSION);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3774,8 +3800,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_159_for_coin_flip_runs` stays
-    /// `protocol_version_is_157_for_total_mana_value_zone_choices` stays
+    /// `protocol_version_is_owned_by_broker` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

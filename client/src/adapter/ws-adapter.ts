@@ -1,3 +1,4 @@
+import { PROTOCOL_VERSION, LOBBY_PROTOCOL_VERSION, MIN_SUPPORTED_LOBBY_PROTOCOL as MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL } from "../generated/protocol-versions";
 import { initializeLanCapabilities, isLanEndpoint } from "../services/lan";
 import { observeSocketDiagnostics, type SocketDiagnosticObserver } from "../services/socketDiagnostics";
 import { completeSocketDiagnostics, DIAGNOSTIC_HISTORY_LIMIT, type SocketReconnectOutcome } from "../services/troubleshooting";
@@ -179,6 +180,8 @@ export interface NativeSocketAdapterOptions {
   socketFactory: PhaseSocketFactory;
   /** Present on release only; preview parity is verified by the shell. */
   expectedServerVersion?: string;
+  /** Native P2P owns terminal fan-out and ACK ordering across local seat sockets. */
+  callerManagedTerminalDelivery?: boolean;
 }
 
 /** Native server setup for one local P2P seat. The PeerJS connection remains
@@ -212,8 +215,9 @@ export class NativeEngineVersionMismatchError extends Error {
 
 /**
  * Wire-protocol version the client speaks. Must match `PROTOCOL_VERSION` in
- * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
- * adds, removes, renames, or changes the type of a protocol variant field.
+ * `crates/server-core/src/protocol.rs`. Record incompatible changes with
+ * `node scripts/protocol-versions.mjs bump game --reason "description"`.
+ * The entries below are historical introduction versions.
  *
  * 159 — Coin-flip effects are one Effect::FlipCoins { flips, .. } (the FlipCoin and
  *       FlipCoinUntilLose tags are no longer written, count moves into flips) and
@@ -968,7 +972,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 159;
+export { PROTOCOL_VERSION };
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
@@ -1139,7 +1143,7 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * 1 — Initial lobby-owned version, covering the lobby variant set unchanged
  *     since #1880.
  */
-export const LOBBY_PROTOCOL_VERSION = 16;
+export { LOBBY_PROTOCOL_VERSION };
 
 /**
  * Lowest broker LOBBY_PROTOCOL_VERSION this client accepts.
@@ -1151,7 +1155,7 @@ export const LOBBY_PROTOCOL_VERSION = 16;
  * new variant it may never need — which is precisely how a protocol-bumping
  * release used to strand every older desktop build.
  */
-export const MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL = 2;
+export { MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL };
 
 /**
  * Lowest broker LOBBY_PROTOCOL_VERSION that can answer a gated tournament
@@ -1589,6 +1593,7 @@ export class WebSocketAdapter implements EngineAdapter {
   /** Set by AiDriverFault: the server permanently rejects every later submission for this game code. */
   private aiDriverFault: { gameCode: string | null; message: string } | null = null;
   private gameEnded = false;
+  private terminalCleanupPending = false;
   /**
    * Populated once the server's `ServerHello` arrives. `null` between the
    * WebSocket opening and the hello being delivered. Consumers see it via
@@ -2318,7 +2323,7 @@ export class WebSocketAdapter implements EngineAdapter {
     this.receivedGameStarted = false;
     this.emit({ type: "actionPendingChanged", pending: false });
     this.emit({ type: "latencyChanged", latencyMs: null });
-    if (this.gameEnded) {
+    if (this.gameEnded && !this.terminalCleanupPending) {
       this.emit({ type: "sessionChanged", session: null });
     }
     this.listeners = [];
@@ -3129,6 +3134,13 @@ export class WebSocketAdapter implements EngineAdapter {
       case "TerminalResult": {
         const delivery = (msg.data as { delivery?: FullTerminalDelivery }).delivery;
         if (!delivery) break;
+        if (this.options.nativePregame?.callerManagedTerminalDelivery) {
+          this.gameEnded = true;
+          this.emit({ type: "actionPendingChanged", pending: false });
+          this.emit({ type: "sessionChanged", session: null });
+          this.emit({ type: "terminalDelivery", delivery });
+          break;
+        }
         void (async () => {
           if (!(await commitFullTerminalDelivery(delivery))) {
             this.emit({
@@ -3139,13 +3151,20 @@ export class WebSocketAdapter implements EngineAdapter {
           }
           this.gameEnded = true;
           this.emit({ type: "actionPendingChanged", pending: false });
-          this.emit({ type: "sessionChanged", session: null });
+          const terminalSession = this.currentSession();
+          this.terminalCleanupPending = true;
+          if (terminalSession) {
+            this.emit({ type: "sessionChanged", session: { ...terminalSession, terminalOnly: true } });
+          }
           this.emit({ type: "terminalDelivery", delivery });
-          await acknowledgeFullTerminalDelivery(
+          if (await acknowledgeFullTerminalDelivery(
             this.serverUrl,
-            delivery.delivery_id,
+            delivery.deliveryId,
             delivery.credential,
-          );
+          )) {
+            this.terminalCleanupPending = false;
+            this.emit({ type: "sessionChanged", session: null });
+          }
         })().catch((error: unknown) => {
           this.emit({
             type: "terminalUnavailable",

@@ -1,3 +1,4 @@
+import { WIRE_PROTOCOL_VERSION } from "../generated/protocol-versions";
 import type {
   AbilityBlockEntry,
   EndContinuousEffectOffer,
@@ -105,7 +106,8 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * first-contact gate rejects a missing or unequal value before it allocates a
  * seat or adopts reconnect state.
  *
- * Bumps to date:
+ * Record incompatible changes: `node scripts/protocol-versions.mjs bump game --reason "description"`.
+ * Historical introductions:
  *  141 — game_setup and state_update carry GameState whose effects carry
  *       Effect::FlipCoins { flips, .. } in place of FlipCoin, FlipCoins { count }
  *       and FlipCoinUntilLose, and whose coin-flip resolution frame kind is
@@ -745,7 +747,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 141 as const;
+export { WIRE_PROTOCOL_VERSION };
 
 export type P2PMessage = P2PAuthorityWire & (
   | {
@@ -847,6 +849,8 @@ export type P2PMessage = P2PAuthorityWire & (
    * lease-bound; guests pin the first valid terminal id and never reconnect
    * after accepting the commitment for their filtered state. */
   | { type: "terminal_result"; result: P2PTerminalResult }
+  /** Guest → host: the exact statement already committed to IndexedDB. */
+  | { type: "terminal_result_receipt"; result: P2PTerminalResult }
   /** Native server AI became unable to advance the authoritative session.
    * The host sends this only after the final state revision it depends on. */
   | { type: "ai_driver_fault"; id: number; revision: number; message: string }
@@ -896,6 +900,7 @@ const VALID_TYPES = new Set([
   "kick",
   "host_left",
   "terminal_result",
+  "terminal_result_receipt",
   "ai_driver_fault",
   "player_kicked",
   "player_conceded",

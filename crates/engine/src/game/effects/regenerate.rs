@@ -563,6 +563,7 @@ mod tests {
             .act(GameAction::ActivateAbility {
                 source_id: mamba_id,
                 ability_index,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             })
             .expect("activation must succeed");
         resolve_stack_to_empty(&mut runner);
@@ -762,6 +763,7 @@ mod tests {
             .act(GameAction::ActivateAbility {
                 source_id: card_id,
                 ability_index: regen_idx,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             })
             .expect("activation must succeed");
         resolve_stack_to_empty(&mut runner);
