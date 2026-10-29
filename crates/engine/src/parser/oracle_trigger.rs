@@ -88,12 +88,12 @@ use crate::types::ability::{
 };
 use crate::types::card_type::{is_land_subtype, CoreType};
 use crate::types::counter::CounterType;
-use crate::types::events::{ClashResult, PlayerActionKind};
+use crate::types::event_kinds::{ClashResult, PlayerActionKind};
 use crate::types::keywords::{Keyword, KeywordKind};
 use crate::types::mana::{ManaColor, ManaType};
 use crate::types::phase::{Phase, PhaseGroup};
 use crate::types::triggers::{
-    AbilityLifecyclePoint, AttackTargetFilter, PlaneswalkRole, TriggerMode,
+    AbilityLifecyclePoint, AttackTargetFilter, ControlChangeSide, PlaneswalkRole, TriggerMode,
 };
 use crate::types::zones::Zone;
 use std::str::FromStr;
@@ -647,7 +647,7 @@ fn rewrite_cost_x_in_condition(cond: &mut crate::types::ability::AbilityConditio
 /// mirror image of the lying green, and just as dishonest.
 fn cost_x_sibling_slot_still_unbound(def: &crate::types::ability::AbilityDefinition) -> bool {
     use crate::types::ability::AbilityCondition;
-    use crate::types::game_state::TargetSelectionConstraint;
+    use crate::types::game_state_kinds::TargetSelectionConstraint;
 
     fn condition_has_bare_x(cond: &AbilityCondition) -> bool {
         match cond {
@@ -735,7 +735,7 @@ fn cost_x_sibling_slot_still_unbound(def: &crate::types::ability::AbilityDefinit
 /// it is correct at both selection time and resolution time.
 fn rewrite_cost_x_in_ability(def: &mut crate::types::ability::AbilityDefinition) {
     use super::oracle_replacement::rewrite_variable_x_to_cost_x_paid;
-    use crate::types::game_state::TargetSelectionConstraint;
+    use crate::types::game_state_kinds::TargetSelectionConstraint;
 
     if let Some(cond) = def.condition.as_mut() {
         rewrite_cost_x_in_condition(cond);
@@ -2802,7 +2802,7 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
         && !trigger_condition_excludes_mana_activations(def.condition.as_ref())
     {
         if let Some(execute) = def.execute.as_deref_mut() {
-            if crate::game::mana_abilities::could_be_triggered_mana_ability_body(execute) {
+            if crate::types::ability::could_be_triggered_mana_ability_body(execute) {
                 *execute.effect = Effect::unimplemented(
                     "activation_triggered_mana_ability",
                     "a mana-producing trigger on activating a mana ability resolves \
@@ -2821,7 +2821,7 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
         TriggerMode::TapsForMana | TriggerMode::ManaAdded | TriggerMode::ManaAbilityProduced
     ) {
         if let Some(execute) = def.execute.as_deref_mut() {
-            if crate::game::mana_abilities::could_be_triggered_mana_ability_body(execute) {
+            if crate::types::ability::could_be_triggered_mana_ability_body(execute) {
                 super::oracle_effect::refuse_linked_paid_cast_in_mana_ability(
                     execute,
                     def.description.as_deref().unwrap_or_default(),
@@ -4091,7 +4091,7 @@ fn lift_filter_shared_quality_parent_target_to_triggering_source(filter: &mut Ta
 /// trigger source must be the entering object).
 ///
 /// A hand reveal that parks a card choice
-/// (`reveal_hand::effect_parks_reveal_card_choice`) also returns `true`: a later
+/// (`types::ability::effect_parks_reveal_card_choice`) also returns `true`: a later
 /// `ParentTarget` binds to the chosen revealed card, whatever player the reveal
 /// targets.
 ///
@@ -4127,7 +4127,7 @@ fn introduces_chosen_object_target(effect: &Effect) -> bool {
     // event. Its player target (`Controller` / `ScopedPlayer` under a per-player
     // scope, `TriggeringPlayer`, …) is not a chosen object filter, so the `Typed`
     // test below cannot see it. Shares the resolver's card-parking authority.
-    if crate::game::effects::reveal_hand::effect_parks_reveal_card_choice(effect) {
+    if crate::types::ability::effect_parks_reveal_card_choice(effect) {
         return true;
     }
     // CR 608.2c + CR 608.2d: a zone choice ("choose a card at random exiled
@@ -5144,7 +5144,7 @@ fn cost_contains_one_of(cost: &AbilityCost) -> bool {
 }
 
 fn reflexive_optional_cost_payable_by_resolution_prompt(cost: &AbilityCost) -> bool {
-    if !crate::game::costs::supported_at_resolution(cost) {
+    if !crate::types::ability::supported_at_resolution(cost) {
         return false;
     }
     match cost {
@@ -5201,7 +5201,7 @@ fn reflexive_optional_cost_payable_by_resolution_prompt(cost: &AbilityCost) -> b
 /// a typed permanent population. This excludes self/granting-object/any
 /// targets, aggregate requirements, and the `u32::MAX` X/any-number sentinel.
 fn reflexive_optional_direct_cost(cost: &AbilityCost) -> bool {
-    crate::game::costs::is_direct_resolution_optional_payment_branch(cost)
+    crate::types::ability::is_direct_resolution_optional_payment_branch(cost)
         || matches!(
             cost,
             AbilityCost::Sacrifice(cost)
@@ -8703,7 +8703,8 @@ fn try_extract_entering_object_name_comparison(
 /// `try_extract_entering_object_name_comparison`. See that function's doc.
 fn parse_entering_object_name_comparison(input: &str) -> OracleResult<'_, TriggerCondition> {
     let (rest, _) = tag("if it ").parse(input)?;
-    let (rest, prop) = crate::parser::oracle_effect::parse_search_name_reference_suffix(rest)?;
+    let (rest, prop) =
+        crate::parser::oracle_effect::parse_search_name_reference_suffix(rest, None)?;
     let FilterProp::SharesQuality {
         quality,
         reference,
@@ -10683,7 +10684,7 @@ fn try_extract_not_completed_dungeon(
     lower: &str,
     text: &str,
 ) -> Option<(String, Option<TriggerCondition>)> {
-    use crate::game::dungeon::DungeonId;
+    use crate::types::dungeon::DungeonId;
 
     let prefix = "if you haven't completed ";
     let pos = tp.find(prefix)?;
@@ -13225,6 +13226,15 @@ pub(crate) fn parse_trigger_condition(
     if let Some((mode, mut def)) = try_parse_event(&subject, rest, &lower, ctx) {
         // Re-emit subject diagnostics — the trigger parsed but the subject degraded to Any.
         ctx.diagnostics.extend(subject_diagnostics);
+        // CR 109.2: the type-phrase parser swallows the trailing "card" of "a
+        // creature card", but the word is what stops the subject from denoting
+        // only battlefield permanents. Restore it for becomes-target subjects,
+        // whose matcher reads it (`filter_denotes_battlefield_permanent`).
+        if def.mode == TriggerMode::BecomesTarget
+            && subject_ends_with_card_noun(&after_keyword[..after_keyword.len() - rest.len()])
+        {
+            def.valid_card = def.valid_card.take().map(with_card_qualifier);
+        }
         if is_batched {
             def.batched = true;
         }
@@ -14936,6 +14946,31 @@ fn collapse_or(mut filters: Vec<TargetFilter>) -> TargetFilter {
     }
 }
 
+/// CR 109.2: does the consumed subject phrase end in the noun "card"/"cards"?
+fn subject_ends_with_card_noun(consumed: &str) -> bool {
+    let last_word = consumed.trim_end().rsplit(' ').next().unwrap_or_default();
+    all_consuming(alt((tag::<_, _, OracleError<'_>>("cards"), tag("card"))))
+        .parse(last_word)
+        .is_ok()
+}
+
+/// CR 109.2: add the `Card` type qualifier to every typed leaf of a subject
+/// filter whose printed phrase carried the word "card".
+fn with_card_qualifier(filter: TargetFilter) -> TargetFilter {
+    match filter {
+        TargetFilter::Typed(mut typed) => {
+            if !typed.type_filters.contains(&TypeFilter::Card) {
+                typed.type_filters.push(TypeFilter::Card);
+            }
+            TargetFilter::Typed(typed)
+        }
+        TargetFilter::Or { filters } => TargetFilter::Or {
+            filters: filters.into_iter().map(with_card_qualifier).collect(),
+        },
+        other => other,
+    }
+}
+
 fn set_trigger_subject(def: &mut TriggerDefinition, subject: &TargetFilter) {
     if subject_is_player(subject) {
         def.valid_target = Some(subject.clone());
@@ -15088,6 +15123,10 @@ fn parse_taps_for_mana_actor_line(
         alt((
             value(Some(ControllerRef::Opponent), tag("an opponent taps ")),
             value(None, tag("a player taps ")),
+            // CR 603.2 + CR 106.12a: "you tap … for mana" taps-for-mana actor —
+            // the trigger event is a tap for mana performed by the trigger
+            // source's controller (Molten Tide class).
+            value(Some(ControllerRef::You), tag("you tap ")),
         )),
     )
     .parse(i)?;
@@ -20181,7 +20220,7 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
             let (mut filter, sub_rem) =
                 parse_trigger_subject(&subject_text, &mut ParseContext::default());
             if sub_rem.trim().is_empty() {
-                if let Some(c) = actor_controller {
+                if let Some(c) = actor_controller.clone() {
                     // Constrain subject to opponent-controlled permanents via the
                     // single `add_controller` authority (shared with the "you tap"
                     // arm above).
@@ -20190,31 +20229,51 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
                 let mut def = make_base();
                 def.mode = TriggerMode::TapsForMana;
                 def.valid_card = Some(filter);
+                // CR 603.2 + CR 106.12a: the "you tap …" actor binds the tapper
+                // to the trigger source's controller. Keyworded printed
+                // "whenever/when you tap …" still hits the :19178 loop first
+                // (left byte-identical); keyword-stripped delayed conditions
+                // reach this site; both produce identical
+                // `valid_card = add_controller(filter, You)` +
+                // `valid_target = Controller` + `taps_for_mana_produced`
+                // passthrough.
+                if actor_controller == Some(ControllerRef::You) {
+                    def.valid_target = Some(TargetFilter::Controller);
+                }
                 def.taps_for_mana_produced = produced_filter;
                 return Some((TriggerMode::TapsForMana, def));
             }
         }
     }
 
-    // CR 603.2 + CR 613.3: "When you lose control of ~" — fires after a
-    // controller change on the source object. Maps to ChangesController so
-    // the trigger fires on the GainControl/GiveControl effect-resolved event.
-    // valid_card = SelfRef gates the trigger to changes on this specific object.
-    // The trigger controller is the previous controller (still Khârn's holder
-    // at trigger-scan time, because layer re-evaluation runs after trigger
-    // collection in the post-action pipeline).
-    fn parse_you_lose_control_of_self(i: &str) -> OracleResult<'_, ()> {
+    // CR 603.2 + CR 603.10 + CR 603.10d: "When[ever] you lose control of ~" /
+    // "When[ever] you gain control of ~[ from another player]". Maps to
+    // ChangesController, which fires on the `ControllerChanged` event published by
+    // the control-changing instructions (not by control the layer pass assigns or
+    // retires, #9903).
+    // valid_card = SelfRef gates the trigger to
+    // changes on this specific object; the `side` names which endpoint of the
+    // change is "you" (CR 603.3a: the trigger's controller). "From another player"
+    // adds no constraint: a ControllerChanged event exists only when the
+    // controller changed, and every permanent has a controller (CR 110.2).
+    fn parse_you_change_control_of_self(i: &str) -> OracleResult<'_, ControlChangeSide> {
         all_consuming(preceded(
-            alt((tag("when "), tag("whenever "))),
-            value((), tag("you lose control of ~")),
+            (alt((tag("when "), tag("whenever "))), tag("you ")),
+            alt((
+                value(ControlChangeSide::Loses, tag("lose control of ~")),
+                value(
+                    ControlChangeSide::Gains,
+                    terminated(tag("gain control of ~"), opt(tag(" from another player"))),
+                ),
+            )),
         ))
         .parse(i)
     }
-    if parse_you_lose_control_of_self(lower).is_ok() {
+    if let Ok((_, side)) = parse_you_change_control_of_self(lower) {
         let mut def = make_base();
-        def.mode = TriggerMode::ChangesController;
+        def.mode = TriggerMode::ChangesController { side };
         def.valid_card = Some(TargetFilter::SelfRef);
-        return Some((TriggerMode::ChangesController, def));
+        return Some((def.mode.clone(), def));
     }
 
     if matches!(lower, "whenever you lose life" | "when you lose life") {
@@ -21723,7 +21782,9 @@ pub(crate) fn parse_post_spell_modifier(modifier: &str) -> Option<TargetFilter> 
     // CR 608.2b: "that has the same name as a card in your graveyard"
     // (Pyromancer's Ascension). Reuse the search-filter name-reference suffix
     // combinator so graveyard SharesQuality semantics stay aligned.
-    if let Ok((rest, prop)) = super::oracle_effect::parse_search_name_reference_suffix(modifier) {
+    if let Ok((rest, prop)) =
+        super::oracle_effect::parse_search_name_reference_suffix(modifier, None)
+    {
         if rest.trim().is_empty() {
             return Some(TargetFilter::Typed(
                 TypedFilter::default().properties(vec![prop]),
@@ -25338,6 +25399,36 @@ mod attached_set_trigger_tests {
             FilterProp::AttachedTo {
                 to: AttachmentReferent::Host { filter }
             } if **filter == TargetFilter::Typed(TypedFilter::creature())
+        ));
+    }
+
+    /// CR 109.2: "a creature card" keeps its `Card` qualifier on a
+    /// becomes-target subject, while "a creature" stays a bare permanent type.
+    #[test]
+    fn becomes_target_subject_keeps_card_qualifier() {
+        let card = parse_trigger_line(
+            "Whenever a creature card becomes the target of a spell or ability, draw a card.",
+            "Test",
+        );
+        let Some(TargetFilter::Typed(typed)) = &card.valid_card else {
+            panic!("expected typed subject, got {:?}", card.valid_card);
+        };
+        assert!(typed.type_filters.contains(&TypeFilter::Card));
+        assert!(typed.type_filters.contains(&TypeFilter::Creature));
+        assert!(!crate::game::filter::filter_denotes_battlefield_permanent(
+            card.valid_card.as_ref().unwrap()
+        ));
+
+        let bare = parse_trigger_line(
+            "Whenever a creature becomes the target of a spell or ability, draw a card.",
+            "Test",
+        );
+        let Some(TargetFilter::Typed(typed)) = &bare.valid_card else {
+            panic!("expected typed subject, got {:?}", bare.valid_card);
+        };
+        assert!(!typed.type_filters.contains(&TypeFilter::Card));
+        assert!(crate::game::filter::filter_denotes_battlefield_permanent(
+            bare.valid_card.as_ref().unwrap()
         ));
     }
 }
