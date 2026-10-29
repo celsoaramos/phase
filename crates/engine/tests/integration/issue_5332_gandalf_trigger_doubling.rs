@@ -122,6 +122,10 @@ fn gandalf_parsed_static_doubles_legendary_reentry_triggers() {
             mana_value: 0,
             controller: P0,
             owner: P0,
+            arrival: engine::types::game_state::ArrivalIdentity {
+                owner: P0,
+                controller: P0,
+            },
             from_zone: Some(Zone::Exile),
             cast_from_zone: None,
             played_from_zone: None,
@@ -137,6 +141,8 @@ fn gandalf_parsed_static_doubles_legendary_reentry_triggers() {
             turn_zone_change_index: 0,
             recorded_turn_number: 0,
             is_suspected: false,
+            was_prepared: false,
+            departure: engine::types::game_state::ZoneDeparture::Moved,
         }),
     };
 

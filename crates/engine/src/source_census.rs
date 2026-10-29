@@ -217,6 +217,11 @@ mod tests {
                 "Same inverse polarity: the asserted subject IS comment text (CR annotations).",
             ),
             (
+                "src/game/engine_resolution_choices.rs",
+                "Same inverse polarity: the citation gate's subject IS comment text (line-number \
+                 citations).",
+            ),
+            (
                 "tests/integration/loop_shortcut.rs",
                 "Parses with `syn` rather than by substring, so comments are excluded by \
                  construction — the stronger instrument this module approximates.",
@@ -249,6 +254,11 @@ mod tests {
             ),
             (
                 "tests/integration/waiting_for_actor_authority_census.rs",
+                "Parses with `syn` rather than by substring, so comments are excluded by \
+                 construction — the stronger instrument this module approximates.",
+            ),
+            (
+                "tests/integration/layer_boundary_census.rs",
                 "Parses with `syn` rather than by substring, so comments are excluded by \
                  construction — the stronger instrument this module approximates.",
             ),

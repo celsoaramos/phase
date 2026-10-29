@@ -137,6 +137,12 @@ const DOCUMENTED_OVER_PROMPT: &[&str] = &[
     // same-event sibling triggers, so they commute. The conservative prompt
     // remains fail-closed until that per-source proof is structural.
     "adaptive training post",
+    // Woodwork Prodigy: its source-local prepared intervening-if
+    // ("if this creature isn't prepared") and the corresponding BecomePrepared
+    // write targeting SelfRef are disjoint for same-event sibling triggers,
+    // so they commute. The conservative prompt remains fail-closed until that
+    // per-source proof is structural.
+    "woodwork prodigy",
     // ---- L8-held: a self-scoped write can flip a sibling's re-checked
     // intervening-if (CR 603.4), but the flip is monotone/self-limiting, so
     // identical siblings still commute semantically. The L8 idempotence recognizer
@@ -279,6 +285,28 @@ const DOCUMENTED_OVER_PROMPT: &[&str] = &[
     // assertion names the consumed set directly, so the next maintainer need not
     // re-derive it.
     "biowaste blob",
+    // ---- dynamic P/T read of frozen or per-source objects (CR 603.10a) ----
+    // Token P/T = total power of the co-departed batch: a frozen LKI read no sibling's
+    // token creation changes, so the copies' tokens are identical in either order.
+    "the skullspore nexus",
+    // -X/-X where X is the mana value of the card THIS source exiled: each member reads
+    // its own exile pile and writes only to it, so the members commute.
+    "cemetery desecrator",
+    // Each member adds one slime counter, then creates a token whose P/T is a CDA (CR 604.3a)
+    // reading the counter total, so either order ends with the same counters and tokens.
+    "gutter grime",
+    // Combat-begin "any opponent may tap an untapped creature they control; if
+    // they do, tap this creature and create a 1/1 Fish" (AST measured). Each
+    // member taps only ITSELF (disjoint self-write) and creates a Fish the
+    // Kraken's controller owns, so no sibling's product feeds another's
+    // "creature they [opponent] control" choice; the opponent's tapped pool is
+    // monotone (tapped stays tapped) and the intervening-if reads only
+    // self-tappedness, which no sibling writes. Identical siblings commute up
+    // to relabeling — either order ends with the same Fish count and tapped
+    // sets. Only visible post-#9830 — the scoped-player parse binds "they
+    // control" to the acting opponent; the pre-regen fixture carried
+    // controller You, which the discriminator auto-ordered.
+    "reservoir kraken",
 ];
 
 /// Batch-depth GENUINE order-dependence (kept SEPARATE from the same-event
@@ -1093,6 +1121,7 @@ fn token_power_src() -> Effect {
         owner: TargetFilter::Controller,
         attach_to: None,
         enters_attacking: false,
+        attack_destination: crate::types::ability::TokenAttackDestination::ControllerChooses,
         supertypes: vec![],
         static_abilities: vec![],
         enter_with_counters: vec![],
@@ -1380,6 +1409,7 @@ fn n_d2_commander_intervening_if_is_fed_by_a_sibling_membership_write() {
         owner: TargetFilter::Controller,
         source_filter: None,
         enters_attacking: false,
+        attack_destination: crate::types::ability::TokenAttackDestination::ControllerChooses,
         tapped: false,
         count: qfix(1),
         extra_keywords: vec![],

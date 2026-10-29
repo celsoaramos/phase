@@ -12,10 +12,11 @@ use crate::parser::oracle_ir::trigger::TriggerNodeIr;
 use crate::parser::{parse_oracle_text, parse_oracle_text_traced};
 use crate::types::ability::MultiTargetSpec;
 use crate::types::ability::{
-    AbilityCost, ActivationRestriction, ControllerRef, Effect, FilterProp, TargetChoiceTiming,
-    TargetFilter, TriggerCondition, TypedFilter,
+    AbilityCost, ActivationRestriction, ControllerRef, Effect, FilterProp, QuantityExpr,
+    QuantityRef, TargetChoiceTiming, TargetFilter, TriggerCondition, TypedFilter,
 };
 use crate::types::game_state::DistributionUnit;
+use crate::types::mana::{ManaCost, ManaCostShard};
 
 fn ability_has_unimplemented(def: &crate::types::ability::AbilityDefinition) -> bool {
     matches!(def.effect.as_ref(), Effect::Unimplemented { .. })
@@ -322,6 +323,35 @@ fn barbarian_ring_ability_word_activated_router_is_ir_native() {
 
     insta::assert_json_snapshot!("barbarian_ring_activated_ir", &ir);
     insta::assert_json_snapshot!("barbarian_ring_activated_lowered", &lowered);
+}
+
+/// CR 602.1b + CR 511.1: "Activate only during the end of combat step" is an
+/// activation instruction naming one turn step with no turn owner; it lowers to
+/// a typed `RequiresCondition { CurrentPhaseIs }` restriction and leaves no
+/// `Effect::Unimplemented` residue on the damage ability.
+#[test]
+fn desert_named_step_activated_is_ir_native() {
+    let (ir, lowered) = parse_two_layer(
+        "{T}: Add {C}.\n{T}: This land deals 1 damage to target attacking creature. Activate only during the end of combat step.",
+        "Desert",
+        &["Land"],
+        &["Desert"],
+    );
+
+    assert_eq!(lowered.abilities.len(), 2);
+    let ability = &lowered.abilities[1];
+    assert!(
+        !ability_has_unimplemented(ability),
+        "named-step activated route must not fall back: {ability:?}"
+    );
+    assert!(matches!(ability.effect.as_ref(), Effect::DealDamage { .. }));
+    assert!(
+        !ability.activation_restrictions.is_empty(),
+        "explicit Activate only restriction must survive"
+    );
+
+    insta::assert_json_snapshot!("desert_named_step_activated_ir", &ir);
+    insta::assert_json_snapshot!("desert_named_step_activated_lowered", &lowered);
 }
 
 /// CR 706.3b: an activated terminal die roll owns only its contiguous result
@@ -728,25 +758,27 @@ fn trigger_die_table_scanner_preserves_non_table_and_unsupported_rows() {
 /// to give it a private one. `OracleDocIr.diagnostics` is the single warning
 /// channel; `parse_warnings` is a copy of it.
 ///
-/// Fixture is pool-verified, not synthetic: Boing!'s Oracle text is verbatim
-/// MTGJSON, and it carries a live `DynamicQty` swallowed-clause warning — "scry
-/// a number of cards equal to the result" lowers to a fixed `Scry` count, so
-/// the die-result-dependent quantity is genuinely dropped from the parse. A
-/// synthetic fixture could go vacuously green if the detector stopped firing;
-/// this one cannot without that separately-tracked defect being fixed.
+/// Fixture is pool-verified, not synthetic: Hinder's Oracle text is verbatim
+/// MTGJSON, and it carries a live `Replacement_Instead` swallowed-clause warning —
+/// "put that card on your choice of the top or bottom of its owner's library
+/// instead of into that player's graveyard" has no modeled countered-spell
+/// destination, so the redirect is genuinely dropped from the parse. A synthetic
+/// fixture could go vacuously green if the detector stopped firing; this one
+/// cannot without that separately-tracked defect being fixed.
 ///
-/// (Intermediate Chirography previously served as this fixture, but issue
+/// (Boing! previously served as this fixture, until its "scry a number of cards
+/// equal to the result" stopped swallowing: the count position now reads or
+/// fails closed. Intermediate Chirography served before that, until issue
 /// #5638's fix taught `parse_class_oracle_text` to compose a level-gated
 /// trigger's printed intervening-if with its `ClassLevelGE` condition instead
-/// of overwriting it — the card's `Duration_ThisTurn` warning was that
-/// overwrite silently dropping the "this turn" scoped condition, and is gone
-/// now that the condition survives.)
+/// of overwriting it.)
 #[test]
 fn swallow_diagnostics_are_homed_in_the_doc_ir_channel() {
     let (ir, lowered) = parse_two_layer(
-        "Return target creature to its owner's hand, then roll a six-sided die. \
-         If the result is 3 or less, scry a number of cards equal to the result.",
-        "Boing!",
+        "Counter target spell. If that spell is countered this way, put that card on your \
+         choice of the top or bottom of its owner's library instead of into that player's \
+         graveyard.",
+        "Hinder",
         &["Instant"],
         &[],
     );
@@ -3048,11 +3080,9 @@ fn themberchaud() {
 /// Conditional form: `"If this creature hasn't been exerted this turn, …"`.
 /// Combat Celebrant is the ONLY card in the pool that reaches this arm.
 ///
-/// Baselines a known pre-existing gap rather than hiding it: the leading
-/// if-gate is parsed for dispatch and then **dropped** — the emitted trigger
-/// carries no condition for it. That is recorded as a census harvest item; this
-/// fixture pins the current (wrong) shape so the conversion is provably
-/// behavior-preserving and the gap stays visible for a separate fix.
+/// The leading condition is retained as `attack_cost_condition`, checked before
+/// optional payment (CR 508.1g). The paid linked payoff remains a real trigger;
+/// the payment gate is not an intervening-if condition (CR 603.4).
 #[test]
 fn combat_celebrant() {
     let (ir, lowered) = parse_two_layer(
@@ -3095,7 +3125,9 @@ fn armor_of_thorns() {
 // ---------------------------------------------------------------------------
 
 mod diagnostic_snapshots {
+    use super::{ability_has_unimplemented, parse_two_layer};
     use crate::parser::oracle::parse_oracle_ir;
+    use crate::types::ability::{Effect, TargetFilter};
 
     /// Parse Oracle text and return only the diagnostics vec from the IR.
     fn parse_diagnostics(
@@ -3131,9 +3163,13 @@ mod diagnostic_snapshots {
 
     #[test]
     fn diagnostic_ignored_remainder() {
+        // The Swordjack clause with a TARGETED recipient: "target player or planeswalker"
+        // consumes only up to the noun, leaving the trailing "it's attacking" ignored.
+        // (The printed untargeted phrase is consumed whole by the attacked-referent
+        // combinator; see `diagnostic_attacked_referent_leaves_no_remainder`.)
         let diagnostics = parse_diagnostics(
-            "Whenever this creature attacks, it deals damage to the player or planeswalker it's attacking equal to the number of artifacts you control.\nEncore {5}{R} ({5}{R}, Exile this card from your graveyard: For each opponent, create a token copy that attacks that opponent this turn if able. They gain haste. Sacrifice them at the beginning of the next end step. Activate only as a sorcery.)",
-            "Fathom Fleet Swordjack",
+            "Whenever this creature attacks, it deals damage to target player or planeswalker it's attacking equal to the number of artifacts you control.",
+            "Synthetic Swordjack",
             &["Creature"],
             &["Orc", "Pirate"],
         );
@@ -3141,10 +3177,64 @@ mod diagnostic_snapshots {
             diagnostics
                 .iter()
                 .any(|d| d.category_name() == "ignored-remainder"),
-            "Expected ignored-remainder diagnostic for Fathom Fleet Swordjack, got: {:?}",
+            "Expected ignored-remainder diagnostic, got: {:?}",
             diagnostics
         );
         insta::assert_json_snapshot!("diagnostic_ignored_remainder", &diagnostics);
+    }
+
+    #[test]
+    fn diagnostic_attacked_referent_leaves_no_remainder() {
+        let (_, lowered) = parse_two_layer(
+            "Whenever this creature attacks, it deals damage to the player or planeswalker it's attacking equal to the number of artifacts you control.\nEncore {5}{R} ({5}{R}, Exile this card from your graveyard: For each opponent, create a token copy that attacks that opponent this turn if able. They gain haste. Sacrifice them at the beginning of the next end step. Activate only as a sorcery.)",
+            "Fathom Fleet Swordjack", &["Creature"], &["Orc", "Pirate"],
+        );
+        let body = lowered
+            .triggers
+            .iter()
+            .find_map(|trigger| trigger.execute.as_deref())
+            .expect("printed attack trigger lowered successfully");
+        assert!(matches!(
+            body.effect.as_ref(),
+            Effect::DealDamage {
+                target: TargetFilter::AttackedPlayerOrPlaneswalker,
+                ..
+            }
+        ));
+        assert!(!lowered.abilities.iter().any(ability_has_unimplemented));
+        assert!(lowered
+            .triggers
+            .iter()
+            .filter_map(|trigger| trigger.execute.as_deref())
+            .all(|body| !ability_has_unimplemented(body)));
+        // CR 506.3: the printed Fathom Fleet Swordjack text. "the player or planeswalker
+        // it's attacking" is consumed whole by the attacked-referent combinator, leaving
+        // no ignored-remainder "it's attacking". Reach guard: the
+        // targeted spelling of the same clause still reports the remainder.
+        let printed = parse_diagnostics(
+            "Whenever this creature attacks, it deals damage to the player or planeswalker it's attacking equal to the number of artifacts you control.\nEncore {5}{R} ({5}{R}, Exile this card from your graveyard: For each opponent, create a token copy that attacks that opponent this turn if able. They gain haste. Sacrifice them at the beginning of the next end step. Activate only as a sorcery.)",
+            "Fathom Fleet Swordjack",
+            &["Creature"],
+            &["Orc", "Pirate"],
+        );
+        let targeted = parse_diagnostics(
+            "Whenever this creature attacks, it deals damage to target player or planeswalker it's attacking equal to the number of artifacts you control.",
+            "Synthetic Swordjack",
+            &["Creature"],
+            &["Orc", "Pirate"],
+        );
+        assert!(
+            targeted
+                .iter()
+                .any(|d| d.category_name() == "ignored-remainder"),
+            "reach guard: {targeted:?}"
+        );
+        assert!(
+            !printed
+                .iter()
+                .any(|d| d.category_name() == "ignored-remainder"),
+            "unexpected ignored-remainder for Fathom Fleet Swordjack: {printed:?}"
+        );
     }
 
     #[test]
@@ -3305,4 +3395,50 @@ fn druid_of_the_emerald_grove_trigger_owns_all_three_printed_rows() {
          lower bound 0, because CR 706.2 selects on the post-modifier result and \
          `apply_modifier` clamps it to 0) and the open-ended \"20+\" (u8::MAX)"
     );
+}
+
+// SHAPE: CR 107.3a + CR 602.5d + CR 701.63a: the full printed activation
+// keeps the same X in mana, life payment and Endure, with sorcery timing.
+#[test]
+fn krumar_initiate_preserves_full_activation_in_both_layers() {
+    let (ir, lowered) = parse_two_layer(
+        "{X}{B}, {T}, Pay X life: This creature endures X. Activate only as a sorcery. (Put X +1/+1 counters on it or create an X/X white Spirit creature token.)",
+        "Krumar Initiate", &["Creature"], &["Human", "Cleric"],
+    );
+    assert_eq!(ir.items.len(), 1);
+    assert_eq!(lowered.abilities.len(), 1);
+    let def = &lowered.abilities[0];
+    assert!(matches!(def.effect.as_ref(), Effect::Endure {
+        amount: QuantityExpr::Ref { qty: QuantityRef::Variable { name } }, subject: TargetFilter::SelfRef,
+    } if name == "X"));
+    assert_eq!(
+        def.cost,
+        Some(AbilityCost::Composite {
+            costs: vec![
+                AbilityCost::Mana {
+                    cost: ManaCost::Cost {
+                        shards: vec![ManaCostShard::X, ManaCostShard::Black],
+                        generic: 0
+                    }
+                },
+                AbilityCost::Tap,
+                AbilityCost::PayLife {
+                    amount: QuantityExpr::Ref {
+                        qty: QuantityRef::Variable {
+                            name: "X".to_string()
+                        }
+                    }
+                },
+            ]
+        })
+    );
+    assert_eq!(
+        def.activation_restrictions,
+        vec![ActivationRestriction::AsSorcery]
+    );
+    assert!(!ability_has_unimplemented(def));
+    assert!(def.sub_ability.is_none());
+    assert!(lowered.parse_warnings.is_empty());
+    insta::assert_json_snapshot!("krumar_initiate_ir", &ir);
+    insta::assert_json_snapshot!("krumar_initiate_lowered", &lowered);
 }

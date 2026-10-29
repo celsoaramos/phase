@@ -135,6 +135,35 @@ export function getVisibleBoardPlayerIds(
   return focusedId == null ? [viewerId] : [viewerId, focusedId];
 }
 
+/** The seat whose container stores the shared `zone`, as published by the engine; null when per-player. */
+export function getSharedPileHolder(
+  gameState: GameState | null | undefined,
+  zone: "graveyard" | "library",
+): PlayerId | null {
+  return gameState?.derived?.shared_piles?.[zone] ?? null;
+}
+
+/** Selects between two engine-provided seats: the shared pile's holder, else `seat`. */
+export function resolvePileSeat(
+  gameState: GameState | null | undefined,
+  zone: "graveyard" | "library",
+  seat: PlayerId,
+): PlayerId {
+  return getSharedPileHolder(gameState, zone) ?? seat;
+}
+
+/** The zone viewer pile a Graveyard/Exile object belongs to; exile stays per-seat. */
+export function getZoneViewerPile(
+  gameState: GameState | null | undefined,
+  obj: Pick<GameObject, "zone" | "owner">,
+): { zone: "graveyard" | "exile"; playerId: PlayerId } | null {
+  if (obj.zone === "Graveyard") {
+    return { zone: "graveyard", playerId: resolvePileSeat(gameState, "graveyard", obj.owner) };
+  }
+  if (obj.zone === "Exile") return { zone: "exile", playerId: obj.owner };
+  return null;
+}
+
 export function getPlayerZoneIds(
   gameState: GameState | null,
   zone: "graveyard" | "exile" | "library",
@@ -142,13 +171,13 @@ export function getPlayerZoneIds(
 ): ObjectId[] {
   if (!gameState) return [];
   if (zone === "graveyard") {
-    return gameState.players[playerId]?.graveyard ?? [];
+    return gameState.players[resolvePileSeat(gameState, "graveyard", playerId)]?.graveyard ?? [];
   }
   if (zone === "library") {
     // library[0] = top of library (engine convention from zones.rs). Returns
     // the full ordered library; the library viewer consumes each object's
     // engine-projected display visibility before rendering it.
-    return gameState.players[playerId]?.library ?? [];
+    return gameState.players[resolvePileSeat(gameState, "library", playerId)]?.library ?? [];
   }
   return gameState.exile.filter((id) => gameState.objects[id]?.owner === playerId);
 }
@@ -221,14 +250,21 @@ export function isObjectReportableToViewer(
  *                            no amount (DistributeAmongModal).
  *   - `ProliferateChoice` -> `SelectTargets`; CR 701.34a chooses any-size subset
  *     `TimeTravelChoice`     of permanents and/or players (ProliferateModal).
- *     `ChooseObjectsSelection`
+ *   - multi-pick `ChooseObjectsSelection` -> `SelectTargets` (ProliferateModal).
  *   - `EachPlayerCopyChosenSelection` -> `SelectTargets`, ORDERED (first pick is
  *                            copied, second scales); a click carries no order.
  *   - `ChooseOneOfBranch` -> `ChooseBranch { index }`; `parent_targets` is
  *                            continuation context the modal never reads.
- * All of the above are host-wrapped (absent from
- * `DialogHost.CLICK_THROUGH_WAITING_FOR_TYPES`), so a HUD glow beneath their
- * `fixed inset-0` host could not be clicked even if it were offered.
+ * All of the above are host-wrapped (`isClickThroughWaitingFor` is false for
+ * them: absent from `DialogHost.CLICK_THROUGH_WAITING_FOR_TYPES`, or, for
+ * multi-pick `ChooseObjectsSelection`, excluded by its `max !== 1` guard), so a
+ * HUD glow beneath their `fixed inset-0` host could not be clicked even if it
+ * were offered.
+ *
+ * A single-pick `ChooseObjectsSelection` (`max === 1`) meets both criteria: the
+ * engine also accepts one `ChooseTarget` for it, and `eligible` is `TargetRef[]`.
+ * It is click-through (`ChooseObjectsSelection(max 1)` in `isClickThroughWaitingFor`);
+ * multi-pick shapes stay dialog-only.
  *
  * NOTE: `getWaitingForObjectChoiceIds` below keeps its own switch over a
  * superset of these arms. The two must agree on every shared arm, and neither
@@ -264,6 +300,18 @@ export function getWaitingForClickTargetRefs(
       // mixes both. The engine owns which hosts are legal; the client only routes
       // each ref to the surface that can render it.
       return waitingFor.data.legal_targets;
+    case "ChooseTokenHost":
+      // Digital-only Alchemy (no CR entry): a batch boon's "one of them" host
+      // pick. Same cluster shape as ReturnAsAuraTarget — the engine owns which
+      // stamped entrants are still legal; the client only routes each ref.
+      return waitingFor.data.legal_targets;
+    case "ChooseObjectsSelection":
+      // CR 608.2d + CR 115.10a: a single-pick resolution choice is answered by one
+      // board/HUD click (the engine's `ChooseTarget` arm admits only `max == Some(1)`);
+      // its `eligible` mixes objects and players and is not a target list — hexproof
+      // creatures stay in it. Multi-pick selections keep ProliferateModal's
+      // `SelectTargets` subset.
+      return waitingFor.data.max === 1 ? waitingFor.data.eligible : null;
     default:
       return null;
   }
@@ -324,6 +372,17 @@ export function getWaitingForObjectChoiceIds(
       return waitingFor.data.legal_targets.flatMap((target) =>
         "Object" in target ? [target.Object] : [],
       );
+    case "ChooseTokenHost":
+      // Same mixed-axis projection as ReturnAsAuraTarget: object entrants glow
+      // on the board, player hosts on the seats.
+      return waitingFor.data.legal_targets.flatMap((target) =>
+        "Object" in target ? [target.Object] : [],
+      );
+    case "ChooseObjectsSelection":
+      // CR 608.2d: only a single-pick selection is a board pick; multi-pick
+      // selections keep the dialog. Same mixed-axis projection as above.
+      if (waitingFor.data.max !== 1) return [];
+      return waitingFor.data.eligible.flatMap((t) => "Object" in t ? [t.Object] : []);
     default:
       return [];
   }
@@ -413,6 +472,12 @@ function payCostSourceId(data: Extract<WaitingFor, { type: "PayCost" }>["data"])
   if (data.resume.type === "Resolution") {
     return undefined;
   }
+  if (data.resume.type === "TurnFaceUp") {
+    return (data.resume.source?.object_id ?? data.resume.object_id) as ObjectId;
+  }
+  if (data.resume.type === "SpellCost") {
+    return (data.resume.Spell as { object_id?: ObjectId } | undefined)?.object_id;
+  }
   return (data.resume.Spell as { object_id?: ObjectId } | undefined)?.object_id;
 }
 
@@ -467,9 +532,24 @@ function tapCreaturesAggregateSelection(aggregate: TapCreaturesAggregate): Board
   }
 }
 
+function isCancellablePayCost(
+  resume: Extract<WaitingFor, { type: "PayCost" }>["data"]["resume"],
+  allowsCancelCast?: boolean,
+): boolean {
+  if (allowsCancelCast !== undefined) {
+    return allowsCancelCast;
+  }
+  return (
+    resume.type === "Spell" ||
+    resume.type === "SpellCost" ||
+    resume.type === "TurnFaceUp"
+  );
+}
+
 export function getBoardChoiceView(
   waitingFor: WaitingFor | null | undefined,
   objects?: Record<ObjectId, GameObject | undefined>,
+  allowsCancelCast?: boolean,
 ): BoardChoiceView | null {
   switch (waitingFor?.type) {
     case "EffectZoneChoice": {
@@ -545,6 +625,8 @@ export function getBoardChoiceView(
     }
     case "PayCost": {
       if (!isBattlefieldCostChoice(waitingFor, objects)) return null;
+      const canCancel = isCancellablePayCost(waitingFor.data.resume, allowsCancelCast);
+      const cancelAction = canCancel ? { type: "CancelCast" as const } : undefined;
       switch (waitingFor.data.kind.type) {
         case "Sacrifice":
           return {
@@ -554,7 +636,7 @@ export function getBoardChoiceView(
             selection: confirmedCountSelection(waitingFor.data.count, waitingFor.data.min_count),
             response: { type: "SelectCards" },
             sourceId: payCostSourceId(waitingFor.data),
-            cancelAction: waitingFor.data.resume.type === "Spell" ? { type: "CancelCast" } : undefined,
+            cancelAction,
           };
         case "ReturnToHand":
           return {
@@ -564,7 +646,7 @@ export function getBoardChoiceView(
             selection: confirmedCountSelection(waitingFor.data.count, waitingFor.data.min_count),
             response: { type: "SelectCards" },
             sourceId: payCostSourceId(waitingFor.data),
-            cancelAction: waitingFor.data.resume.type === "Spell" ? { type: "CancelCast" } : undefined,
+            cancelAction,
           };
         case "ExilePermanent":
           return {
@@ -574,7 +656,7 @@ export function getBoardChoiceView(
             selection: confirmedCountSelection(waitingFor.data.count, waitingFor.data.min_count),
             response: { type: "SelectCards" },
             sourceId: payCostSourceId(waitingFor.data),
-            cancelAction: waitingFor.data.resume.type === "Spell" ? { type: "CancelCast" } : undefined,
+            cancelAction,
           };
         case "TapCreatures": {
           const { mode } = waitingFor.data.kind;
@@ -588,7 +670,7 @@ export function getBoardChoiceView(
                 : confirmedCountSelection(waitingFor.data.count, waitingFor.data.min_count),
             response: { type: "SelectCards" },
             sourceId: payCostSourceId(waitingFor.data),
-            cancelAction: waitingFor.data.resume.type === "Spell" ? { type: "CancelCast" } : undefined,
+            cancelAction,
           };
         }
         default:
@@ -638,6 +720,7 @@ export function getBoardChoiceView(
         },
         response: { type: "SaddleMount", mountId: waitingFor.data.mount_id },
         sourceId: waitingFor.data.mount_id,
+        cancelAction: { type: "CancelCast" },
       };
     case "StationTarget":
       return {
@@ -647,6 +730,7 @@ export function getBoardChoiceView(
         selection: { type: "single", immediate: true },
         response: { type: "ActivateStation", spacecraftId: waitingFor.data.spacecraft_id },
         sourceId: waitingFor.data.spacecraft_id,
+        cancelAction: { type: "CancelCast" },
       };
     case "BlightChoice":
       return {
