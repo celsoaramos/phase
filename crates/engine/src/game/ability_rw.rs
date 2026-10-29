@@ -107,8 +107,9 @@ use crate::types::ability::{
     Duration, Effect, GuessSubject, KeeperConstraint, ModalChoice, MultiTargetSpec, NameStickerSet,
     ObjectProperty, ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
     ReciprocalZoneChoiceRole, RepeatContinuation, ReplacementDefinition, ResolvedAbility,
-    StaticCondition, StaticDefinition, TargetFilter, TriggerCondition, TriggerDefinition,
-    TurnJournalKind, TypeFilter, TypedFilter, ZoneChoiceCandidateSource, ZoneRef,
+    StaticCondition, StaticDefinition, TargetFilter, TokenAttackDestination, TriggerCondition,
+    TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter, ZoneChoiceCandidateSource,
+    ZoneRef,
 };
 use crate::types::game_state::TargetSelectionConstraint;
 use crate::types::zones::Zone;
@@ -1982,6 +1983,7 @@ fn legacy_trigger_condition(x: &TriggerCondition) -> bool {
         | TriggerCondition::CompletedDungeon { .. }
         | TriggerCondition::TributeNotPaid
         | TriggerCondition::CastDuringPhase { .. }
+        | TriggerCondition::CurrentPhaseIs { .. }
         | TriggerCondition::CastTimingPermission { .. }
         | TriggerCondition::ControlsCommander { .. }
         | TriggerCondition::ChosenLabelIs { .. }
@@ -2550,6 +2552,12 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         FilterProp::AttachedTo {
             to: AttachmentReferent::DeclaredTarget { .. },
         } => false,
+        // CR 701.3a: the filter-matched host axis nests its own `TargetFilter`;
+        // whether it carries a frozen event-context tag is exactly whether that
+        // filter does — recurse rather than assert.
+        FilterProp::AttachedTo {
+            to: AttachmentReferent::Host { filter },
+        } => legacy_target_filter(filter),
         FilterProp::Token
         | FilterProp::NonToken
         | FilterProp::RepresentedByCard
@@ -2854,6 +2862,12 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         FilterProp::AttachedTo {
             to: AttachmentReferent::DeclaredTarget { .. },
         } => true,
+        // CR 701.3a: the filter-matched host axis is member-bound exactly when
+        // its inner `TargetFilter` is — recurse, mirroring the nested-filter arms
+        // above (`CanEnchant`/`DistinctFrom`/`Targets`).
+        FilterProp::AttachedTo {
+            to: AttachmentReferent::Host { filter },
+        } => member_bound_target_filter(filter),
         FilterProp::Token
         | FilterProp::NonToken
         | FilterProp::RepresentedByCard
@@ -3201,7 +3215,6 @@ fn legacy_effect(x: &Effect) -> bool {
         | Effect::PutCounterAll { count, target, .. }
         | Effect::Connive { target, count }
         | Effect::GivePlayerCounter { count, target, .. }
-        | Effect::PutAtLibraryPosition { target, count, .. }
         | Effect::ExtraTurn { target, count }
         | Effect::SkipNextTurn { target, count }
         | Effect::SkipNextStep { target, count, .. }
@@ -3209,6 +3222,16 @@ fn legacy_effect(x: &Effect) -> bool {
             amount: count,
             target,
         } => legacy_quantity_expr(count) || legacy_target_filter(target),
+        Effect::PutAtLibraryPosition {
+            target,
+            count,
+            arranger,
+            ..
+        } => {
+            legacy_quantity_expr(count)
+                || legacy_target_filter(target)
+                || arranger.as_ref().is_some_and(legacy_target_filter)
+        }
         Effect::AdditionalPhase {
             recipient, count, ..
         } => legacy_quantity_expr(count) || legacy_target_filter(recipient.as_target_filter()),
@@ -3709,7 +3732,10 @@ fn legacy_effect(x: &Effect) -> bool {
                     .as_ref()
                     .is_some_and(|d| legacy_definition(d))
         }
-        Effect::EpicCopy { spell } => contains_legacy_event_ref(spell),
+        // CR 603.3b: the handle carries no event reference, and every member of
+        // an `EpicCopy` group fires off the one upkeep event, so the legacy
+        // batch prompt this flag feeds is never consulted for it.
+        Effect::EpicCopy { .. } => false,
         Effect::CreateDelayedTrigger { effect, .. } => legacy_definition(effect),
         Effect::CreateDrawReplacement { replacement_effect } => legacy_effect(replacement_effect),
         Effect::RollDie { count, results, .. } => {
@@ -4363,6 +4389,7 @@ fn walk_ability(
         chosen_players: _,
         sub_link: _,
         target_reads: _, // origin of `Target` reads; the reads are profiled on condition/effect
+        entry_onset: _,  // CR 611.2e onset tag, no read or write
         sibling_condition: _, // replication marker, no read/write effect
         replacement_applied: _,
         parent_target_missing_reason: _,
@@ -4498,6 +4525,7 @@ fn walk_definition(
         target_selection_mode: _,
         sub_link: _,
         target_reads: _, // origin of `Target` reads; the reads are profiled on condition/effect
+        entry_onset: _,  // CR 611.2e onset tag, no read or write
         iteration_kind_binding: _,
         sibling_condition: _,
         // Parser scratch, not runtime state: `parse_oracle_pipeline` settles every
@@ -4946,6 +4974,7 @@ fn rw_effect(
             target: _,
             count,
             position: _,
+            arranger: _,
         } => {
             let mut p = ext_write(StateKind::HandLibrary);
             p.merge(rw_quantity_expr(count));
@@ -5591,6 +5620,7 @@ fn rw_effect(
             owner: _,
             attach_to: _,
             enters_attacking: _,
+            attack_destination,
             supertypes: _,
             static_abilities: _,
             enter_with_counters,
@@ -5612,6 +5642,7 @@ fn rw_effect(
             p.merge(rw_quantity_expr(count));
             p.merge(rw_pt_value(power));
             p.merge(rw_pt_value(toughness));
+            p.merge(rw_token_attack_destination(attack_destination));
             (p, Some(WriteScope::Created))
         }
         Effect::CopyTokenOf {
@@ -5619,6 +5650,7 @@ fn rw_effect(
             owner: _,
             source_filter,
             enters_attacking: _,
+            attack_destination,
             tapped: _,
             count,
             extra_keywords: _,
@@ -5662,6 +5694,7 @@ fn rw_effect(
             // retains the batch prompt (CR 603.10a).
             flag_legacy_write_target(&mut p, target);
             p.merge(rw_quantity_expr(count));
+            p.merge(rw_token_attack_destination(attack_destination));
             (p, Some(WriteScope::Created))
         }
         Effect::Conjure {
@@ -7137,6 +7170,7 @@ fn rw_trigger_condition(x: &TriggerCondition) -> RwProfile {
         | TriggerCondition::CompletedDungeon { .. }
         | TriggerCondition::TributeNotPaid
         | TriggerCondition::CastDuringPhase { .. }
+        | TriggerCondition::CurrentPhaseIs { .. }
         | TriggerCondition::CastTimingPermission { .. }
         | TriggerCondition::ChosenLabelIs { .. }
         | TriggerCondition::ExceptFirstDrawInDrawStep
@@ -7557,6 +7591,15 @@ fn rw_player_scope(x: &PlayerScope) -> RwProfile {
         // from a value/quantity/player-selection position.
         | PlayerScope::SpecificPlayer { .. }
         | PlayerScope::DefendingPlayer => RwProfile::empty(),
+    }
+}
+
+/// CR 508.4: the reads of the defender a token instruction names.
+fn rw_token_attack_destination(x: &TokenAttackDestination) -> RwProfile {
+    match x {
+        TokenAttackDestination::ControllerChooses => RwProfile::empty(),
+        TokenAttackDestination::Player { player, scope: _ } => rw_controller_ref(player),
+        TokenAttackDestination::EachPlayer { filter, scope: _ } => rw_player_filter(filter),
     }
 }
 
@@ -8118,11 +8161,123 @@ mod tests {
             owner: TargetFilter::Controller,
             attach_to: None,
             enters_attacking: false,
+            attack_destination: crate::types::ability::TokenAttackDestination::ControllerChooses,
             supertypes: vec![],
             static_abilities: vec![],
             enter_with_counters: vec![],
         }
     }
+    /// The destination a token instruction names is a player-reference read:
+    /// the defending player adds nothing, the triggering player reads the event.
+    /// Revert-probe: bind `attack_destination: _` in the `Token` / `CopyTokenOf`
+    /// arms ⇒ the triggering-player rows equal the unnamed profile.
+    #[test]
+    fn token_attack_destination_is_a_player_reference_read() {
+        use crate::types::ability::{NamedDefenderScope, TokenAttackDestination};
+
+        let naming = |player: Option<ControllerRef>| match player {
+            None => TokenAttackDestination::ControllerChooses,
+            Some(player) => TokenAttackDestination::Player {
+                player,
+                scope: NamedDefenderScope::Player,
+            },
+        };
+        let token = |player| {
+            let mut effect = token(&["Creature"], qfix(1));
+            if let Effect::Token {
+                attack_destination, ..
+            } = &mut effect
+            {
+                *attack_destination = naming(player);
+            }
+            effect
+        };
+        let copy = |player| Effect::CopyTokenOf {
+            target: TargetFilter::Typed(TypedFilter::creature()),
+            owner: TargetFilter::Controller,
+            source_filter: None,
+            enters_attacking: true,
+            attack_destination: naming(player),
+            tapped: false,
+            count: qfix(1),
+            extra_keywords: vec![],
+            additional_modifications: vec![],
+        };
+
+        for (label, build) in [
+            ("Token", &token as &dyn Fn(Option<ControllerRef>) -> Effect),
+            ("CopyTokenOf", &copy),
+        ] {
+            let profile = |player| ability_rw_profile(&ra(build(player)));
+            assert_eq!(
+                profile(Some(ControllerRef::DefendingPlayer)),
+                profile(None),
+                "{label}: the defending player adds nothing to the profile"
+            );
+            assert_ne!(
+                profile(Some(ControllerRef::TriggeringPlayer)),
+                profile(None),
+                "{label}: the triggering player is a read the unnamed form is not"
+            );
+        }
+    }
+
+    /// A destination that names each player a filter lists is read as that
+    /// filter: `Opponent` adds nothing to the profile, `OpponentLostLife` reads
+    /// the life journal.
+    /// Revert-probe: make the `EachPlayer` arm return `RwProfile::empty()` ⇒ the
+    /// `OpponentLostLife` rows equal the unnamed profile.
+    #[test]
+    fn each_player_token_attack_destination_is_read_as_its_player_filter() {
+        use crate::types::ability::{NamedDefenderScope, TokenAttackDestination};
+
+        let naming = |filter: Option<PlayerFilter>| match filter {
+            None => TokenAttackDestination::ControllerChooses,
+            Some(filter) => TokenAttackDestination::EachPlayer {
+                filter,
+                scope: NamedDefenderScope::Player,
+            },
+        };
+        let token = |filter| {
+            let mut effect = token(&["Creature"], qfix(1));
+            if let Effect::Token {
+                attack_destination, ..
+            } = &mut effect
+            {
+                *attack_destination = naming(filter);
+            }
+            effect
+        };
+        let copy = |filter| Effect::CopyTokenOf {
+            target: TargetFilter::Typed(TypedFilter::creature()),
+            owner: TargetFilter::Controller,
+            source_filter: None,
+            enters_attacking: true,
+            attack_destination: naming(filter),
+            tapped: false,
+            count: qfix(1),
+            extra_keywords: vec![],
+            additional_modifications: vec![],
+        };
+
+        for (label, build) in [
+            ("Token", &token as &dyn Fn(Option<PlayerFilter>) -> Effect),
+            ("CopyTokenOf", &copy),
+        ] {
+            let profile = |filter| ability_rw_profile(&ra(build(filter)));
+            assert_eq!(
+                profile(Some(PlayerFilter::Opponent)),
+                profile(None),
+                "{label}: each opponent adds nothing to the profile"
+            );
+            assert_ne!(
+                profile(Some(PlayerFilter::OpponentLostLife)),
+                profile(None),
+                "{label}: opponents who lost life are a read the unnamed form is not"
+            );
+        }
+    }
+
     fn change_zone(origin: Option<Zone>, dest: Zone, target: TargetFilter) -> Effect {
         Effect::ChangeZone {
             origin,
@@ -8864,6 +9019,7 @@ mod tests {
             target: t,
             count: qfix(1),
             position: LibraryPosition::Top,
+            arranger: None,
         };
         let destroy = |t: TargetFilter| Effect::Destroy {
             target: t,
