@@ -181,7 +181,19 @@ fn ugin_labyrinth_returns_the_imprinted_card_to_hand() {
     let return_index = runner.state().objects[&labyrinth]
         .abilities
         .iter()
-        .position(|a| matches!(a.effect.as_ref(), Effect::Bounce { .. }))
+        // v0.119.0 lowers the linked return as a `ChangeZoneAll` from exile
+        // keyed on `ExiledBySource`; older builds lowered it as a `Bounce`.
+        // Either is the return ability — the movement below is the assertion.
+        .position(|a| {
+            matches!(
+                a.effect.as_ref(),
+                Effect::Bounce { .. }
+                    | Effect::ChangeZoneAll {
+                        destination: Zone::Hand,
+                        ..
+                    }
+            )
+        })
         .expect("the land must carry the return ability");
 
     runner.activate(labyrinth, return_index).resolve();
