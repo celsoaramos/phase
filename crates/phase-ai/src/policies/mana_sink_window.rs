@@ -27,7 +27,8 @@
 //!
 //! # Windows
 //!
-//! * AI's own turn → hold.
+//! * AI's own turn → hold, unless mana is already floating outside a main
+//!   phase (it empties with the step, CR 500.4).
 //! * Opponent's turn → free; this is the window the hold saves it for.
 //!
 //! # Why `Reject` and not a penalty
@@ -43,6 +44,7 @@ use engine::types::ability::{AbilityCost, AbilityDefinition, Effect};
 use engine::types::actions::GameAction;
 use engine::types::game_state::{GameState, WaitingFor};
 use engine::types::mana::ManaCost;
+use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 
 use super::context::PolicyContext;
@@ -102,6 +104,15 @@ impl TacticalPolicy for ManaSinkWindowPolicy {
 
         if state.active_player != ctx.ai_player {
             return neutral("mana_sink_window_free_window");
+        }
+
+        // CR 500.4: mana already floating outside a main phase empties when the
+        // step ends, before any sorcery-speed spell could spend it. Activating
+        // with it now costs nothing the turn could use (Thran Turbine's
+        // activation-only mana in the upkeep).
+        let floating = state.players[ctx.ai_player.0 as usize].mana_pool.total() > 0;
+        if floating && !matches!(state.phase, Phase::PreCombatMain | Phase::PostCombatMain) {
+            return neutral("mana_sink_window_floating_mana");
         }
 
         PolicyVerdict::reject(
