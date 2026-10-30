@@ -16409,10 +16409,21 @@ fn snuff_out_from_card_database_alt_cost_destroys_target() {
         .core_types
         .push(CoreType::Creature);
 
+    // Cast through the production action entry, like the hand-built variant
+    // above: the announcement's trigger carrier is opened and closed by the
+    // action boundary (`begin_action` / `end_action`), so a bare
+    // `handle_cast_spell` call would leave it in flight for the next action.
     let card_id = state.objects[&spell_id].card_id;
-    let waiting = handle_cast_spell(&mut state, PlayerId(0), spell_id, card_id, &mut Vec::new())
-        .expect("Snuff Out should reach the alternative-cost choice");
-    state.waiting_for = waiting;
+    crate::game::engine::apply_as_current(
+        &mut state,
+        GameAction::CastSpell {
+            object_id: spell_id,
+            card_id,
+            targets: Vec::new(),
+            payment_mode: CastPaymentMode::Auto,
+        },
+    )
+    .expect("Snuff Out should reach the alternative-cost choice");
     assert!(
         matches!(
             state.waiting_for,

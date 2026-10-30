@@ -15577,6 +15577,9 @@ fn plan_auto_tap_rows(
     let mut used_sources: HashSet<ObjectId> = HashSet::new();
     let mut assigned = vec![false; needs.len()];
     let mut unfilled_shards = 0usize;
+    // Shards Phase 1 hands to the generic walk (`two_generic_fallback`): they
+    // are paid by Phase 2's sources, not by a source picked for the shard.
+    let mut shards_left_to_generic = 0usize;
     let mut remaining_generic = generic_units;
 
     // Phase 0 (combo pre-pass): CR 605.3b + CR 106.1a — filter-land rows
@@ -15670,11 +15673,25 @@ fn plan_auto_tap_rows(
             to_tap.push(option);
         } else if *two_generic_fallback {
             remaining_generic += 2;
+            shards_left_to_generic += 1;
         } else {
             unfilled_shards += 1;
         }
         assigned[idx] = true;
     }
+
+    // CR 107.4b + CR 601.2g: a source picked for a colored shard may produce
+    // more mana than the shards it pays — a land tapped while Extraplanar Lens
+    // or Mana Reflection echoes its mana, a combination row that covers one
+    // shard — and that mana pays generic like any other. Credit it before the
+    // generic walk so the walk does not tap a source the surplus already covers.
+    let colored_units: usize = to_tap
+        .iter()
+        .map(|option| option_mana_types_for_context(option, payment_context).len())
+        .sum();
+    let shards_paid_by_sources = needs.len() - unfilled_shards - shards_left_to_generic;
+    remaining_generic =
+        remaining_generic.saturating_sub(colored_units.saturating_sub(shards_paid_by_sources));
 
     // Phase 2: satisfy generic cost + deferred shards. CR 107.4b: generic mana
     // in costs can be paid with any type of mana — including colorless — so a
