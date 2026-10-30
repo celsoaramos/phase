@@ -6,7 +6,9 @@ name: MagicFinder — motor do fork
 #   test    → monta a integração (commits com data fixa: mesmo conteúdo em todo job), gera o
 #             card-data e roda a suíte COMPLETA (phase-engine + phase-ai).
 #   build   → WASM release + worker com as URLs do NOSSO prefixo embutidas.
-#   publish → sobe ao R2, smoke em Node e SÓ ENTÃO publica engine/manifest.json.
+#   publish → sobe ao R2, smoke em Node, regressão com decks reais (build novo × o que está
+#             no ar, `engine-regression.mjs`) e SÓ ENTÃO publica engine/manifest.json. Se
+#             smoke ou regressão reprovam, o source.json do prefixo sai: o próximo run tenta de novo.
 # Conflito só de DADOS (backlog/fixture) é resolvido sozinho; conflito de código FALHA e avisa.
 # Nada disto roda os workflows do upstream: esta branch (padrão do fork) só tem este arquivo.
 # Voltar uma versão: no repo magic, `node scripts/publish-phase-manifest.mjs --rollback`.
@@ -30,6 +32,10 @@ on:
         description: 'Tag do phase-rs a usar (vazio = a mais recente)'
         type: string
         default: ''
+      skip_regression:
+        description: 'Publicar sem o portão de regressão (só para falso alarme já conferido)'
+        type: boolean
+        default: false
 
 concurrency:
   group: magicfinder-engine
@@ -178,7 +184,7 @@ jobs:
   publish:
     needs: [plan, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 75
     env:
       R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
       R2_PUBLIC_ACCESS_KEY_ID: ${{ secrets.R2_PUBLIC_ACCESS_KEY_ID }}
@@ -199,18 +205,25 @@ jobs:
         run: node ci/magicfinder/upload-engine.mjs --dir engine --prefix "${{ needs.plan.outputs.prefix }}" --out mirrored.json
       - name: Smoke do motor no prefixo
         run: node ci/magicfinder/scripts/engine-smoke.mjs --base "$(node -p "require('./mirrored.json').base")"
+      # Os decks do robô (+ cartas de relatos) IA × IA no build novo E no do manifesto atual;
+      # reprova se o novo entra em pânico, gira em falso ou recusa jogadas mais que o atual.
+      - name: Regressão com decks reais (novo × no ar)
+        if: ${{ inputs.skip_regression != true }}
+        run: >
+          node ci/magicfinder/scripts/engine-regression.mjs
+          --candidate "$(node -p "require('./mirrored.json').base")" --baseline auto
+          --workers 2 --budget-min 40 --out regression
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regression
+          path: regression/verdict.json
+          retention-days: 14
+          if-no-files-found: ignore
       - name: Publicar manifesto
         run: node ci/magicfinder/scripts/publish-phase-manifest.mjs --mirrored mirrored.json
-
-  report:
-    needs: [plan, test, build, publish]
-    if: failure()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Avisar o MagicFinder
-        run: |
-          curl -sS -X POST "https://magicfinder.app/api/cron/report-failure?job=magicfinder-engine" \
-            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
-            -H "Content-Type: application/json" \
-            -d '{"detail":"fork celsoaramos/phase: build automático do motor falhou (versão ${{ needs.plan.outputs.version }}); manifesto NÃO foi publicado. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' \
-            --max-time 30 || true
+      # Sem isto o prefixo reprovado ficava "completo" no R2 e o plan dizia "nada novo"
+      # para sempre: o build só voltava a rodar com outra tag ou outra lista de branches.
+      - name: Liberar o prefixo reprovado para a próxima tentativa
+        if: failure()
+        run: node ci/magicfinder/release-prefix.mjs --prefix "${{ needs.plan.outputs.prefix }}"
