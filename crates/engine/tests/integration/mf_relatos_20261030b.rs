@@ -3,7 +3,9 @@
 //! * Surgical Suite // Hospital Room — the right door was unlocked and its
 //!   "Whenever you attack" trigger never fired. The door text was lost when the
 //!   game was restored (undo / reload): rehydration re-stamped only the cast
-//!   half's printed triggers on the battlefield Room.
+//!   half's printed triggers on the battlefield Room. Secret Arcade // Dusty
+//!   Parlor ("Whenever you cast an enchantment spell", relato de 30/10 on
+//!   v0.119.0) is the same defect.
 //! * Glimmer Seeker — tapped from attacking, no Glimmer creature, and the
 //!   survival trigger created no token in the second main phase.
 //! * Sword of Hearth and Home — the exiled creature never came back.
@@ -318,4 +320,66 @@ fn room_right_door_trigger_survives_save_restore() {
         }),
         "Locker Room's door text must still be on the Room after a restore"
     );
+}
+
+/// Secret Arcade // Dusty Parlor (relato de 30/10): the right door's "Whenever
+/// you cast an enchantment spell" with both doors unlocked. `restore` runs the
+/// game through the save/undo pipeline after the unlock, as the mesa does.
+fn dusty_parlor_counters_after_enchantment_cast(restore: bool) -> u32 {
+    let db = shared_card_db().expect("fixture loads");
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let creature = scenario.add_creature(P0, "Counter Target", 2, 2).id();
+    let room = scenario.add_real_card(P0, "Secret Arcade", Zone::Hand, db);
+    let enchantment = scenario
+        .add_spell_to_hand_from_oracle(P0, "Test Enchantment", false, "")
+        .as_enchantment()
+        .with_mana_cost(engine::types::mana::ManaCost::Cost {
+            shards: vec![engine::types::mana::ManaCostShard::White],
+            generic: 1,
+        })
+        .id();
+    scenario.with_mana_pool(P0, white_mana(room, 10));
+    let mut runner = scenario.build();
+    engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+    runner.cast(room).modal_back_face(false).resolve();
+    drive_to_empty_stack(&mut runner, None);
+    runner
+        .act(GameAction::UnlockRoomDoor {
+            object_id: room,
+            door: RoomDoor::Right,
+        })
+        .expect("unlocking Dusty Parlor");
+    drive_to_empty_stack(&mut runner, None);
+    let mut runner = if restore {
+        round_trip_rehydrated(&runner, db)
+    } else {
+        runner
+    };
+    runner
+        .act(GameAction::CastSpell {
+            object_id: enchantment,
+            card_id: runner.state().objects[&enchantment].card_id,
+            targets: Vec::new(),
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+        })
+        .expect("casting the enchantment");
+    drive_to_empty_stack(&mut runner, Some(TargetRef::Object(creature)));
+    runner.state().objects[&creature]
+        .counters
+        .get(&engine::types::counter::CounterType::Plus1Plus1)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// CR 709.5: Dusty Parlor puts counters equal to the enchantment's mana value.
+#[test]
+fn dusty_parlor_triggers_on_enchantment_cast() {
+    assert_eq!(dusty_parlor_counters_after_enchantment_cast(false), 2);
+}
+
+/// CR 709.5: …and keeps doing so after the mesa restores the game.
+#[test]
+fn dusty_parlor_triggers_after_save_restore() {
+    assert_eq!(dusty_parlor_counters_after_enchantment_cast(true), 2);
 }
