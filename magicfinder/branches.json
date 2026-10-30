@@ -331,5 +331,8 @@
   },
   {
     "branch": "ai/named-choice-criteria"
+  },
+  {
+    "branch": "ai/combat-sim-prompts"
   }
 ]
