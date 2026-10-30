@@ -10441,19 +10441,27 @@ fn ugin_labyrinth_returns_the_card_linked_to_the_land() {
         &["Land"],
         &[],
     );
-    let bounce = r
+    // v0.119.0 lowers the linked return as a `ChangeZoneAll` to the hand;
+    // older builds lowered it as a `Bounce`. Either way the moved object must
+    // be the card linked to this land.
+    let target = r
         .abilities
         .iter()
-        .find(|a| matches!(a.effect.as_ref(), Effect::Bounce { .. }))
+        .find_map(|a| match a.effect.as_ref() {
+            Effect::Bounce { target, .. }
+            | Effect::ChangeZoneAll {
+                destination: crate::types::zones::Zone::Hand,
+                target,
+                ..
+            } => Some(target),
+            _ => None,
+        })
         .expect("expected the return ability");
-    match bounce.effect.as_ref() {
-        Effect::Bounce { target, .. } => assert_eq!(
-            *target,
-            TargetFilter::ExiledBySource,
-            "the return must name the card linked to this land, not an empty tracked set"
-        ),
-        other => panic!("expected Bounce, got {other:?}"),
-    }
+    assert_eq!(
+        *target,
+        TargetFilter::ExiledBySource,
+        "the return must name the card linked to this land, not an empty tracked set"
+    );
 }
 
 /// Counter-example: when the SAME ability exiles and then refers back, the
