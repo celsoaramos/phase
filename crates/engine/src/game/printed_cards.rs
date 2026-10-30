@@ -1960,6 +1960,14 @@ fn reapply_printed_faces_from_card_db(state: &mut GameState, db: &CardDatabase) 
             }
 
             populate_back_face_if_dfc(obj, db, &card_face);
+            // CR 709.5 + CR 709.5h: the reapply above restored only the live
+            // half's printed text. A Room permanent carries BOTH halves'
+            // door-stamped text, and its unlock designations decide which half
+            // functions — so a restored game (undo, reload) must reinstall the
+            // other door, or unlocking it later gives the Room no rules text.
+            if obj.zone == Zone::Battlefield && crate::game::room::is_room(obj) {
+                obj.install_room_door_text();
+            }
             if let Some(prohibition) = cast_prohibition {
                 if !obj
                     .static_definitions

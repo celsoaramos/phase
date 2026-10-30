@@ -1536,31 +1536,51 @@ pub(crate) fn instead_override_definition(
         .sub_ability(body)
 }
 
-/// CR 608.2c: a trailing "<instruction> if <condition>, then" guards that
-/// instruction alone, so the instruction after it is the next independent one and a
-/// following instruction with its own trailing guard is evaluated on that guard.
+/// Where a chunk's own guard sits relative to its instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardPosition {
+    /// "If <condition>, <instruction>"
+    Leading,
+    /// "<instruction> if <condition>"
+    Trailing,
+}
+
+/// CR 608.2c: a trailing "<instruction> if <condition>" guards that instruction
+/// alone, so the instruction after it — across ", then" or a sentence break — is
+/// the next independent one, and a following instruction with its own guard
+/// (leading or trailing) is evaluated on that guard even when the earlier one was
+/// false (Glimmer Seeker: "draw a card if you control a Glimmer creature. If you
+/// don't control a Glimmer creature, create a … Glimmer … token."). A leading
+/// guard is a sentence-level gate and releases nothing.
 /// `pushed_from` is the clause count before the guarded chunk pushed anything.
 fn settle_trailing_guard(
     clauses: &mut [ClauseIr],
-    pushed_from: Option<usize>,
+    pushed_from: Option<(usize, GuardPosition)>,
     released: &mut bool,
 ) {
-    let guarded = pushed_from
-        .and_then(|start| clauses.get_mut(start..))
-        .and_then(<[ClauseIr]>::last_mut)
-        .filter(|clause| {
-            clause.condition.is_some()
-                && !clause.is_optional
-                && matches!(clause.disposition, ClauseDisposition::Emit { .. })
-        });
-    let Some(clause) = guarded else {
+    let guarded = pushed_from.and_then(|(start, position)| {
+        clauses
+            .get_mut(start..)
+            .and_then(<[ClauseIr]>::last_mut)
+            .filter(|clause| {
+                clause.condition.is_some()
+                    && !clause.is_optional
+                    && matches!(clause.disposition, ClauseDisposition::Emit { .. })
+            })
+            .map(|clause| (clause, position))
+    });
+    let Some((clause, position)) = guarded else {
         *released = false;
         return;
     };
     if *released {
         clause.sibling_condition = SiblingCondition::ReplicatedOrBranch;
     }
-    *released = matches!(clause.boundary, Some(ClauseBoundary::Then));
+    *released = position == GuardPosition::Trailing
+        && matches!(
+            clause.boundary,
+            Some(ClauseBoundary::Then | ClauseBoundary::Sentence)
+        );
     if *released {
         clause.boundary = Some(ClauseBoundary::Sentence);
     }
@@ -43910,7 +43930,7 @@ fn parse_effect_chain_ir_body(
     // CR 608.2c: the clause count before the previous chunk's trailing-guarded
     // instruction was pushed, and whether the instruction settled before it
     // released its successor (see `settle_trailing_guard`).
-    let mut pending_trailing_guard: Option<usize> = None;
+    let mut pending_trailing_guard: Option<(usize, GuardPosition)> = None;
     let mut trailing_guard_released = false;
     'chunks: for (chunk_idx, chunk) in chunks.iter().enumerate() {
         settle_trailing_guard(
@@ -45668,12 +45688,16 @@ fn parse_effect_chain_ir_body(
             );
             continue;
         }
-        if if_you_do.is_none()
-            && guard_condition.is_some()
-            && conditions::parse_leading_conditional_prefix(&normalized_text.to_lowercase())
-                .is_none()
-        {
-            pending_trailing_guard = Some(builder.clauses().len());
+        if if_you_do.is_none() && guard_condition.is_some() {
+            let position =
+                if conditions::parse_leading_conditional_prefix(&normalized_text.to_lowercase())
+                    .is_none()
+                {
+                    GuardPosition::Trailing
+                } else {
+                    GuardPosition::Leading
+                };
+            pending_trailing_guard = Some((builder.clauses().len(), position));
         }
         let condition = match (if_you_do, guard_condition) {
             (Some(reflexive), Some(guard)) if reflexive.has_when_you_do_marker() => {

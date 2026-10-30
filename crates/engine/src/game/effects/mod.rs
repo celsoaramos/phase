@@ -7239,8 +7239,9 @@ pub(crate) fn condition_survives_false_parent_gate(condition: &AbilityCondition)
 ///   on the mana spent to cast the spell that directly follows another such
 ///   clause (CR 601.2h + CR 608.2c: "A if {R} was spent …, and B if {G} was
 ///   spent …"), whose gate reads the spell's payment rather than the previous
-///   clause, and on a suffix-guarded instruction that follows another across
-///   ", then" (CR 608.2c), whose guard governs only its own instruction.
+///   clause, and on a guarded instruction that follows a suffix-guarded one
+///   across ", then" or a sentence break (CR 608.2c), since that suffix guard
+///   governs only its own instruction.
 ///
 /// Two consumers, which is why this is factored out rather than spelled twice:
 /// `resolve_ability_chain` (below) on its condition-false path, and
@@ -13158,6 +13159,79 @@ fn branch_references_tracked_set(node: Option<&ResolvedAbility>) -> bool {
 /// sites serve today.
 pub(crate) fn chain_references_tracked_set(ability: &ResolvedAbility) -> bool {
     branch_references_tracked_set(Some(ability))
+}
+
+/// CR 608.2c + CR 701.23a: whether the continuation of a library search can
+/// name the FOUND cards through its tracked-set anaphor — the question the
+/// search's own publication is gated on, so a later instruction that reads an
+/// earlier producer's set is not handed the search result instead.
+///
+/// The found cards are in the searched library until the continuation's own
+/// delivery moves them (its leading `ChangeZone`). A tracked-set consumer that
+/// only scans some OTHER zone — a mass move whose `origin` is neither the
+/// library nor that delivery destination — therefore names an earlier
+/// producer's set. Sword of Hearth and Home: "exile up to one target creature
+/// you own, then search your library for a basic land card. Put both cards
+/// onto the battlefield under your control" delivers the land through the
+/// search and returns the exiled creature through `ChangeZoneAll { origin:
+/// Exile, target: TrackedSet }`; publishing the land as a fresh set stranded
+/// the creature in exile. Every other consumer shape counts as a reader
+/// (conservative: the search keeps owning its result).
+pub(crate) fn continuation_reads_search_result(continuation: &ResolvedAbility) -> bool {
+    let delivery = match &continuation.effect {
+        Effect::ChangeZone { destination, .. } => Some(*destination),
+        _ => None,
+    };
+    let mut readers = 0usize;
+    let mut excluded = 0usize;
+    let mut stack = vec![continuation];
+    while let Some(node) = stack.pop() {
+        if !node_or_branch_references_tracked_set(node, ParentAnaphor::NamesPublisher) {
+            continue;
+        }
+        let node_consumes = effect_references_tracked_set(&node.effect)
+            || matches!(
+                &node.effect,
+                Effect::CreateDelayedTrigger {
+                    uses_tracked_set: true,
+                    ..
+                } | Effect::ChooseFromZone { .. }
+            )
+            || node
+                .repeat_for
+                .as_ref()
+                .is_some_and(quantity_expr_references_tracked_set)
+            || node
+                .player_scope
+                .as_ref()
+                .is_some_and(player_filter_references_tracked_set)
+            || grant_affects_parent_target(&node.effect);
+        if node_consumes {
+            match &node.effect {
+                Effect::ChangeZoneAll {
+                    origin: Some(origin),
+                    target: TargetFilter::TrackedSet { .. },
+                    ..
+                } if node.repeat_for.is_none()
+                    && node.player_scope.is_none()
+                    && *origin != Zone::Library
+                    && Some(*origin) != delivery =>
+                {
+                    excluded += 1;
+                }
+                _ => readers += 1,
+            }
+        }
+        for branch in [node.sub_ability.as_deref(), node.else_ability.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if !crosses_modal_boundary(branch) {
+                stack.push(branch);
+            }
+        }
+    }
+    readers > 0 || excluded == 0
 }
 
 /// CR 608.2c + CR 611.2c: An event-less producer publishes the population its

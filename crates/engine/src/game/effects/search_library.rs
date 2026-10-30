@@ -862,6 +862,10 @@ pub fn resolve(
         // chain needs a fresh set before that postlude can union its result.
         if state.chain_tracked_set_id.is_some()
             && super::resolution_next_needs_tracked_set(state, ability)
+            && ability
+                .sub_ability
+                .as_deref()
+                .is_none_or(super::continuation_reads_search_result)
         {
             super::publish_fresh_tracked_set(state, Vec::new());
         }
