@@ -328,5 +328,8 @@
   },
   {
     "branch": "card/silent-drops-1030"
+  },
+  {
+    "branch": "ai/named-choice-criteria"
   }
 ]
