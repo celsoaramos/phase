@@ -1554,10 +1554,51 @@ pub fn synthesize_gift(face: &mut CardFace) {
     // Gift uses a zero-cost optional additional cost — the "cost" is just a decision.
     face.additional_cost = Some(gift_additional_cost());
 
-    // Inject GiftDelivery as a wrapper around the first spell ability.
+    let instant_or_sorcery = face
+        .card_type
+        .core_types
+        .iter()
+        .any(|t| matches!(t, CoreType::Instant | CoreType::Sorcery));
+    if !instant_or_sorcery {
+        // CR 702.174b: on a permanent, Gift means "When this permanent enters, if
+        // its gift was promised, the chosen opponent gets the gift." A permanent
+        // spell has no spell ability to wrap — wrapping `abilities[0]` turned
+        // Starforged Sword's Equip into a sub-ability of a spell-kind delivery,
+        // and Scrapshooter/Kitnap (no abilities) never delivered at all.
+        face.triggers.push(
+            TriggerDefinition::new(TriggerMode::ChangesZone)
+                .destination(Zone::Battlefield)
+                .valid_card(TargetFilter::SelfRef)
+                .trigger_zones(vec![Zone::Battlefield])
+                .condition(TriggerCondition::AdditionalCostPaid {
+                    source: AdditionalCostPaymentSource::Any,
+                    origin: Some(AdditionalCostOrigin::Gift),
+                    origin_ordinal: None,
+                    variant: None,
+                    kicker_cost: None,
+                    min_count: 1,
+                })
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::GiftDelivery { kind: gift_kind },
+                ))
+                .description(
+                    "CR 702.174b: When this permanent enters, if its gift was promised, the chosen opponent gets the gift."
+                        .to_string(),
+                ),
+        );
+        return;
+    }
+
+    // CR 702.174j: for an instant or sorcery the gift happens before the other
+    // effects — inject GiftDelivery as a wrapper around the first SPELL ability.
     // The delivery effect is a no-op when the gift wasn't promised, so the
     // chain always flows through to the spell's normal effects.
-    if let Some(first_ability) = face.abilities.first_mut() {
+    if let Some(first_ability) = face
+        .abilities
+        .iter_mut()
+        .find(|a| a.kind == AbilityKind::Spell)
+    {
         let original = std::mem::replace(
             first_ability,
             AbilityDefinition::new(AbilityKind::Spell, Effect::GiftDelivery { kind: gift_kind }),
