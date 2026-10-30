@@ -7,8 +7,8 @@
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::character::complete::{alphanumeric1, space1};
-use nom::combinator::{map, not, opt, peek, value};
-use nom::sequence::{preceded, terminated};
+use nom::combinator::{map, not, opt, value};
+use nom::sequence::preceded;
 use nom::Parser;
 
 use super::error::OracleResult;
@@ -17,15 +17,18 @@ use super::primitives::{
 };
 use super::quantity::{parse_quantity_expr_number, parse_quantity_ref};
 use crate::types::ability::{
-    AggregateFunction, AttackerBlockStatus, Comparator, ControllerRef, FilterProp, ObjectProperty,
-    PtStat, PtValueScope, QuantityExpr, SourceExclusion,
+    AggregateFunction, Comparator, FilterProp, ObjectProperty, PtStat, PtValueScope, QuantityExpr,
+    SourceExclusion,
 };
 use crate::types::card_type::CoreType;
 #[cfg(test)]
 use crate::types::counter::CounterType;
 use crate::types::counter::{parse_counter_type, CounterMatch};
-use crate::types::mana::ManaColor;
 use crate::types::zones::Zone;
+
+pub use crate::types::text_grammar::{
+    parse_color_property, parse_property_filter, parse_zone_filter,
+};
 
 /// CR 201.2 + CR 201.2a: "not named <name>" — a NAME predicate, lowered to
 /// `Not(Named)`. It's never a self-exclusion (`Another`): a different object
@@ -60,30 +63,6 @@ pub(crate) fn parse_not_named_suffix(input: &str) -> OracleResult<'_, FilterProp
             }),
         },
     ))
-}
-/// Parse a zone filter phrase from Oracle text.
-///
-/// Matches "on the battlefield", "in your graveyard", "in your hand",
-/// "in exile", "in your library", and opponent-scoped variants.
-pub fn parse_zone_filter(input: &str) -> OracleResult<'_, Zone> {
-    alt((
-        value(Zone::Battlefield, tag("on the battlefield")),
-        value(Zone::Graveyard, tag("in your graveyard")),
-        value(Zone::Graveyard, tag("in a graveyard")),
-        value(Zone::Graveyard, tag("in their graveyard")),
-        value(Zone::Hand, tag("in your hand")),
-        value(Zone::Hand, tag("in a player's hand")),
-        value(Zone::Hand, tag("from your hand")),
-        value(Zone::Exile, tag("in exile")),
-        value(Zone::Exile, tag("from exile")),
-        value(Zone::Library, tag("in your library")),
-        value(Zone::Library, tag("from your library")),
-        value(Zone::Stack, tag("on the stack")),
-        value(Zone::Graveyard, tag("from your graveyard")),
-        value(Zone::Graveyard, tag("from a graveyard")),
-        value(Zone::Library, tag("of your library")),
-    ))
-    .parse(input)
 }
 
 /// Parse an origin-zone qualifier for ChangesZone triggers — the "from <zone>"
@@ -126,107 +105,6 @@ pub fn parse_zone_word(input: &str) -> OracleResult<'_, Zone> {
         value(Zone::Library, tag("a library")),
         value(Zone::Library, tag("their library")),
         value(Zone::Stack, tag("the stack")),
-    ))
-    .parse(input)
-}
-
-/// Parse a zone owner/controller qualifier following a zone filter.
-///
-/// Matches "you control", "an opponent controls", "your opponents control",
-/// "you don't control", "target player controls", "defending player controls".
-pub fn parse_zone_controller(input: &str) -> OracleResult<'_, ControllerRef> {
-    alt((
-        value(ControllerRef::You, tag("you control")),
-        value(ControllerRef::Opponent, tag("an opponent controls")),
-        value(ControllerRef::Opponent, tag("your opponents control")),
-        value(ControllerRef::Opponent, tag("you don't control")),
-        // CR 109.4 + CR 115.1: "target player controls" — the filter controller
-        // is the player chosen as a target of the enclosing ability. The
-        // consumer must surface a companion TargetFilter::Player target slot
-        // (see `collect_target_slots` in `game/ability_utils.rs`) so the player
-        // is selected as part of target declaration.
-        value(ControllerRef::TargetPlayer, tag("target player controls")),
-        // CR 109.4 + CR 102.2 / CR 102.3: "target opponent controls" — filter
-        // controller is the opponent chosen as a target. Consumer surfaces an
-        // opponent-only companion slot (see `companion_target_player_legal_targets`
-        // in `game/ability_utils.rs`). Runtime read identical to TargetPlayer.
-        value(
-            ControllerRef::TargetOpponent,
-            tag("target opponent controls"),
-        ),
-        // CR 508.5 / CR 508.5a: "defending player controls" — the controller
-        // scope is the defending player (or that player's planeswalker
-        // controller / battle protector) the attacking creature is attacking.
-        // Resolved per attacker at runtime by
-        // `combat::defending_player_for_attacker`. Shares no prefix with the
-        // arms above, so dispatch order is not load-bearing.
-        value(
-            ControllerRef::DefendingPlayer,
-            tag("defending player controls"),
-        ),
-        // CR 303.4b + CR 702.5a: "enchanted player controls" — the controller
-        // scope is the player the source Aura is attached to. Resolved at
-        // runtime by reading `source.attached_to.as_player()`. Powers the
-        // Curse cycle (Trespasser's Curse, Curse of Clinging Webs, etc.).
-        value(
-            ControllerRef::EnchantedPlayer,
-            tag("enchanted player controls"),
-        ),
-        // CR 102.1: "the active player controls" — the turn player. Shares no
-        // prefix with the arms above, so dispatch order is not load-bearing.
-        value(
-            ControllerRef::ActivePlayer,
-            tag("the active player controls"),
-        ),
-    ))
-    .parse(input)
-}
-
-/// Parse a property filter from Oracle text.
-///
-/// Matches object property keywords: "tapped", "untapped", "attacking",
-/// "blocking", "token", "face down", "nontoken", "enchanted", "equipped".
-pub fn parse_property_filter(input: &str) -> OracleResult<'_, FilterProp> {
-    alt((
-        value(FilterProp::Tapped, tag("tapped")),
-        value(FilterProp::Untapped, tag("untapped")),
-        // CR 702.171b: "saddled Mount/creature" selector.
-        value(FilterProp::IsSaddled, tag("saddled")),
-        value(FilterProp::Attacking { defender: None }, tag("attacking")),
-        value(FilterProp::Blocking, tag("blocking")),
-        value(FilterProp::Token, tag("token")),
-        value(FilterProp::NonToken, tag("nontoken")),
-        value(FilterProp::FaceDown, tag("face down")),
-        // CR 701.27g: "transformed permanent"/"transformed creature" selector.
-        value(FilterProp::Transformed, tag("transformed")),
-        value(
-            FilterProp::BlockStatus {
-                status: AttackerBlockStatus::Unblocked,
-            },
-            tag("unblocked"),
-        ),
-        // CR 509.1h: "blocked" as a prefix adjective; postfix "blocked by"/"blocked this
-        // turn" are handled elsewhere and must not be consumed here.
-        value(
-            FilterProp::BlockStatus {
-                status: AttackerBlockStatus::Blocked,
-            },
-            terminated(
-                tag("blocked"),
-                peek(preceded(tag(" "), not(alt((tag("by"), tag("this turn")))))),
-            ),
-        ),
-        value(FilterProp::Suspected, tag("suspected")),
-        value(FilterProp::Renowned, tag("renowned")),
-        // CR 701.15b/c: standalone "goaded" designation property token.
-        value(FilterProp::Goaded, tag("goaded")),
-        value(FilterProp::EnchantedBy, tag("enchanted")),
-        value(FilterProp::EquippedBy, tag("equipped")),
-        parse_color_property,
-        value(
-            FilterProp::EnteredThisTurn,
-            tag("entered the battlefield this turn"),
-        ),
     ))
     .parse(input)
 }
@@ -570,51 +448,6 @@ fn parse_with_counter_property(input: &str) -> OracleResult<'_, FilterProp> {
     ))
 }
 
-/// Parse a color-as-property from Oracle text: "white", "blue", "black", "red", "green",
-/// "colorless", "monocolored", "multicolored".
-/// Returns a `FilterProp` for the color match.
-pub fn parse_color_property(input: &str) -> OracleResult<'_, FilterProp> {
-    alt((
-        map(tag("white"), |_| FilterProp::HasColor {
-            color: ManaColor::White,
-        }),
-        map(tag("blue"), |_| FilterProp::HasColor {
-            color: ManaColor::Blue,
-        }),
-        map(tag("black"), |_| FilterProp::HasColor {
-            color: ManaColor::Black,
-        }),
-        map(tag("red"), |_| FilterProp::HasColor {
-            color: ManaColor::Red,
-        }),
-        map(tag("green"), |_| FilterProp::HasColor {
-            color: ManaColor::Green,
-        }),
-        value(
-            FilterProp::ColorCount {
-                comparator: Comparator::EQ,
-                count: 0,
-            },
-            tag("colorless"),
-        ),
-        value(
-            FilterProp::ColorCount {
-                comparator: Comparator::EQ,
-                count: 1,
-            },
-            tag("monocolored"),
-        ),
-        value(
-            FilterProp::ColorCount {
-                comparator: Comparator::GE,
-                count: 2,
-            },
-            tag("multicolored"),
-        ),
-    ))
-    .parse(input)
-}
-
 /// CR 105.4: the trailing "of the color of your choice" object-filter
 /// qualifier — the clause PRINTS its own colour choice (Wash Out,
 /// Root Greevil).
@@ -837,6 +670,7 @@ pub fn parse_controlled_permanents_conjunct(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::mana::ManaColor;
 
     /// CR 614.1a + CR 109.1: the single authority must cover every plural noun
     /// BOTH former copies knew, and must carry the "other" article rather than
@@ -1448,33 +1282,6 @@ mod tests {
             }
             _ => panic!("expected Counters"),
         }
-    }
-
-    #[test]
-    fn test_parse_zone_controller() {
-        let (rest, c) = parse_zone_controller("you control forever").unwrap();
-        assert_eq!(c, ControllerRef::You);
-        assert_eq!(rest, " forever");
-
-        let (rest2, c2) = parse_zone_controller("you don't control").unwrap();
-        assert_eq!(c2, ControllerRef::Opponent);
-        assert_eq!(rest2, "");
-    }
-
-    // CR 508.5 / CR 508.5a: "defending player controls" scopes the filter
-    // controller to the defending player for attack-trigger targets (Kogla,
-    // The Tarrasque, ~42 cards). Class-level combinator behavior, not one card.
-    #[test]
-    fn test_parse_zone_controller_defending_player() {
-        let (rest, c) = parse_zone_controller("defending player controls").unwrap();
-        assert_eq!(c, ControllerRef::DefendingPlayer);
-        assert_eq!(rest, "");
-
-        // Remainder preservation: the new arm consumes only the qualifier and
-        // does not over-consume trailing text.
-        let (rest2, c2) = parse_zone_controller("defending player controls and ").unwrap();
-        assert_eq!(c2, ControllerRef::DefendingPlayer);
-        assert_eq!(rest2, " and ");
     }
 
     #[test]

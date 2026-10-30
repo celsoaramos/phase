@@ -151,6 +151,17 @@ pub struct StackBulkCounters {
     pub post_action_pipeline_passes: u64,
 }
 
+/// Test-only count of full `TriggerIndex` rebuilds, whatever the caller. Kept
+/// out of [`PerfCounterSnapshot`], whose fields `phase-ai`'s
+/// `PerfCounters::from_snapshot` maps one-for-one into the AI performance
+/// baseline.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TriggerIndexCounters {
+    /// Calls to `TriggerIndex::rebuild_from_battlefield`.
+    pub full_rebuilds: u64,
+}
+
 /// Test-only counters for the CR 508.1d attack-declaration solver
 /// (`combat::selectable_targets_by_attacker` and the strict validator it
 /// drives). Kept out of [`PerfCounterSnapshot`] for the same reason the two
@@ -286,6 +297,40 @@ impl PlayTraceCounters {
             step_end_lookups: self.step_end_lookups - earlier.step_end_lookups,
             engine_b_rebuilds: self.engine_b_rebuilds - earlier.engine_b_rebuilds,
             face_set_scans: self.face_set_scans - earlier.face_set_scans,
+        }
+    }
+}
+
+/// Test-only counters for the CR 733.1 cast-undo record
+/// (`engine_casting::record_spell_cast_undo`): the changed-member values it
+/// builds and what they serialize. Kept out of [`PerfCounterSnapshot`], whose
+/// serialized field set powers the AI performance baseline.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CastUndoRecordCounters {
+    /// CR 733.1: changed-member cast-undo values built by `record_spell_cast_undo` (two per recorded step).
+    pub values: u64,
+    /// Game objects serialized into those values.
+    pub objects: u64,
+    /// Deck-pool entries serialized into those values.
+    pub deck_pool_entries: u64,
+    /// Recorded steps also computed over the complete states and compared (`CastUndoReferenceCheck`).
+    pub reference_checks: u64,
+    /// Of those, steps that folded a cast-start boundary rather than the prior reversal.
+    pub cast_start_reference_checks: u64,
+}
+
+#[cfg(feature = "test-support")]
+impl CastUndoRecordCounters {
+    /// The counts accrued since `earlier`, a snapshot taken on the same thread.
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            values: self.values - earlier.values,
+            objects: self.objects - earlier.objects,
+            deck_pool_entries: self.deck_pool_entries - earlier.deck_pool_entries,
+            reference_checks: self.reference_checks - earlier.reference_checks,
+            cast_start_reference_checks: self.cast_start_reference_checks
+                - earlier.cast_start_reference_checks,
         }
     }
 }
@@ -505,6 +550,20 @@ thread_local! {
             post_action_pipeline_passes: 0,
         })
     };
+    #[cfg(feature = "test-support")]
+    static TRIGGER_INDEX_COUNTERS: Cell<TriggerIndexCounters> = const {
+        Cell::new(TriggerIndexCounters { full_rebuilds: 0 })
+    };
+    #[cfg(feature = "test-support")]
+    static CAST_UNDO_RECORD_COUNTERS: Cell<CastUndoRecordCounters> = const {
+        Cell::new(CastUndoRecordCounters {
+            values: 0,
+            objects: 0,
+            deck_pool_entries: 0,
+            reference_checks: 0,
+            cast_start_reference_checks: 0,
+        })
+    };
     static LEGALITY_CLONE_PHASE: Cell<Option<LegalityClonePhase>> = const { Cell::new(None) };
 }
 
@@ -697,10 +756,9 @@ pub fn record_combat_shadow_block_scan() {
 }
 
 /// Counts every per-provider `matches_target_filter` evaluation done while
-/// populating the per-controller provider cache in
-/// `expand_granted_activated_abilities`. Memoizing the matching-provider set by
-/// recipient controller collapses the O(recipients×objects) filter sweep to
-/// O(controllers×objects).
+/// populating the per-controller provider cache in the referenced-grant
+/// expanders. Memoizing the matching-provider set by recipient controller
+/// collapses the O(recipients×objects) filter sweep to O(controllers×objects).
 pub fn record_granted_ability_provider_scan() {
     with_mut(|s| s.granted_ability_provider_scans += 1);
 }
@@ -1133,6 +1191,10 @@ pub fn reset() {
     EXILE_RETURN_LATCH_COUNTERS.with(|counters| counters.set(ExileReturnLatchCounters::default()));
     #[cfg(feature = "test-support")]
     STACK_BULK_COUNTERS.with(|counters| counters.set(StackBulkCounters::default()));
+    #[cfg(feature = "test-support")]
+    TRIGGER_INDEX_COUNTERS.with(|counters| counters.set(TriggerIndexCounters::default()));
+    #[cfg(feature = "test-support")]
+    CAST_UNDO_RECORD_COUNTERS.with(|counters| counters.set(CastUndoRecordCounters::default()));
 }
 
 /// One committed bulk token run resolved `n` stack entries.
@@ -1158,4 +1220,56 @@ pub fn record_post_action_pipeline_pass() {
 #[cfg(feature = "test-support")]
 pub fn stack_bulk_snapshot() -> StackBulkCounters {
     STACK_BULK_COUNTERS.with(Cell::get)
+}
+
+/// One full `TriggerIndex::rebuild_from_battlefield`.
+#[cfg(feature = "test-support")]
+pub fn record_trigger_index_rebuild() {
+    TRIGGER_INDEX_COUNTERS.with(|cell| {
+        let mut c = cell.get();
+        c.full_rebuilds += 1;
+        cell.set(c);
+    });
+}
+
+#[cfg(feature = "test-support")]
+pub fn trigger_index_snapshot() -> TriggerIndexCounters {
+    TRIGGER_INDEX_COUNTERS.with(Cell::get)
+}
+
+#[cfg(feature = "test-support")]
+fn with_cast_undo_record(f: impl FnOnce(&mut CastUndoRecordCounters)) {
+    CAST_UNDO_RECORD_COUNTERS.with(|cell| {
+        let mut counters = cell.get();
+        f(&mut counters);
+        cell.set(counters);
+    });
+}
+
+/// CR 733.1: one changed-member cast-undo value holding `objects` game objects
+/// and `deck_pool_entries` deck pools.
+#[cfg(feature = "test-support")]
+pub fn record_cast_undo_value(objects: usize, deck_pool_entries: usize) {
+    with_cast_undo_record(|c| {
+        c.values += 1;
+        c.objects += objects as u64;
+        c.deck_pool_entries += deck_pool_entries as u64;
+    });
+}
+
+/// CR 733.1: one recorded step also computed over the complete states.
+#[cfg(feature = "test-support")]
+pub fn record_cast_undo_reference_check() {
+    with_cast_undo_record(|c| c.reference_checks += 1);
+}
+
+/// CR 733.1: one reference-checked step that folded a cast-start boundary.
+#[cfg(feature = "test-support")]
+pub fn record_cast_undo_cast_start_reference_check() {
+    with_cast_undo_record(|c| c.cast_start_reference_checks += 1);
+}
+
+#[cfg(feature = "test-support")]
+pub fn cast_undo_record_snapshot() -> CastUndoRecordCounters {
+    CAST_UNDO_RECORD_COUNTERS.with(Cell::get)
 }
