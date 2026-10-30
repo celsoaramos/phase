@@ -2231,8 +2231,13 @@ pub fn max_mana_yield(state: &GameState, object_id: ObjectId, controller: Player
     // Each outer element of `taps_for_mana_aura_bonus` is one aura that adds
     // exactly one mana unit; the inner vec holds the color alternatives (1 for
     // Fixed, N for AnyOneColor) — only the count of auras matters here.
+    // CR 605.1b + CR 106.3: an echo bonus ("one mana of any type that land
+    // produced", Extraplanar Lens) adds one more mana per tap as well.
     let aura_bonus = if obj.card_types.core_types.contains(&CoreType::Land) {
-        taps_for_mana_aura_bonus(state, object_id, controller).len() as u32
+        let sources = taps_for_mana_trigger_sources(state);
+        (taps_for_mana_aura_bonus_indexed(state, object_id, controller, &sources).len()
+            + taps_for_mana_echo_bonus_indexed(state, object_id, controller, &sources).len())
+            as u32
     } else {
         0
     };
@@ -3247,6 +3252,44 @@ fn land_mana_options(
     // mana ability at resolution time. `atomic_combination` includes the full
     // output (land + aura) for planner coverage checks; `production_override_for_option`
     // caps it to the land's own portion when dispatching the land's own ability.
+    // CR 605.1b + CR 106.3 + CR 603.7c: echo bonuses ("add one mana of any type
+    // that land produced" — Extraplanar Lens, Vorinclex, Dictate of Karametra)
+    // copy what THIS option makes the land produce, so they fold in per option
+    // and before the aura bonuses (an aura's mana is not "produced by that
+    // land"). Only an option whose land output is a single type is extended:
+    // there the echo owes no choice and adds exactly that type (CR 106.5 aside),
+    // while a multi-type output pauses the live payment for the echo's choice.
+    // The override entry keeps `production_override_for_option`'s land-portion
+    // cap counting the echo as bonus, not as the land's own output.
+    let echo_bonus = match aura_sources {
+        Some(sources) => taps_for_mana_echo_bonus_indexed(state, object_id, controller, sources),
+        None => taps_for_mana_echo_bonus_indexed(
+            state,
+            object_id,
+            controller,
+            &taps_for_mana_trigger_sources(state),
+        ),
+    };
+    for echo_ref in echo_bonus {
+        for opt in options.iter_mut() {
+            let land_output = opt
+                .atomic_combination
+                .clone()
+                .unwrap_or_else(|| vec![opt.mana_type]);
+            let Some(&echoed) = land_output.first() else {
+                continue;
+            };
+            if land_output.iter().any(|&mana_type| mana_type != echoed) {
+                continue;
+            }
+            let mut combined = land_output;
+            combined.push(echoed);
+            opt.atomic_combination = Some(combined);
+            opt.taps_for_mana_overrides
+                .push((echo_ref.clone(), ProductionOverride::SingleColor(echoed)));
+        }
+    }
+
     let aura_bonus = match aura_sources {
         Some(sources) => taps_for_mana_aura_bonus_indexed(state, object_id, controller, sources),
         None => taps_for_mana_aura_bonus(state, object_id, controller),
@@ -3955,7 +3998,51 @@ pub(crate) fn taps_for_mana_aura_bonus_indexed(
     controller: PlayerId,
     sources: &[ObjectId],
 ) -> Vec<(TriggerDefinitionRef, Vec<ManaType>)> {
-    let mut per_aura: Vec<(TriggerDefinitionRef, Vec<ManaType>)> = Vec::new();
+    taps_for_mana_mana_productions(state, land_id, controller, sources)
+        .into_iter()
+        .filter_map(|(definition_ref, object_id, produced)| {
+            // For Fixed production the choices are collapsed to one concrete
+            // option; for AnyOneColor each color is a separate choice.
+            // `mana_options_from_production` already does this enumeration.
+            let choices = mana_options_from_production(state, controller, object_id, produced);
+            (!choices.is_empty()).then_some((definition_ref, choices))
+        })
+        .collect()
+}
+
+/// CR 605.1b + CR 106.3 + CR 603.7c: `TapsForMana` triggered mana abilities
+/// that add "one mana of any type that land produced" (Extraplanar Lens,
+/// Vorinclex, Voice of Hunger; Dictate of Karametra; Mana Reflection-class
+/// echoes) and would fire when `land_id` is tapped for mana by `controller`.
+///
+/// `mana_options_from_production` has no trigger event to read, so these
+/// echoes never appear in [`taps_for_mana_aura_bonus_indexed`]. The auto-tap
+/// planner folds each one in per option instead: the echoed type is the type
+/// that option makes the land produce, known before the land is tapped.
+pub(crate) fn taps_for_mana_echo_bonus_indexed(
+    state: &GameState,
+    land_id: ObjectId,
+    controller: PlayerId,
+    sources: &[ObjectId],
+) -> Vec<TriggerDefinitionRef> {
+    taps_for_mana_mana_productions(state, land_id, controller, sources)
+        .into_iter()
+        .filter(|(_, _, produced)| matches!(produced, ManaProduction::TriggerEventManaType))
+        .map(|(definition_ref, _, _)| definition_ref)
+        .collect()
+}
+
+/// Single-authority scan behind the `TapsForMana` bonus views: every
+/// `TapsForMana` trigger among `sources` whose card and player matchers accept
+/// a tap of `land_id` by `controller` and whose effect adds mana, with the
+/// trigger's source and mana production.
+fn taps_for_mana_mana_productions<'a>(
+    state: &'a GameState,
+    land_id: ObjectId,
+    controller: PlayerId,
+    sources: &[ObjectId],
+) -> Vec<(TriggerDefinitionRef, ObjectId, &'a ManaProduction)> {
+    let mut matches = Vec::new();
     for &object_id in sources.iter() {
         // Skip the land itself — we're looking for OTHER permanents whose
         // TapsForMana trigger fires when `land_id` is tapped.
@@ -3997,16 +4084,10 @@ pub(crate) fn taps_for_mana_aura_bonus_indexed(
             let Effect::Mana { produced, .. } = &*execute.effect else {
                 continue;
             };
-            // For Fixed production the choices are collapsed to one concrete
-            // option; for AnyOneColor each color is a separate choice.
-            // `mana_options_from_production` already does this enumeration.
-            let choices = mana_options_from_production(state, controller, object_id, produced);
-            if !choices.is_empty() {
-                per_aura.push((active.definition_ref, choices));
-            }
+            matches.push((active.definition_ref, object_id, produced));
         }
     }
-    per_aura
+    matches
 }
 
 /// CR 605.1b + CR 605.3b: Enumerate object ids on the battlefield whose

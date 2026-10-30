@@ -507,6 +507,7 @@ mod gemstone_caverns_begin_game;
 mod gemstone_mine_depletion_sacrifice_6507;
 mod gev_scaled_scorch_enter_counters;
 mod ghalta_and_mavren_attack_trigger;
+mod ghalta_immovable_lens_auto_pay;
 mod giada_angel_counters;
 mod giada_metallic_mimic;
 mod giant_ox_crew_toughness;

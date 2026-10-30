@@ -57,7 +57,10 @@ fn the_destroyed_creatures_controller_manifests_dread() {
     let manifested = &runner.state().objects[&victim_top];
     assert_eq!(manifested.zone, Zone::Battlefield);
     assert!(manifested.face_down, "the manifested card enters face down");
-    assert_eq!(manifested.controller, P1, "the 2/2 enters under the victim's control");
+    assert_eq!(
+        manifested.controller, P1,
+        "the 2/2 enters under the victim's control"
+    );
     assert_eq!(
         runner.state().players[0].library,
         caster_library,
