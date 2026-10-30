@@ -5793,12 +5793,17 @@ fn card_name_choice_candidates(
         push_name(source_display_name, &legal_names, &mut seen, &mut choices);
     }
 
+    // CR 708.2 + CR 406.3: a face-down card's name is hidden from everyone but
+    // the player allowed to look at it, so another player's face-down object
+    // never lends its name to the domain.
     fn object_names<'a>(
         state: &'a GameState,
         ids: &'a im::Vector<ObjectId>,
+        player: PlayerId,
     ) -> impl Iterator<Item = &'a str> {
         ids.iter()
             .filter_map(|id| state.objects.get(id))
+            .filter(move |obj| !obj.face_down || obj.controller == player)
             .map(|obj| obj.name.as_str())
     }
 
@@ -5808,10 +5813,34 @@ fn card_name_choice_candidates(
         }
     };
 
-    object_names(state, &state.battlefield).for_each(&mut push_candidate);
+    object_names(state, &state.battlefield, player).for_each(&mut push_candidate);
+    // CR 400.2 + CR 701.20b: what the opponents have SHOWN is public — their
+    // graveyards and every card of theirs revealed at least once. It comes
+    // before the chooser's own hand and library: a discard or a lock
+    // (Cabal Therapy, Meddling Mage) names the opponent's cards, and the cap
+    // below used to fill with the chooser's own deck before reaching them.
+    // The opponents' hands and libraries stay hidden and are never read.
+    for opponent in state.players.iter().filter(|p| p.id != player) {
+        object_names(state, state.graveyard_of(opponent.id), player).for_each(&mut push_candidate);
+    }
+    let mut shown: Vec<ObjectId> = state
+        .public_revealed_cards
+        .iter()
+        .chain(state.revealed_cards.iter())
+        .copied()
+        .filter(|id| state.objects.get(id).is_some_and(|obj| obj.owner != player))
+        .collect();
+    // HashSet order is not stable across runs; the candidate order must be.
+    shown.sort();
+    shown.dedup();
+    shown
+        .iter()
+        .filter_map(|id| state.objects.get(id))
+        .for_each(|obj| push_candidate(&obj.name));
     if let Some(controller) = state.players.iter().find(|p| p.id == player) {
-        object_names(state, &controller.hand).for_each(&mut push_candidate);
-        object_names(state, state.graveyard_of(controller.id)).for_each(&mut push_candidate);
+        object_names(state, &controller.hand, player).for_each(&mut push_candidate);
+        object_names(state, state.graveyard_of(controller.id), player)
+            .for_each(&mut push_candidate);
         // CR 400.2: the library is a hidden zone, so the chooser's domain is the pile's
         // registered pool names, not its live identities.
         match state.shared_zone_holder(Zone::Library) {
@@ -5820,12 +5849,11 @@ fn card_name_choice_candidates(
                 .into_iter()
                 .flat_map(|pool| pool.current_main.iter())
                 .for_each(|entry| push_candidate(&entry.card.name)),
-            None => {
-                object_names(state, state.library_of(controller.id)).for_each(&mut push_candidate)
-            }
+            None => object_names(state, state.library_of(controller.id), player)
+                .for_each(&mut push_candidate),
         }
     }
-    object_names(state, &state.exile).for_each(&mut push_candidate);
+    object_names(state, &state.exile, player).for_each(&mut push_candidate);
 
     if choices.is_empty() {
         let fallback = state
@@ -8263,6 +8291,69 @@ mod tests {
             issued_names(&state),
             ["Field", "Held", "Grave", "Deep", "Exiled"].map(String::from)
         );
+    }
+
+    #[test]
+    fn card_name_candidates_put_what_the_opponent_has_shown_before_the_own_deck() {
+        let mut state = GameState::new_two_player(42);
+        for i in 0..30 {
+            create_object(
+                &mut state,
+                CardId(10 + i),
+                PlayerId(0),
+                format!("Own {i}"),
+                Zone::Library,
+            );
+        }
+        create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Their Grave".to_string(),
+            Zone::Graveyard,
+        );
+        let revealed = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Their Revealed".to_string(),
+            Zone::Hand,
+        );
+        state.public_revealed_cards.insert(revealed);
+        create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Their Secret".to_string(),
+            Zone::Hand,
+        );
+        let morph = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(1),
+            "Their Morph".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&morph).unwrap().face_down = true;
+        let mut names: Vec<String> = (0..30).map(|i| format!("Own {i}")).collect();
+        names.extend(
+            [
+                "Their Grave",
+                "Their Revealed",
+                "Their Secret",
+                "Their Morph",
+            ]
+            .map(String::from),
+        );
+        let issued = issued_names(&card_name_prompt(state, names));
+        assert_eq!(issued.len(), 24, "capped");
+        assert_eq!(
+            issued[..2],
+            ["Their Grave", "Their Revealed"].map(String::from)
+        );
+        assert!(!issued
+            .iter()
+            .any(|n| n == "Their Secret" || n == "Their Morph"));
     }
 
     #[test]

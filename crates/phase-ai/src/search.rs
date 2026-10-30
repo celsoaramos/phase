@@ -3934,7 +3934,14 @@ fn score_candidates_core_for_root(
                 .stack
                 .iter()
                 .any(|entry| entry.controller != ai_player);
-        let tactical_weight = if is_target_selection {
+        // CR 608.2d: a named choice (colour, card name, creature type) has the
+        // same shape as a target choice — the payoff is decided by the answer
+        // and the search usually can't see it (a named discard resolves
+        // against a hand the AI can only sample), so every option evaluates
+        // the same and a 0.1 policy nudge drowns in the softmax. Give the
+        // named-choice policies the target-selection weight.
+        let is_named_choice = matches!(state.waiting_for, WaitingFor::NamedChoice { .. });
+        let tactical_weight = if is_target_selection || is_named_choice {
             0.7
         } else if is_stack_response {
             0.35

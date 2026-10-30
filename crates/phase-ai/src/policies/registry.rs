@@ -166,6 +166,13 @@ pub enum PolicyId {
     CostReduction,
     /// CR 121.1: reward drawing into an on-battlefield "whenever you draw" engine.
     DrawPayoff,
+    /// CR 702.16 + CR 702.11d: pick the colour (or colorless) a protection /
+    /// hexproof grant must name to stop the opponent's spell or creatures,
+    /// instead of the first colour of the list.
+    ColorChoice,
+    /// CR 400.2: name a card the opponent has shown (battlefield, graveyard,
+    /// exile, revealed), never the AI's own card or the first candidate.
+    CardNameChoice,
     /// CR 701.9: reward discarding into an on-battlefield "whenever you discard"
     /// engine — disjoint from `HandDisruption`, which scores OPPONENT discard.
     DiscardPayoff,
@@ -445,6 +452,8 @@ impl Default for PolicyRegistry {
             Box::new(super::self_bounce_target::SelfBounceTargetPolicy),
             Box::new(super::cost_reduction::CostReductionPolicy),
             Box::new(super::draw_payoff::DrawPayoffPolicy),
+            Box::new(super::color_choice::ColorChoicePolicy),
+            Box::new(super::card_name_choice::CardNameChoicePolicy),
             Box::new(super::discard_payoff::DiscardPayoffPolicy),
             Box::new(super::vehicle_deployment::VehicleDeploymentPolicy),
             Box::new(CreatureTypeChoicePolicy),

@@ -638,6 +638,34 @@ pub struct PolicyPenalties {
     /// options with equal presence. Consumed by `CreatureTypeChoicePolicy`.
     #[serde(default = "default_creature_type_tribe_bonus")]
     pub creature_type_tribe_bonus: f64,
+    /// CR 702.16b + CR 702.11d: card-equivalent value of naming the colour
+    /// (or colorless) that makes ONE opponent stack entry aimed at the
+    /// protected creature lose its target — the creature is saved, so a card.
+    /// Consumed by `ColorChoicePolicy`.
+    #[serde(default = "default_chosen_color_stack_threat")]
+    pub chosen_color_stack_threat: f64,
+    /// CR 702.16c-e: card-equivalent value of ONE opponent creature the chosen
+    /// protection walls off (can't block, its damage is prevented). A capped
+    /// tiebreak, strictly below one stack threat. Consumed by
+    /// `ColorChoicePolicy`.
+    #[serde(default = "default_chosen_color_board_unit")]
+    pub chosen_color_board_unit: f64,
+    /// CR 400.2: card-equivalent value of ONE nonland copy of a name the
+    /// opponent has shown (battlefield, graveyard, exile, revealed) when the
+    /// AI names a card. Capped at a playset by `CardNameChoicePolicy`.
+    #[serde(default = "default_card_name_shown_unit")]
+    pub card_name_shown_unit: f64,
+    /// Card-equivalent cost of naming a card only the AI is known to play —
+    /// the discard or lock hits nothing of the opponent's and can shut off
+    /// the AI's own copies. Consumed by `CardNameChoicePolicy`.
+    #[serde(default = "default_card_name_own_penalty")]
+    pub card_name_own_penalty: f64,
+    /// CR 701.20b: card-equivalent value of ONE copy of the name revealed while
+    /// it is still in the opponent's hand — a named discard is sure to hit it.
+    /// Strictly above the capped shown evidence, so a known card in hand always
+    /// outranks a playset in the graveyard. Consumed by `CardNameChoicePolicy`.
+    #[serde(default = "default_card_name_known_in_hand")]
+    pub card_name_known_in_hand: f64,
     /// Card-equivalent value of ONE colored pip the AI's near-term
     /// hand demands, that its battlefield lands cannot yet produce, and that the
     /// land being played does produce. Counted per unmet color and capped by the
@@ -758,6 +786,11 @@ impl Default for PolicyPenalties {
             graveyard_authority_idle_slot: default_graveyard_authority_idle_slot(),
             graveyard_authority_destination: default_graveyard_authority_destination(),
             creature_type_tribe_bonus: default_creature_type_tribe_bonus(),
+            chosen_color_stack_threat: default_chosen_color_stack_threat(),
+            chosen_color_board_unit: default_chosen_color_board_unit(),
+            card_name_shown_unit: default_card_name_shown_unit(),
+            card_name_own_penalty: default_card_name_own_penalty(),
+            card_name_known_in_hand: default_card_name_known_in_hand(),
             land_color_demand_unit: default_land_color_demand_unit(),
             land_tempo_rider_penalty: default_land_tempo_rider_penalty(),
             self_cost_material_life: default_self_cost_material_life(),
@@ -815,6 +848,40 @@ fn default_creature_type_presence_unit() -> f64 {
 /// `Default` and `#[serde(default)]` for the same artifact-compatibility reason.
 fn default_creature_type_tribe_bonus() -> f64 {
     0.25
+}
+
+/// CR 702.16b. One card: the protected creature survives the spell. Shared by
+/// `Default` and `#[serde(default)]` so a tuning artifact written before this
+/// field existed still deserializes.
+fn default_chosen_color_stack_threat() -> f64 {
+    1.0
+}
+
+/// CR 702.16c-e. A fifth of a card per walled-off creature, capped at four by the
+/// policy, so the whole board (0.8) never outranks one spell on the stack.
+/// Shared by `Default` and `#[serde(default)]` for artifact compatibility.
+fn default_chosen_color_board_unit() -> f64 {
+    0.2
+}
+
+/// CR 400.2. Half a card per shown copy: a named discard that hits takes a
+/// card, and every shown copy raises the odds one is still in hand. Shared by
+/// `Default` and `#[serde(default)]` for artifact compatibility.
+fn default_card_name_shown_unit() -> f64 {
+    0.5
+}
+
+/// Half a card: below one shown copy, so any name the opponent has shown wins
+/// over a name only the AI plays. Shared by `Default` and `#[serde(default)]`
+/// for artifact compatibility.
+fn default_card_name_own_penalty() -> f64 {
+    0.5
+}
+
+/// CR 701.20b. Above the shown-evidence cap (4 × 0.5 = 2.0). Shared by
+/// `Default` and `#[serde(default)]` for artifact compatibility.
+fn default_card_name_known_in_hand() -> f64 {
+    2.5
 }
 
 /// Half a card per unmet color the land covers, so the capped
@@ -1324,6 +1391,26 @@ pub const UNTUNED_POLICY_PENALTY_FIELDS: &[(&str, &str)] = &[
     (
         "creature_type_tribe_bonus",
         "CreatureTypeChoicePolicy dominant-tribe tiebreak; must stay strictly below creature_type_presence_unit, and no paired-seed calibration exists — the duel suite never raises a creature-type prompt",
+    ),
+    (
+        "chosen_color_stack_threat",
+        "ColorChoicePolicy per-spell weight for a protection colour that stops an opposing spell or ability aimed at the protected creature; no paired-seed calibration — the duel suite rarely raises a protection colour prompt",
+    ),
+    (
+        "chosen_color_board_unit",
+        "ColorChoicePolicy per-creature weight for the colour shared by the opposing board; must stay below chosen_color_stack_threat even at the board cap, and no paired-seed calibration exists",
+    ),
+    (
+        "card_name_shown_unit",
+        "CardNameChoicePolicy per-copy weight for a name the opponent has shown; no paired-seed calibration — the duel suite rarely raises a card-name prompt",
+    ),
+    (
+        "card_name_own_penalty",
+        "CardNameChoicePolicy penalty for naming only the AI's own card; no paired-seed calibration — the duel suite rarely raises a card-name prompt",
+    ),
+    (
+        "card_name_known_in_hand",
+        "CardNameChoicePolicy weight for a name revealed in the opponent's hand; must stay above the capped shown evidence, and no paired-seed calibration exists",
     ),
     (
         "land_color_demand_unit",
