@@ -2086,6 +2086,43 @@ fn mark_independent_mana_spent_gates(defs: &mut [AbilityDefinition]) {
     }
 }
 
+/// CR 122.1 + CR 608.2c: "put a +1/+1 counter on it if it's a creature and a
+/// loyalty counter on it if it's a planeswalker" (Forge of Heroes) is two
+/// counter placements on the same object, each gated on its OWN type test of
+/// that object. The second gate never reads the first clause's effect or gate,
+/// so a planeswalker commander (first gate false) must still get its loyalty
+/// counter. Stamp the second placement with the independent OR-branch marker
+/// (`SiblingCondition::ReplicatedOrBranch` on a `SequentialSibling`) so it is
+/// evaluated when the previous placement's gate is false — the same treatment
+/// [`mark_independent_mana_spent_gates`] gives two mana-spent gates.
+///
+/// Only a gate that DIFFERS from the previous placement's is independent; a
+/// placement repeating the same gate stays a `ContinuationStep` of the first.
+fn mark_independent_type_gated_counter_placements(defs: &mut [AbilityDefinition]) {
+    let mut previous_gate: Option<TargetFilter> = None;
+    for def in defs {
+        let gate = match (&*def.effect, def.condition.as_ref()) {
+            (
+                Effect::PutCounter {
+                    target: TargetFilter::ParentTarget,
+                    ..
+                },
+                Some(AbilityCondition::TargetMatchesFilter {
+                    filter: filter @ TargetFilter::Typed(_),
+                    subject_slot: None,
+                    ..
+                }),
+            ) => Some(filter.clone()),
+            _ => None,
+        };
+        if gate.is_some() && previous_gate.is_some() && gate != previous_gate {
+            def.sub_link = SubAbilityLink::SequentialSibling;
+            def.sibling_condition = SiblingCondition::ReplicatedOrBranch;
+        }
+        previous_gate = gate;
+    }
+}
+
 pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     let kind = ir.kind;
     let continuation_kind = ir.continuation_kind.unwrap_or(AbilityKind::Spell);
@@ -4149,6 +4186,7 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     thread_chosen_damage_source_into_oneshot_effects(&mut defs);
 
     mark_independent_mana_spent_gates(&mut defs);
+    mark_independent_type_gated_counter_placements(&mut defs);
 
     // Chain: last has no sub_ability, each earlier one chains to next.
     // When a def already has a sub_ability (e.g., TargetOnly with attached Explore),

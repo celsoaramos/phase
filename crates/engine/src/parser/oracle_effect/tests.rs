@@ -88169,3 +88169,61 @@ fn cast_permission_rider_requires_the_lingering_shape() {
         );
     }
 }
+
+/// CR 122.1 + CR 608.2c: Forge of Heroes — "Put a +1/+1 counter on it if it's a
+/// creature and a loyalty counter on it if it's a planeswalker." The second
+/// conjunct elides "put" and carries its own type gate: the chain is two
+/// placements, each gated on its own `TargetMatchesFilter`, never one clause
+/// with only the trailing gate (which left "a loyalty counter on it" as a
+/// verbless `put_counter_tail`).
+#[test]
+fn forge_of_heroes_splits_type_gated_counter_conjuncts() {
+    let parsed = parse_oracle_text(
+        "{T}: Add {C}.\n{T}: Choose target commander that entered this turn. Put a +1/+1 counter on it if it's a creature and a loyalty counter on it if it's a planeswalker.",
+        "Forge of Heroes",
+        &[],
+        &["Land".to_string()],
+        &[],
+    );
+    let ability = &parsed.abilities[1];
+    let mut placements = Vec::new();
+    let mut node = ability.sub_ability.as_deref();
+    while let Some(def) = node {
+        assert!(
+            !matches!(&*def.effect, Effect::Unimplemented { .. }),
+            "no unimplemented link, got {:?}",
+            def.effect
+        );
+        if let Effect::PutCounter { counter_type, .. } = &*def.effect {
+            let Some(AbilityCondition::TargetMatchesFilter { filter, .. }) = def.condition.as_ref()
+            else {
+                panic!(
+                    "each placement carries its own type gate, got {:?}",
+                    def.condition
+                );
+            };
+            let TargetFilter::Typed(typed) = filter else {
+                panic!("typed gate, got {filter:?}");
+            };
+            if *counter_type == CounterType::Loyalty {
+                assert_eq!(
+                    (def.sub_link, def.sibling_condition),
+                    (
+                        SubAbilityLink::SequentialSibling,
+                        SiblingCondition::ReplicatedOrBranch
+                    ),
+                    "the loyalty placement must survive a false creature gate"
+                );
+            }
+            placements.push((counter_type.clone(), typed.type_filters.clone()));
+        }
+        node = def.sub_ability.as_deref();
+    }
+    assert_eq!(
+        placements,
+        vec![
+            (CounterType::Plus1Plus1, vec![TypeFilter::Creature]),
+            (CounterType::Loyalty, vec![TypeFilter::Planeswalker]),
+        ]
+    );
+}

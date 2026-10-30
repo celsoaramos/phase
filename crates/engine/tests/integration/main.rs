@@ -449,6 +449,7 @@ mod food_chain_board;
 mod for_each_put_counter_head;
 mod forced_retarget_multi_role_mana_6056;
 mod foretell_pipeline;
+mod forge_of_heroes_type_gated_counters;
 mod format_axis_census;
 mod fra_bloodline_recollector;
 mod freeform_commander_deck_rules;

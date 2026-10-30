@@ -1774,6 +1774,12 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
                                             remainder_trimmed,
                                         )
                                     })
+                                    .or_else(|| {
+                                        type_gated_counter_conjunct_prepend(
+                                            before_and,
+                                            remainder_trimmed,
+                                        )
+                                    })
                             {
                                 push_clause_chunk(
                                     &mut chunks,
@@ -3975,6 +3981,56 @@ fn mana_spent_amount_conjunct_prepend(before_and: &str, remainder_trimmed: &str)
         return None;
     }
     Some(before_and[..before_lower.len() - after_head.len()].to_string())
+}
+
+/// CR 122.1 + CR 608.2c: "put <counters> on it if it's a <type> and <counters>
+/// on it if it's a <type>" (Forge of Heroes: "a +1/+1 counter on it if it's a
+/// creature and a loyalty counter on it if it's a planeswalker"). The second
+/// conjunct elides "put" and carries its OWN type gate, so the two halves are
+/// two gated placements, not one. Left whole, the suffix-condition stripper
+/// peels only the last gate ("if it's a planeswalker") over a clause that still
+/// holds both conjuncts, and the verbless second half fails as
+/// `put_counter_tail`. Returns the head through "put " to prepend so the second
+/// conjunct reaches the counter parser as its own gated clause. Both halves must
+/// carry an "if it's a(n)" gate within their sentence, and the second must parse
+/// as a counter placement up to that gate.
+fn type_gated_counter_conjunct_prepend(
+    before_and: &str,
+    remainder_trimmed: &str,
+) -> Option<String> {
+    let before_lower = before_and.to_ascii_lowercase();
+    let remainder_lower = remainder_trimmed.to_ascii_lowercase();
+    let remainder_sentence = before_sentence_boundary(&remainder_lower);
+    let (_, (), after_head) = nom_primitives::scan_preceded(&before_lower, |i| {
+        value((), tag::<_, _, OracleError<'_>>("put ")).parse(i)
+    })?;
+    let (conjunct1, (), _) = nom_primitives::scan_preceded(after_head, parse_its_a_type_gate)?;
+    if !nom_primitives::scan_contains(conjunct1, "counter") {
+        return None;
+    }
+    let (counter_part, (), _) =
+        nom_primitives::scan_preceded(remainder_sentence, parse_its_a_type_gate)?;
+    let reparsed = format!("put {}", counter_part.trim_end());
+    let (effect, rest, _) =
+        super::counter::try_parse_put_counter(&reparsed, &reparsed, &mut ParseContext::default())?;
+    if !rest.trim().is_empty() || !matches!(effect, Effect::PutCounter { .. }) {
+        return None;
+    }
+    Some(before_and[..before_lower.len() - after_head.len()].to_string())
+}
+
+/// "if it's a " / "if it's an " — the anaphoric type gate that opens each
+/// conjunct's own condition in [`type_gated_counter_conjunct_prepend`].
+fn parse_its_a_type_gate(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        (
+            tag("if it"),
+            alt((tag("'s "), tag("\u{2019}s "), tag(" is "))),
+            alt((tag("an "), tag("a "))),
+        ),
+    )
+    .parse(input)
 }
 
 fn combat_requirement_conjunct_prepend(
