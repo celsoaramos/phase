@@ -25586,6 +25586,21 @@ pub(crate) fn effect_bound_filter_matches(
             return true;
         }
     }
+    // CR 115.1 + CR 608.2d: a random battlefield pick scoped to a targeted
+    // player's permanents ("target opponent chooses a permanent they control at
+    // random" — Tyrant of Discord) needs that player announced as a target, or
+    // the pool reads no player and comes back empty.
+    if let Effect::ChooseFromZone {
+        zone: crate::types::zones::Zone::Battlefield,
+        filter: Some(filter),
+        selection,
+        ..
+    } = effect
+    {
+        if selection.is_random() && pred(filter) {
+            return true;
+        }
+    }
     if effect.target_filter().is_some_and(pred) {
         return true;
     }

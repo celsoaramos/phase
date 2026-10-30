@@ -352,6 +352,22 @@ pub(super) fn patch_choose_from_zone_counter_continuation_target(def: &mut Abili
                     {
                         *target = TargetFilter::ParentTarget;
                     }
+                    // CR 701.21a + CR 608.2c: "chooses a permanent they control at
+                    // random and sacrifices it" (Tyrant of Discord) — "it" is the
+                    // picked permanent, never the source.
+                    Effect::Sacrifice { target, .. }
+                        if matches!(target, TargetFilter::SelfRef)
+                            && matches!(
+                                &*cursor.effect,
+                                Effect::ChooseFromZone {
+                                    zone: Zone::Battlefield,
+                                    selection,
+                                    ..
+                                } if selection.is_random()
+                            ) =>
+                    {
+                        *target = TargetFilter::ParentTarget;
+                    }
                     _ => {}
                 }
             }
@@ -7923,7 +7939,9 @@ pub(super) fn strip_temporal_suffix(text: &str) -> (&str, Option<DelayedTriggerC
             DelayedTriggerCondition::AtNextPhaseForPlayer {
                 phase: Phase::End,
                 player: crate::types::player::PlayerId(0),
-                gate: crate::types::ability::TurnGate::None,
+                // CR 500.7: the extra turn comes after the current one, so the
+                // current turn's own end step is never "that turn's".
+                gate: crate::types::ability::TurnGate::AfterCreationTurn,
                 binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
             },
         ),
@@ -8103,11 +8121,15 @@ pub(crate) fn strip_temporal_prefix(text: &str) -> (&str, Option<DelayedTriggerC
             // controller's next end step, identical to the "your next end step"
             // arm above. PlayerId(0) is rewritten to ability.controller at
             // resolve time.
+            // CR 500.7: the extra turn starts after the current one, so cast in
+            // the controller's own main phase the current end step is NOT "that
+            // turn's" — `AfterCreationTurn` skips it (without the gate the
+            // spell lost at the end of the turn it was cast).
             value(
                 DelayedTriggerCondition::AtNextPhaseForPlayer {
                     phase: Phase::End,
                     player: crate::types::player::PlayerId(0),
-                    gate: crate::types::ability::TurnGate::None,
+                    gate: crate::types::ability::TurnGate::AfterCreationTurn,
                     binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 tag("at the beginning of that turn's end step, "),
@@ -15613,7 +15635,9 @@ mod tests {
         let expected = DelayedTriggerCondition::AtNextPhaseForPlayer {
             phase: Phase::End,
             player: crate::types::player::PlayerId(0),
-            gate: crate::types::ability::TurnGate::None,
+            // CR 500.7: the extra turn is after the current one, so the current
+            // turn's end step is skipped.
+            gate: crate::types::ability::TurnGate::AfterCreationTurn,
             binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
         };
 

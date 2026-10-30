@@ -2286,6 +2286,14 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                                 {
                                     rewrite_else_event_context_to_stable(&mut else_def, &stable);
                                 }
+                                // CR 111.1 + CR 608.2c: "Otherwise, create one of
+                                // those tokens" names the token the gated branch
+                                // creates; the else chain was parsed on its own, so
+                                // bind the anaphor to that token here (Brood Birthing).
+                                super::lower::rewrite_those_tokens_from_antecedent(
+                                    &mut else_def.effect,
+                                    &d.effect,
+                                );
                                 d.else_ability = Some(else_def);
                                 attached = true;
                             }
@@ -4558,6 +4566,9 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // clause in the same chain reads it back ("the highest number", "each player
     // who didn't choose the lowest number").
     super::promote_chosen_number_persistence(&mut result);
+    // CR 105.4 + CR 607.2d: persist a chosen color a later discard reads back
+    // ("discards all cards of that color").
+    super::promote_chosen_color_persistence(&mut result);
     // CR 608.2d: gate the whole "if they guessed wrong/right" branch, including
     // any "and ..." continuation steps.
     super::propagate_guess_branch_condition_to_continuations(&mut result);

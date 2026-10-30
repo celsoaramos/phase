@@ -146,6 +146,12 @@ pub(crate) fn parse_oracle_block(lines: &[&str], start: usize) -> Option<(Oracle
     }
 
     if let Some((trigger_line, header)) = split_triggered_modal_header(&candidate) {
+        // CR 700.2 + CR 608.2c: "choose one … and you lose 2 life —" (Zuko,
+        // Conflicted) adds an instruction to every resolution whatever the mode.
+        let (header, modes) = match split_modal_header_rider(&header) {
+            Some((bare, rider)) => (bare, append_rider_to_modes(modes.clone(), &rider)),
+            None => (header, modes.clone()),
+        };
         if let Some(header) = parse_modal_header_ast(&header) {
             // CR 603.12 + CR 700.2b: A reflexive optional-cost header
             // ("Whenever you attack, you may sacrifice another creature. When
@@ -979,6 +985,50 @@ fn parse_modal_override_count(input: &str) -> nom::IResult<&str, usize, OracleEr
         tag(" instead"),
     )
     .parse(input)
+}
+
+/// CR 700.2 + CR 608.2c: a mode header that carries its own instruction after
+/// the choice ("choose one that hasn't been chosen and you lose 2 life —",
+/// Zuko, Conflicted). Returns the header without the rider and the rider
+/// clause. Only a player-subject rider ("and you …") is split: it cannot be
+/// part of the count or constraint phrase.
+fn split_modal_header_rider(header: &str) -> Option<(String, String)> {
+    let lower = header.to_lowercase();
+    let (_, (before, _, rider, dash)) = (
+        take_until::<_, _, OracleError<'_>>(" and you "),
+        tag(" and "),
+        take_until(" \u{2014}"),
+        rest,
+    )
+        .parse(lower.as_str())
+        .ok()?;
+    if !rider.starts_with("you ") {
+        return None;
+    }
+    let rider = &header[before.len() + " and ".len()..before.len() + " and ".len() + rider.len()];
+    Some((
+        format!("{}{}", &header[..before.len()], dash),
+        rider.trim().to_string(),
+    ))
+}
+
+/// Appends the header rider to every mode body, as its last instruction.
+fn append_rider_to_modes(modes: Vec<ModeAst>, rider: &str) -> Vec<ModeAst> {
+    let mut chars = rider.chars();
+    let sentence = match chars.next() {
+        Some(first) => format!("{}{}.", first.to_uppercase(), chars.as_str()),
+        None => return modes,
+    };
+    modes
+        .into_iter()
+        .map(|mode| {
+            let body = mode.body.trim().trim_end_matches('.');
+            ModeAst {
+                body: format!("{body}. {sentence}"),
+                ..mode
+            }
+        })
+        .collect()
 }
 
 fn split_triggered_modal_header(line: &str) -> Option<(String, String)> {

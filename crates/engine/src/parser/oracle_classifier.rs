@@ -276,6 +276,27 @@ pub(crate) fn should_defer_spell_to_effect(lower: &str) -> bool {
         return true;
     }
 
+    // CR 611.2a + CR 611.2c: on an instant or sorcery, "<subject> gain(s)
+    // <ability>" with no stated duration is the spell's own continuous effect —
+    // it lasts for the rest of the game and fixes its affected set at
+    // resolution — never a static ability of the card. Classified as a static,
+    // the whole line was dropped, and with it every instruction after the grant
+    // (Chance for Glory's extra turn and delayed loss).
+    if scan_contains(lower, "gain ") || scan_contains(lower, "gains ") {
+        return true;
+    }
+
+    // CR 111.1 + CR 608.2c: on an instant or sorcery, a line that creates
+    // tokens is the spell's one-shot instruction; a following "They have
+    // \"…\"" sentence grants the ability to those tokens, not to a static of the
+    // card. Classified as a static, the whole line was dropped (Brood Birthing's
+    // "If you control an Eldrazi Spawn, create three … Otherwise, create one").
+    if scan_contains(lower, "create ")
+        && (scan_contains(lower, "they have \"") || scan_contains(lower, "it has \""))
+    {
+        return true;
+    }
+
     ((scan_contains(lower, "deals ") || scan_contains(lower, "deal "))
         && scan_contains(lower, "damage"))
         || scan_contains(lower, "until end of turn")

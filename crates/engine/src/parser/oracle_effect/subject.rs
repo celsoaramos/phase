@@ -5396,6 +5396,18 @@ fn build_continuous_clause(
     {
         return None;
     }
+    // CR 120.3 + CR 608.2c: "~ deals N damage to X and gains Y" opens with a
+    // one-shot damage instruction, not a continuous modification. Routing it
+    // here keeps only the trailing "gains Y" grant and silently drops the damage
+    // (Ellie, Vengeful Hunter); decline so the compound splitter peels the
+    // damage clause off and the grant rides as its continuation.
+    let normalized_lower = normalized.to_lowercase();
+    if tag::<_, _, OracleError<'_>>("deal ")
+        .parse(normalized_lower.as_str())
+        .is_ok()
+    {
+        return None;
+    }
 
     // Try the full predicate first (simple pump with no compound).
     if let Some((power, toughness, duration)) =

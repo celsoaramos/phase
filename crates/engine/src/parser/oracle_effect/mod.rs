@@ -1740,6 +1740,61 @@ fn quantity_expr_reads_player_chosen_number(expr: &QuantityExpr) -> bool {
     }
 }
 
+/// CR 105.4 + CR 607.2d: a color choice must PERSIST on the source when a later
+/// discard in the same chain filters by it ("choose a color, then that player
+/// reveals their hand and discards all cards of that color" — Crosis, the
+/// Purger; Persecute). `FilterProp::IsChosenColor` reads the source's chosen
+/// attributes, so an unpersisted choice leaves the filter matching nothing.
+/// Scoped to the discard reader: the other anaphor forms ("each creature of the
+/// chosen color") are not lowered to `IsChosenColor` yet.
+pub(super) fn promote_chosen_color_persistence(ability: &mut AbilityDefinition) {
+    if chain_discards_chosen_color(ability) {
+        persist_color_choices(ability);
+    }
+}
+
+fn chain_discards_chosen_color(def: &AbilityDefinition) -> bool {
+    fn reads(filter: &TargetFilter) -> bool {
+        match filter {
+            TargetFilter::Typed(typed) => typed
+                .properties
+                .iter()
+                .any(|prop| matches!(prop, FilterProp::IsChosenColor)),
+            TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+                filters.iter().any(reads)
+            }
+            TargetFilter::Not { filter } => reads(filter),
+            _ => false,
+        }
+    }
+    matches!(&*def.effect, Effect::Discard { filter: Some(filter), .. } if reads(filter))
+        || def
+            .sub_ability
+            .as_deref()
+            .is_some_and(chain_discards_chosen_color)
+        || def
+            .else_ability
+            .as_deref()
+            .is_some_and(chain_discards_chosen_color)
+}
+
+fn persist_color_choices(def: &mut AbilityDefinition) {
+    if let Effect::Choose {
+        choice_type: ChoiceType::Color { .. },
+        persist,
+        ..
+    } = def.effect.as_mut()
+    {
+        *persist = true;
+    }
+    if let Some(sub) = def.sub_ability.as_deref_mut() {
+        persist_color_choices(sub);
+    }
+    if let Some(els) = def.else_ability.as_deref_mut() {
+        persist_color_choices(els);
+    }
+}
+
 fn persist_number_choices(def: &mut AbilityDefinition) {
     if let Effect::Choose {
         choice_type: ChoiceType::NumberRange { .. },
@@ -3731,6 +3786,13 @@ fn parse_token_creation_replacement_effect(lower: &str) -> Option<Effect> {
         .parse(rest)
         .ok()?;
 
+    // CR 111.1 + CR 614.1a: the installer replaces token CREATION, so the clause
+    // must be about tokens. The shared shape scan keys on "twice that many"
+    // alone, which also matches a quantity anaphor of another instruction
+    // (Angel of Suffering's "mill twice that many cards").
+    if !nom_primitives::scan_contains(rest, "token") {
+        return None;
+    }
     let mut def = crate::parser::oracle_replacement::parse_token_replacement(rest, rest)?;
     // CR 514.2: The installed replacement lasts "until end of turn"; stamp the
     // expiry directly so the lifetime is self-contained (not dependent on the
@@ -29487,6 +29549,22 @@ fn lower_subject_predicate_ast_body(
                     *chooser = crate::types::ability::Chooser::Opponent.into();
                     return clause;
                 }
+            }
+            // CR 608.2d (override): a random pick has no chooser — the game
+            // selects — so the subject only scopes the pool, which the imperative
+            // layer already resolved into the filter ("target opponent chooses a
+            // permanent they control at random" — Tyrant of Discord).
+            if matches!(
+                &clause.effect,
+                Effect::ChooseFromZone {
+                    filter: Some(_),
+                    zone: Zone::Battlefield,
+                    zone_owner: crate::types::ability::ZoneOwner::AllOwners,
+                    selection,
+                    ..
+                } if selection.is_random()
+            ) {
+                return clause;
             }
             if matches!(
                 &clause.effect,

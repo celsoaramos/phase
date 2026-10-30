@@ -1777,7 +1777,55 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
                         || loses_all_other_card_types_continuation
                         || shared_equal_to_quantity_conjunct
                         || inside_prefix_comma_and_continuation;
-                        if !suppress && starts_bare_and_clause(remainder_trimmed) {
+                        // CR 701.20a + CR 701.9a + CR 608.2c: "<player> reveals their
+                        // hand and discards …" (Cabal Therapy, Persecute, Amnesia) is
+                        // two instructions by the same player. Kept whole, the hand
+                        // reveal absorbed the discard and the spell discarded nothing;
+                        // split, the discard inherits the reveal's player subject.
+                        // A conditional body ("If you do, choose a color, then that
+                        // player reveals …") is split again by its own nested pass,
+                        // where the reveal's player is in reach; splitting it here
+                        // would hand the discard to the caster.
+                        let reveal_hand_then_discard = {
+                            // allow-noncombinator: terminal suffix probe on the chunk buffer during the char scan.
+                            let before = before_lower.trim_end();
+                            (before.ends_with("reveals their hand")
+                                || before.ends_with("reveals his or her hand"))
+                                && tag::<_, _, OracleError<'_>>("discards ")
+                                    .parse(remainder_lower_for_loses.as_str())
+                                    .is_ok()
+                                && alt((tag::<_, _, OracleError<'_>>("if "), tag("when ")))
+                                    .parse(before.trim_start_matches(|c: char| {
+                                        c == ',' || c.is_whitespace()
+                                    }))
+                                    .is_err()
+                        };
+                        // CR 701.21a + CR 608.2d (override): "<player> chooses a
+                        // permanent they control at random and sacrifices it" (Tyrant
+                        // of Discord) is a random pick followed by the sacrifice of the
+                        // picked permanent. Kept whole, it lowered to an edict the
+                        // player chose freely; split, the pick is a random zone choice
+                        // and "sacrifices it" names the picked permanent.
+                        let random_pick_then_verb_it = {
+                            // allow-noncombinator: terminal suffix probe on the chunk buffer during the char scan.
+                            before_lower.trim_end().ends_with(" at random")
+                                && crate::parser::oracle_nom::primitives::scan_contains(
+                                    before_lower.as_str(),
+                                    "chooses ",
+                                )
+                                && alt((
+                                    tag::<_, _, OracleError<'_>>("sacrifices it"),
+                                    tag("exiles it"),
+                                    tag("destroys it"),
+                                ))
+                                .parse(remainder_lower_for_loses.as_str())
+                                .is_ok()
+                        };
+                        if !suppress
+                            && (starts_bare_and_clause(remainder_trimmed)
+                                || reveal_hand_then_discard
+                                || random_pick_then_verb_it)
+                        {
                             push_clause_chunk(&mut chunks, before_and, Some(ClauseBoundary::Comma));
                             current.clear();
                             compound_subject_each_sticky = false;

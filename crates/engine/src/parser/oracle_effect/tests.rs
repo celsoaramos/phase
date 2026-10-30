@@ -69646,6 +69646,7 @@ fn effect_filter_has_chosen_color(effect: &Effect) -> bool {
         } => damage_source_filter
             .as_ref()
             .is_some_and(filter_has_chosen_color),
+        Effect::Discard { filter, .. } => filter.as_ref().is_some_and(filter_has_chosen_color),
         Effect::StartYourEngines { .. }
         | Effect::ChangeSpeed { .. }
         | Effect::DealDamage { .. }
@@ -69733,7 +69734,6 @@ fn effect_filter_has_chosen_color(effect: &Effect) -> bool {
         | Effect::GenericEffect { .. }
         | Effect::Cleanup { .. }
         | Effect::Mana { .. }
-        | Effect::Discard { .. }
         | Effect::Shuffle { .. }
         | Effect::Transform { .. }
         | Effect::FlipPermanent { .. }
@@ -69897,9 +69897,9 @@ fn tree_has_is_chosen_color(def: &AbilityDefinition) -> bool {
         .any(|d| effect_filter_has_chosen_color(&d.effect))
 }
 
-/// V-ANAPHOR (SHAPE) — CR 105.4 + CR 607.2d. The three anaphor cards
-/// (`of the chosen color` / `of that color`) parse exactly as they do today:
-/// the printed-form arm must NOT widen to the anaphor forms.
+/// V-ANAPHOR (SHAPE) — CR 105.4 + CR 607.2d. The anaphor cards outside the
+/// discard grammar (`of the chosen color` / `of that color`) parse exactly as
+/// they do today: the printed-form arm must NOT widen to the anaphor forms.
 ///
 /// The negatives (zero `IsChosenColor`, zero `Unimplemented`) are each paired
 /// with a positive reach-guard on the surface that ACTUALLY carries the chain —
@@ -69944,9 +69944,37 @@ fn anaphor_color_cards_are_unchanged_by_the_printed_qualifier_arm() {
         dromar.triggers.len()
     );
 
+    // Persecute's discard anaphor IS implemented (the discard grammar reads "of
+    // that color" and persists the choice — `promote_chosen_color_persistence`);
+    // the other two forms stay out of scope (F1).
+    {
+        let nodes = all_card_defs(&persecute);
+        assert!(
+            nodes.iter().any(|d| matches!(
+                &*d.effect,
+                Effect::Choose {
+                    choice_type: ChoiceType::Color { .. },
+                    persist: true,
+                    ..
+                }
+            )),
+            "Persecute: the colour choice persists for the discard"
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|d| effect_filter_has_chosen_color(&d.effect)),
+            "Persecute: the discard is limited to the chosen colour"
+        );
+        assert_eq!(
+            nodes.iter().filter(|d| is_unimplemented_def(d)).count(),
+            0,
+            "Persecute: no clause may lower to Unimplemented"
+        );
+    }
+
     for (name, parsed) in [
         ("Sudden Demise", &sudden_demise),
-        ("Persecute", &persecute),
         ("Dromar, the Banisher", &dromar),
     ] {
         let nodes = all_card_defs(parsed);

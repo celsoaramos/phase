@@ -1444,6 +1444,66 @@ pub(crate) fn parse_discard_card_filter(tail: &str) -> Option<TargetFilter> {
     Some(filter)
 }
 
+/// CR 701.9a + CR 608.2c: the noun of "discard all <noun>": "cards", a typed
+/// card phrase ("land cards", "nonland cards"), optionally followed by "with
+/// that name" (CR 201.2a, the name chosen earlier in the resolution) or "of
+/// that color" / "of the chosen color" (CR 105.4, the color chosen earlier).
+/// Returns `Some(None)` for a bare "cards" (the whole hand) and `None` when the
+/// noun is not readable.
+fn parse_discard_all_filter(noun: &str) -> Option<Option<TargetFilter>> {
+    // CR 608.2c: "all other <cards>" excludes cards an earlier instruction
+    // picked (Noxious Vapors: "chooses one card of each color …, then discards
+    // all other nonland cards"). No filter names that antecedent here, so decline
+    // instead of discarding every card of the type.
+    if tag::<_, _, OracleError<'_>>("other ").parse(noun).is_ok() {
+        return None;
+    }
+    let (noun, has_name) = match terminated(
+        take_until::<_, _, OracleError<'_>>(" with that name"),
+        all_consuming(tag(" with that name")),
+    )
+    .parse(noun)
+    {
+        Ok((_, base)) => (base, true),
+        Err(_) => (noun, false),
+    };
+    let (noun, has_color) = match terminated(
+        take_until::<_, _, OracleError<'_>>(" of "),
+        all_consuming(alt((
+            tag::<_, _, OracleError<'_>>(" of that color"),
+            tag(" of the chosen color"),
+        ))),
+    )
+    .parse(noun)
+    {
+        Ok((_, base)) => (base, true),
+        Err(_) => (noun, false),
+    };
+    let type_filter = if noun == "cards" {
+        None
+    } else {
+        Some(parse_discard_card_filter(noun)?)
+    };
+    let type_filter = match (type_filter, has_color) {
+        (filter, false) => filter,
+        (None, true) => Some(TargetFilter::Typed(
+            TypedFilter::card().properties(vec![FilterProp::IsChosenColor]),
+        )),
+        (Some(TargetFilter::Typed(mut typed)), true) => {
+            typed.properties.push(FilterProp::IsChosenColor);
+            Some(TargetFilter::Typed(typed))
+        }
+        (Some(_), true) => return None,
+    };
+    Some(match (type_filter, has_name) {
+        (filter, false) => filter,
+        (None, true) => Some(TargetFilter::HasChosenName),
+        (Some(filter), true) => Some(TargetFilter::And {
+            filters: vec![filter, TargetFilter::HasChosenName],
+        }),
+    })
+}
+
 /// CR 701.21a + CR 608.2k: When a targeted-action body has been stripped of an
 /// actor prefix ("you (may) ", "an opponent (may) ", "each opponent ", "each
 /// player "), `ctx.actor` carries the resolving player's controller-ref. This
@@ -2094,6 +2154,26 @@ pub(super) fn parse_targeted_action_ast(
                 up_to,
                 unless_filter: None,
                 filter: None,
+            });
+        }
+        // CR 701.9a + CR 608.2c: "discards all [<type>] cards [with that name |
+        // of that color]" (Cabal Therapy, Persecute, Amnesia) discards every
+        // matching card in the hand. The count is the hand size: the resolver
+        // discards `min(count, eligible)`, so a hand-size count takes all the
+        // eligible cards with no choice to make. A noun the filter cannot read
+        // fails closed.
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("all ").parse(after_discard) {
+            let filter = parse_discard_all_filter(rest.trim_end_matches('.'))?;
+            return Some(TargetedImperativeAst::Discard {
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::HandSize {
+                        player: PlayerScope::Target,
+                    },
+                },
+                random,
+                up_to,
+                unless_filter: None,
+                filter,
             });
         }
         // CR 701.9a: "discard any number of [filter] cards" — opt-choice
@@ -4598,6 +4678,70 @@ fn parse_choose_discard_rest_of_hand(text: &str, lower: &str) -> Option<Targeted
     })
 }
 
+/// CR 608.2d (override): "a[n] <type> they control at random" — a random pick
+/// among the permanents the clause's player controls, made at resolution and
+/// handed to the next instruction ("sacrifices it") as the parent target.
+/// Lowered to `Effect::ChooseFromZone` with `CardSelectionMode::Random`. The
+/// controller phrase is read by the shared target parser (which resolves "they"
+/// to the clause's player), scanning every battlefield permanent and letting
+/// that filter scope it.
+fn try_parse_choose_controlled_permanent_at_random(
+    rest: &str,
+    rest_lower: &str,
+    ctx: &mut ParseContext,
+) -> Option<ChooseImperativeAst> {
+    let (_, (article, body, _)) = (
+        alt((tag::<_, _, OracleError<'_>>("a "), tag("an "))),
+        recognize(many_till(
+            anychar,
+            peek((tag(" at random"), opt(tag(".")), eof)),
+        )),
+        (
+            tag::<_, _, OracleError<'_>>(" at random"),
+            opt(tag(".")),
+            eof,
+        ),
+    )
+        .parse(rest_lower)
+        .ok()?;
+    // The body must end in a controller phrase, so the pick is among a player's
+    // permanents ("a card at random", "a player at random" are other shapes).
+    let (_, _) = (
+        many_till(
+            anychar,
+            peek((
+                tag::<_, _, OracleError<'_>>(" "),
+                controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]),
+                eof,
+            )),
+        ),
+        tag::<_, _, OracleError<'_>>(" "),
+        controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]),
+        eof,
+    )
+        .parse(body)
+        .ok()?;
+    let saved_mode = ctx.target_selection_mode;
+    let diagnostic_count = ctx.diagnostics.len();
+    let original_body = &rest[..article.len() + body.len()];
+    let (filter, remainder) = parse_target_with_ctx(original_body, ctx);
+    ctx.target_selection_mode = saved_mode;
+    ctx.diagnostics.truncate(diagnostic_count);
+    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
+        return None;
+    }
+    Some(ChooseImperativeAst::FromZone {
+        count: 1,
+        zones: vec![Zone::Battlefield],
+        zone_owner: ZoneOwner::AllOwners,
+        filter,
+        chooser: Chooser::Controller,
+        up_to: false,
+        selection: crate::types::ability::CardSelectionMode::Random,
+        candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Direct,
+    })
+}
+
 /// CR 701.13a + CR 109.5 + CR 608.2c: "choose a[n] <type> they control and
 /// [verb]s it" — the per-actor edict where the chooser both selects and acts on
 /// one of their own permanents (Sothera, the Supervoid: "each opponent chooses a
@@ -4615,25 +4759,31 @@ fn parse_choose_discard_rest_of_hand(text: &str, lower: &str) -> Option<Targeted
 /// `alt()`, covering the edict class (exile / sacrifice / destroy) without
 /// proliferating recognizers.
 fn try_parse_choose_and_verb_it_edict(rest_lower: &str) -> Option<ChooseImperativeAst> {
-    let they_control_and = || {
+    let they_control = || {
         (
             tag::<_, _, OracleError<'_>>(" "),
             controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]),
-            tag(" and "),
         )
     };
-    let (_, (_, type_text, _, verb, _, _, _)) = (
+    let and_verb_it = || {
+        (
+            tag::<_, _, OracleError<'_>>(" and "),
+            alt((
+                value("exile", tag::<_, _, OracleError<'_>>("exiles")),
+                value("sacrifice", tag("sacrifices")),
+                value("destroy", tag("destroys")),
+            )),
+            tag::<_, _, OracleError<'_>>(" it"),
+            opt(tag::<_, _, OracleError<'_>>(".")),
+            eof,
+        )
+    };
+    let (_, (_, type_text, _, qualifier, (_, verb, _, _, _))) = (
         alt((tag::<_, _, OracleError<'_>>("a "), tag("an "))),
-        recognize(many_till(anychar, peek(they_control_and()))),
-        they_control_and(),
-        alt((
-            value("exile", tag::<_, _, OracleError<'_>>("exiles")),
-            value("sacrifice", tag("sacrifices")),
-            value("destroy", tag("destroys")),
-        )),
-        tag::<_, _, OracleError<'_>>(" it"),
-        opt(tag::<_, _, OracleError<'_>>(".")),
-        eof,
+        recognize(many_till(anychar, peek(they_control()))),
+        they_control(),
+        recognize(many_till(anychar, peek(and_verb_it()))),
+        and_verb_it(),
     )
         .parse(rest_lower)
         .ok()?;
@@ -4644,8 +4794,22 @@ fn try_parse_choose_and_verb_it_edict(rest_lower: &str) -> Option<ChooseImperati
     if !filter_rem.trim().is_empty() || matches!(filter, TargetFilter::Any) {
         return None;
     }
+    // CR 608.2c: the chosen permanent may carry a relative clause between "they
+    // control" and the verb (Fatal Grudge: "chooses a permanent they control that
+    // shares a card type with the sacrificed permanent and sacrifices it"). It
+    // belongs to the object the verb acts on, so it carries over verbatim onto
+    // the reparsed edict, whose own parser reads it. Any other text declines, so
+    // the recognizer stays exact. ("at random" never reaches here: the clause
+    // splitter separates the random pick from its verb — Tyrant of Discord.)
+    if !qualifier.is_empty()
+        && tag::<_, _, OracleError<'_>>(" that ")
+            .parse(qualifier)
+            .is_err()
+    {
+        return None;
+    }
     Some(ChooseImperativeAst::Reparse {
-        text: format!("{verb} a {type_text} you control"),
+        text: format!("{verb} a {type_text} you control{qualifier}"),
     })
 }
 
@@ -4959,6 +5123,16 @@ pub(super) fn parse_choose_ast(
         // and drop the exile. Operates on `rest_lower` (the "choose " strip has
         // de-inflected the leading actor verb; the inner "exiles" keeps its -s).
         if let Some(ast) = try_parse_choose_and_verb_it_edict(rest_lower) {
+            return Some(ast);
+        }
+
+        // CR 608.2d (override) + CR 701.21a: "<player> chooses a permanent they
+        // control at random" (Tyrant of Discord) — the clause splitter has peeled
+        // the "and sacrifices it" off. The game picks when the ability RESOLVES,
+        // so a "repeat this process" picks again each time; the announce-time
+        // random target (the legacy fallback below) picked once and would also
+        // randomize the "target opponent" slot.
+        if let Some(ast) = try_parse_choose_controlled_permanent_at_random(rest, rest_lower, ctx) {
             return Some(ast);
         }
 
