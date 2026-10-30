@@ -6,10 +6,7 @@
 //! +1/+1 counter, a planeswalker commander only the loyalty counter.
 
 use engine::game::scenario::GameScenario;
-use engine::types::ability::TargetRef;
-use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
-use engine::types::game_state::WaitingFor;
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::ObjectId;
@@ -42,33 +39,13 @@ fn counters_after_forge(planeswalker: bool) -> (u32, u32) {
     };
     let mut runner = scenario.build();
     let loyalty_before = counter(&runner, commander, CounterType::Loyalty);
-    runner
-        .act(GameAction::ActivateAbility {
-            source_id: forge,
-            ability_index: 1,
-        })
-        .expect("activate Forge of Heroes");
-
-    let mut resolved = false;
-    for _ in 0..16 {
-        match &runner.state().waiting_for {
-            WaitingFor::TargetSelection { .. } => {
-                runner
-                    .act(GameAction::SelectTargets {
-                        targets: vec![TargetRef::Object(commander)],
-                    })
-                    .expect("target the commander");
-            }
-            WaitingFor::Priority { .. } if !runner.state().stack.is_empty() => {
-                runner.act(GameAction::PassPriority).expect("pass priority");
-                resolved = true;
-            }
-            WaitingFor::Priority { .. } => break,
-            other => panic!("unexpected window: {other:?}"),
-        }
-    }
-    assert!(resolved, "the ability reached the stack and resolved");
-    assert!(runner.state().stack.is_empty());
+    // The activation driver resolves the whole stack and is the same in every
+    // engine version this branch is integrated onto.
+    runner.activate(forge, 1).target_object(commander).resolve();
+    assert!(
+        runner.state().stack.is_empty(),
+        "the ability resolved and left the stack"
+    );
     (
         counter(&runner, commander, CounterType::Plus1Plus1),
         counter(&runner, commander, CounterType::Loyalty) - loyalty_before,
