@@ -272,3 +272,58 @@ fn flag_positions() {
         );
     }
 }
+
+/// Kaalia of the Vast {1}{R}{W}{B} — verbatim Oracle text.
+const KAALIA: &str = "Flying\nWhenever Kaalia of the Vast attacks an opponent, you may put an \
+     Angel, Demon, or Dragon creature card from your hand onto the battlefield tapped and \
+     attacking.";
+
+/// Angel of Despair {3}{W}{W}{B}{B} — verbatim Oracle text.
+const ANGEL_OF_DESPAIR: &str = "Flying\nWhen this creature enters, destroy target permanent.";
+
+/// Field report (MagicFinder, 2026-10-19 and 10-29: six "bad play" flags in one
+/// game, plus "never cast its commander"): Kaalia of the Vast never attacked.
+/// Its attack trigger asks "you may put…", and the replay dropped every
+/// declaration that reached a prompt, so no Kaalia attack was ever measured and
+/// the heuristic's "stay home" stood.
+///
+/// The board mirrors the T17 flag: an opposing ground army that is lethal
+/// (28 power against 27 life) once Kaalia and whatever she brings stay tapped.
+/// With an Angel of Despair in hand the attack is right — the Angel enters,
+/// destroys the 8/8, and the crack-back drops to 20. Two cards qualify, so
+/// accepting opens a second choice: the answer must look past the accept.
+#[test]
+fn kaalia_attacks_to_put_an_angel_into_play() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    s.with_life(P0, 27);
+    let kaalia = s
+        .add_creature_from_oracle(P0, "Kaalia of the Vast", 2, 2, KAALIA)
+        .id();
+    s.add_creature_to_hand_from_oracle(P0, "Angel of Despair", 5, 5, ANGEL_OF_DESPAIR)
+        .with_subtypes(vec!["Angel"])
+        .flying();
+    s.add_creature_to_hand(P0, "Serra Angel", 4, 4)
+        .with_subtypes(vec!["Angel"])
+        .flying();
+    for (name, power, toughness) in [
+        ("Ground Titan", 8, 8),
+        ("Bonebreaker", 6, 6),
+        ("Siege Wurm", 5, 5),
+        ("Craw Wurm", 5, 5),
+        ("Hill Giant", 4, 4),
+    ] {
+        s.add_creature(P1, name, power, toughness);
+    }
+    let mut r = s.build();
+    at_attack(&mut r);
+
+    let heuristic = attackers_of(&choose(r.state(), false));
+    assert!(heuristic.is_empty(), "the heuristic keeps Kaalia home");
+    let replay = attackers_of(&choose(r.state(), true));
+    assert_eq!(
+        replay,
+        vec![kaalia],
+        "Kaalia attacks: the Angel she brings kills the 8/8"
+    );
+}

@@ -3527,7 +3527,7 @@ fn score_candidates_core_for_root(
                     state,
                     ai_player,
                     config,
-                    session.as_ref(),
+                    session,
                     services
                         .context
                         .adjusted_weights
@@ -4658,14 +4658,40 @@ fn refine_root_combat(
     state: &GameState,
     ai_player: PlayerId,
     config: &AiConfig,
-    session: &AiSession,
+    session: &Arc<AiSession>,
     weights: &crate::eval::EvalWeights,
     action: GameAction,
 ) -> GameAction {
+    // A prompt of ours inside the replay (Kaalia's "you may put … attacking",
+    // the card to put, its enters trigger's target) gets the AI's own answer
+    // from a small search. Without search the policies score "accept" and
+    // "decline" the same and a coin flip declined Kaalia's trigger; one ply
+    // still declined in the field position, where accepting only opens the
+    // choice of which Angel — two plies see the Angel land. No nested combat
+    // replay (cannot recurse), no rollouts and 16 nodes keep it cheap; the
+    // measurement seed keeps the replay a pure function of the state.
+    let mut quick = config.clone().into_measurement(0);
+    quick.search.max_depth = 2;
+    quick.search.max_nodes = 16;
+    quick.search.rollout_depth = 0;
+    quick.search.rollout_samples = 0;
+    quick.play_lookahead = false;
+    quick.combat_lookahead = false;
+    quick.combat_simulation = false;
+    let answer = |prompt: &GameState| {
+        choose_action_with_session(
+            prompt,
+            ai_player,
+            &quick,
+            &mut ChaCha20Rng::seed_from_u64(0),
+            session,
+        )
+    };
     let input = crate::combat_sim::CombatSimInput {
         state,
         player: ai_player,
         weights,
+        answer: &answer,
         deadline: match config.execution_mode {
             crate::config::ExecutionMode::Measurement { .. } => None,
             crate::config::ExecutionMode::Interactive => {
