@@ -89,8 +89,6 @@ fn run(legendary_victim: bool) -> usize {
 }
 
 #[test]
-#[ignore = "full-card parse still emits instead_condition for this line (the bare \
-            parse_effect_chain path lowers it); the legendary arm draws two"]
 fn nasty_end_draws_three_for_a_legendary_sacrifice() {
     assert_eq!(run(false), 2, "nonlegendary sacrifice draws two");
     assert_eq!(
