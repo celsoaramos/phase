@@ -22201,8 +22201,9 @@ fn resolve_chain_body(
                 // one of several ordinal clauses chained in written order, so it
                 // has no claim on an escape whose whole justification is CR 608.2c
                 // written-order evaluation of successive ordinals.
-                let sub_reads_resolution_ordinal = sub.sub_link
+                let is_ordinal_sequential_sibling = sub.sub_link
                     == SubAbilityLink::SequentialSibling
+                    && sub.sibling_condition == SiblingCondition::Dependent
                     && matches!(
                         sub.condition.as_ref(),
                         Some(AbilityCondition::AbilityUseCountThisTurn {
@@ -22210,8 +22211,6 @@ fn resolve_chain_body(
                             ..
                         })
                     );
-                let is_ordinal_sequential_sibling = sub_reads_resolution_ordinal
-                    && sub.sibling_condition == SiblingCondition::Dependent;
                 if sub_outlives_false_parent_gate(sub)
                     || (sub.sub_link == SubAbilityLink::SequentialSibling
                         && (sub.condition.is_none() || is_ordinal_sequential_sibling))
@@ -22239,7 +22238,13 @@ fn resolve_chain_body(
                     // independent (it follows a suffix-guarded ordinal: Belladonna
                     // Took's "you gain 1 life if this is the first time … If it's
                     // the second time, draw a card.").
-                    if sub_reads_resolution_ordinal {
+                    if matches!(
+                        sub.condition.as_ref(),
+                        Some(AbilityCondition::AbilityUseCountThisTurn {
+                            tally: AbilityUseTally::Resolved,
+                            ..
+                        })
+                    ) {
                         apply_parent_chain_context(&mut sub_resolved, ability, None, state);
                     }
                     progress = resolve_ability_chain_step(state, &sub_resolved, events, depth + 1)?;
