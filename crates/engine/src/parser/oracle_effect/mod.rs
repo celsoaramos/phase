@@ -38245,7 +38245,8 @@ fn ability_definition_uses_tracked_set(def: &AbilityDefinition) -> bool {
     // put into your graveyard this way" — Song of Blood) consumes it just like a
     // `TrackedSet` filter does. Same authority the runtime publish gate uses.
     def.effect.for_each_quantity_expr(&mut |qty| {
-        uses_tracked_set |= crate::game::effects::quantity_expr_references_tracked_set(qty);
+        uses_tracked_set |=
+            crate::types::tracked_set_refs::quantity_expr_references_tracked_set(qty);
     });
     uses_tracked_set
         || def

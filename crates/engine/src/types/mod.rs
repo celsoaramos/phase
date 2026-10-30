@@ -43,6 +43,7 @@ pub mod text_grammar;
 pub mod text_word_carriers;
 pub mod token_presets;
 pub mod token_spec;
+pub(crate) mod tracked_set_refs;
 pub mod triggers;
 pub mod zones;
 
