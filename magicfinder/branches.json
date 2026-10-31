@@ -334,5 +334,8 @@
   },
   {
     "branch": "ai/combat-sim-prompts"
+  },
+  {
+    "branch": "card/mf-relatos-20261031"
   }
 ]
