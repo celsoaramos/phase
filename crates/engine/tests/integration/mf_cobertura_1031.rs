@@ -16,6 +16,9 @@
 //!   spell, that creature enters with an additional +1/+1 counter on it" só era
 //!   lido na forma do Opal Palace; vale também para Animal Attendant e
 //!   Guildmages' Forum.
+//! - Lavinia, Azorius Renegade (CR 101.2 + CR 109.5): "can't cast noncreature
+//!   spells with mana value greater than the number of lands that player
+//!   controls" — o "that player" é quem conjura, não o controlador da Lavinia.
 
 use super::rules::run_combat;
 use engine::game::commander::record_commander_cast;
@@ -32,7 +35,7 @@ use engine::types::counter::CounterType;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
-use engine::types::mana::{ManaCost, ManaSpellGrant, ManaType, ManaUnit};
+use engine::types::mana::{ManaColor, ManaCost, ManaSpellGrant, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
@@ -390,5 +393,65 @@ fn biophagus_mana_spent_on_a_creature_adds_a_counter() {
             .unwrap_or(0),
         1,
         "the creature cast with Biophagus mana enters with one +1/+1 counter"
+    );
+}
+
+const LAVINIA: &str = "Each opponent can't cast noncreature spells with mana value greater \
+    than the number of lands that player controls.\nWhenever an opponent casts a spell, if no \
+    mana was spent to cast it, counter that spell.";
+
+fn try_cast(runner: &mut GameRunner, spell: ObjectId) -> bool {
+    let card_id = runner.state().objects[&spell].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: spell,
+            card_id,
+            targets: vec![],
+            payment_mode: Default::default(),
+        })
+        .is_ok()
+}
+
+#[test]
+fn lavinia_compares_the_spell_to_the_casters_own_land_count() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario
+        .add_creature(P0, "Lavinia, Azorius Renegade", 2, 2)
+        .from_oracle_text(LAVINIA);
+    // Lavinia's controller has five lands; the caster has two. The bound is two.
+    for _ in 0..5 {
+        scenario.add_basic_land(P0, ManaColor::White);
+    }
+    for _ in 0..2 {
+        scenario.add_basic_land(P1, ManaColor::Red);
+    }
+    let three = scenario
+        .add_spell_to_hand(P1, "Three Drop Instant", true)
+        .with_mana_cost(ManaCost::generic(3))
+        .id();
+    let two = scenario
+        .add_spell_to_hand(P1, "Two Drop Instant", true)
+        .with_mana_cost(ManaCost::generic(2))
+        .id();
+    // Enough floating mana that paying is never what stops the cast.
+    scenario.with_mana_pool(
+        P1,
+        (0..6)
+            .map(|_| ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]))
+            .collect(),
+    );
+    let mut runner = scenario.build();
+    runner
+        .act(GameAction::PassPriority)
+        .expect("P0 passes so P1 can cast");
+
+    assert!(
+        !try_cast(&mut runner, three),
+        "mana value 3 is greater than the caster's two lands"
+    );
+    assert!(
+        try_cast(&mut runner, two),
+        "mana value 2 is not greater than the caster's two lands"
     );
 }

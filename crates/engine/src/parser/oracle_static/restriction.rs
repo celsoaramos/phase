@@ -1403,11 +1403,10 @@ pub(crate) fn parse_cant_cast_type_spells(
     let trimmed = after_cant_cast.trim_end_matches('.');
 
     // --- "spells with mana value N or less/greater" ---
-    if let Some(rest) = nom_tag_lower(trimmed, trimmed, "spells with mana value ") {
-        return attach_parsed_static_gate(
-            parse_cant_cast_mana_value(rest, who, text)?,
-            gate_condition_text,
-        );
+    if let Some(def) = nom_tag_lower(trimmed, trimmed, "spells with mana value ")
+        .and_then(|rest| parse_cant_cast_mana_value(rest, who.clone(), text))
+    {
+        return attach_parsed_static_gate(def, gate_condition_text);
     }
 
     // --- "spells with the chosen name" ---
@@ -1467,6 +1466,20 @@ pub(crate) fn parse_cant_cast_type_spells(
     if nom_tag_lower(trimmed, trimmed, "spells by paying alternative cost").is_some() {
         let def =
             StaticDefinition::new(StaticMode::CantBeCast { who }).description(text.to_string());
+        return attach_parsed_static_gate(def, gate_condition_text);
+    }
+
+    // --- "[type] spells with mana value <comparison>" ---
+    // CR 101.2 + CR 202.3: the type prefix and the mana-value comparison are
+    // independent axes; the comparison delegates to the shared type-phrase
+    // suffix authority, so "greater than 3" and a dynamic comparand ("greater
+    // than the number of lands that player controls" — Lavinia, Azorius
+    // Renegade) both lower to `FilterProp::Cmc`. "That player" is the caster,
+    // read through `ControllerRef::ScopedPlayer` (CR 109.5).
+    if let Some(filter) = parse_cant_cast_typed_mana_value_filter(trimmed) {
+        let def = StaticDefinition::new(StaticMode::CantBeCast { who })
+            .affected(filter)
+            .description(text.to_string());
         return attach_parsed_static_gate(def, gate_condition_text);
     }
 
@@ -1723,6 +1736,46 @@ pub(crate) fn parse_enchanted_controller_cant_cast(
 
 /// Parse "mana value N or less" / "mana value N or greater" from the remainder
 /// after "spells with mana value ".
+/// CR 101.2 + CR 202.3: "[type] spells with mana value <comparison>" — an
+/// optional type prefix plus the shared mana-value suffix, which must consume
+/// the rest of the clause. Declines when either axis fails to parse so the
+/// clause keeps its gap instead of losing the comparison.
+fn parse_cant_cast_typed_mana_value_filter(clause: &str) -> Option<TargetFilter> {
+    let (with_suffix, type_text) = alt((
+        terminated(
+            take_until::<_, _, OracleError<'_>>(" spells with mana value "),
+            tag(" spells"),
+        ),
+        value("", tag("spells")),
+    ))
+    .parse(clause)
+    .ok()?;
+    // CR 109.5: "that player" in the comparand names the affected caster.
+    let mut ctx = ParseContext {
+        relative_player_scope: Some(ControllerRef::ScopedPlayer),
+        ..ParseContext::default()
+    };
+    let (prop, consumed) =
+        crate::parser::oracle_target::parse_mana_value_suffix(with_suffix, &mut ctx)?;
+    if !with_suffix[consumed..].trim().is_empty() {
+        return None;
+    }
+    let mut typed = if type_text.is_empty() {
+        TypedFilter::default()
+    } else {
+        match parse_type_phrase_folding(type_text) {
+            (TargetFilter::Typed(tf), rest)
+                if rest.trim().is_empty() && !tf.type_filters.is_empty() =>
+            {
+                tf
+            }
+            _ => return None,
+        }
+    };
+    typed.properties.push(prop);
+    Some(TargetFilter::Typed(typed))
+}
+
 pub(crate) fn parse_cant_cast_mana_value(
     rest: &str,
     who: ProhibitionScope,
