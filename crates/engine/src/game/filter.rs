@@ -11,8 +11,8 @@ use crate::game::game_object::GameObject;
 use crate::game::game_object::ObjectIncarnationRefExt;
 use crate::game::keywords::HeldObject;
 use crate::game::quantity::{
-    counter_count_from_map, quantity_expr_characteristic_reads_at, resolve_quantity,
-    resolve_quantity_with_ctx, resolve_quantity_with_targets, QuantityContext,
+    counter_count_from_map, quantity_expr_characteristic_reads_at, resolve_quantity_with_ctx,
+    resolve_quantity_with_targets, QuantityContext,
 };
 use crate::game::targeting::{DeclaredSlotBinding, SlotReferent};
 use crate::types::ability::{
