@@ -10247,7 +10247,13 @@ pub(crate) fn player_count_matching_ids(
                         comparator,
                         count,
                     } => {
-                        let threshold = resolve_quantity(state, count, controller, source_id);
+                        // CR 603.4 + CR 608.2c: the threshold keeps the
+                        // resolving ability's context, so an event-anchored
+                        // count ("more lands than each other player" measured
+                        // against THAT player — Battle Angels of Tyr) reads the
+                        // bound scoped player rather than the controller.
+                        let threshold =
+                            resolve_quantity_with_ctx(state, count, controller, ctx.clone());
                         crate::game::players::matches_relation(state, p.id, controller, *relation)
                             && crate::game::effects::player_control_count_compares(
                                 state,

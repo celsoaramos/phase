@@ -504,6 +504,7 @@ fn parse_remaining_state_presence_conditions(input: &str) -> OracleResult<'_, St
         parse_opponent_poison_conditions,
         parse_defending_player_more_life_than_another_opponent,
         parse_defending_player_comparison_conditions,
+        parse_that_player_unique_lead_condition,
         parse_that_player_controls_more_comparison,
         parse_no_opponent_comparison_conditions,
         parse_triggering_player_has_unattacked_opponent,
@@ -10577,6 +10578,86 @@ fn parse_there_exists_condition(input: &str) -> OracleResult<'_, StaticCondition
         rest,
         make_quantity_ge(
             crate::parser::oracle_quantity::canonicalize_quantity_ref(qty),
+            1,
+        ),
+    ))
+}
+
+/// CR 102.1 + CR 603.4: "that player has more `<property>` than each other
+/// player" / "that player controls more `<type>` than each other player" —
+/// the ANCHORED sibling of [`parse_unique_property_lead_tail`]: the event
+/// player (`ScopedPlayer`, bound to the damaged player of a combat-damage
+/// trigger — Battle Angels of Tyr) must strictly exceed every other player.
+///
+/// * Player scalars (life, cards in hand) compare the anchor against the
+///   maximum over every OTHER player (`AllPlayers { Max, exclude: anchor }`).
+/// * Controlled-permanent counts have no per-player scalar, so strictness is
+///   carried by uniqueness instead: the players who control at least as many
+///   `<type>` as the anchor are exactly the anchor itself (count == 1).
+fn parse_that_player_unique_lead_condition(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = alt((tag("that player "), tag("that opponent "))).parse(input)?;
+    alt((
+        |i| parse_scoped_player_property_lead(i),
+        |i| parse_scoped_player_controls_lead(i),
+    ))
+    .parse(rest)
+}
+
+fn parse_scoped_player_property_lead(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, property) = preceded(
+        tag("has more "),
+        nom_quantity::parse_player_property_keyword,
+    )
+    .parse(input)?;
+    let (rest, _) = tag(" than each other player").parse(rest)?;
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: nom_quantity::player_property_quantity(property, PlayerScope::ScopedPlayer),
+            },
+            comparator: Comparator::GT,
+            rhs: QuantityExpr::Ref {
+                qty: nom_quantity::player_property_quantity(
+                    property,
+                    PlayerScope::AllPlayers {
+                        aggregate: AggregateFunction::Max,
+                        exclude: Some(Box::new(PlayerScope::ScopedPlayer)),
+                    },
+                ),
+            },
+        },
+    ))
+}
+
+fn parse_scoped_player_controls_lead(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("controls more ").parse(input)?;
+    let (rest, type_text) = take_until(" than each other player").parse(rest)?;
+    let (rest, _) = tag(" than each other player").parse(rest)?;
+    let (TargetFilter::Typed(typed), remainder) = parse_type_phrase_folding(type_text.trim())
+    else {
+        return Err(oracle_err(input));
+    };
+    if !remainder.trim().is_empty() || typed.type_filters.is_empty() {
+        return Err(oracle_err(input));
+    }
+    let anchor_count = QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCount {
+            filter: TargetFilter::Typed(typed.clone().controller(ControllerRef::ScopedPlayer)),
+        },
+    };
+    Ok((
+        rest,
+        make_quantity_comparison(
+            QuantityRef::PlayerCount {
+                filter: PlayerFilter::ControlsCount {
+                    relation: PlayerRelation::All,
+                    filter: TargetFilter::Typed(typed),
+                    comparator: Comparator::GE,
+                    count: Box::new(anchor_count),
+                },
+            },
+            Comparator::EQ,
             1,
         ),
     ))
