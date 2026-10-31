@@ -30,6 +30,16 @@
 //! read their hidden hand. Anything else drops that candidate. When the
 //! incumbent itself cannot be replayed, the heuristic answer stands unchanged:
 //! this layer only ever swaps a declaration it has measured for a better one.
+//!
+//! The replay never sees the other player's hand, so on its own it assumes
+//! they hold nothing. With open mana that is the trade a person wins with a
+//! Giant Growth. When the difficulty-gated threat profile says a combat trick
+//! is castable (`CombatSimInput::trick`), every blocked exchange is also played
+//! with the opponent's best pump on one of its creatures in the combat (an
+//! instant after blockers are declared, CR 509.4 + CR 117.3b), and the
+//! exchange is worth `(1 − p) · plain + p · min(plain, pumped)`. Only the
+//! probability comes from the profile; which creature gets the pump is the
+//! opponent's best pick, as with blocks.
 
 use std::collections::HashMap;
 
@@ -39,8 +49,10 @@ use engine::game::combat::{
     AttackTarget, CombatTaxPosture,
 };
 use engine::game::engine::apply_as_current_for_simulation;
+use engine::game::layers::flush_layers;
 use engine::game::players;
 use engine::types::actions::GameAction;
+use engine::types::counter::CounterType;
 use engine::types::game_state::{CombatDamageAssignmentMode, GameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::phase::Phase;
@@ -63,7 +75,9 @@ const MAX_DEFENDER_ENUMERATION: usize = 24;
 const MAX_BLOCK_ENUMERATION: usize = 64;
 /// Hard cap on reducer replays per decision. Bounds the browser cost and keeps
 /// the choice deterministic in measurement mode (no wall clock involved).
-const MAX_REPLAYS: usize = 160;
+const MAX_REPLAYS: usize = 240;
+/// Opponent creatures in a blocked exchange that are tried as the pump target.
+const MAX_TRICK_TARGETS: usize = 2;
 /// An alternative must beat the incumbent by this much (evaluation units: a
 /// point of life is ~0.5, a 2/2 ~6) — measurement noise must not churn the
 /// heuristic's choice.
@@ -85,6 +99,38 @@ pub(crate) struct CombatSimInput<'a> {
     /// The AI's own answer (a small search, no nested combat replay) to a
     /// prompt of `player`'s that opens mid-replay. `None` drops the candidate.
     pub answer: &'a dyn Fn(&GameState) -> Option<GameAction>,
+    /// The opponent may hold a combat trick. `None` = it can't (no open mana,
+    /// no hand, or a profile that rules it out).
+    pub trick: Option<TrickRisk>,
+}
+
+/// The combat trick the replay accounts for: a pump of `size` (+N/+N until
+/// end of turn) the opponent holds with `probability`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TrickRisk {
+    pub probability: f64,
+    pub size: u32,
+}
+
+/// Ceiling on the trick probability. The pump is played as the opponent's
+/// best pick, so the probability only weighs it — a strong prior here would
+/// stop every attack into open mana.
+const MAX_TRICK_PROBABILITY: f64 = 0.35;
+
+impl TrickRisk {
+    /// `raw` = P(a castable combat trick in hand), from the threat profile.
+    /// The pump is +2/+2 with one open mana and +3/+3 with two or more —
+    /// the sizes of the cheap tricks people actually play.
+    pub(crate) fn from_probability(raw: f64, scale: f64, open_mana: u32) -> Option<Self> {
+        if open_mana == 0 {
+            return None;
+        }
+        let probability = (raw * scale).clamp(0.0, MAX_TRICK_PROBABILITY);
+        (probability > 0.0).then_some(TrickRisk {
+            probability,
+            size: if open_mana >= 2 { 3 } else { 2 },
+        })
+    }
 }
 
 struct Budget {
@@ -216,6 +262,120 @@ fn answer_prompt(input: &CombatSimInput<'_>, state: &GameState) -> Option<GameAc
         (Some(only), None) => Some(only),
         _ => None,
     }
+}
+
+fn set_pump(state: &mut GameState, id: ObjectId, size: u32, on: bool) -> bool {
+    let Some(object) = state.objects.get_mut(&id) else {
+        return false;
+    };
+    let counters = object.counters.entry(CounterType::Plus1Plus1).or_insert(0);
+    if on {
+        *counters += size;
+    } else {
+        *counters = counters.saturating_sub(size);
+        if *counters == 0 {
+            object.counters.remove(&CounterType::Plus1Plus1);
+        }
+    }
+    state.layers_dirty.mark_full();
+    flush_layers(state);
+    true
+}
+
+/// The opponent's creatures in this combat a pump would matter on, most
+/// valuable exchange first: on attack, its blockers; on block, its attackers.
+fn trick_targets(state: &GameState, opponent: PlayerId, attacking: bool) -> Vec<ObjectId> {
+    let Some(combat) = state.combat.as_ref() else {
+        return Vec::new();
+    };
+    let size = |id: ObjectId| {
+        state
+            .objects
+            .get(&id)
+            .map_or(0, |o| o.power.unwrap_or(0) + o.toughness.unwrap_or(0))
+    };
+    let mut out: Vec<(i32, ObjectId)> = if attacking {
+        combat
+            .blocker_to_attacker
+            .iter()
+            .filter(|(blocker, _)| {
+                state
+                    .objects
+                    .get(blocker)
+                    .is_some_and(|o| o.controller == opponent)
+            })
+            .map(|(&blocker, attackers)| {
+                (
+                    attackers.iter().map(|&a| size(a)).max().unwrap_or(0),
+                    blocker,
+                )
+            })
+            .collect()
+    } else {
+        combat
+            .attackers
+            .iter()
+            .filter(|a| {
+                state
+                    .objects
+                    .get(&a.object_id)
+                    .is_some_and(|o| o.controller == opponent)
+            })
+            .map(|a| (size(a.object_id), a.object_id))
+            .collect()
+    };
+    out.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    out.into_iter()
+        .map(|(_, id)| id)
+        .take(MAX_TRICK_TARGETS)
+        .collect()
+}
+
+/// Play the rest of combat from `branch` (blocks declared) and score it, with
+/// the trick risk folded in: `(1 − p) · plain + p · min(plain, pumped)`.
+/// `None` when a replay can't be finished honestly.
+fn finish_with_trick(
+    input: &CombatSimInput<'_>,
+    opponent: PlayerId,
+    branch: &GameState,
+    turn: u32,
+    attacking: bool,
+    budget: &mut Budget,
+) -> Option<f64> {
+    let untap_mine = !attacking;
+    let mut plain = branch.clone();
+    match advance(input, &mut plain, turn, false) {
+        Reached::Finished => {}
+        _ => return None,
+    }
+    let plain_value = position_value(&plain, input.player, opponent, input.weights, untap_mine);
+    let Some(trick) = input.trick else {
+        return Some(plain_value);
+    };
+    if plain_value.abs() >= DECIDED {
+        return Some(plain_value);
+    }
+    let mut pumped_worst = plain_value;
+    for target in trick_targets(branch, opponent, attacking) {
+        if !budget.take() {
+            // A partial worst case would flatter this declaration.
+            return None;
+        }
+        let mut pumped = branch.clone();
+        if !set_pump(&mut pumped, target, trick.size, true) {
+            continue;
+        }
+        if !matches!(advance(input, &mut pumped, turn, false), Reached::Finished) {
+            continue;
+        }
+        // The pump ends with the turn (CR 514.2): score the board without it.
+        if pumped.battlefield.contains(&target) {
+            set_pump(&mut pumped, target, trick.size, false);
+        }
+        let value = position_value(&pumped, input.player, opponent, input.weights, untap_mine);
+        pumped_worst = pumped_worst.min(value);
+    }
+    Some(plain_value - trick.probability * (plain_value - pumped_worst))
 }
 
 /// Damage the opponent's whole creature board can push through `player`'s
@@ -376,14 +536,10 @@ fn attack_value(
         if apply_as_current_for_simulation(&mut branch, blocks).is_err() {
             continue;
         }
-        match advance(input, &mut branch, turn, false) {
-            Reached::Finished => {}
-            // The defender's answer led to a prompt the replay will not answer
-            // (a trigger target, a damage-assignment order): this attack can't
-            // be measured honestly.
-            _ => return None,
-        }
-        let value = position_value(&branch, input.player, opponent, input.weights, false);
+        // The defender's answer led to a prompt the replay will not answer
+        // (a trigger target, a damage-assignment order): this attack can't be
+        // measured honestly.
+        let value = finish_with_trick(input, opponent, &branch, turn, true, budget)?;
         worst = Some(worst.map_or(value, |w: f64| w.min(value)));
     }
     worst
@@ -510,16 +666,7 @@ fn block_value(
     let turn = input.state.turn_number;
     let mut branch = input.state.clone();
     apply_as_current_for_simulation(&mut branch, action.clone()).ok()?;
-    match advance(input, &mut branch, turn, false) {
-        Reached::Finished => Some(position_value(
-            &branch,
-            input.player,
-            opponent,
-            input.weights,
-            true,
-        )),
-        _ => None,
-    }
+    finish_with_trick(input, opponent, &branch, turn, false, budget)
 }
 
 /// Block declarations to compare, incumbent first: no block, then every legal
@@ -640,6 +787,85 @@ mod tests {
         assert!(survival_penalty(6, 4, w) > survival_penalty(20, 4, w));
         assert!(survival_penalty(5, 4, w) > survival_penalty(6, 4, w));
         assert!(survival_penalty(5, 4, w) < LETHAL_NEXT_SWING);
+    }
+
+    fn attack_into(
+        trick: Option<TrickRisk>,
+        mine: (i32, i32),
+        theirs: (i32, i32),
+        their_life: i32,
+    ) -> Vec<ObjectId> {
+        use engine::game::scenario::{GameScenario, P0, P1};
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        s.with_life(P1, their_life);
+        let ogre = s.add_creature(P0, "Ogre", mine.0, mine.1).id();
+        s.add_creature(P1, "Bear", theirs.0, theirs.1);
+        let mut r = s.build();
+        r.advance_to_combat();
+        let state = r.state();
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::DeclareAttackers { .. }
+        ));
+        let weights = EvalWeights::default();
+        let answer = |_: &GameState| None;
+        let input = CombatSimInput {
+            state,
+            player: P0,
+            weights: &weights,
+            deadline: None,
+            answer: &answer,
+            trick,
+        };
+        let declare = |attacks: Vec<(ObjectId, AttackTarget)>| GameAction::DeclareAttackers {
+            attacks,
+            bands: vec![],
+        };
+        let incumbent = declare(vec![(ogre, AttackTarget::Player(P1))]);
+        match refine_attack(&input, incumbent, declare) {
+            GameAction::DeclareAttackers { attacks, .. } => {
+                attacks.into_iter().map(|(id, _)| id).collect()
+            }
+            other => panic!("expected DeclareAttackers, got {other:?}"),
+        }
+    }
+
+    /// An even trade is worth offering when the defender holds nothing; into
+    /// open mana that may be a Giant Growth it is a 2/2 lost for nothing. A
+    /// clearly better attack still goes: a likely pump only tips the close ones.
+    #[test]
+    fn a_likely_pump_on_the_blocker_keeps_the_even_trade_home() {
+        let trick = Some(TrickRisk {
+            probability: MAX_TRICK_PROBABILITY,
+            size: 3,
+        });
+        assert_eq!(
+            attack_into(None, (2, 2), (2, 2), 20).len(),
+            1,
+            "no trick: offer the trade"
+        );
+        assert!(
+            attack_into(trick, (2, 2), (2, 2), 20).is_empty(),
+            "a +3/+3 on their 2/2 eats ours: stay home"
+        );
+        for (mine, theirs) in [((3, 3), (2, 2)), ((4, 4), (3, 3)), ((3, 3), (1, 1))] {
+            assert_eq!(
+                attack_into(trick, mine, theirs, 20).len(),
+                1,
+                "{mine:?} into {theirs:?} still attacks"
+            );
+        }
+    }
+
+    #[test]
+    fn trick_risk_needs_open_mana_and_is_capped() {
+        assert_eq!(TrickRisk::from_probability(0.9, 1.0, 0), None);
+        let one = TrickRisk::from_probability(0.9, 1.0, 1).unwrap();
+        assert_eq!(one.probability, MAX_TRICK_PROBABILITY);
+        assert_eq!(one.size, 2);
+        assert_eq!(TrickRisk::from_probability(0.2, 1.0, 3).unwrap().size, 3);
+        assert_eq!(TrickRisk::from_probability(0.0, 1.0, 3), None);
     }
 
     #[test]

@@ -3528,6 +3528,7 @@ fn score_candidates_core_for_root(
                     ai_player,
                     config,
                     session,
+                    services.context.opponent_threat.as_ref(),
                     services
                         .context
                         .adjusted_weights
@@ -4647,6 +4648,35 @@ pub(crate) fn deterministic_choice(
     None
 }
 
+/// The combat trick the root combat replay plays against: the probability
+/// comes from the difficulty-gated threat profile (never the real hand) — the
+/// same source the heuristic's `defender_trick_risk` reads, without its turn
+/// gate: the attacker may pump its own creature after our blocks, too.
+fn combat_trick_risk(
+    state: &GameState,
+    ai_player: PlayerId,
+    config: &AiConfig,
+    opponent_threat: Option<&ThreatProfile>,
+) -> Option<crate::combat_sim::TrickRisk> {
+    let opponents = engine::game::players::opponents(state, ai_player);
+    let [opponent] = opponents.as_slice() else {
+        return None;
+    };
+    let opponent = *opponent;
+    if state.players[opponent.0 as usize].hand.is_empty() {
+        return None;
+    }
+    let open_mana = crate::zone_eval::available_mana(state, opponent);
+    let raw = match opponent_threat {
+        Some(threat) if threat.pool_size > 0 => {
+            crate::threat_profile::castable_probabilities(threat, state, opponent).combat_trick
+        }
+        Some(threat) => threat.probabilities.combat_trick,
+        None => (f64::from(open_mana.saturating_sub(1)) * 0.08).min(0.25),
+    };
+    crate::combat_sim::TrickRisk::from_probability(raw, config.profile.trick_risk_scale, open_mana)
+}
+
 /// Wall-clock guard for the combat replays in interactive play. Combat is the
 /// decision a person watches the AI take, so it gets more than a priority pass.
 const COMBAT_SIM_BUDGET_MS: u32 = 1200;
@@ -4659,6 +4689,7 @@ fn refine_root_combat(
     ai_player: PlayerId,
     config: &AiConfig,
     session: &Arc<AiSession>,
+    opponent_threat: Option<&ThreatProfile>,
     weights: &crate::eval::EvalWeights,
     action: GameAction,
 ) -> GameAction {
@@ -4692,6 +4723,7 @@ fn refine_root_combat(
         player: ai_player,
         weights,
         answer: &answer,
+        trick: combat_trick_risk(state, ai_player, config, opponent_threat),
         deadline: match config.execution_mode {
             crate::config::ExecutionMode::Measurement { .. } => None,
             crate::config::ExecutionMode::Interactive => {
