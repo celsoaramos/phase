@@ -9,10 +9,17 @@
 //!   creatures dealt to that player" não tinha quantidade.
 //! - Nissa's Pilgrimage (CR 614.15): o "instead of two" do Spell mastery troca só
 //!   a contagem da busca; revelar, pôr no campo e embaralhar seguem nos dois ramos.
+//! - Sage's Reverie (CR 303.4b): "each Aura you control that's attached to a
+//!   creature" não tinha filtro; o compra-cartas ficava sem quantidade e o bônus
+//!   estático contava também Auras presas a jogadores.
 
 use super::rules::run_combat;
 use engine::game::commander::record_commander_cast;
-use engine::game::scenario::{GameRunner, GameScenario, P0};
+use engine::game::derived::derive_display_state;
+use engine::game::effects::attach::attach_to;
+use engine::game::game_object::AttachTarget;
+use engine::game::layers::evaluate_layers;
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::Effect;
@@ -238,4 +245,102 @@ fn nissas_pilgrimage_without_spell_mastery_finds_two() {
         "one Forest enters"
     );
     assert_eq!(forests_in(&runner, Zone::Hand), 1, "the other goes to hand");
+}
+
+const SAGES_REVERIE: &str = "Enchant creature\nWhen this Aura enters, draw a card for each Aura \
+    you control that's attached to a creature.\nEnchanted creature gets +1/+1 for each Aura you \
+    control that's attached to a creature.";
+
+/// Auras around the Reverie's host: one of ours on an opponent's creature (counts),
+/// one of ours on a player (not attached to a creature), one of the opponent's on
+/// our creature (not ours).
+fn reverie_board(scenario: &mut GameScenario) -> (ObjectId, [ObjectId; 3]) {
+    let host = scenario.add_creature(P0, "Reverie Host", 2, 2).id();
+    scenario.add_creature(P1, "Their Creature", 1, 1);
+    let mine_on_creature = scenario
+        .add_enchantment_from_oracle(P0, "Mine On Creature", "Enchant creature")
+        .with_subtypes(vec!["Aura"])
+        .id();
+    let mine_on_player = scenario
+        .add_enchantment_from_oracle(P0, "Mine On Player", "Enchant player")
+        .with_subtypes(vec!["Aura", "Curse"])
+        .id();
+    let their_aura = scenario
+        .add_enchantment_from_oracle(P1, "Their Aura", "Enchant creature")
+        .with_subtypes(vec!["Aura"])
+        .id();
+    (host, [mine_on_creature, mine_on_player, their_aura])
+}
+
+fn attach_reverie_board(runner: &mut GameRunner, host: ObjectId, auras: [ObjectId; 3]) {
+    let theirs = runner
+        .state()
+        .battlefield
+        .iter()
+        .copied()
+        .find(|id| runner.state().objects[id].name == "Their Creature")
+        .expect("opponent creature");
+    let [mine_on_creature, mine_on_player, their_aura] = auras;
+    attach_to(runner.state_mut(), mine_on_creature, theirs);
+    attach_to(runner.state_mut(), their_aura, host);
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&mine_on_player)
+        .unwrap()
+        .attached_to = Some(AttachTarget::Player(P1));
+}
+
+#[test]
+fn sages_reverie_counts_only_your_auras_attached_to_creatures() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let (host, auras) = reverie_board(&mut scenario);
+    let reverie = scenario
+        .add_enchantment_from_oracle(P0, "Sage's Reverie", "")
+        .with_subtypes(vec!["Aura"])
+        .from_oracle_text_with_keywords(&["Enchant creature"], SAGES_REVERIE)
+        .id();
+    let mut runner = scenario.build();
+    attach_reverie_board(&mut runner, host, auras);
+    attach_to(runner.state_mut(), reverie, host);
+    evaluate_layers(runner.state_mut());
+    derive_display_state(runner.state_mut());
+
+    let obj = &runner.state().objects[&host];
+    assert_eq!(
+        (obj.power, obj.toughness),
+        (Some(4), Some(4)),
+        "+1/+1 for the Reverie and for our Aura on a creature; the Curse and the \
+         opponent's Aura do not count"
+    );
+}
+
+#[test]
+fn sages_reverie_enters_and_draws_for_each_of_your_auras_on_creatures() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let (host, auras) = reverie_board(&mut scenario);
+    let reverie = scenario
+        .add_creature_to_hand(P0, "Sage's Reverie", 0, 0)
+        .as_enchantment()
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(ManaCost::generic(0))
+        .from_oracle_text_with_keywords(&["Enchant creature"], SAGES_REVERIE)
+        .id();
+    scenario.with_library_top(P0, &["Island", "Island", "Island", "Island"]);
+    let mut runner = scenario.build();
+    attach_reverie_board(&mut runner, host, auras);
+    let hand_before = runner.state().players[0].hand.len();
+
+    runner.cast(reverie).target_object(host).resolve();
+    runner.advance_until_stack_empty();
+
+    let state = runner.state();
+    assert_eq!(state.objects[&reverie].zone, Zone::Battlefield);
+    assert_eq!(
+        state.players[0].hand.len(),
+        hand_before - 1 + 2,
+        "draws for the Reverie itself and our Aura on a creature"
+    );
 }

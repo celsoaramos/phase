@@ -8963,6 +8963,10 @@ pub(crate) fn parse_that_clause_suffix<'a>(
         }
     }
 
+    if let Some(parsed) = parse_attached_to_host_relative_clause_suffix(trimmed, leading_ws) {
+        return Some(parsed);
+    }
+
     if let Some(parsed) = parse_color_relative_clause_suffix(trimmed, leading_ws) {
         return Some(parsed);
     }
@@ -9358,6 +9362,48 @@ fn parse_color_relative_clause_suffix(
         }]
     };
     Some((props, consumed))
+}
+
+/// CR 303.4b + CR 301.5a: "that's / that is / that are attached to a <type>"
+/// (and the negated intros) — a relative clause naming an INDEFINITE host class
+/// ("each Aura you control that's attached to a creature" — Sage's Reverie).
+/// The host is a self-contained type filter, not an anaphor, so it lowers to
+/// `AttachmentReferent::Host { filter }`, which the runtime evaluates against
+/// every battlefield object matching the host filter. Only the article-led form
+/// is claimed: "attached to it / that creature" needs per-clause binding and is
+/// left to the effect layer.
+fn parse_attached_to_host_relative_clause_suffix(
+    trimmed: &str,
+    leading_ws: usize,
+) -> Option<(Vec<FilterProp>, usize)> {
+    let (after_intro, intro_len, negated) = parse_relative_clause_intro(trimmed)?;
+    let (after_article, _) = (
+        tag::<_, _, OracleError<'_>>("attached to "),
+        alt((tag("an "), tag("a "))),
+    )
+        .parse(after_intro)
+        .ok()?;
+    let (host, rest) = parse_type_phrase_folding(after_article);
+    let TargetFilter::Typed(typed) = &host else {
+        return None;
+    };
+    if typed.type_filters.is_empty() {
+        return None;
+    }
+    let prop = FilterProp::AttachedTo {
+        to: AttachmentReferent::Host {
+            filter: Box::new(host),
+        },
+    };
+    let prop = if negated {
+        FilterProp::Not {
+            prop: Box::new(prop),
+        }
+    } else {
+        prop
+    };
+    let consumed = leading_ws + intro_len + (after_intro.len() - rest.len());
+    Some((vec![prop], consumed))
 }
 
 fn parse_relative_clause_intro(trimmed: &str) -> Option<(&str, usize, bool)> {
