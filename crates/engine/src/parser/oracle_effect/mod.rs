@@ -1539,6 +1539,9 @@ pub(crate) fn instead_override_definition(
 /// CR 608.2c: a trailing "<instruction> if <condition>, then" guards that
 /// instruction alone, so the instruction after it is the next independent one and a
 /// following instruction with its own trailing guard is evaluated on that guard.
+/// The same holds across a sentence boundary ("Draw a card if X. Then you create a
+/// Treasure token if Y." — Battle Angels of Tyr): each trailing guard governs only
+/// its own sentence.
 /// `pushed_from` is the clause count before the guarded chunk pushed anything.
 fn settle_trailing_guard(
     clauses: &mut [ClauseIr],
@@ -1560,8 +1563,11 @@ fn settle_trailing_guard(
     if *released {
         clause.sibling_condition = SiblingCondition::ReplicatedOrBranch;
     }
-    *released = matches!(clause.boundary, Some(ClauseBoundary::Then));
-    if *released {
+    *released = matches!(
+        clause.boundary,
+        Some(ClauseBoundary::Then | ClauseBoundary::Sentence)
+    );
+    if clause.boundary == Some(ClauseBoundary::Then) {
         clause.boundary = Some(ClauseBoundary::Sentence);
     }
 }

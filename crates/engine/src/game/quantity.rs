@@ -5293,7 +5293,16 @@ fn resolve_ref(
                 }
             }
         }
-        QuantityRef::PlayerCount { filter } => resolve_player_count(state, filter, controller, ctx),
+        QuantityRef::PlayerCount { filter } => {
+            // CR 608.2c: candidate thresholds read the resolving ability's bound
+            // event player (the damaged player of a combat-damage trigger) when
+            // the caller supplied it on the ability rather than the context.
+            let mut ctx = ctx;
+            if ctx.scoped_player.is_none() {
+                ctx.scoped_player = ability.and_then(|a| a.scoped_player);
+            }
+            resolve_player_count(state, filter, controller, ctx)
+        }
         // CR 120.1 + CR 603.2c + CR 608.2c: "for each opponent dealt damage"
         // on a batched damage trigger counts DISTINCT damaged players carried by
         // the resolving trigger event batch. This intentionally does not read
