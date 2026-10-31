@@ -12,6 +12,10 @@
 //! - Sage's Reverie (CR 303.4b): "each Aura you control that's attached to a
 //!   creature" não tinha filtro; o compra-cartas ficava sem quantidade e o bônus
 //!   estático contava também Auras presas a jogadores.
+//! - Biophagus (CR 106.6a + CR 614.1c): "If this mana is spent to cast a creature
+//!   spell, that creature enters with an additional +1/+1 counter on it" só era
+//!   lido na forma do Opal Palace; vale também para Animal Attendant e
+//!   Guildmages' Forum.
 
 use super::rules::run_combat;
 use engine::game::commander::record_commander_cast;
@@ -24,6 +28,7 @@ use engine::game::scenario_db::GameScenarioDbExt;
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::Effect;
 use engine::types::actions::GameAction;
+use engine::types::counter::CounterType;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
@@ -342,5 +347,48 @@ fn sages_reverie_enters_and_draws_for_each_of_your_auras_on_creatures() {
         state.players[0].hand.len(),
         hand_before - 1 + 2,
         "draws for the Reverie itself and our Aura on a creature"
+    );
+}
+
+const BIOPHAGUS: &str = "Genomic Enhancement — {T}: Add one mana of any color. If this mana \
+    is spent to cast a creature spell, that creature enters with an additional +1/+1 counter \
+    on it.";
+
+#[test]
+fn biophagus_mana_spent_on_a_creature_adds_a_counter() {
+    let grants = mana_grants(BIOPHAGUS, "Biophagus");
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let biophagus = scenario.add_creature(P0, "Biophagus", 1, 1).id();
+    let creature = scenario
+        .add_creature_to_hand(P0, "Grown Bear", 2, 2)
+        .with_mana_cost(ManaCost::generic(2))
+        .id();
+    let mut pool = vec![{
+        let mut mana = ManaUnit::new(ManaType::Green, biophagus, false, vec![]);
+        mana.grants = grants;
+        mana
+    }];
+    pool.push(ManaUnit::new(
+        ManaType::Colorless,
+        ObjectId(0),
+        false,
+        vec![],
+    ));
+    scenario.with_mana_pool(P0, pool);
+    let mut runner = scenario.build();
+
+    runner.cast(creature).resolve();
+    runner.advance_until_stack_empty();
+
+    let obj = &runner.state().objects[&creature];
+    assert_eq!(obj.zone, Zone::Battlefield);
+    assert_eq!(
+        obj.counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0),
+        1,
+        "the creature cast with Biophagus mana enters with one +1/+1 counter"
     );
 }
