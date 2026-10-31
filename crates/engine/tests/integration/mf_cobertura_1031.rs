@@ -7,10 +7,13 @@
 //!   cast from the command zone this game" não tinha quantidade.
 //! - Quartzwood Crasher (CR 120.1 + CR 603.2c): "the amount of damage those
 //!   creatures dealt to that player" não tinha quantidade.
+//! - Nissa's Pilgrimage (CR 614.15): o "instead of two" do Spell mastery troca só
+//!   a contagem da busca; revelar, pôr no campo e embaralhar seguem nos dois ramos.
 
 use super::rules::run_combat;
 use engine::game::commander::record_commander_cast;
-use engine::game::scenario::{GameScenario, P0};
+use engine::game::scenario::{GameRunner, GameScenario, P0};
+use engine::game::scenario_db::GameScenarioDbExt;
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::Effect;
 use engine::types::actions::GameAction;
@@ -19,6 +22,9 @@ use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaCost, ManaSpellGrant, ManaType, ManaUnit};
 use engine::types::phase::Phase;
+use engine::types::zones::Zone;
+
+use super::support::shared_card_db;
 
 fn mana_grants(oracle: &str, name: &str) -> Vec<ManaSpellGrant> {
     let parsed = parse_oracle_text(oracle, name, &[], &["Land".to_string()], &[]);
@@ -129,4 +135,107 @@ fn quartzwood_crasher_token_is_the_total_trample_damage_to_that_player() {
         vec![(Some(8), Some(8))],
         "one X/X token where X is the trample creatures' damage (6 + 2)"
     );
+}
+
+const NISSAS_PILGRIMAGE: &str = "Search your library for up to two basic Forest cards, reveal \
+    those cards, and put one onto the battlefield tapped and the rest into your hand. Then \
+    shuffle.\nSpell mastery — If there are two or more instant and/or sorcery cards in your \
+    graveyard, search your library for up to three basic Forest cards instead of two.";
+
+/// Casts Nissa's Pilgrimage with `spells_in_graveyard` instants in the graveyard,
+/// asserts the search size, takes every offered Forest, and returns the runner.
+fn cast_pilgrimage(spells_in_graveyard: usize, expected_count: usize) -> Option<GameRunner> {
+    let db = shared_card_db()?;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let pilgrimage = scenario
+        .add_spell_to_hand_from_oracle(P0, "Nissa's Pilgrimage", false, NISSAS_PILGRIMAGE)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    for _ in 0..spells_in_graveyard {
+        scenario.add_spell_to_graveyard(P0, "Spent Instant", true);
+    }
+    for _ in 0..4 {
+        scenario.add_real_card(P0, "Forest", Zone::Library, db);
+    }
+    let mut runner = scenario.build();
+    engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+
+    let outcome = runner.cast(pilgrimage).resolve();
+    let WaitingFor::SearchChoice { cards, count, .. } = outcome.final_waiting_for().clone() else {
+        panic!(
+            "expected the Forest search, got {:?}",
+            outcome.final_waiting_for()
+        );
+    };
+    assert_eq!(count, expected_count, "Spell mastery sets the search size");
+    runner
+        .act(GameAction::SelectCards {
+            cards: cards.into_iter().take(expected_count).collect(),
+        })
+        .expect("take the offered Forests");
+    // CR 701.23a: "put one onto the battlefield tapped and the rest into your hand".
+    let WaitingFor::SearchPartitionChoice { cards, .. } = runner.state().waiting_for.clone() else {
+        panic!(
+            "expected the battlefield/hand split, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(
+        cards.len(),
+        expected_count,
+        "the split sees every found Forest"
+    );
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![cards[0]],
+        })
+        .expect("choose the Forest that enters");
+    runner.advance_until_stack_empty();
+    Some(runner)
+}
+
+fn forests_in(runner: &GameRunner, zone: Zone) -> usize {
+    runner
+        .state()
+        .objects
+        .values()
+        .filter(|obj| obj.name == "Forest" && obj.zone == zone && obj.owner == P0)
+        .count()
+}
+
+#[test]
+fn nissas_pilgrimage_spell_mastery_finds_three_and_keeps_the_split() {
+    let Some(runner) = cast_pilgrimage(2, 3) else {
+        return;
+    };
+    assert_eq!(
+        forests_in(&runner, Zone::Battlefield),
+        1,
+        "one Forest enters"
+    );
+    assert_eq!(forests_in(&runner, Zone::Hand), 2, "the rest go to hand");
+    assert!(
+        runner
+            .state()
+            .battlefield
+            .iter()
+            .map(|id| &runner.state().objects[id])
+            .filter(|obj| obj.name == "Forest")
+            .all(|obj| obj.tapped),
+        "the Forest enters tapped"
+    );
+}
+
+#[test]
+fn nissas_pilgrimage_without_spell_mastery_finds_two() {
+    let Some(runner) = cast_pilgrimage(1, 2) else {
+        return;
+    };
+    assert_eq!(
+        forests_in(&runner, Zone::Battlefield),
+        1,
+        "one Forest enters"
+    );
+    assert_eq!(forests_in(&runner, Zone::Hand), 1, "the other goes to hand");
 }

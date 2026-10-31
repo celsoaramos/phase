@@ -96,7 +96,9 @@ use super::oracle_ir::effect_chain::{
     ResidualConditionPolicy, ShellStage,
 };
 use super::oracle_ir::feature::ItemIdTracks;
-use super::oracle_ir::relation::{DocumentRelationIr, LinkedChoiceKind, LinkedReturnOutcome};
+use super::oracle_ir::relation::{
+    DocumentRelationIr, LinkedChoiceKind, LinkedReturnOutcome, OverrideReach,
+};
 use super::oracle_ir::replacement::ReplacementIr;
 use super::oracle_ir::static_ir::StaticIr;
 use super::oracle_ir::trace::{
@@ -1702,6 +1704,7 @@ fn apply_self_replacement_override(
             base,
             override_item,
             selector,
+            reach,
         } = relation
         else {
             continue;
@@ -1758,7 +1761,19 @@ fn apply_self_replacement_override(
             &mut crate::parser::oracle_effect::instead_override_body_mut(&mut override_def).effect,
             &base.effect,
         );
-        override_def.else_ability = base.sub_ability.take();
+        let tail = base.sub_ability.take();
+        // CR 614.15: an override that replaces only the base's first instruction
+        // leaves the rest of the ability in force, so the swapped-in body runs the
+        // same remaining instructions the unreplaced path runs.
+        if *reach == OverrideReach::LeadingInstruction {
+            let body = crate::parser::oracle_effect::instead_override_body_mut(&mut override_def);
+            let mut slot = &mut body.sub_ability;
+            while let Some(node) = slot {
+                slot = &mut node.sub_ability;
+            }
+            *slot = tail.clone();
+        }
+        override_def.else_ability = tail;
         base.sub_ability = Some(Box::new(override_def));
 
         for (slot, def) in result.abilities.iter_mut().enumerate() {
@@ -8247,8 +8262,30 @@ fn parse_normalized_oracle_ir(
                     &mut ctx,
                 )
             });
-            let is_cross_line_dig_alt = dig_alt.is_some();
-            if let Some(alt) = dig_alt {
+            // CR 614.15: the same partial override with a `SearchLibrary` antecedent
+            // ("Spell mastery — If <cond>, search your library for up to three basic
+            // Forest cards instead of two"). Only the search's count changes; the
+            // instructions after the search (reveal, put onto the battlefield,
+            // shuffle) are not replaced, so the bind keeps them in both branches.
+            let search_alt = if dig_alt.is_some() {
+                None
+            } else {
+                previous_spell.as_ref().and_then(|previous| {
+                    crate::parser::oracle_effect::conditions::try_parse_search_count_instead_alternative(
+                        &effect_line,
+                        previous,
+                        AbilityKind::Spell,
+                        &mut ctx,
+                    )
+                })
+            };
+            let override_reach = if search_alt.is_some() {
+                OverrideReach::LeadingInstruction
+            } else {
+                OverrideReach::Remainder
+            };
+            let is_cross_line_dig_alt = dig_alt.is_some() || search_alt.is_some();
+            if let Some(alt) = dig_alt.or(search_alt) {
                 ability_ir = alt;
             }
 
@@ -8343,6 +8380,7 @@ fn parse_normalized_oracle_ir(
                         base,
                         override_item,
                         selector,
+                        reach: override_reach,
                     });
                     continue;
                 } else if lower_ability_ir(&ability_ir).condition.is_none()
