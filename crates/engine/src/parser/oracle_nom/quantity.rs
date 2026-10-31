@@ -4892,6 +4892,22 @@ fn parse_event_context_refs(input: &str) -> OracleResult<'_, QuantityRef> {
                 tag("damage dealt"),
             ),
         ),
+        // CR 120.1 + CR 603.2c + CR 608.2h: "the amount of damage those creatures
+        // dealt [to that player]" (Quartzwood Crasher) names the batched
+        // "one or more creatures … deal combat damage to a player" trigger's own
+        // amount: the matcher stamps the event with the total the filtered source
+        // set dealt to that one recipient, so the subject and the recipient are
+        // both the trigger's referents, not new qualifiers.
+        value(
+            QuantityRef::EventContextAmount,
+            (
+                opt(alt((tag("the amount of "), tag("amount of "), tag("the ")))),
+                tag("damage "),
+                alt((tag("those creatures"), tag("they"))),
+                tag(" dealt"),
+                opt(tag(" to that player")),
+            ),
+        ),
         // CR 701.47c: amass-specific definite phrases name the Army chosen by
         // the current amass instruction, not the generic demonstrative referent.
         parse_amassed_army_property_ref,
@@ -6500,12 +6516,32 @@ fn parse_for_each_commander_cast_count(input: &str) -> OracleResult<'_, Quantity
     let (rest, _) = tag("time").parse(input)?;
     let (rest, _) = opt(tag("s")).parse(rest)?;
     let (rest, _) = tag(" ").parse(rest)?;
-    let (rest, _) = alt((tag("you've"), tag("youve"))).parse(rest)?;
-    // CR 903.8: "a commander" / "your commander" both count the controller's
-    // command-zone casts; the resolver sums over every commander the player owns.
-    let (rest, _) = tag(" cast ").parse(rest)?;
-    let (rest, _) = alt((tag("your"), tag("a"))).parse(rest)?;
-    let (rest, _) = tag(" commander from the command zone this game").parse(rest)?;
+    let (rest, _) = alt((
+        // CR 903.8: "a commander" / "your commander" both count the controller's
+        // command-zone casts; the resolver sums over every commander the player owns.
+        value(
+            (),
+            (
+                alt((tag("you've"), tag("youve"))),
+                tag(" cast "),
+                alt((tag("your"), tag("a"))),
+                tag(" commander"),
+            ),
+        ),
+        // CR 903.8: "it's been cast" — the anaphor is the commander spell the
+        // mana was just spent on (Study Hall: "When you spend this mana to cast
+        // your commander, scry X, where X is the number of times it's been cast
+        // from the command zone this game").
+        value(
+            (),
+            (
+                alt((tag("it's been"), tag("its been"), tag("it has been"))),
+                tag(" cast"),
+            ),
+        ),
+    ))
+    .parse(rest)?;
+    let (rest, _) = tag(" from the command zone this game").parse(rest)?;
     Ok((rest, QuantityRef::CommanderCastFromCommandZoneCount))
 }
 
