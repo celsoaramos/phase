@@ -9020,6 +9020,34 @@ fn spell_cast_mana_value_for_event(state: &GameState, event: &GameEvent) -> Opti
         .then(|| u32_to_i32_saturating(record.mana_value))
 }
 
+/// CR 707.10 + CR 707.2 + CR 202.3: the mana value of the spell a `SpellCopied`
+/// event names — the copy while it is on the stack, then its last known
+/// information, then the copied spell (a copy has the original's mana cost).
+/// `None` for every other event.
+fn spell_copied_mana_value_for_event(state: &GameState, event: &GameEvent) -> Option<i32> {
+    let GameEvent::SpellCopied {
+        object_id,
+        original_id,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    [*object_id, *original_id].iter().find_map(|id| {
+        state
+            .objects
+            .get(id)
+            .filter(|obj| obj.zone == Zone::Stack)
+            .map(|obj| u32_to_i32_saturating(obj.spell_mana_value()))
+            .or_else(|| {
+                state
+                    .lki_cache
+                    .get(id)
+                    .map(|lki| u32_to_i32_saturating(lki.mana_value))
+            })
+    })
+}
+
 /// CR 202.3: Resolve an object's mana value through the same ObjectScope axis
 /// used for power/toughness. Source scope falls back to LKI for objects that
 /// moved during resolution; target scope reads the selected object target.
@@ -9060,8 +9088,15 @@ fn resolve_object_mana_value(
             DepartureLookback::Malformed => return Some(0),
             DepartureLookback::Absent | DepartureLookback::NotBattlefieldDeparture => {}
         }
-        let id = object_lookback_event(state, ability)
-            .and_then(|e| crate::game::targeting::extract_source_from_event(&e))?;
+        let event = object_lookback_event(state, ability)?;
+        // CR 707.10 + CR 707.2: a copy trigger's "that spell" is the copy, which
+        // has the copied spell's mana cost. `SpellCopied` names no generic event
+        // source, so it is answered here (Deekah, Fractal Theorist's copy
+        // Fractal read 0 and died as a 0/0).
+        if let Some(mana_value) = spell_copied_mana_value_for_event(state, &event) {
+            return Some(mana_value);
+        }
+        let id = crate::game::targeting::extract_source_from_event(&event)?;
         state
             .objects
             .get(&id)
