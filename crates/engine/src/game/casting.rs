@@ -21609,7 +21609,7 @@ fn can_cast_prepared_now_with_probe(
         // Power, My Precious's Adventure, with no creature to sacrifice).
         // Waterbend is a mana leg settled by the spell's own payment step.
         if !matches!(cost, AbilityCost::Waterbend { .. })
-            && !cost.is_payable(state, player, prepared.object_id)
+            && !cost.is_payable_for_spell(state, player, prepared.object_id)
         {
             return false;
         }
