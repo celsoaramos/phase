@@ -23002,6 +23002,13 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
         ));
     }
 
+    // CR 608.2c: a counter list only splits off a SECOND RECIPIENT of counters
+    // (Arwen). Any other conjunct keeps the whole clause fail-closed as
+    // `put_counter_tail`, so the list never resolves without its tail.
+    if primary_list.is_some() && !matches!(sub_clause.effect, Effect::PutCounter { .. }) {
+        return None;
+    }
+
     // If the remainder contains anaphoric references ("it", "that creature", "them"),
     // replace the sub_effect's target with ParentTarget so it inherits the parent's targets.
     // CR 608.2k carve-out (issue #319): in typed-trigger-subject context the
