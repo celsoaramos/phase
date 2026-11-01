@@ -2534,33 +2534,72 @@ fn parse_conditional_cant_be_countered_grant(lower: &str) -> Option<ManaSpellGra
 }
 
 /// CR 106.6a + CR 614.1c: Parse mana whose spent-mana replacement effect has
-/// a counter-bearing battlefield entry result (Opal Palace class).
+/// a counter-bearing battlefield entry result. The spend lead, the entering
+/// subject and the counter count are independent axes:
+/// - "If you spend this mana to cast <spell>, it enters with a number of
+///   additional <counter> counters on it equal to <qty>" (Opal Palace)
+/// - "If this/that mana is spent to cast <spell>, that creature enters with an
+///   additional <counter> counter on it" (Biophagus, Animal Attendant)
+/// - "If that mana is spent on <spell>, that creature enters with an additional
+///   <counter> counter on it" (Guildmages' Forum)
 fn parse_conditional_enters_with_counters_grant(lower: &str) -> Option<ManaSpellGrant> {
-    let (rest, _) = tag::<_, _, OracleError<'_>>("if you spend this mana to cast ")
-        .parse(lower)
-        .ok()?;
+    let (rest, _) = alt((
+        value(
+            (),
+            tag::<_, _, OracleError<'_>>("if you spend this mana to cast "),
+        ),
+        value(
+            (),
+            (
+                tag("if "),
+                opt(tag("any of ")),
+                alt((tag("this mana"), tag("that mana"))),
+                alt((tag(" is spent to cast "), tag(" is spent on "))),
+            ),
+        ),
+    ))
+    .parse(lower)
+    .ok()?;
     let (rest, filter_text) = terminated(
-        take_until::<_, _, OracleError<'_>>(", it enters with a number of additional "),
-        tag(", it enters with a number of additional "),
+        take_until::<_, _, OracleError<'_>>(", "),
+        (
+            tag(", "),
+            alt((tag("it"), tag("that creature"), tag("that spell"))),
+            tag(" enters with "),
+        ),
     )
     .parse(rest)
     .ok()?;
     let filter = parse_spend_trigger_filter(filter_text.trim())?;
-    let (rest, counter_type) = terminated(
-        nom_primitives::parse_counter_type_typed,
-        tag::<_, _, OracleError<'_>>(" counters on it equal to "),
-    )
-    .parse(rest)
-    .ok()?;
-    let (_, count) = all_consuming(terminated(
-        value(
-            QuantityExpr::Ref {
-                qty: QuantityRef::CommanderCastFromCommandZoneCount { commander: None },
-            },
-            tag::<_, _, OracleError<'_>>(
-                "the number of times it's been cast from the command zone this game",
+    let (_, (counter_type, count)) = all_consuming(terminated(
+        alt((
+            // CR 122.1: "an additional <counter> counter on it" — one counter.
+            (
+                preceded(
+                    alt((tag("an additional "), tag("one additional "))),
+                    nom_primitives::parse_counter_type_typed,
+                ),
+                value(QuantityExpr::Fixed { value: 1 }, tag(" counter on it")),
             ),
-        ),
+            // CR 903.8: the commander-tax count (Opal Palace).
+            (
+                preceded(
+                    tag("a number of additional "),
+                    nom_primitives::parse_counter_type_typed,
+                ),
+                preceded(
+                    tag(" counters on it equal to "),
+                    value(
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::CommanderCastFromCommandZoneCount { commander: None },
+                        },
+                        tag::<_, _, OracleError<'_>>(
+                            "the number of times it's been cast from the command zone this game",
+                        ),
+                    ),
+                ),
+            ),
+        )),
         opt(char('.')),
     ))
     .parse(rest)

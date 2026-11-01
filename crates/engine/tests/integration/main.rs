@@ -189,6 +189,7 @@ mod cobertura_mf_1101;
 mod cobertura_mf_1102;
 mod cobertura_mf_1103;
 mod cobra_king_guarded_reflexive_modal;
+mod cobertura_mf_1031;
 mod code_of_constraint_addendum;
 mod codie_prepared_spell_trigger;
 mod codie_turn14_effect_zone_wedge;

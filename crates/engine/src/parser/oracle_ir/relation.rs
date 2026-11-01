@@ -81,11 +81,27 @@ pub(crate) enum DocumentRelationIr {
         /// stays on its own instruction. `None` when the body's root condition is
         /// the selector.
         selector: Option<AbilityCondition>,
+        /// CR 614.15: how much of the base the override replaces.
+        reach: OverrideReach,
     },
     /// CR 607.2d: A "choose a [value]" producer linked to an ability that reads
     /// "the chosen [value]" back. One parameterized relation; `LinkedChoiceKind`
     /// distinguishes the value kind and the consumer surface that reads it.
     LinkedChoice(LinkedChoiceKind),
+}
+
+/// CR 614.15: a self-replacement effect replaces "part or all of that spell or
+/// ability's own effect(s)". Parameterizes `SelfReplacementOverride` by that
+/// reach so the fold knows which of the base's instructions the swap consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) enum OverrideReach {
+    /// The override replaces the base from its first instruction on; the base's
+    /// remaining instructions run only when the swap does not fire.
+    Remainder,
+    /// The override replaces only the base's FIRST instruction (Nissa's
+    /// Pilgrimage: "search your library for up to three basic Forest cards
+    /// instead of two"); every later instruction runs in both branches.
+    LeadingInstruction,
 }
 
 /// CR 610.3: How a detected ETB-exile / LTB-return pair is applied during

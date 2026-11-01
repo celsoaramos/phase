@@ -6058,11 +6058,7 @@ pub(crate) fn try_parse_dig_instead_alternative(
     // selection runs from else_ability when Teamwork wasn't paid. Appended
     // last — the teamwork phrase is disjoint from all four arms above, so the
     // ordering is purely defensive.
-    let condition = parse_additional_cost_instead_condition_fragment(&cond_text)
-        .or_else(|| try_nom_condition_as_ability_condition(&cond_text, ctx))
-        .or_else(|| parse_condition_text_in(&cond_text, ctx))
-        .or_else(|| parse_control_count_as_ability_condition(&cond_text))
-        .or_else(|| parse_cast_using_teamwork_condition_text(&cond_text))?;
+    let condition = parse_instead_alternative_condition(&cond_text, ctx)?;
 
     // Clone the preceding Dig's source (top N) and reveal-mode, apply alternative
     // selection parameters. `rest_destination` prefers the alternative's inline value
@@ -6129,6 +6125,116 @@ pub(crate) fn try_parse_dig_instead_alternative(
         root_transforms: vec![AbilityRootTransform::AppendCondition(condition)],
         modal: None,
     })
+}
+
+/// CR 608.2c + CR 614.15: the condition of a cross-line "instead" alternative
+/// (the `<cond>` of "If <cond>, <alternative> instead"), shared by the Dig and
+/// SearchLibrary antecedent handlers.
+fn parse_instead_alternative_condition(
+    cond_text: &str,
+    ctx: &mut ParseContext,
+) -> Option<AbilityCondition> {
+    parse_additional_cost_instead_condition_fragment(cond_text)
+        .or_else(|| try_nom_condition_as_ability_condition(cond_text, ctx))
+        .or_else(|| parse_condition_text_in(cond_text, ctx))
+        .or_else(|| parse_control_count_as_ability_condition(cond_text))
+        .or_else(|| parse_cast_using_teamwork_condition_text(cond_text))
+}
+
+/// CR 614.15 + CR 701.23a: a cross-line self-replacement that changes only how
+/// many cards the preceding `SearchLibrary` finds — "If <cond>, search your
+/// library for up to three basic Forest cards instead of two" (Nissa's
+/// Pilgrimage). The alternative is the antecedent search itself with the new
+/// count, so its reveal / split / target-player fields carry over unchanged.
+///
+/// Declines unless the alternative names the SAME search (filter and zones) and
+/// the "instead of <N>" number is the antecedent's count: anything else is not a
+/// count-only override and stays with the honest residual floor.
+pub(crate) fn try_parse_search_count_instead_alternative(
+    text: &str,
+    previous: &AbilityDefinition,
+    kind: AbilityKind,
+    ctx: &mut ParseContext,
+) -> Option<AbilityIr> {
+    let Effect::SearchLibrary {
+        filter: prev_filter,
+        count: prev_count,
+        source_zones: prev_zones,
+        ..
+    } = &*previous.effect
+    else {
+        return None;
+    };
+    let (condition_fragment, body) = split_leading_conditional(text)?;
+    let condition_lower = condition_fragment.to_lowercase();
+    let cond_text = nom_on_lower(&condition_fragment, &condition_lower, |i| {
+        value((), tag("if ")).parse(i)
+    })
+    .map_or(condition_fragment.as_str(), |((), rest)| rest)
+    .trim()
+    .to_string();
+
+    let body = body.trim().trim_end_matches('.').trim();
+    let body_lower = body.to_lowercase();
+    let (search_text, replaced) = nom_on_lower(body, &body_lower, |i| {
+        let (i, search_lower) = take_until(" instead of ").parse(i)?;
+        let (i, _) = tag(" instead of ").parse(i)?;
+        let (i, replaced) = all_consuming(nom_primitives::parse_number).parse(i)?;
+        Ok((i, (search_lower.len(), replaced)))
+    })
+    .map(|((search_len, replaced), _)| (&body[..search_len], replaced))?;
+    if quantity_ceiling(prev_count) != Some(i32::try_from(replaced).ok()?) {
+        return None;
+    }
+
+    let parsed = super::parse_effect_chain(search_text, kind);
+    let Effect::SearchLibrary {
+        filter,
+        count,
+        source_zones,
+        ..
+    } = &*parsed.effect
+    else {
+        return None;
+    };
+    // The parsed search's own destination tail is the default "put it into your
+    // hand"; the antecedent's tail already says where the cards go.
+    if *filter != *prev_filter || *source_zones != *prev_zones {
+        return None;
+    }
+    let mut alt_effect = (*previous.effect).clone();
+    if let Effect::SearchLibrary {
+        count: alt_count, ..
+    } = &mut alt_effect
+    {
+        *alt_count = count.clone();
+    }
+    let condition = parse_instead_alternative_condition(&cond_text, ctx)?;
+
+    Some(AbilityIr {
+        source_text: text.to_string(),
+        body: EffectChainIr::single_clause(
+            text,
+            kind,
+            parsed_clause(alt_effect),
+            None,
+            None,
+            false,
+        ),
+        shell: AbilityShellIr::default(),
+        die_results: vec![],
+        root_transforms: vec![AbilityRootTransform::AppendCondition(condition)],
+        modal: None,
+    })
+}
+
+/// CR 107.1c: the printed number of a fixed or "up to N" count.
+fn quantity_ceiling(count: &QuantityExpr) -> Option<i32> {
+    match count {
+        QuantityExpr::Fixed { value } => Some(*value),
+        QuantityExpr::UpTo { max } => quantity_ceiling(max),
+        _ => None,
+    }
 }
 
 pub(crate) fn parse_additional_cost_instead_condition_fragment(

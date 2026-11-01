@@ -3750,11 +3750,11 @@ pub fn parse_type_phrase_folding_with_ctx<'a>(
         }
     }
 
-    // CR 301.5a + CR 303.4b + CR 701.3a: "<type> [that's ]attached to a/an
-    // <type phrase>" — the INDEFINITE host form ("Aura you control that's
-    // attached to a creature", "target Aura attached to a permanent"). The host
-    // is any object matching the nested type phrase, so it is a typed
-    // `AttachmentReferent::Host` inside the filter.
+    // CR 301.5a + CR 303.4b + CR 701.3a: "<type> attached to a/an <type
+    // phrase>" — the bare postnominal INDEFINITE host form ("target Aura
+    // attached to a land", Savaen Elves). The relative-clause form ("that's
+    // attached to a creature") is `parse_attached_to_host_relative_clause_suffix`
+    // inside `parse_that_clause_suffix`.
     {
         let after_ws = lower[pos..].trim_start();
         let ws = lower[pos..].len() - after_ws.len();
@@ -6484,8 +6484,10 @@ fn parse_combat_relation_suffix(text: &str, ctx: &ParseContext) -> Option<(Filte
 /// postnominal "creature attacking your opponents"; both resolve to the same
 /// `Attacking { defender }` property, so the intro is stripped here rather than
 /// forking a second attacking grammar in the `that's`-clause path.
-/// CR 301.5a + CR 303.4b + CR 701.3a: postnominal "[that's |that is |that are ]
-/// attached to a/an <type phrase>" → `FilterProp::AttachedTo { Host }`.
+/// CR 301.5a + CR 303.4b + CR 701.3a: bare postnominal "attached to a/an
+/// <type phrase>" → `FilterProp::AttachedTo { Host }` ("Destroy target Aura
+/// attached to a creature"). The "that's/that aren't attached to …" relative
+/// clauses are `parse_attached_to_host_relative_clause_suffix`.
 ///
 /// Only the indefinite article opens the host: the anaphoric referents
 /// ("attached to it"/"that creature") need per-clause binding and stay with
@@ -6498,12 +6500,7 @@ fn parse_attached_to_indefinite_host_suffix(
     ctx: &mut ParseContext,
 ) -> Option<(FilterProp, usize)> {
     let (host_text, _) = (
-        opt(alt((
-            tag::<_, _, OracleError<'_>>("that's "),
-            tag("that is "),
-            tag("that are "),
-        ))),
-        tag("attached to "),
+        tag::<_, _, OracleError<'_>>("attached to "),
         peek(alt((tag("a "), tag("an ")))),
     )
         .parse(text)
@@ -9017,6 +9014,10 @@ pub(crate) fn parse_that_clause_suffix<'a>(
         }
     }
 
+    if let Some(parsed) = parse_attached_to_host_relative_clause_suffix(trimmed, leading_ws) {
+        return Some(parsed);
+    }
+
     if let Some(parsed) = parse_color_relative_clause_suffix(trimmed, leading_ws) {
         return Some(parsed);
     }
@@ -9412,6 +9413,48 @@ fn parse_color_relative_clause_suffix(
         }]
     };
     Some((props, consumed))
+}
+
+/// CR 303.4b + CR 301.5a: "that's / that is / that are attached to a <type>"
+/// (and the negated intros) — a relative clause naming an INDEFINITE host class
+/// ("each Aura you control that's attached to a creature" — Sage's Reverie).
+/// The host is a self-contained type filter, not an anaphor, so it lowers to
+/// `AttachmentReferent::Host { filter }`, which the runtime evaluates against
+/// every battlefield object matching the host filter. Only the article-led form
+/// is claimed: "attached to it / that creature" needs per-clause binding and is
+/// left to the effect layer.
+fn parse_attached_to_host_relative_clause_suffix(
+    trimmed: &str,
+    leading_ws: usize,
+) -> Option<(Vec<FilterProp>, usize)> {
+    let (after_intro, intro_len, negated) = parse_relative_clause_intro(trimmed)?;
+    let (after_article, _) = (
+        tag::<_, _, OracleError<'_>>("attached to "),
+        alt((tag("an "), tag("a "))),
+    )
+        .parse(after_intro)
+        .ok()?;
+    let (host, rest) = parse_type_phrase_folding(after_article);
+    let TargetFilter::Typed(typed) = &host else {
+        return None;
+    };
+    if typed.type_filters.is_empty() {
+        return None;
+    }
+    let prop = FilterProp::AttachedTo {
+        to: AttachmentReferent::Host {
+            filter: Box::new(host),
+        },
+    };
+    let prop = if negated {
+        FilterProp::Not {
+            prop: Box::new(prop),
+        }
+    } else {
+        prop
+    };
+    let consumed = leading_ws + intro_len + (after_intro.len() - rest.len());
+    Some((vec![prop], consumed))
 }
 
 fn parse_relative_clause_intro(trimmed: &str) -> Option<(&str, usize, bool)> {

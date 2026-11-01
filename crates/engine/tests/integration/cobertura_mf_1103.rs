@@ -1,15 +1,15 @@
 //! Quarto lote de cobertura (medição de 30/10/2026, build `v0.119.0-mf`).
 //! Cada teste passa pelo pipeline real de conjurar/resolver.
 //!
-//! - Sage's Reverie (CR 303.4b + CR 701.3a + CR 613.4c): "draw a card for each
-//!   Aura you control that's attached to a creature" e "Enchanted creature
-//!   gets +1/+1 for each Aura you control that's attached to a creature" — a
-//!   população conta só Auras SUAS presas a uma CRIATURA (de qualquer
-//!   controlador); Aura do oponente e Aura presa a terreno ficam de fora.
+//! - Devout Harpist (CR 115.1 + CR 303.4b + CR 701.3a): "Destroy target Aura
+//!   attached to a creature" — a forma sem "that's" do hospedeiro indefinido
+//!   (a forma "that's attached to a creature" é a do Sage's Reverie, coberta
+//!   em `cobertura_mf_1031`). Aura presa a terreno não é alvo legal.
 //! - Study Hall (CR 106.6 + CR 603.2 + CR 903.8): "When you spend this mana to
 //!   cast your commander, scry X, where X is the number of times it's been
 //!   cast from the command zone this game" — X é a contagem DESSE comandante
-//!   (incluindo esta conjuração), não a soma com o parceiro.
+//!   (incluindo esta conjuração), não a soma com o parceiro (o lote 1031 lia a
+//!   soma).
 
 use engine::game::commander::record_commander_cast;
 use engine::game::effects::attach;
@@ -24,69 +24,39 @@ use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
-const SAGES_REVERIE: &str = "Enchant creature\nWhen this Aura enters, draw a card for each Aura \
-    you control that's attached to a creature.\nEnchanted creature gets +1/+1 for each Aura you \
-    control that's attached to a creature.";
-
-fn aura(scenario: &mut GameScenario, owner: PlayerId, name: &str, oracle: &str) -> ObjectId {
-    scenario
-        .add_enchantment_from_oracle(owner, name, oracle)
-        .with_subtypes(vec!["Aura"])
-        .id()
-}
+const DEVOUT_HARPIST: &str = "{T}: Destroy target Aura attached to a creature.";
 
 #[test]
-fn sages_reverie_counts_your_auras_attached_to_creatures() {
+fn devout_harpist_targets_only_auras_attached_to_creatures() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    let bear = scenario.add_creature(P0, "Ally Bear", 2, 2).id();
+    let harpist = scenario
+        .add_creature(P0, "Devout Harpist", 1, 1)
+        .from_oracle_text(DEVOUT_HARPIST)
+        .id();
     let ogre = scenario.add_creature(P1, "Enemy Ogre", 3, 3).id();
     let field = scenario
-        .add_land_from_oracle(P0, "Field", "{T}: Add {G}.")
+        .add_land_from_oracle(P1, "Field", "{T}: Add {G}.")
         .id();
-    // Counted: mine on my creature, mine on the opponent's creature.
-    let mine_on_bear = aura(&mut scenario, P0, "Mine On Bear", "Enchant creature");
-    let mine_on_ogre = aura(&mut scenario, P0, "Mine On Ogre", "Enchant creature");
-    // Not counted: the opponent's Aura, and my Aura attached to a land.
-    let theirs_on_bear = aura(&mut scenario, P1, "Theirs On Bear", "Enchant creature");
-    let mine_on_land = aura(&mut scenario, P0, "Mine On Land", "Enchant land");
-    for _ in 0..4 {
-        scenario.add_land_to_library_top(P0, "Library Land");
-    }
-    let reverie = scenario
-        .add_spell_to_hand(P0, "Sage's Reverie", false)
-        .as_enchantment()
-        .with_subtypes(vec!["Aura"])
-        .with_mana_cost(ManaCost::zero())
-        .from_oracle_text_with_keywords(&["enchant"], SAGES_REVERIE)
-        .id();
+    let on_ogre = aura(&mut scenario, P1, "Aura On Ogre", "Enchant creature");
+    let on_field = aura(&mut scenario, P1, "Aura On Field", "Enchant land");
     let mut runner = scenario.build();
-    attach::attach_to(runner.state_mut(), mine_on_bear, bear);
-    attach::attach_to(runner.state_mut(), mine_on_ogre, ogre);
-    attach::attach_to(runner.state_mut(), theirs_on_bear, bear);
-    attach::attach_to(runner.state_mut(), mine_on_land, field);
+    attach::attach_to(runner.state_mut(), on_ogre, ogre);
+    attach::attach_to(runner.state_mut(), on_field, field);
 
-    let library_before = runner.state().players[P0.0 as usize].library.len();
-    runner.cast(reverie).target_object(bear).resolve();
-    runner.advance_until_stack_empty();
+    assert!(
+        runner
+            .activate(harpist, 0)
+            .target_object(on_field)
+            .try_resolve()
+            .is_err(),
+        "an Aura attached to a land is not a legal target"
+    );
+    assert_eq!(runner.state().objects[&on_field].zone, Zone::Battlefield);
 
-    let library_after = runner.state().players[P0.0 as usize].library.len();
-    assert_eq!(
-        library_before - library_after,
-        3,
-        "draws for Sage's Reverie itself, Mine On Bear and Mine On Ogre only"
-    );
-    let bear_obj = &runner.state().objects[&bear];
-    assert_eq!(
-        (bear_obj.power, bear_obj.toughness),
-        (Some(5), Some(5)),
-        "the enchanted creature gets +1/+1 for each of the three"
-    );
-    assert_eq!(
-        runner.state().objects[&ogre].power,
-        Some(3),
-        "only the enchanted creature gets the bonus"
-    );
+    runner.activate(harpist, 0).target_object(on_ogre).resolve();
+    assert_eq!(runner.state().objects[&on_ogre].zone, Zone::Graveyard);
+    assert_eq!(runner.state().objects[&on_field].zone, Zone::Battlefield);
 }
 
 const STUDY_HALL: &str = "{T}: Add {C}.\n{1}, {T}: Add one mana of any color. When you spend this \

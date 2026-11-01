@@ -2226,7 +2226,6 @@ fn parse_number_of_inner(input: &str) -> OracleResult<'_, QuantityRef> {
             // with the other this-turn zone-change counts.
             parse_number_of_cards_put_into_graveyard_from_anywhere_this_turn,
             parse_number_of_times_you_chose_a_mode,
-            parse_number_of_times_it_was_cast_from_command_zone,
         )),
         parse_tokens_created_this_turn_tail,
         parse_distinct_colors_among_tail,
@@ -4893,6 +4892,22 @@ fn parse_event_context_refs(input: &str) -> OracleResult<'_, QuantityRef> {
                 tag("damage dealt"),
             ),
         ),
+        // CR 120.1 + CR 603.2c + CR 608.2h: "the amount of damage those creatures
+        // dealt [to that player]" (Quartzwood Crasher) names the batched
+        // "one or more creatures … deal combat damage to a player" trigger's own
+        // amount: the matcher stamps the event with the total the filtered source
+        // set dealt to that one recipient, so the subject and the recipient are
+        // both the trigger's referents, not new qualifiers.
+        value(
+            QuantityRef::EventContextAmount,
+            (
+                opt(alt((tag("the amount of "), tag("amount of "), tag("the ")))),
+                tag("damage "),
+                alt((tag("those creatures"), tag("they"))),
+                tag(" dealt"),
+                opt(tag(" to that player")),
+            ),
+        ),
         // CR 701.47c: amass-specific definite phrases name the Army chosen by
         // the current amass instruction, not the generic demonstrative referent.
         parse_amassed_army_property_ref,
@@ -6505,15 +6520,34 @@ fn parse_for_each_commander_cast_count(input: &str) -> OracleResult<'_, Quantity
     let (rest, _) = tag("time").parse(input)?;
     let (rest, _) = opt(tag("s")).parse(rest)?;
     let (rest, _) = tag(" ").parse(rest)?;
-    let (rest, _) = alt((tag("you've"), tag("youve"))).parse(rest)?;
-    // CR 903.8: "a commander" / "your commander" both count the controller's
-    // command-zone casts; the resolver sums over every commander the player owns.
-    let (rest, _) = tag(" cast ").parse(rest)?;
-    let (rest, _) = alt((tag("your"), tag("a"))).parse(rest)?;
-    let (rest, _) = tag(" commander from the command zone this game").parse(rest)?;
+    // CR 903.8: "you've cast your/a commander" sums every commander the
+    // controller owns; "it's been cast" names the ONE commander spell the
+    // trigger event carries (Study Hall: "When you spend this mana to cast your
+    // commander, scry X, where X is the number of times it's been cast from the
+    // command zone this game"), so a partner's casts are not added in.
+    let (rest, commander) = alt((
+        value(
+            None,
+            (
+                alt((tag("you've"), tag("youve"))),
+                tag(" cast "),
+                alt((tag("your"), tag("a"))),
+                tag(" commander"),
+            ),
+        ),
+        value(
+            Some(CastManaObjectScope::TriggeringSpell),
+            (
+                alt((tag("it's been"), tag("its been"), tag("it has been"))),
+                tag(" cast"),
+            ),
+        ),
+    ))
+    .parse(rest)?;
+    let (rest, _) = tag(" from the command zone this game").parse(rest)?;
     Ok((
         rest,
-        QuantityRef::CommanderCastFromCommandZoneCount { commander: None },
+        QuantityRef::CommanderCastFromCommandZoneCount { commander },
     ))
 }
 
@@ -6912,25 +6946,6 @@ fn parse_number_of_times_you_chose_a_mode(input: &str) -> OracleResult<'_, Quant
     let (rest, _) = tag("times you chose a mode").parse(input)?;
     let (rest, _) = opt(tag(" for that spell")).parse(rest)?;
     Ok((rest, QuantityRef::EventContextSourceModesChosen))
-}
-
-/// CR 903.8: "[the number of] times it's been cast from the command zone this
-/// game" — the cast count of ONE commander, the spell the trigger event names
-/// (Study Hall's "when you spend this mana to cast your commander"), as in
-/// "spell you've cast before it this turn". Partners keep separate counts, so
-/// this is not the controller-wide "times you've cast your commander" sum.
-fn parse_number_of_times_it_was_cast_from_command_zone(
-    input: &str,
-) -> OracleResult<'_, QuantityRef> {
-    let (rest, _) = tag("times it").parse(input)?;
-    let (rest, _) = alt((tag("'s"), tag(" has"))).parse(rest)?;
-    let (rest, _) = tag(" been cast from the command zone this game").parse(rest)?;
-    Ok((
-        rest,
-        QuantityRef::CommanderCastFromCommandZoneCount {
-            commander: Some(CastManaObjectScope::TriggeringSpell),
-        },
-    ))
 }
 
 /// CR 701.21a: "[type] you['ve] sacrificed this turn" in a "for each" context →
