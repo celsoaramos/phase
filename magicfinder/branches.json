@@ -352,5 +352,11 @@
   },
   {
     "branch": "card/mf-cobertura-1102"
+  },
+  {
+    "branch": "card/mf-cobertura-1103"
+  },
+  {
+    "branch": "card/animation-module-player-counters"
   }
 ]
