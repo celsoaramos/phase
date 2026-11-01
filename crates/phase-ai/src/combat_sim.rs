@@ -18,7 +18,8 @@
 //! The position after damage is scored by the same evaluation the search uses,
 //! minus a survival term for the next swing the opponent can make at the board
 //! the combat left behind (attackers stay tapped through the opponent's turn —
-//! CR 502.3 untaps them only in their controller's untap step).
+//! CR 502.3 untaps them only in their controller's untap step), plus the same
+//! term for the next swing that board makes at the opponent.
 //!
 //! A prompt that belongs to the simulating player mid-replay ("you may put an
 //! Angel, Demon, or Dragon onto the battlefield attacking" — Kaalia of the
@@ -378,20 +379,25 @@ fn finish_with_trick(
     Some(plain_value - trick.probability * (plain_value - pumped_worst))
 }
 
-/// Damage the opponent's whole creature board can push through `player`'s
-/// untapped creatures on its next swing. `untap_mine` = the player untaps
-/// before that swing (we are blocking now; our turn comes first).
-fn next_swing(state: &GameState, player: PlayerId, opponent: PlayerId, untap_mine: bool) -> i32 {
+/// Damage `attacker`'s whole creature board can push through `defender`'s
+/// untapped creatures on `attacker`'s next swing. `untap_defender` = the
+/// defender untaps before that swing (its turn comes first).
+fn next_swing(
+    state: &GameState,
+    defender: PlayerId,
+    attacker: PlayerId,
+    untap_defender: bool,
+) -> i32 {
     let mut view = state.clone();
     let battlefield: Vec<ObjectId> = view.battlefield.iter().copied().collect();
     for id in battlefield {
         if let Some(object) = view.objects.get_mut(&id) {
-            if object.controller == opponent || (untap_mine && object.controller == player) {
+            if object.controller == attacker || (untap_defender && object.controller == defender) {
                 object.tapped = false;
             }
         }
     }
-    crackback_damage(&view, player, &[opponent], &[], None)
+    crackback_damage(&view, defender, &[attacker], &[], None)
 }
 
 /// Evaluation-unit cost of facing `threat` damage at `life`. Concave: the last
@@ -418,10 +424,27 @@ fn position_value(
     if base.abs() >= DECIDED {
         return base;
     }
+    // Both next swings, read off the board this combat leaves. CR 502.3: each
+    // player untaps only in its own untap step, so whoever's turn comes first
+    // faces the other's creatures still tapped from this combat. Attacking now
+    // (`untap_mine` false), the opponent untaps before its swing and before
+    // ours; blocking now, we untap first and its attackers can't block us.
+    //
+    // The swing at us is the risk the combat leaves; the swing at the opponent
+    // is what it buys, priced by the same concave curve. Without that credit,
+    // a declaration that forces the defender to chump its board away (CR
+    // 509.1a — 5 life behind four blockers facing four attackers) scored as
+    // the creature it costs, and "stay home" won over an attack that leaves
+    // the opponent dead to the next swing.
     let life = state.players[player.0 as usize].life;
+    let opponent_life = state.players[opponent.0 as usize].life;
     base - survival_penalty(
         life,
         next_swing(state, player, opponent, untap_mine),
+        weights.life,
+    ) + survival_penalty(
+        opponent_life,
+        next_swing(state, opponent, player, !untap_mine),
         weights.life,
     )
 }
