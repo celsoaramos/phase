@@ -33329,6 +33329,7 @@ mod tests {
         let window = || {
             ResolvedAbility::new(
                 Effect::CastFromZone {
+                    caster: TargetFilter::Controller,
                     target: TargetFilter::ExiledBySource,
                     without_paying_mana_cost: true,
                     mode: CardPlayMode::Cast,
@@ -50647,6 +50648,7 @@ mod tests {
             (
                 "CastFromZone constraint",
                 effect_row(Box::new(move |filter| Effect::CastFromZone {
+                    caster: TargetFilter::Controller,
                     target: TargetFilter::Any,
                     without_paying_mana_cost: true,
                     mode: CardPlayMode::Cast,
@@ -58232,6 +58234,7 @@ mod tests {
         let cast = AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -58298,6 +58301,7 @@ mod tests {
             let cast = AbilityDefinition::new(
                 AbilityKind::Spell,
                 Effect::CastFromZone {
+                    caster: TargetFilter::Controller,
                     target: TargetFilter::Typed(
                         TypedFilter::new(TypeFilter::Instant)
                             .properties(vec![FilterProp::InZone { zone }]),
@@ -58335,6 +58339,7 @@ mod tests {
         use crate::types::ability::CardPlayMode;
         let mut ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: if bound.is_some() {
                     TargetFilter::ParentTarget
                 } else {
@@ -58728,6 +58733,7 @@ mod tests {
             ] {
                 let mut ability = ResolvedAbility::new(
                     Effect::CastFromZone {
+                        caster: TargetFilter::Controller,
                         target: TargetFilter::ParentTarget,
                         without_paying_mana_cost: false,
                         mode,
@@ -58769,6 +58775,7 @@ mod tests {
         let state = GameState::new_two_player(42);
         let mut ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Play,
@@ -58939,6 +58946,7 @@ mod tests {
         }
         let mut ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -58979,6 +58987,7 @@ mod tests {
         ] {
             let mut ability = ResolvedAbility::new(
                 Effect::CastFromZone {
+                    caster: TargetFilter::Controller,
                     target: target.clone(),
                     without_paying_mana_cost: true,
                     mode: CardPlayMode::Cast,
@@ -59103,6 +59112,7 @@ mod tests {
         let cast = AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Typed(
                     TypedFilter::new(TypeFilter::Instant)
                         .properties(vec![FilterProp::InZone { zone: Zone::Exile }]),
@@ -59224,6 +59234,7 @@ mod tests {
         let cast_sub = AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::And {
                     filters: vec![
                         TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant)),
@@ -61647,6 +61658,7 @@ mod resolution_progress_contract_tests {
         let mut state = GameState::new_two_player(42);
         let mut optional = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,

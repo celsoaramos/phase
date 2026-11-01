@@ -30137,6 +30137,7 @@ fn parse_linked_exile_owner_may_cast_that_card_is_owner_scoped_resolution_cast()
         );
         let Effect::CastFromZone {
             target,
+            caster,
             without_paying_mana_cost,
             mode,
             cast_transformed,
@@ -30153,6 +30154,9 @@ fn parse_linked_exile_owner_may_cast_that_card_is_owner_scoped_resolution_cast()
         };
         assert!(additional_cost.is_none(), "{subject}");
         assert_eq!(target, &owned_linked_card, "{subject}");
+        // The owner scope rides on `player_scope`; the caster stays the
+        // (per-iteration) controller.
+        assert_eq!(caster, &TargetFilter::Controller, "{subject}");
         assert!(*without_paying_mana_cost, "{subject}");
         assert_eq!(mode, &Cast, "{subject}");
         assert!(!*cast_transformed, "{subject}");
@@ -77803,6 +77807,7 @@ fn refuse_cast_cost_modifier_on_unsupported_driver_spares_only_the_lingering_dri
     use crate::types::ability::{CastFromZoneDriver, ResolutionCastWindow};
 
     let cast_from_zone = |driver: CastFromZoneDriver| Effect::CastFromZone {
+        caster: TargetFilter::Controller,
         target: TargetFilter::ExiledBySource,
         without_paying_mana_cost: false,
         mode: Cast,

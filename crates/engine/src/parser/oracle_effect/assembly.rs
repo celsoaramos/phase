@@ -1682,6 +1682,36 @@ fn bind_chosen_number_anaphor(def: &mut AbilityDefinition, prior: &[AbilityDefin
     }
 }
 
+/// CR 107.1 + CR 608.2c: "Choose 1, 2, or 3 at random. Its controller mills
+/// that many cards" (Tibalt's Trickery) — a "that many" instruction that
+/// DIRECTLY follows a number choice counts the number just chosen. A resolving
+/// spell has no event amount, so the unbound `EventContextAmount` would read 0;
+/// the choice records the number for its controller (`record_player_chosen_number`),
+/// which is what `PlayerChosenNumber { Controller }` reads.
+fn bind_that_many_to_chosen_number(def: &mut AbilityDefinition, prev: Option<&AbilityDefinition>) {
+    let Some(prev) = prev else {
+        return;
+    };
+    if !matches!(
+        &*prev.effect,
+        Effect::Choose {
+            choice_type: ChoiceType::NumberRange { .. },
+            ..
+        }
+    ) {
+        return;
+    }
+    let amount = match def.effect.as_mut() {
+        Effect::Mill { count, .. } | Effect::Draw { count, .. } => Some(count),
+        other => scalar_amount_mut(other),
+    };
+    if let Some(amount) = amount {
+        amount.rebind_event_context_amount(&QuantityRef::PlayerChosenNumber {
+            player: PlayerScope::Controller,
+        });
+    }
+}
+
 /// CR 608.2d + CR 603.7b/d/e: WHEN a stamped announcer anaphor will be resolved.
 ///
 /// CR 608.2c binds the clause's anaphor by the rules of English; CR 608.2d then
@@ -1761,9 +1791,14 @@ fn subject_anchored_optional_actor(
     // It is also what keeps this correct for an announcer recorded in a slot
     // `Effect::target_filter()` does not surface (`PayCost { payer }` and the
     // rest of the named residue).
-    let actor = match def.optional_player.as_ref() {
-        Some(actor) => actor,
-        None => def.effect.target_filter()?,
+    let actor = match (def.optional_player.as_ref(), &*def.effect) {
+        (Some(actor), _) => actor,
+        // CR 601.2 + CR 608.2d: "They may cast that card" — the caster, not the
+        // card, is the clause's subject and announces the may.
+        (None, Effect::CastFromZone { caster, .. }) if *caster != TargetFilter::Controller => {
+            caster
+        }
+        (None, effect) => effect.target_filter()?,
     };
     match window {
         // CR 603.7b: the delayed ability triggers on its OWN event, so only
@@ -2978,6 +3013,7 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
         // CR 608.2c + CR 101.4: bind a "that much … to them" pair back to the
         // number the earlier player selection was made by (Itazura).
         bind_chosen_number_anaphor(&mut def, &defs);
+        bind_that_many_to_chosen_number(&mut def, defs.last());
         if let Some(prev) = defs.last() {
             if def.sub_link == SubAbilityLink::ContinuationStep
                 && prev.sub_ability.is_none()

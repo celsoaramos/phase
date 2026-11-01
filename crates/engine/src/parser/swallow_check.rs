@@ -14785,6 +14785,7 @@ this spell's mana cost.\nDestroy target attacking creature without flying.",
             AbilityDefinition::new(
                 AbilityKind::Spell,
                 Effect::CastFromZone {
+                    caster: TargetFilter::Controller,
                     target: TargetFilter::Any,
                     without_paying_mana_cost: true,
                     mode: CardPlayMode::Cast,
@@ -15364,6 +15365,7 @@ mod detect_condition_if_replacement_exemption_tests {
         AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,

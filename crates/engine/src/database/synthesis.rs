@@ -6758,6 +6758,7 @@ fn build_suspend_last_counter_cast_trigger() -> TriggerDefinition {
     let cast = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::SelfRef,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,
@@ -10032,6 +10033,7 @@ pub fn synthesize_siege_intrinsics(face: &mut CardFace) {
         let cast_sub = AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::SelfRef,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,

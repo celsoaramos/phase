@@ -23906,6 +23906,17 @@ pub enum Effect {
     CastFromZone {
         #[serde(default = "default_target_filter_any")]
         target: TargetFilter,
+        /// CR 601.2 + CR 109.5: the player who casts the card. `Controller` (the
+        /// ability's controller, "you may cast") by default; a subject-anchored
+        /// clause names another player — "They may cast that card without
+        /// paying its mana cost" after "Its controller … exiles cards"
+        /// (Tibalt's Trickery), "That player may cast that card" (Possibility
+        /// Storm). Resolved once at resolution by `cast_from_zone::resolve`.
+        #[serde(
+            default = "default_target_filter_controller",
+            skip_serializing_if = "is_target_filter_controller"
+        )]
+        caster: TargetFilter,
         #[serde(default)]
         without_paying_mana_cost: bool,
         /// CR 601.2 vs CR 305.1: Cast (spells only) vs Play (spells + lands).

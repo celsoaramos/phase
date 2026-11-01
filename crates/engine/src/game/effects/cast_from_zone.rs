@@ -679,7 +679,40 @@ fn open_linked_exile_cast_selection(
 /// priority. They can then cast the card via the normal `GameAction::CastSpell`
 /// flow, which handles target selection (CR 601.2c), modal choices, X costs,
 /// additional costs, and all other casting steps.
+///
+/// CR 601.2 + CR 109.5: the cast is made by the effect's `caster`. A caster
+/// other than the ability's controller ("They may cast that card…" — Tibalt's
+/// Trickery, Possibility Storm) is bound to one player here and the rest of
+/// the resolution runs from that player's seat, so every permission, offer and
+/// cast below names the caster. An unresolvable caster casts nothing.
 pub fn resolve(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    if let Effect::CastFromZone { caster, .. } = &ability.effect {
+        if *caster != TargetFilter::Controller {
+            let Some(player) =
+                crate::game::targeting::resolve_effect_player_ref(state, ability, caster)
+            else {
+                events.push(GameEvent::EffectResolved {
+                    kind: EffectKind::from(&ability.effect),
+                    source_id: ability.source_id,
+                    subject: None,
+                });
+                return Ok(());
+            };
+            if player != ability.controller {
+                let mut as_caster = ability.clone();
+                as_caster.controller = player;
+                return resolve_as_caster(state, &as_caster, events);
+            }
+        }
+    }
+    resolve_as_caster(state, ability, events)
+}
+
+fn resolve_as_caster(
     state: &mut GameState,
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
@@ -3224,6 +3257,7 @@ mod tests {
                 ]));
             let ability = ResolvedAbility::new(
                 Effect::CastFromZone {
+                    caster: TargetFilter::Controller,
                     target: target.clone(),
                     without_paying_mana_cost: true,
                     mode: CardPlayMode::Cast,
@@ -3440,6 +3474,7 @@ mod tests {
         let target = TargetFilter::Typed(TypedFilter::new(TypeFilter::Enchantment));
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: target.clone(),
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -3482,6 +3517,7 @@ mod tests {
         let target = TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant));
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: target.clone(),
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -3727,6 +3763,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::And {
                     filters: vec![
                         TargetFilter::Typed(
@@ -3848,6 +3885,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Any,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Play,
@@ -3907,6 +3945,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Any,
                 without_paying_mana_cost: false,
                 mode: CardPlayMode::Play,
@@ -3949,6 +3988,7 @@ mod tests {
     fn electrodominance_hand_ability(max_value: i32) -> ResolvedAbility {
         ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Typed(
                     TypedFilter::default()
                         .with_type(TypeFilter::Card)
@@ -4067,6 +4107,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: false,
                 mode: CardPlayMode::Cast,
@@ -4121,6 +4162,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -4198,6 +4240,7 @@ mod tests {
                 .push(CoreType::Instant);
             let mut ability = ResolvedAbility::new(
                 Effect::CastFromZone {
+                    caster: TargetFilter::Controller,
                     target: TargetFilter::Typed(
                         TypedFilter::new(TypeFilter::Instant)
                             .controller(ControllerRef::You)
@@ -4251,6 +4294,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -4329,6 +4373,7 @@ mod tests {
         // when the final time counter is removed.
         let cast_ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::SelfRef,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -4441,6 +4486,7 @@ mod tests {
 
         let cast_ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -4563,6 +4609,7 @@ mod tests {
         state.spells_cast_this_game.insert(PlayerId(0), u32::MAX);
         let cast = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -4650,6 +4697,7 @@ mod tests {
         // source, not a pre-selected target.
         let mut ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::SelfRef,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -4723,6 +4771,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Any,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -4767,6 +4816,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Any,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -4803,6 +4853,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Any,
                 without_paying_mana_cost: false,
                 mode: CardPlayMode::Cast,
@@ -4870,6 +4921,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::And {
                     filters: vec![
                         TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant)),
@@ -4938,6 +4990,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ExiledBySource,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -5010,6 +5063,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::And {
                     filters: vec![
                         TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant)),
@@ -5214,6 +5268,7 @@ mod tests {
         // cost, during-resolution driver.
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Typed(
                     TypedFilter::default()
                         .with_type(TypeFilter::Card)
@@ -5308,6 +5363,7 @@ mod tests {
         // cannot supply.
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Typed(
                     TypedFilter::default()
                         .with_type(TypeFilter::Card)
@@ -5548,6 +5604,7 @@ mod tests {
         let card = add_card_to_graveyard(&mut state, PlayerId(0), CardId(515));
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Any,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Play,
@@ -5615,6 +5672,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Any,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -5657,6 +5715,7 @@ mod tests {
 
         let mut ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -5834,6 +5893,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -5903,6 +5963,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Any,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -5997,6 +6058,7 @@ mod tests {
     fn paid_during_resolution_grant(source: ObjectId, target: ObjectId) -> ResolvedAbility {
         ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Any,
                 without_paying_mana_cost: false,
                 mode: CardPlayMode::Cast,
@@ -6316,6 +6378,7 @@ mod tests {
         fn fanout_grant(source: ObjectId, targets: Vec<ObjectId>) -> ResolvedAbility {
             let mut ability = ResolvedAbility::new(
                 Effect::CastFromZone {
+                    caster: TargetFilter::Controller,
                     target: TargetFilter::Typed(
                         TypedFilter::new(TypeFilter::Instant)
                             .controller(ControllerRef::TargetPlayer),
@@ -6458,6 +6521,7 @@ mod tests {
         fn batch_grant(source: ObjectId, targets: Vec<ObjectId>) -> ResolvedAbility {
             ResolvedAbility::new(
                 Effect::CastFromZone {
+                    caster: TargetFilter::Controller,
                     target: TargetFilter::ExiledBySource,
                     without_paying_mana_cost: true,
                     mode: CardPlayMode::Cast,
@@ -6574,6 +6638,7 @@ mod tests {
     fn play_now_ability(card: ObjectId) -> ResolvedAbility {
         ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Play,
@@ -6729,6 +6794,7 @@ mod tests {
         let obj_id = add_card_to_exile(&mut state, PlayerId(1), CardId(9_106));
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Any,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Play,
@@ -6784,6 +6850,7 @@ mod tests {
         });
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ExiledBySource,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Play,

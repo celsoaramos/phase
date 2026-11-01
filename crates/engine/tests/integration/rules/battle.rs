@@ -126,6 +126,7 @@ fn siege_victory_cast_during_resolution_enters_transformed() {
 
     let cast_victory_back_face = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: engine::types::ability::TargetFilter::Controller,
             target: TargetFilter::SelfRef,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,

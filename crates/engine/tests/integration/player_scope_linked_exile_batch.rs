@@ -60,6 +60,7 @@ fn choose_exile(state: &mut GameState, player: PlayerId, card: ObjectId) -> Acti
 fn cast_window(source: ObjectId) -> ResolvedAbility {
     ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: engine::types::ability::TargetFilter::Controller,
             target: TargetFilter::ExiledBySource,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,

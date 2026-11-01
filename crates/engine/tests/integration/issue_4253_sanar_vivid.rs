@@ -532,6 +532,7 @@ fn tracked_set_cast_anaphor_applies_both_cause_and_type_gates() {
     };
     let ability = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: cast_filter,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,

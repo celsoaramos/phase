@@ -1320,6 +1320,7 @@ fn mad_wizards_lair(source_id: ObjectId, controller: PlayerId) -> ResolvedAbilit
 
     let mut cast = simple(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::LastRevealed,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,

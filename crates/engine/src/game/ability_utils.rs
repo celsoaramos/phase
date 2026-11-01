@@ -21156,6 +21156,7 @@ mod tests {
         let state = GameState::new_two_player(42);
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::And {
                     filters: vec![
                         TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant)),
@@ -21191,6 +21192,7 @@ mod tests {
         let state = GameState::new_two_player(42);
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Typed(
                     TypedFilter::default()
                         .with_type(TypeFilter::Card)
@@ -21232,6 +21234,7 @@ mod tests {
         let state = GameState::new_two_player(42);
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Or {
                     filters: vec![
                         TargetFilter::ExiledBySource,
@@ -22993,6 +22996,7 @@ mod tests {
         );
         let mut ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: filter,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,

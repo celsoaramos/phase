@@ -1424,6 +1424,7 @@ mod linked_exile_cleanup_tests {
 
     fn cast_from_zone(target: TargetFilter) -> Effect {
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target,
             without_paying_mana_cost: false,
             mode: crate::types::ability::CardPlayMode::Cast,

@@ -38,6 +38,7 @@ pub fn arm_rebound(
     // card from exile without paying its mana cost.
     let mut inner = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::SelfRef,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,

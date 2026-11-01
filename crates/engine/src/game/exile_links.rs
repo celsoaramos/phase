@@ -1292,6 +1292,7 @@ mod tests {
     fn target_filter_or_branch_counts_as_linked_exile_consumer() {
         let ability = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::Or {
                     filters: vec![TargetFilter::ExiledBySource, TargetFilter::Any],
                 },

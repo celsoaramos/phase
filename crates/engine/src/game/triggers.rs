@@ -35711,6 +35711,7 @@ pub mod tests {
     fn extract_target_skips_cast_from_zone_from_hand() {
         use crate::types::ability::{CardPlayMode, FilterProp, TypedFilter};
         let effect = Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::Typed(
                 TypedFilter::default()
                     .with_type(crate::types::ability::TypeFilter::Card)
@@ -35749,6 +35750,7 @@ pub mod tests {
     fn extract_target_keeps_cast_from_zone_from_graveyard() {
         use crate::types::ability::{CardPlayMode, FilterProp, TypedFilter};
         let effect = Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::Typed(
                 TypedFilter::default()
                     .with_type(crate::types::ability::TypeFilter::Card)

@@ -908,6 +908,7 @@ fn queued_optional_repeat_order(scope: Option<PlayerFilter>) {
     let mut s = GameScenario::new();
     s.at_phase(Phase::PreCombatMain);
     let impossible = def(Effect::CastFromZone {
+        caster: engine::types::ability::TargetFilter::Controller,
         target: TargetFilter::ParentTarget,
         without_paying_mana_cost: true,
         mode: CardPlayMode::Cast,

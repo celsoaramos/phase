@@ -11767,6 +11767,7 @@ fn cast_from_zone_exile_redirect_pauses_before_lingering_permission_tail() {
     runner.state_mut().players[P0.0 as usize].library = im::vector![card];
     let ability = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,
@@ -11855,6 +11856,7 @@ fn cast_from_zone_exile_delivery_stays_synchronous_and_grants_permission() {
     runner.state_mut().players[P0.0 as usize].library = im::vector![card, second_card];
     let ability = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,

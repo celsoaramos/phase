@@ -11573,6 +11573,7 @@ fn jhoira_granted_suspend_last_counter_cast_tags_suspend_variant() {
     // (issue #1520).
     let cast_trigger_ability = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::SelfRef,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,
@@ -11703,6 +11704,7 @@ fn jhoira_granted_suspend_creature_cast_gains_haste() {
     // installs the haste TCE for creatures.
     let cast_trigger_ability = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::SelfRef,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,
@@ -20545,6 +20547,7 @@ fn cast_from_zone_exile_rider_exiles_graveyard_cast_on_resolution() {
 
     let mut ability = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,
@@ -20689,6 +20692,7 @@ fn cast_from_exile_library_bottom_rider_bottoms_resolved_spell() {
     // exiled card exactly as `grant_lingering_permissions` does at runtime.
     let mut grant = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,
@@ -20804,6 +20808,7 @@ fn graveyard_timed_alt_cost_grant_is_castable_in_place() {
 
     let ability = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: false,
             mode: CardPlayMode::Cast,
@@ -20899,6 +20904,7 @@ fn graveyard_timed_alt_cost_grant_omits_an_artifact_land_but_keeps_its_land_play
     let grant = |target: ObjectId, source: ObjectId| {
         ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: false,
                 mode: CardPlayMode::Cast,
@@ -21112,6 +21118,7 @@ fn graveyard_cast_this_way_enters_with_finality_counter() {
     );
     let mut grant = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,
@@ -21215,6 +21222,7 @@ fn graveyard_cast_without_rider_has_no_finality_counter() {
 
     let grant = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,
@@ -21322,6 +21330,7 @@ fn graveyard_cast_this_way_enters_with_type_grant_rider() {
     )));
     let mut grant = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,
@@ -21441,6 +21450,7 @@ fn graveyard_cast_without_type_rider_is_not_a_vampire() {
 
     let grant = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,
@@ -55110,6 +55120,7 @@ fn quistis_class_grant_forwards_any_type_mana_and_pays_off_color_full_cost() {
     // Grant via the production resolver (Quistis-class lowering).
     let grant = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: false,
             mode: CardPlayMode::Cast,
@@ -55431,6 +55442,7 @@ fn resolve_graveyard_paid_grant_with_permission(
 ) {
     let grant = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: false,
             mode: CardPlayMode::Cast,
@@ -55457,6 +55469,7 @@ fn resolve_graveyard_paid_grant_with_permission(
 fn resolve_graveyard_paid_grant_with_exile_rider(state: &mut GameState, spell: ObjectId) {
     let mut grant = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: false,
             mode: CardPlayMode::Cast,
@@ -55531,6 +55544,7 @@ fn resolve_graveyard_paid_grant_with_gains_rider(
 ) {
     let mut grant = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: false,
             mode: CardPlayMode::Cast,
@@ -56376,6 +56390,7 @@ fn paid_cast_with_explicit_duration_remains_a_lingering_permission() {
     let spell = make_graveyard_blue_sorcery(&mut state, PlayerId(0));
     let grant = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: false,
             mode: CardPlayMode::Cast,
@@ -58026,6 +58041,7 @@ fn without_paying_graveyard_free_cast_bypasses_paid_offer() {
     let spell = make_graveyard_blue_sorcery(&mut state, PlayerId(0));
     let grant = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,
