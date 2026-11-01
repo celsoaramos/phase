@@ -13505,8 +13505,12 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef) -> bool {
         | QuantityRef::AdditionalCostPaymentCountFor { .. }
         | QuantityRef::ConvokedCreatureCount
         | QuantityRef::ColorsInCommandersColorIdentity
-        | QuantityRef::CommanderCastFromCommandZoneCount
         | QuantityRef::CommanderManaValue { .. } => false,
+        // CR 903.8: the per-commander read binds like `ManaSpentToCast` — only
+        // an `AbilityTarget` scope is a target-slot read.
+        QuantityRef::CommanderCastFromCommandZoneCount { commander } => {
+            *commander == Some(crate::types::ability::CastManaObjectScope::AbilityTarget)
+        }
     }
 }
 

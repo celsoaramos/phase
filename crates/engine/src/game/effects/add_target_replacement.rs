@@ -481,9 +481,12 @@ fn entry_counter_reference_is_deferred(qty: &QuantityRef) -> bool {
         | QuantityRef::DungeonsCompleted
         | QuantityRef::TimesCostPaidThisResolution
         | QuantityRef::ColorsInCommandersColorIdentity
-        | QuantityRef::CommanderCastFromCommandZoneCount
         | QuantityRef::CommanderManaValue { .. }
         | QuantityRef::VoteCount { .. } => false,
+        // Mirrors `ManaSpentToCast`: a `SelfObject` scope names the entrant.
+        QuantityRef::CommanderCastFromCommandZoneCount { commander } => {
+            *commander == Some(CastManaObjectScope::SelfObject)
+        }
     }
 }
 

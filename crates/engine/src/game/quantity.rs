@@ -1968,7 +1968,7 @@ pub(crate) fn quantity_ref_recipient_read(qty: &QuantityRef) -> RecipientRead {
         | QuantityRef::ConvokedCreatureCount
         | QuantityRef::TimesCostPaidThisResolution
         | QuantityRef::ColorsInCommandersColorIdentity
-        | QuantityRef::CommanderCastFromCommandZoneCount
+        | QuantityRef::CommanderCastFromCommandZoneCount { .. }
         | QuantityRef::CommanderManaValue { .. }
         | QuantityRef::VoteCount { .. } => RecipientRead::Unread,
     }
@@ -2462,7 +2462,7 @@ fn quantity_ref_uses_unspent_mana(qty: &QuantityRef) -> bool {
         | QuantityRef::DistinctCounterKindsAmong { .. }
         | QuantityRef::EnteredThisTurn { .. }
         | QuantityRef::CommanderManaValue { .. }
-        | QuantityRef::CommanderCastFromCommandZoneCount => false,
+        | QuantityRef::CommanderCastFromCommandZoneCount { .. } => false,
     }
 }
 
@@ -2799,7 +2799,7 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::ManaSpentToCast { .. }
         | QuantityRef::ColorsInCommandersColorIdentity
         | QuantityRef::VoteCount { .. }
-        | QuantityRef::CommanderCastFromCommandZoneCount => false,
+        | QuantityRef::CommanderCastFromCommandZoneCount { .. } => false,
     }
 }
 
@@ -3112,7 +3112,7 @@ fn quantity_ref_characteristic_reads(qty: &QuantityRef, depth: u32) -> Character
         | QuantityRef::ManaSpentToCast { .. }
         // CR 903.4: color identity is fixed by the printed card.
         | QuantityRef::ColorsInCommandersColorIdentity
-        | QuantityRef::CommanderCastFromCommandZoneCount
+        | QuantityRef::CommanderCastFromCommandZoneCount { .. }
         | QuantityRef::VoteCount { .. } => CharacteristicKinds::EMPTY,
     }
 }
@@ -3374,7 +3374,7 @@ fn entered_object_perturbs_quantity_ref(
         | QuantityRef::ManaSpentToCast { .. }
         | QuantityRef::ColorsInCommandersColorIdentity
         | QuantityRef::VoteCount { .. }
-        | QuantityRef::CommanderCastFromCommandZoneCount => false,
+        | QuantityRef::CommanderCastFromCommandZoneCount { .. } => false,
     }
 }
 
@@ -4931,6 +4931,31 @@ fn current_cast_occurrence_matches(
         .is_some_and(|record| record.spell_object_id == Some(ability.source_id))
 }
 
+/// CR 601.2h: the cast object a [`CastManaObjectScope`] names — the ability's
+/// source (or ETB entrant), the spell of the current trigger event, or the
+/// resolving ability's first object target.
+fn cast_object_for_scope(
+    state: &GameState,
+    scope: CastManaObjectScope,
+    ctx: &QuantityContext,
+    targets: &[TargetRef],
+) -> Option<ObjectId> {
+    match scope {
+        CastManaObjectScope::SelfObject => Some(ctx.self_object()),
+        CastManaObjectScope::TriggeringSpell => state
+            .current_trigger_event
+            .as_ref()
+            .and_then(crate::game::targeting::extract_source_from_event),
+        CastManaObjectScope::AbilityTarget => targets.iter().find_map(|target| {
+            if let crate::types::ability::TargetRef::Object(id) = target {
+                Some(*id)
+            } else {
+                None
+            }
+        }),
+    }
+}
+
 fn resolve_ref(
     state: &GameState,
     qty: &QuantityRef,
@@ -6138,21 +6163,7 @@ fn resolve_ref(
         // queries do not depend on the producing permanent still existing or
         // retaining the same type.
         QuantityRef::ManaSpentToCast { scope, metric } => {
-            let cast_object = match scope {
-                CastManaObjectScope::SelfObject => Some(ctx.self_object()),
-                CastManaObjectScope::TriggeringSpell => state
-                    .current_trigger_event
-                    .as_ref()
-                    .and_then(crate::game::targeting::extract_source_from_event),
-                CastManaObjectScope::AbilityTarget => targets.iter().find_map(|target| {
-                    if let crate::types::ability::TargetRef::Object(id) = target {
-                        Some(*id)
-                    } else {
-                        None
-                    }
-                }),
-            };
-            cast_object
+            cast_object_for_scope(state, *scope, &ctx, targets)
                 .and_then(|id| {
                     // CR 603.4 + CR 400.7d: the resolver reads through the
                     // latched trigger source when (and only when) it is the
@@ -6176,9 +6187,16 @@ fn resolve_ref(
         QuantityRef::ColorsInCommandersColorIdentity => usize_to_i32_saturating(
             super::commander::commander_color_identity(state, controller).len(),
         ),
-        QuantityRef::CommanderCastFromCommandZoneCount => u32_to_i32_saturating(
-            super::commander::commander_casts_from_command_zone(state, controller),
-        ),
+        QuantityRef::CommanderCastFromCommandZoneCount { commander } => match commander {
+            None => u32_to_i32_saturating(super::commander::commander_casts_from_command_zone(
+                state, controller,
+            )),
+            // CR 903.8: one commander's own command-zone cast count ("the
+            // number of times it's been cast"), keyed by the cast object.
+            Some(scope) => cast_object_for_scope(state, *scope, &ctx, targets)
+                .and_then(|id| state.commander_cast_count.get(&id).copied())
+                .map_or(0, u32_to_i32_saturating),
+        },
         // CR 903.3d: Mana value of a commander you own on the battlefield or in the command zone.
         // Used by Stinging Study's "X is the mana value of a commander you own on the battlefield
         // or in the command zone" pattern. Returns the mana value of the first matching commander
@@ -14315,7 +14333,7 @@ mod tests {
         record_commander_cast(&mut state, opponent_commander);
 
         let expr = QuantityExpr::Ref {
-            qty: QuantityRef::CommanderCastFromCommandZoneCount,
+            qty: QuantityRef::CommanderCastFromCommandZoneCount { commander: None },
         };
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), ObjectId(0)), 3);
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(1), ObjectId(0)), 1);

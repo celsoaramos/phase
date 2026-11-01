@@ -2555,7 +2555,7 @@ fn parse_conditional_enters_with_counters_grant(lower: &str) -> Option<ManaSpell
     let (_, count) = all_consuming(terminated(
         value(
             QuantityExpr::Ref {
-                qty: QuantityRef::CommanderCastFromCommandZoneCount,
+                qty: QuantityRef::CommanderCastFromCommandZoneCount { commander: None },
             },
             tag::<_, _, OracleError<'_>>(
                 "the number of times it's been cast from the command zone this game",
@@ -4104,7 +4104,7 @@ mod tests {
                 filter: TargetFilter::Typed(TypedFilter { properties, .. }),
                 counter_type: CounterType::Plus1Plus1,
                 count: QuantityExpr::Ref {
-                    qty: QuantityRef::CommanderCastFromCommandZoneCount,
+                    qty: QuantityRef::CommanderCastFromCommandZoneCount { .. },
                 },
             }] if properties == &[FilterProp::IsCommander]
         ));

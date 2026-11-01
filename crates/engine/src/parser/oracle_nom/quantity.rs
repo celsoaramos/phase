@@ -2226,6 +2226,7 @@ fn parse_number_of_inner(input: &str) -> OracleResult<'_, QuantityRef> {
             // with the other this-turn zone-change counts.
             parse_number_of_cards_put_into_graveyard_from_anywhere_this_turn,
             parse_number_of_times_you_chose_a_mode,
+            parse_number_of_times_it_was_cast_from_command_zone,
         )),
         parse_tokens_created_this_turn_tail,
         parse_distinct_colors_among_tail,
@@ -6510,7 +6511,10 @@ fn parse_for_each_commander_cast_count(input: &str) -> OracleResult<'_, Quantity
     let (rest, _) = tag(" cast ").parse(rest)?;
     let (rest, _) = alt((tag("your"), tag("a"))).parse(rest)?;
     let (rest, _) = tag(" commander from the command zone this game").parse(rest)?;
-    Ok((rest, QuantityRef::CommanderCastFromCommandZoneCount))
+    Ok((
+        rest,
+        QuantityRef::CommanderCastFromCommandZoneCount { commander: None },
+    ))
 }
 
 /// CR 400.7 + CR 700.4: Parse a trailing "that died [under your control] this
@@ -6908,6 +6912,25 @@ fn parse_number_of_times_you_chose_a_mode(input: &str) -> OracleResult<'_, Quant
     let (rest, _) = tag("times you chose a mode").parse(input)?;
     let (rest, _) = opt(tag(" for that spell")).parse(rest)?;
     Ok((rest, QuantityRef::EventContextSourceModesChosen))
+}
+
+/// CR 903.8: "[the number of] times it's been cast from the command zone this
+/// game" — the cast count of ONE commander, the spell the trigger event names
+/// (Study Hall's "when you spend this mana to cast your commander"), as in
+/// "spell you've cast before it this turn". Partners keep separate counts, so
+/// this is not the controller-wide "times you've cast your commander" sum.
+fn parse_number_of_times_it_was_cast_from_command_zone(
+    input: &str,
+) -> OracleResult<'_, QuantityRef> {
+    let (rest, _) = tag("times it").parse(input)?;
+    let (rest, _) = alt((tag("'s"), tag(" has"))).parse(rest)?;
+    let (rest, _) = tag(" been cast from the command zone this game").parse(rest)?;
+    Ok((
+        rest,
+        QuantityRef::CommanderCastFromCommandZoneCount {
+            commander: Some(CastManaObjectScope::TriggeringSpell),
+        },
+    ))
 }
 
 /// CR 701.21a: "[type] you['ve] sacrificed this turn" in a "for each" context →
@@ -13725,14 +13748,20 @@ mod tests {
             "times you've cast your commander from the command zone this game",
         )
         .unwrap();
-        assert_eq!(q, QuantityRef::CommanderCastFromCommandZoneCount);
+        assert_eq!(
+            q,
+            QuantityRef::CommanderCastFromCommandZoneCount { commander: None }
+        );
         assert_eq!(rest, "");
 
         let (rest, q) = parse_for_each_clause_ref(
             "time youve cast your commander from the command zone this game",
         )
         .unwrap();
-        assert_eq!(q, QuantityRef::CommanderCastFromCommandZoneCount);
+        assert_eq!(
+            q,
+            QuantityRef::CommanderCastFromCommandZoneCount { commander: None }
+        );
         assert_eq!(rest, "");
     }
 
@@ -13744,7 +13773,11 @@ mod tests {
             "times youve cast a commander from the command zone this game",
         ] {
             let (rest, q) = parse_for_each_clause_ref(text).unwrap();
-            assert_eq!(q, QuantityRef::CommanderCastFromCommandZoneCount, "{text}");
+            assert_eq!(
+                q,
+                QuantityRef::CommanderCastFromCommandZoneCount { commander: None },
+                "{text}"
+            );
             assert_eq!(rest, "");
         }
         assert!(parse_for_each_clause_ref(

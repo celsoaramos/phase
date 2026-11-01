@@ -14404,7 +14404,7 @@ fn effect_copy_it_for_each_commander_cast_sets_repeat_for() {
     assert!(matches!(
         def.repeat_for,
         Some(QuantityExpr::Ref {
-            qty: QuantityRef::CommanderCastFromCommandZoneCount
+            qty: QuantityRef::CommanderCastFromCommandZoneCount { .. }
         })
     ));
 }
