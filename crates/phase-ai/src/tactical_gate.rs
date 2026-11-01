@@ -371,6 +371,12 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject;
     }
 
+    // Before the empty-effects early return: an Aura such as Aether Meltdown
+    // has no spell effect of its own, and it is the case that was reported.
+    if own_beginning_phase_cast_is_dominated(ctx) {
+        return GateDecision::Reject;
+    }
+
     let effects = ctx.effects();
     if effects.is_empty() {
         return GateDecision::Allow;
@@ -381,6 +387,10 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     }
 
     if is_proven_conditional_destroy_whiff(ctx) {
+        return GateDecision::Reject;
+    }
+
+    if is_proven_mass_whiff(ctx) {
         return GateDecision::Reject;
     }
 
@@ -2320,6 +2330,98 @@ fn is_proven_conditional_destroy_whiff(ctx: &PolicyContext<'_>) -> bool {
     !ctx.has_legal_opponent_creature_target(filter, source.id, |id| {
         conditional_destroy_kills(ctx.state, source, &nodes, id)
     }) && !caster_has_cast_payoff(ctx.state, *object_id)
+}
+
+/// A spell cast in the AI's OWN upkeep or draw step with nothing on the stack
+/// is dominated by the same spell in the main phase that follows (CR 503,
+/// CR 504, CR 505): the mana is the same (CR 502.3 untapped it already), the
+/// opponent can answer it the same way, and waiting adds the drawn card to the
+/// decision. Casting early only spends the mana a sorcery-speed play of that
+/// main phase needed.
+///
+/// Field report (2026-11-01): the bot cast Aether Meltdown in its own upkeep,
+/// on one of two identical 1/1 deathtouch creatures, with its 2 lands; the
+/// same turn's Harnessed Lightning was the same kind of early cast.
+///
+/// Fail-open: any effect that touches a library (draw, scry, surveil, dig,
+/// search, mill, a zone move to or from a library) in the spell or in a trigger
+/// of the permanent — the upkeep before the draw is exactly when those are
+/// played (Mystical Tutor, Brainstorm).
+fn own_beginning_phase_cast_is_dominated(ctx: &PolicyContext<'_>) -> bool {
+    let GameAction::CastSpell { object_id, .. } = &ctx.candidate.action else {
+        return false;
+    };
+    if !ctx.state.stack.is_empty()
+        || !matches!(ctx.state.phase, Phase::Upkeep | Phase::Draw)
+        || engine::game::turn_control::turn_decision_maker(ctx.state) != ctx.ai_player
+    {
+        return false;
+    }
+    let Some(object) = ctx.state.objects.get(object_id) else {
+        return false;
+    };
+    let spell_touches_library = object
+        .abilities
+        .iter()
+        .any(ability_touches_library);
+    let trigger_touches_library = object
+        .trigger_definitions
+        .as_slice()
+        .iter()
+        .any(|entry| entry.definition.execute.as_deref().is_some_and(ability_touches_library));
+    !spell_touches_library && !trigger_touches_library
+}
+
+fn ability_touches_library(ability: &AbilityDefinition) -> bool {
+    let mut touches = false;
+    let _ = visit_ability_def(ability, &mut |effect| {
+        let library = match effect {
+            Effect::Draw { .. }
+            | Effect::Mill { .. }
+            | Effect::Scry { .. }
+            | Effect::Surveil { .. }
+            | Effect::Dig { .. }
+            | Effect::Explore
+            | Effect::SearchLibrary { .. }
+            | Effect::RevealTop { .. }
+            | Effect::Discover { .. }
+            | Effect::Cascade
+            | Effect::PutOnTopOrBottom { .. }
+            | Effect::ManifestDread => true,
+            Effect::ChangeZone {
+                origin,
+                destination,
+                ..
+            }
+            | Effect::ChangeZoneAll {
+                origin,
+                destination,
+                ..
+            } => *origin == Some(Zone::Library) || *destination == Zone::Library,
+            _ => false,
+        };
+        if library {
+            touches = true;
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    touches
+}
+
+/// A spell whose ONLY effects are mass removal with a provably empty
+/// population (CR 115.10a) — Aetherize ("Return all attacking creatures to
+/// their owner's hand") cast with no creature attacking. The card is spent for
+/// nothing.
+///
+/// Field report (2026-11-01): the bot cast Aetherize in the opponent's upkeep,
+/// before any combat, and lost the card while facing 10 power at 10 life.
+fn is_proven_mass_whiff(ctx: &PolicyContext<'_>) -> bool {
+    let GameAction::CastSpell { object_id, .. } = &ctx.candidate.action else {
+        return false;
+    };
+    ctx.mass_removal_population_is_empty() && !caster_has_cast_payoff(ctx.state, *object_id)
 }
 
 /// One `Destroy` node of a Fatal Push-class chain, with the conditions of the

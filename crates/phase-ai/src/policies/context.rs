@@ -291,6 +291,12 @@ impl<'a> PolicyContext<'a> {
         super::removal_lethality::has_opposing_mass_population(self)
     }
 
+    /// Is the pending spell nothing but mass removal (`DestroyAll`,
+    /// `BounceAll`) with a provably empty population (CR 115.10a)?
+    pub(crate) fn mass_removal_population_is_empty(&self) -> bool {
+        super::removal_lethality::mass_removal_population_is_empty(self)
+    }
+
     /// Can the pending spell's modelled damage kill at least one legal
     /// opposing creature target (CR 704.5f/g/h)? `false` only for a PROVEN
     /// total whiff — every unknown fails open. The cast-commit anti-whiff

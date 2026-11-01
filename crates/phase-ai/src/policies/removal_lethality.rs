@@ -1022,6 +1022,47 @@ pub(crate) fn has_opposing_mass_population(ctx: &PolicyContext<'_>) -> bool {
     })
 }
 
+/// Is every effect of the pending spell a non-targeted mass removal
+/// (`DestroyAll`, `BounceAll`) whose population is provably EMPTY on the whole
+/// battlefield, on every side of the table? CR 115.10a: the population is
+/// matched at resolution with no targeting, so an empty match now (Aetherize's
+/// "all attacking creatures" outside combat, a wrath on an empty board) means
+/// the card does nothing. Indestructible objects don't count for `DestroyAll`
+/// (CR 702.12b). Fail-open: any other effect in the chain, or a
+/// player-relative population ([`filter_has_unbound_player_controller`]).
+pub(crate) fn mass_removal_population_is_empty(ctx: &PolicyContext<'_>) -> bool {
+    let Some(source) = ctx.source_object() else {
+        return false;
+    };
+    let effects = ctx.effects();
+    if effects.is_empty() {
+        return false;
+    }
+    let default_population = TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature));
+    let filter_ctx = FilterContext::from_source_with_controller(source.id, source.controller);
+    effects.iter().all(|effect| {
+        let (target, skip_indestructible) = match effect {
+            Effect::DestroyAll { target, .. } => (target, true),
+            Effect::BounceAll { target, .. } => (target, false),
+            _ => return false,
+        };
+        let population = if matches!(target, TargetFilter::None) {
+            &default_population
+        } else {
+            target
+        };
+        if filter_has_unbound_player_controller(population) {
+            return false;
+        }
+        !ctx.state.battlefield.iter().any(|&id| {
+            ctx.state.objects.get(&id).is_some_and(|obj| {
+                !(skip_indestructible && obj.has_keyword(&Keyword::Indestructible))
+                    && matches_target_filter(ctx.state, id, population, &filter_ctx)
+            })
+        })
+    })
+}
+
 /// Does this non-`DealDamage` effect currently have a legal target or
 /// population under an OPPONENT's control? Applies the full typed filter —
 /// including `TypedFilter.controller` (CR 108.4 / CR 109.5) — via the

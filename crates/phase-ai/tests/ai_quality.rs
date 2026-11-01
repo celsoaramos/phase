@@ -2964,3 +2964,173 @@ fn fatal_push_targets_the_two_drop_not_the_three_drop() {
         );
     }
 }
+
+// ── Bot flags of 2026-11-01 ──────────────────────────────────────────────
+
+const AETHERIZE_ORACLE: &str = "Return all attacking creatures to their owner's hand.";
+const SHOCK_ORACLE: &str = "Shock deals 2 damage to any target.";
+const OPT_ORACLE: &str = "Scry 1.\nDraw a card.";
+const SCUTE_SWARM_ORACLE: &str = "Landfall — Whenever a land you control enters, create a 1/1 green Insect creature token. If you control six or more lands, create a token that's a copy of Scute Swarm instead.";
+
+/// The AI (P0) holds `spell` with one generic mana floating, in `phase` of its
+/// own turn; the opponent has a 3/3. Returns the runner and the spell.
+fn instant_in_hand_board(
+    phase: Phase,
+    name: &str,
+    oracle: &str,
+) -> (engine::game::scenario::GameRunner, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(phase);
+    scenario.add_creature(P1, "Opposing Bear", 3, 3);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, name, true, oracle)
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![ManaUnit::new(ManaType::Red, ObjectId(9_999), false, vec![])],
+    );
+    let mut runner = scenario.build();
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+    (runner, spell)
+}
+
+fn assert_castable(state: &engine::types::game_state::GameState, spell: ObjectId) {
+    assert!(
+        engine::ai_support::build_decision_context(state)
+            .candidates
+            .iter()
+            .any(|c| matches!(c.action, GameAction::CastSpell { object_id, .. } if object_id == spell)),
+        "the spell must be a legal, affordable cast — otherwise the test is vacuous"
+    );
+}
+
+/// Field report: the bot cast Aetherize in the opponent's upkeep, before any
+/// combat. CR 115.10a: "all attacking creatures" is matched at resolution, and
+/// with no creature attacking the card is spent for nothing.
+#[test]
+fn does_not_cast_aetherize_with_no_attacking_creature() {
+    let (runner, aetherize) =
+        instant_in_hand_board(Phase::PreCombatMain, "Aetherize", AETHERIZE_ORACLE);
+    assert_castable(runner.state(), aetherize);
+    for diff in [
+        AiDifficulty::Easy,
+        AiDifficulty::Medium,
+        AiDifficulty::Hard,
+        AiDifficulty::VeryHard,
+    ] {
+        assert!(
+            !offers_cast(runner.state(), diff, aetherize),
+            "{diff:?}: Aetherize returns nothing when no creature is attacking"
+        );
+    }
+}
+
+/// Field report: the bot cast Aether Meltdown in its own upkeep. With nothing
+/// on the stack, the main phase that follows offers the same mana and the drawn
+/// card besides (CR 503-505), so a removal spell is held.
+#[test]
+fn holds_removal_in_its_own_upkeep() {
+    let (runner, shock) = instant_in_hand_board(Phase::Upkeep, "Shock", SHOCK_ORACLE);
+    assert_castable(runner.state(), shock);
+    for diff in [AiDifficulty::Hard, AiDifficulty::VeryHard] {
+        assert!(
+            !offers_cast(runner.state(), diff, shock),
+            "{diff:?}: Shock in its own upkeep is dominated by the main phase"
+        );
+    }
+}
+
+/// Negative control: a spell that touches the library is exactly what the
+/// upkeep before the draw is for, so the gate leaves it alone.
+#[test]
+fn own_upkeep_gate_leaves_library_spells_alone() {
+    let (runner, opt) = instant_in_hand_board(Phase::Upkeep, "Opt", OPT_ORACLE);
+    assert_castable(runner.state(), opt);
+    assert!(
+        offers_cast(runner.state(), AiDifficulty::VeryHard, opt),
+        "Opt in the upkeep must stay a candidate"
+    );
+}
+
+/// Field report: Harnessed Lightning killed an Insect token next to the Scute
+/// Swarm that made it. Same 1/1 body, but the Swarm makes another one on every
+/// land drop (CR 603.2) and the token is only its output.
+#[test]
+fn removal_targets_the_token_maker_not_its_token() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let swarm = scenario
+        .add_creature_from_oracle(P1, "Scute Swarm", 1, 1, SCUTE_SWARM_ORACLE)
+        .id();
+    let insect = scenario.add_creature(P1, "Insect", 1, 1).id();
+    let shock = scenario
+        .add_spell_to_hand_from_oracle(P0, "Shock", true, SHOCK_ORACLE)
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![ManaUnit::new(ManaType::Red, ObjectId(9_999), false, vec![])],
+    );
+    let mut runner = scenario.build();
+    runner.state_mut().objects.get_mut(&insect).unwrap().is_token = true;
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+    let card_id = runner.state().objects[&shock].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: shock,
+            card_id,
+            targets: Vec::new(),
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("Shock should reach target selection");
+
+    let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+    let scored = phase_ai::score_candidates(runner.state(), P0, &config);
+    let score_of = |id: ObjectId| {
+        scored
+            .iter()
+            .find(|(a, _)| {
+                matches!(a, GameAction::ChooseTarget { target: Some(TargetRef::Object(t)) } if *t == id)
+            })
+            .map(|(_, s)| *s)
+            .unwrap_or_else(|| panic!("no ChooseTarget candidate for {id:?}: {scored:?}"))
+    };
+    let (swarm_score, insect_score) = (score_of(swarm), score_of(insect));
+    assert!(
+        swarm_score > insect_score,
+        "Scute Swarm ({swarm_score}) must outrank its Insect token ({insect_score})"
+    );
+}
+
+const AETHER_MELTDOWN_ORACLE: &str = "Flash\nEnchant creature or Vehicle\nWhen Aether Meltdown enters, you get {E}{E}.\nEnchanted permanent gets -4/-0.";
+
+/// The reported card itself: a flash Aura has no spell effect of its own, so
+/// the upkeep gate has to run before the empty-effects early return.
+#[test]
+fn holds_a_flash_aura_in_its_own_upkeep() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::Upkeep);
+    scenario.add_creature(P1, "Opposing Bear", 3, 3);
+    let meltdown = scenario
+        .add_spell_to_hand(P0, "Aether Meltdown", true)
+        .as_enchantment()
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(ManaCost::generic(1))
+        .from_oracle_text_with_keywords(&["Flash"], AETHER_MELTDOWN_ORACLE)
+        .with_keyword(<Keyword as std::str::FromStr>::from_str("Enchant:creature").unwrap())
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![ManaUnit::new(ManaType::Blue, ObjectId(9_999), false, vec![])],
+    );
+    let mut runner = scenario.build();
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+    assert_castable(runner.state(), meltdown);
+    for diff in [AiDifficulty::Hard, AiDifficulty::VeryHard] {
+        assert!(
+            !offers_cast(runner.state(), diff, meltdown),
+            "{diff:?}: a flash Aura in its own upkeep is dominated by the main phase"
+        );
+    }
+}
