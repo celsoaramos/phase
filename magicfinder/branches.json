@@ -300,7 +300,7 @@
     "branch": "card/elimination-under-post-replacement"
   },
   {
-    "branch": "ai/turn-search"
+    "branch": "ai/turn-sim-breadth"
   },
   {
     "branch": "card/desecration-demon-any-opponent"
@@ -349,5 +349,8 @@
   },
   {
     "branch": "card/mf-cobertura-1101"
+  },
+  {
+    "branch": "card/mf-cobertura-1102"
   }
 ]
