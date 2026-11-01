@@ -1156,7 +1156,8 @@ fn restriction_scope_matches_player(
             debug_assert!(false, "ScopedPlayer should be resolved by add_restriction");
             false
         }
-        RestrictionPlayerScope::ParentObjectTargetController => {
+        RestrictionPlayerScope::ParentObjectTargetController
+        | RestrictionPlayerScope::ParentObjectTargetOwner => {
             // CR 109.4: normally resolved to `SpecificPlayer` by `add_restriction`
             // (via `parent_target_controller`) when the restriction is created.
             // Unlike the always-resolved sibling scopes (`TargetedPlayer`,

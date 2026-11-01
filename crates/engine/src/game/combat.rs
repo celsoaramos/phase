@@ -5554,6 +5554,7 @@ fn attack_passes_temporary_prohibition(
             | crate::types::ability::RestrictionPlayerScope::ParentTargetedPlayer
             | crate::types::ability::RestrictionPlayerScope::DefendingPlayer
             | crate::types::ability::RestrictionPlayerScope::ParentObjectTargetController
+            | crate::types::ability::RestrictionPlayerScope::ParentObjectTargetOwner
             | crate::types::ability::RestrictionPlayerScope::ScopedPlayer
             | crate::types::ability::RestrictionPlayerScope::SourceController => false,
         };

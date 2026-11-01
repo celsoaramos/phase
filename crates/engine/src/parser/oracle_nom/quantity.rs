@@ -6077,7 +6077,11 @@ fn parse_counter_added_this_turn_condition_active(input: &str) -> OracleResult<'
 
 fn parse_counter_added_this_turn_condition_passive(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, _) = parse_article(input)?;
-    let (rest, counters) = parse_typed_counter_match(rest)?;
+    // CR 122.6: the passive voice carries the same counter axis as the active
+    // one — a typed counter ("a +1/+1 counter was put on …") or any counter
+    // ("a counter was put on ~ this turn" — Wakka, Devoted Guardian).
+    let (rest, counters) =
+        alt((parse_typed_counter_match, parse_generic_counter_match)).parse(rest)?;
     let (rest, _) = tag(" was put on ").parse(rest)?;
     let (rest, target) = parse_counter_added_target(rest)?;
     let (rest, _) = tag(" this turn").parse(rest)?;

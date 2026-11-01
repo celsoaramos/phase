@@ -9124,7 +9124,10 @@ fn source_chosen_player(source: &SourceContext<'_>) -> Option<PlayerId> {
 /// Returns `None` when no ability is in scope, when the ability has no object
 /// targets, or when the referenced object has no record in either `state.objects`
 /// or `state.lki_cache`.
-fn parent_target_name(state: &GameState, ability: Option<&ResolvedAbility>) -> Option<String> {
+pub(crate) fn parent_target_name(
+    state: &GameState,
+    ability: Option<&ResolvedAbility>,
+) -> Option<String> {
     let ability = ability?;
     let id = first_object_target(ability)?;
     if let Some(snapshot) = ability

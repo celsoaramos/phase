@@ -4933,6 +4933,15 @@ pub enum RestrictionPlayerScope {
     /// Mirrors `PlayerFilter::ParentObjectTargetController` /
     /// `PlayerScope::ParentObjectTarget` on the sibling enums.
     ParentObjectTargetController,
+    /// CR 108.3 + CR 109.4: The OWNER of the parent object target — "that
+    /// creature's owner can't cast spells with the same name as that creature"
+    /// (Reflector Mage), where the bounced creature may have been controlled by
+    /// someone other than its owner. Resolved to `SpecificPlayer` by
+    /// `add_restriction::fill_runtime_fields` via
+    /// `ability_utils::parent_target_owner`. Owner sibling of
+    /// `ParentObjectTargetController`, mirroring `PlayerFilter`'s
+    /// `ParentObjectTargetController` / `ParentObjectTargetOwner` pair.
+    ParentObjectTargetOwner,
     OpponentsOfSourceController,
     /// CR 508.5 / CR 508.5a: The defending player for the source's attack
     /// ("Whenever ~ attacks, defending player can't cast spells this turn." —
@@ -34077,8 +34086,9 @@ impl ContinuousEffectOnset {
 /// `mark_independent_mana_spent_gates` (a clause gated on the mana spent to cast
 /// the spell that directly follows another such clause, CR 601.2h — its gate
 /// reads the payment, never the previous clause), and by `settle_trailing_guard`
-/// (a suffix-guarded instruction after an earlier suffix-guarded one across
-/// ", then", CR 608.2c) — never by ordinary
+/// (a guarded instruction after an earlier suffix-guarded one across ", then"
+/// or a sentence break, CR 608.2c — the suffix guard governs only its own
+/// instruction) — never by ordinary
 /// sentence-boundary `SequentialSibling` stamping — so it cannot leak into a
 /// Thieving-Skydiver-shaped dependent continuation that also happens to carry
 /// `SequentialSibling`.

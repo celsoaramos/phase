@@ -8045,7 +8045,7 @@ fn parse_keyword_suffix(text: &str) -> Option<(KeywordSuffix, usize)> {
 ///     Pulse, the Echoing cycle, Bile Blight, Homing Lightning, Detention Sphere.
 ///     Without it the secondary mass effect drops the name constraint and
 ///     degrades into an unconditional board wipe.
-fn parse_same_name_suffix(text: &str) -> Option<(FilterProp, usize)> {
+pub(crate) fn parse_same_name_suffix(text: &str) -> Option<(FilterProp, usize)> {
     let trimmed = text.trim_start();
     let leading_ws = text.len() - trimmed.len();
     let (rest, _) = tag::<_, _, OracleError<'_>>("with the same name as ")
