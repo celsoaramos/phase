@@ -1682,6 +1682,30 @@ fn bind_chosen_number_anaphor(def: &mut AbilityDefinition, prior: &[AbilityDefin
     }
 }
 
+/// CR 608.2d + CR 603.7b/d/e: WHEN a stamped announcer anaphor will be resolved.
+///
+/// CR 608.2c binds the clause's anaphor by the rules of English; CR 608.2d then
+/// has the player so named announce the choice *while the effect is being
+/// applied*. Which anaphors are still bound at that moment depends on which
+/// resolution that is. This is the only axis on which the two stamp sites
+/// differ, so it is spelled as a type rather than carried as a flag.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActorBindingWindow {
+    /// Announced during THIS resolution. Every event-context anaphor
+    /// (`state.current_trigger_event`) and resolution-scoped anaphor is live.
+    ThisResolution,
+    /// CR 603.7d + CR 603.7e: announced when a delayed triggered ability later
+    /// resolves, whose controller is the creating SPELL'S OR ABILITY'S controller
+    /// (603.7d is the spell case — Arcane Denial, an instant, is the one printed
+    /// card reaching the ADMIT arm; 603.7e the activated/triggered-ability case,
+    /// which is what every printed card reaching the REFUSAL arm today is).
+    /// Only anaphors carried on the ability's own target list survive the delay:
+    /// per CR 603.7b the delayed ability triggers on its OWN event, so an
+    /// event-context ref would read that firing event — a different event — and
+    /// is refused rather than silently mis-bound.
+    DeferredDelayedTrigger,
+}
+
 /// CR 107.1 + CR 608.2c: "Choose 1, 2, or 3 at random. Its controller mills
 /// that many cards" (Tibalt's Trickery) — a "that many" instruction that
 /// DIRECTLY follows a number choice counts the number just chosen. A resolving
@@ -1710,30 +1734,6 @@ fn bind_that_many_to_chosen_number(def: &mut AbilityDefinition, prev: Option<&Ab
             player: PlayerScope::Controller,
         });
     }
-}
-
-/// CR 608.2d + CR 603.7b/d/e: WHEN a stamped announcer anaphor will be resolved.
-///
-/// CR 608.2c binds the clause's anaphor by the rules of English; CR 608.2d then
-/// has the player so named announce the choice *while the effect is being
-/// applied*. Which anaphors are still bound at that moment depends on which
-/// resolution that is. This is the only axis on which the two stamp sites
-/// differ, so it is spelled as a type rather than carried as a flag.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ActorBindingWindow {
-    /// Announced during THIS resolution. Every event-context anaphor
-    /// (`state.current_trigger_event`) and resolution-scoped anaphor is live.
-    ThisResolution,
-    /// CR 603.7d + CR 603.7e: announced when a delayed triggered ability later
-    /// resolves, whose controller is the creating SPELL'S OR ABILITY'S controller
-    /// (603.7d is the spell case — Arcane Denial, an instant, is the one printed
-    /// card reaching the ADMIT arm; 603.7e the activated/triggered-ability case,
-    /// which is what every printed card reaching the REFUSAL arm today is).
-    /// Only anaphors carried on the ability's own target list survive the delay:
-    /// per CR 603.7b the delayed ability triggers on its OWN event, so an
-    /// event-context ref would read that firing event — a different event — and
-    /// is refused rather than silently mis-bound.
-    DeferredDelayedTrigger,
 }
 
 /// CR 608.2c + CR 608.2d (+ CR 603.7b/d/e for the deferred window): Which player

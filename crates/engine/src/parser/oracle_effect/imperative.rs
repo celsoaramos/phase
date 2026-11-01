@@ -5013,18 +5013,9 @@ pub(super) fn parse_choose_ast(
         ctx.pending_choice_type,
         Some(crate::types::ability::ChoiceType::NumberRange { .. })
     );
-    // CR 608.2d (override): an "at random" qualifier after an `all_consuming`
-    // object phrase ("Choose 1, 2, or 3 at random" — Tibalt's Trickery) hides
-    // the choice from the phrase table; retry on the clause with the qualifier
-    // excised by the shared authority (the same one the as-enters Haktos path
-    // uses), keeping the random selection mode below.
-    let named_choice = super::try_parse_named_choice_with_provenance(lower, has_number_choice)
-        .or_else(|| {
-            super::excise_selection_qualifier(lower).and_then(|excised| {
-                super::try_parse_named_choice_with_provenance(&excised, has_number_choice)
-            })
-        });
-    if let Some(choice_type) = named_choice {
+    if let Some(choice_type) =
+        super::try_parse_named_choice_with_provenance(lower, has_number_choice)
+    {
         // CR 608.2d (override) + CR 701.9b (analogous): "choose a player at
         // random" (Strax) — the game selects the referent, not the controller.
         let selection = if nom_primitives::scan_contains(lower, "at random") {

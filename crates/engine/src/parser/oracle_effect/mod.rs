@@ -36259,9 +36259,12 @@ fn parse_number_enumeration(rest: &str) -> Option<(u32, u32)> {
         alt((tag(", or "), tag(", "), tag(" or "))).parse(input)
     }
     let rest = rest.trim_end_matches('.').trim_end();
-    let items = match all_consuming(nom::multi::separated_list1(
-        separator,
-        nom_primitives::parse_number,
+    // CR 608.2d (override): a trailing "at random" ("Choose 1, 2, or 3 at
+    // random" — Tibalt's Trickery) qualifies WHO selects, not the candidate
+    // set; the dispatcher reads it as `TargetSelectionMode::Random`.
+    let items = match all_consuming(terminated(
+        nom::multi::separated_list1(separator, nom_primitives::parse_number),
+        opt(tag(" at random")),
     ))
     .parse(rest)
     {
