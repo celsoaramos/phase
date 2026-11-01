@@ -88,20 +88,23 @@ impl PlayerCounterType {
         PlayerCounterType::Kind(PlayerCounterKind::Ticket),
         PlayerCounterType::Energy,
     ];
+}
 
-    /// CR 122.1: How many counters of this kind `player` has.
-    pub fn count_on(self, player: &Player) -> u32 {
-        match self {
-            PlayerCounterType::Kind(kind) => player.player_counter(&kind),
-            PlayerCounterType::Energy => player.energy,
+impl Player {
+    /// CR 122.1: How many counters of `kind` this player has.
+    pub fn counter_type_count(&self, kind: PlayerCounterType) -> u32 {
+        match kind {
+            PlayerCounterType::Kind(kind) => self.player_counter(&kind),
+            PlayerCounterType::Energy => self.energy,
         }
     }
 
-    /// CR 122.1: The distinct kinds of counters `player` has, in `ALL` order.
-    pub fn present_on(player: &Player) -> Vec<PlayerCounterType> {
-        Self::ALL
+    /// CR 122.1: The distinct kinds of counters this player has, in
+    /// `PlayerCounterType::ALL` order.
+    pub fn counter_types(&self) -> Vec<PlayerCounterType> {
+        PlayerCounterType::ALL
             .into_iter()
-            .filter(|kind| kind.count_on(player) > 0)
+            .filter(|kind| self.counter_type_count(*kind) > 0)
             .collect()
     }
 }

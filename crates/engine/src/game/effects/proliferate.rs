@@ -65,7 +65,7 @@ fn collect_proliferate_eligible(state: &GameState) -> Vec<TargetRef> {
     // that have a counter" — a CHOICE, not a target (CR 115.10a), so the seat is judged by
     // the existence authority and NOT by the targeting-only exclusions.
     for player in &state.players {
-        if !PlayerCounterType::present_on(player).is_empty()
+        if !player.counter_types().is_empty()
             && crate::game::players::player_exists_for_choice(state, player.id)
         {
             eligible.push(TargetRef::Player(player.id));
@@ -394,7 +394,7 @@ fn proliferate_addition_plan(
                     .players
                     .iter()
                     .find(|p| p.id == *pid)
-                    .map(PlayerCounterType::present_on)
+                    .map(|player| player.counter_types())
                     .unwrap_or_default();
 
                 for counter in counters {

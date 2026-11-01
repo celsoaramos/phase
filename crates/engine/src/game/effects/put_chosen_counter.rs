@@ -124,7 +124,8 @@ fn players_satisfying_condition(
         })
         .filter(|player| {
             condition.is_none_or(|condition| {
-                let count = crate::game::arithmetic::u32_to_i32_saturating(kind.count_on(player));
+                let count =
+                    crate::game::arithmetic::u32_to_i32_saturating(player.counter_type_count(kind));
                 let mut per_target_ability = ability.clone();
                 per_target_ability.set_unpinned_targets(vec![TargetRef::Player(player.id)]);
                 let rhs = crate::game::quantity::resolve_quantity_for_ability_condition(

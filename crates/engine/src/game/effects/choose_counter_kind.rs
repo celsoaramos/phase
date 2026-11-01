@@ -208,7 +208,11 @@ fn player_counter_kinds_on_targets(
             .collect();
     PlayerCounterType::ALL
         .into_iter()
-        .filter(|kind| players.iter().any(|player| kind.count_on(player) > 0))
+        .filter(|kind| {
+            players
+                .iter()
+                .any(|player| player.counter_type_count(*kind) > 0)
+        })
         .collect()
 }
 
