@@ -225,7 +225,7 @@
     "branch": "card/optional-frame-across-replacement-choice"
   },
   {
-    "branch": "card/adventure-offer-only-castable-faces"
+    "branch": "card/adventure-offer-castable-mf"
   },
   {
     "branch": "ai/x-repeat-and-zero-x"
