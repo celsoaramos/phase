@@ -13451,7 +13451,7 @@ fn parse_context_set_referent<'a>(
 /// can never match there and would make the whole clause inert while coverage
 /// reports it supported. Every player read therefore declines, including a
 /// mixed `Or`/`And` leg (`Or[Typed(Creature), Player]`).
-fn is_object_host_filter(filter: &TargetFilter) -> bool {
+pub(crate) fn is_object_host_filter(filter: &TargetFilter) -> bool {
     if super::player_filter_as_controller_ref(filter).is_some() || is_player_axis_filter(filter) {
         return false;
     }

@@ -187,6 +187,7 @@ mod cloud_key_chosen_type_cost;
 mod coalition_relic_integration;
 mod cobertura_mf_1101;
 mod cobertura_mf_1102;
+mod cobertura_mf_1103;
 mod cobra_king_guarded_reflexive_modal;
 mod code_of_constraint_addendum;
 mod codie_prepared_spell_trigger;
