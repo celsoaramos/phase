@@ -46,6 +46,9 @@ use crate::session::AiSession;
 const MAX_LINES: usize = 5;
 /// Opponent worlds each line is played in.
 const WORLDS: u64 = 4;
+/// Worlds a line must share with the incumbent before it can replace it: one
+/// lucky draw never crowns a line.
+const MIN_WORLDS: usize = 2;
 /// Engine dispatches one playout may take before it is dropped. A full turn of
 /// each side is typically 40–120.
 const MAX_STEPS: usize = 400;
@@ -189,6 +192,11 @@ fn playout_policy(config: &AiConfig, seed: u64) -> AiConfig {
     policy.combat_simulation = false;
     policy.turn_simulation = false;
     policy.projections = false;
+    // Root-only certifications: the lethal-reach search and the fetch-then-cast
+    // route each replay lines through the reducer at every playout step, and
+    // the playout already plays the turn out.
+    policy.play_lookahead = false;
+    policy.fetch_route_check = false;
     policy.into_measurement(seed)
 }
 
@@ -281,7 +289,8 @@ fn measure_lines(
         return scored;
     }
 
-    let base_seed = crate::planner::quick_state_hash(input.state).wrapping_add(input.state.rng_seed);
+    let base_seed =
+        crate::planner::quick_state_hash(input.state).wrapping_add(input.state.rng_seed);
     let worlds: Vec<(GameState, u64)> = (0..WORLDS)
         .map(|i| {
             let seed = base_seed.wrapping_add(crate::determinize::splitmix64(i));
@@ -303,10 +312,22 @@ fn measure_lines(
         deadline: input.deadline,
     };
 
-    let mut values: Vec<Option<Vec<f64>>> = Vec::with_capacity(lines.len());
-    for line in &lines {
-        let mut per_world = Vec::with_capacity(worlds.len());
-        for (world, seed) in &worlds {
+    // Breadth first: every line plays world 0, then every line plays world 1…
+    // A clock that runs out (the browser's, slower on a phone) then cuts WORLDS
+    // off every line alike, instead of cutting the last lines — pass, the
+    // "hold back" line, always came last — off entirely. Each line is compared
+    // with the incumbent on the worlds both finished, so the pairing holds.
+    let mut values: Vec<Vec<f64>> = vec![Vec::new(); lines.len()];
+    // A line the engine could not play in some world (not a clock cut) says
+    // nothing reliable about that world: it is left out of the comparison.
+    let mut unplayable = vec![false; lines.len()];
+    let out_of_budget =
+        |b: &Budget| b.steps_left == 0 || input.deadline.is_some_and(|d| d.expired());
+    'worlds: for (world, seed) in &worlds {
+        for (i, line) in lines.iter().enumerate() {
+            if unplayable[i] {
+                continue;
+            }
             match playout(
                 world,
                 input.player,
@@ -316,55 +337,81 @@ fn measure_lines(
                 *seed,
                 &mut budget,
             ) {
-                Some(end) => per_world.push(evaluate_state(&end, input.player, input.weights)),
-                None => break,
+                Some(end) => values[i].push(evaluate_state(&end, input.player, input.weights)),
+                None if out_of_budget(&budget) => break 'worlds,
+                None => {
+                    if i == 0 {
+                        // The searched answer cannot be played out: leave the
+                        // root alone.
+                        UNMEASURED.fetch_add(1, AtomicOrdering::Relaxed);
+                        return scored;
+                    }
+                    unplayable[i] = true;
+                }
             }
-        }
-        if per_world.len() < worlds.len() {
-            if values.is_empty() {
-                // The searched answer cannot be measured: leave the root alone.
-                UNMEASURED.fetch_add(1, AtomicOrdering::Relaxed);
-                return scored;
+            if out_of_budget(&budget) {
+                break 'worlds;
             }
-            values.push(None);
-        } else {
-            values.push(Some(per_world));
-        }
-        if budget.steps_left == 0 || input.deadline.is_some_and(|d| d.expired()) {
-            break;
         }
     }
 
-    let Some(Some(incumbent)) = values.first().cloned() else {
-        return scored;
-    };
+    match pick_switch(&values, &unplayable) {
+        Verdict::Unmeasured => {
+            UNMEASURED.fetch_add(1, AtomicOrdering::Relaxed);
+            scored
+        }
+        Verdict::Keep => scored,
+        Verdict::Switch(i) => vec![(lines[i].clone(), 1.0)],
+    }
+}
+
+/// What the measured lines say about the incumbent (line 0).
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    /// The incumbent finished too few worlds to compare anything with it.
+    Unmeasured,
+    Keep,
+    Switch(usize),
+}
+
+/// Each line against the incumbent on the worlds both finished: the gain is
+/// the mean of the paired differences, and no shared world may be worse than
+/// `-WORST_WORLD_SLACK`. A decided game is decided: nothing to improve on a
+/// win.
+fn pick_switch(values: &[Vec<f64>], unplayable: &[bool]) -> Verdict {
+    let incumbent = &values[0];
+    if incumbent.len() < MIN_WORLDS {
+        return Verdict::Unmeasured;
+    }
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-    let incumbent_mean = mean(&incumbent);
-    // A decided game is decided: nothing to improve on a win, and a loss in
-    // every line is not a reason to swap.
-    if incumbent_mean >= DECIDED {
-        return scored;
+    if mean(incumbent) >= DECIDED {
+        return Verdict::Keep;
     }
-
     let mut best: Option<(f64, usize)> = None;
-    for (i, value) in values.iter().enumerate().skip(1) {
-        let Some(per_world) = value else { continue };
-        let worst_gap = per_world
-            .iter()
-            .zip(&incumbent)
-            .map(|(line, inc)| line - inc)
-            .fold(f64::INFINITY, f64::min);
-        if worst_gap < -WORST_WORLD_SLACK {
+    for (i, per_world) in values.iter().enumerate().skip(1) {
+        if unplayable[i] {
             continue;
         }
-        let m = mean(per_world);
-        if best.is_none_or(|(b, _)| m > b) {
-            best = Some((m, i));
+        let shared = per_world.len().min(incumbent.len());
+        if shared < MIN_WORLDS {
+            continue;
+        }
+        let gaps: Vec<f64> = per_world[..shared]
+            .iter()
+            .zip(&incumbent[..shared])
+            .map(|(line, inc)| line - inc)
+            .collect();
+        if gaps.iter().any(|gap| *gap < -WORST_WORLD_SLACK) {
+            continue;
+        }
+        let gain = mean(&gaps);
+        if best.is_none_or(|(b, _)| gain > b) {
+            best = Some((gain, i));
         }
     }
     match best {
-        Some((m, i)) if m - incumbent_mean >= SWITCH_MARGIN => vec![(lines[i].clone(), 1.0)],
-        _ => scored,
+        Some((gain, i)) if gain >= SWITCH_MARGIN => Verdict::Switch(i),
+        _ => Verdict::Keep,
     }
 }
 
@@ -372,6 +419,34 @@ fn measure_lines(
 mod tests {
     use super::*;
     use engine::types::identifiers::ObjectId;
+
+    #[test]
+    fn a_line_cut_by_the_clock_is_compared_on_the_worlds_it_finished() {
+        // Pass (line 2) finished 2 of the incumbent's 3 worlds and is +3 in
+        // both: it wins, compared world by world.
+        let values = vec![vec![0.0, 1.0, 50.0], vec![0.5, 1.5, 0.5], vec![3.0, 4.0]];
+        assert_eq!(pick_switch(&values, &[false; 3]), Verdict::Switch(2));
+    }
+
+    #[test]
+    fn one_world_never_crowns_a_line() {
+        let values = vec![vec![0.0, 0.0], vec![20.0]];
+        assert_eq!(pick_switch(&values, &[false; 2]), Verdict::Keep);
+        let values = vec![vec![0.0], vec![20.0]];
+        assert_eq!(pick_switch(&values, &[false; 2]), Verdict::Unmeasured);
+    }
+
+    #[test]
+    fn a_disaster_in_one_shared_world_vetoes_the_switch() {
+        let values = vec![vec![0.0, 0.0, 0.0], vec![10.0, 10.0, -7.0]];
+        assert_eq!(pick_switch(&values, &[false; 2]), Verdict::Keep);
+    }
+
+    #[test]
+    fn an_unplayable_line_is_left_out() {
+        let values = vec![vec![0.0, 0.0], vec![10.0, 10.0]];
+        assert_eq!(pick_switch(&values, &[false, true]), Verdict::Keep);
+    }
 
     #[test]
     fn lines_lead_with_the_argmax_and_always_include_pass() {

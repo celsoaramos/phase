@@ -1365,6 +1365,12 @@ pub struct AiConfig {
     /// opponent's turn, and a projection per policy call per step is what made
     /// a single decision cost seconds.
     pub projections: bool,
+    /// Whether the priority shortcut withholds its pass/low-value answer when a
+    /// fetch-then-cast route certifies (`has_certified_fetch_then_cast_route`,
+    /// which replays the fetch through the reducer). Off only inside a
+    /// `turn_sim` playout: measured 01/11/2026 on a landfall mirror, that check
+    /// was ~28% of the turn simulation's time, paid at every playout step.
+    pub fetch_route_check: bool,
     /// Wall clock for the turn playouts even in measurement mode. `None` in
     /// every preset; the lab sets it (`tsim_ms=`) to stand in for the slower
     /// browser so it measures what the browser can actually finish.
@@ -1584,6 +1590,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
         combat_simulation: difficulty >= AiDifficulty::VeryHard,
         turn_simulation: difficulty >= AiDifficulty::VeryHard,
         projections: true,
+        fetch_route_check: true,
         turn_simulation_clock_ms: None,
         search,
         weights: EvalWeightSet::learned(),

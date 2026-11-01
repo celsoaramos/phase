@@ -763,8 +763,9 @@ fn fast_priority_action(
     }
 
     if large_board_main_phase_has_no_development_sources(state, ai_player) {
-        return (!has_certified_fetch_then_cast_route(state, ai_player))
-            .then_some(GameAction::PassPriority);
+        return (!(config.fetch_route_check
+            && has_certified_fetch_then_cast_route(state, ai_player)))
+        .then_some(GameAction::PassPriority);
     }
 
     // While the engine's pass authority holds, the issued contract holds every
@@ -801,7 +802,9 @@ fn fast_priority_action(
         })
     });
     // One fetch-then-cast filter covers both answers.
-    action.filter(|_| !has_certified_fetch_then_cast_route(state, ai_player))
+    action.filter(|_| {
+        !(config.fetch_route_check && has_certified_fetch_then_cast_route(state, ai_player))
+    })
 }
 
 /// The certified lethal-reach answer to the AI's decision — the next step of a
@@ -3090,7 +3093,8 @@ fn score_candidates_uncertified(
     deadline: engine::util::Deadline,
     root: RootReuse<'_>,
 ) -> Vec<(GameAction, f64)> {
-    let scored = score_candidates_uncertified_searched(root_domain, config, session, deadline, root);
+    let scored =
+        score_candidates_uncertified_searched(root_domain, config, session, deadline, root);
     let (state, ai_player) = (root_domain.state, root_domain.ai_player);
     if !config.turn_simulation || !crate::turn_sim::applies(state, ai_player) {
         return scored;
