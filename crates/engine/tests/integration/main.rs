@@ -1262,6 +1262,7 @@ mod msh_wave5a_group2_conditions;
 mod mulligan_serum_powder_scope;
 mod multi_layer_continuous_effect;
 mod multi_upkeep_triggers_suspend;
+mod mf_relatos_20261030b;
 mod multiface_composite_name_resolution;
 mod multiply_pt_trailing_clause;
 mod must_attack_player_attribution;

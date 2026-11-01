@@ -34075,8 +34075,9 @@ impl ContinuousEffectOnset {
 /// `mark_independent_mana_spent_gates` (a clause gated on the mana spent to cast
 /// the spell that directly follows another such clause, CR 601.2h — its gate
 /// reads the payment, never the previous clause), and by `settle_trailing_guard`
-/// (a suffix-guarded instruction after an earlier suffix-guarded one across
-/// ", then", CR 608.2c) — never by ordinary
+/// (a guarded instruction after an earlier suffix-guarded one across ", then"
+/// or a sentence break, CR 608.2c — the suffix guard governs only its own
+/// instruction) — never by ordinary
 /// sentence-boundary `SequentialSibling` stamping — so it cannot leak into a
 /// Thieving-Skydiver-shaped dependent continuation that also happens to carry
 /// `SequentialSibling`.

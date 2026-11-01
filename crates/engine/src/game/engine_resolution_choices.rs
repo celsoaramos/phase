@@ -1673,7 +1673,10 @@ fn finalize_standard_search_selection(
                 .outer_ability_continuation_of_active_post_replacement_draw()
                 .map(|continuation| &continuation.pending)
         })
-        .is_some_and(|continuation| effects::chain_references_tracked_set(&continuation.chain));
+        .is_some_and(|continuation| {
+            effects::chain_references_tracked_set(&continuation.chain)
+                && effects::continuation_reads_search_result(&continuation.chain)
+        });
     if continuation_consumes_tracked_set {
         effects::publish_fresh_tracked_set(state, chosen.to_vec());
     }

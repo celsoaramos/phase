@@ -3469,7 +3469,7 @@ impl GameObject {
     /// records that the right half is showing — the CR 709.5d mapping,
     /// see `room::live_face_door`). Idempotent: a `None` stamp is claimed
     /// once, and the other half is merged only while absent.
-    fn install_room_door_text(&mut self) {
+    pub(crate) fn install_room_door_text(&mut self) {
         let live_door = crate::game::room::live_face_door(self);
         let other_door = match live_door {
             RoomDoor::Left => RoomDoor::Right,
