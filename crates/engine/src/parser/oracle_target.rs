@@ -196,10 +196,35 @@ pub(crate) fn resolve_demonstrative_target<'a>(
         .parse(text)
         .ok()?;
     match &ctx.subject {
+        // CR 608.2c: a PLAYER subject ("When you unlock this door", "Whenever an
+        // opponent attacks") is not an object, so once an earlier instruction of
+        // the chain produced a permanent, "that creature" names that permanent
+        // (Slimy Aquarium: "manifest dread, then put a +1/+1 counter on that
+        // creature"), not the triggering object. Without a produced permanent the
+        // triggering-object binding stays (a cast trigger's spell).
+        Some(subject) if ctx.token_created_in_chain && trigger_subject_is_player_actor(subject) => {
+            None
+        }
         Some(subject) if !matches!(subject, TargetFilter::SelfRef | TargetFilter::Any) => {
             Some(rest)
         }
         _ => None,
+    }
+}
+
+/// CR 109.5 + CR 608.2k: the trigger subject is the acting PLAYER, never an
+/// object — the player-actor shapes `extract_trigger_subject_for_context`
+/// produces ("you …" → `Controller`, "a player …" → `Player`, "an opponent …" /
+/// "another player …" → a controller-only `Typed` filter). A player can't be the
+/// antecedent of an object demonstrative ("that creature"), so these subjects
+/// never re-anchor it to the triggering object over a chain-created permanent.
+pub(crate) fn trigger_subject_is_player_actor(subject: &TargetFilter) -> bool {
+    match subject {
+        TargetFilter::Controller | TargetFilter::Player => true,
+        TargetFilter::Typed(typed) => {
+            *typed == TypedFilter::default().controller(ControllerRef::Opponent)
+        }
+        _ => false,
     }
 }
 
