@@ -22442,6 +22442,25 @@ fn try_parse_verb_and_target<'a>(
                 rem,
             ));
         }
+        // CR 122.1 + CR 608.2c: a typed counter list on one recipient ("put a
+        // +1/+1 counter and a lifelink counter on that creature") — its
+        // remainder may continue with a second recipient ("and a +1/+1 counter
+        // and a lifelink counter on ~", Arwen, Mortal Queen), which the
+        // compound splitter reads as its own instruction.
+        if let Some((entries, target, rem, multi_target)) =
+            counter::try_parse_put_counter_chain(lower, text, ctx)
+        {
+            return Some((
+                TargetedImperativeAst::ZoneCounterProxy(Box::new(
+                    ZoneCounterImperativeAst::PutCounterList {
+                        entries,
+                        target,
+                        multi_target,
+                    },
+                )),
+                rem,
+            ));
+        }
         if let Some((
             Effect::PutCounter {
                 counter_type,
@@ -22628,10 +22647,21 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
         return None;
     }
 
-    // Lower the primary AST to an Effect
-    let primary_effect = match primary_ast {
-        TargetedImperativeAst::ZoneCounterProxy(ast) => lower_zone_counter_ast(*ast),
-        other => lower_targeted_action_ast(other),
+    // Lower the primary AST to an Effect. A counter list lowers to a chain of
+    // `PutCounter` links on one recipient; the continuation hangs off its tail.
+    let (primary_effect, primary_list) = match primary_ast {
+        TargetedImperativeAst::ZoneCounterProxy(ast) => match *ast {
+            ZoneCounterImperativeAst::PutCounterList {
+                entries,
+                target,
+                multi_target,
+            } => {
+                let list = imperative::lower_put_counter_list(entries, target, multi_target);
+                (list.effect, Some((list.sub_ability, list.multi_target)))
+            }
+            ast => (lower_zone_counter_ast(ast), None),
+        },
+        other => (lower_targeted_action_ast(other), None),
     };
 
     let sub_lower = sub_text.to_lowercase();
@@ -23029,6 +23059,9 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
     // (`ChosenColorQualifierScope` rule 1) — only the recovered `multi` bound
     // is kept, the derived contexts are dropped.
     let primary_multi_target = match &primary_effect {
+        Effect::PutCounter { .. } if primary_list.is_some() => {
+            primary_list.as_ref().and_then(|(_, multi)| multi.clone())
+        }
         Effect::PutCounter { .. } => {
             let primary_clause = &text[..text.len() - remainder.len()];
             let primary_lower = primary_clause.to_ascii_lowercase();
@@ -23052,12 +23085,21 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
         _ => None,
     };
 
+    // CR 608.2c: the continuation follows every counter of the primary list.
+    let sub_ability = match primary_list.and_then(|(chain, _)| chain) {
+        Some(mut chain) => {
+            crate::parser::oracle::append_sub_ability(&mut chain, sub_ability);
+            chain
+        }
+        None => Box::new(sub_ability),
+    };
+
     Some(ParsedEffectClause {
         optional_targeting: false,
         unlowered_guard: None,
         effect: primary_effect,
         duration: None,
-        sub_ability: Some(Box::new(sub_ability)),
+        sub_ability: Some(sub_ability),
         distribute: None,
         multi_target: primary_multi_target,
         condition: None,

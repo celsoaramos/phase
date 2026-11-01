@@ -2106,7 +2106,7 @@ fn target_filter_uses_filter_prop(
     filter_contains_filter_prop(filter, pred)
 }
 
-fn append_sub_ability(chain: &mut AbilityDefinition, tail: AbilityDefinition) {
+pub(crate) fn append_sub_ability(chain: &mut AbilityDefinition, tail: AbilityDefinition) {
     let mut cursor = chain;
     while let Some(ref mut next) = cursor.sub_ability {
         cursor = next;

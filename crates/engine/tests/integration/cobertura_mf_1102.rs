@@ -6,13 +6,18 @@
 //!   exiles cards from the top of their library until they exile a nonland card
 //!   with a different name than that spell. They may cast that card without
 //!   paying its mana cost." — o número escolhido, o "different name", e quem
-//!   conjura (o controlador do mágica anulada, não o de Tibalt).
+//!   conjura (o controlador da mágica anulada, não o de Tibalt).
+//! - Arwen, Mortal Queen (CR 122.1 + CR 608.2c): "Put a +1/+1 counter and a
+//!   lifelink counter on that creature and a +1/+1 counter and a lifelink
+//!   counter on Arwen" — a lista de marcadores com um segundo destinatário.
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
+use engine::types::counter::{parse_counter_type, CounterType};
 use engine::types::game_state::{CastingVariant, StackEntry, StackEntryKind, WaitingFor};
 use engine::types::identifiers::{CardId, ObjectId};
+use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
@@ -230,4 +235,57 @@ fn tibalts_trickery_declined_cast_bottoms_every_exiled_card() {
         0,
         "every exiled card went to the bottom"
     );
+}
+
+const ARWEN: &str = "Arwen enters with an indestructible counter on her.\n{1}, Remove an \
+    indestructible counter from Arwen: Another target creature gains indestructible until end of \
+    turn. Put a +1/+1 counter and a lifelink counter on that creature and a +1/+1 counter and a \
+    lifelink counter on Arwen.";
+
+fn counters(runner: &GameRunner, id: ObjectId, kind: &CounterType) -> u32 {
+    runner.state().objects[&id]
+        .counters
+        .get(kind)
+        .copied()
+        .unwrap_or(0)
+}
+
+#[test]
+fn arwen_puts_both_counters_on_the_target_and_on_herself() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let arwen = scenario
+        .add_creature(P0, "Arwen", 2, 2)
+        .from_oracle_text(ARWEN)
+        .id();
+    let indestructible = parse_counter_type("indestructible");
+    scenario.with_counter(arwen, indestructible.clone(), 1);
+    let bear = scenario.add_creature(P0, "Ally Bear", 2, 2).id();
+    scenario.add_basic_land(P0, ManaColor::White);
+    let mut runner = scenario.build();
+
+    runner.activate(arwen, 0).target_object(bear).resolve();
+
+    let lifelink = parse_counter_type("lifelink");
+    assert_eq!(
+        counters(&runner, arwen, &indestructible),
+        0,
+        "the cost removed it"
+    );
+    assert!(
+        runner.state().objects[&bear].has_keyword(&Keyword::Indestructible),
+        "the target gains indestructible"
+    );
+    for (who, id) in [("target", bear), ("Arwen", arwen)] {
+        assert_eq!(
+            counters(&runner, id, &CounterType::Plus1Plus1),
+            1,
+            "+1/+1 counter on {who}"
+        );
+        assert_eq!(
+            counters(&runner, id, &lifelink),
+            1,
+            "lifelink counter on {who}"
+        );
+    }
 }
