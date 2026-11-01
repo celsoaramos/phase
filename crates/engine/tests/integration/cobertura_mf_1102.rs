@@ -33,8 +33,13 @@ fn put_shock_on_stack(runner: &mut GameRunner) -> ObjectId {
         "Shock".to_string(),
         Zone::Stack,
     );
-    runner.state_mut().objects.get_mut(&spell).unwrap().card_types.core_types =
-        vec![CoreType::Instant];
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&spell)
+        .unwrap()
+        .card_types
+        .core_types = vec![CoreType::Instant];
     runner.state_mut().stack.push_back(StackEntry {
         id: spell,
         source_id: spell,
@@ -73,7 +78,9 @@ fn tibalt_to_cast_prompt() -> Trickery {
     scenario.add_basic_land(P0, ManaColor::Red);
     scenario.add_basic_land(P0, ManaColor::Red);
 
-    let filler = scenario.add_land_to_library_top(P1, "Unreached Plains").id();
+    let filler = scenario
+        .add_land_to_library_top(P1, "Unreached Plains")
+        .id();
     let windfall = scenario
         .add_spell_to_library_top(P1, "Windfall Gift", false)
         .from_oracle_text("You gain 5 life.")
@@ -148,7 +155,11 @@ fn assert_reveal(t: &Trickery) {
         Zone::Exile,
         "a card with the countered spell's name does not stop the reveal"
     );
-    assert_eq!(zone(&t.runner, t.windfall), Zone::Exile, "the reveal stops here");
+    assert_eq!(
+        zone(&t.runner, t.windfall),
+        Zone::Exile,
+        "the reveal stops here"
+    );
     assert_eq!(zone(&t.runner, t.filler), Zone::Library);
 }
 
@@ -160,19 +171,28 @@ fn tibalts_trickery_offers_the_free_cast_to_the_countered_spells_controller() {
     else {
         unreachable!()
     };
-    assert_eq!(player, P1, "\"they may cast\" asks the countered spell's controller");
+    assert_eq!(
+        player, P1,
+        "\"they may cast\" asks the countered spell's controller"
+    );
 
     t.runner
         .act(GameAction::DecideOptionalEffect { accept: true })
         .expect("accept the free cast");
     for _ in 0..16 {
         if !t.runner.state().stack.is_empty() {
-            t.runner.act(GameAction::PassPriority).expect("pass priority");
+            t.runner
+                .act(GameAction::PassPriority)
+                .expect("pass priority");
         }
     }
 
     assert_eq!(life(&t.runner, P1), 25, "P1 cast the sorcery and gained 5");
-    assert_eq!(life(&t.runner, P0), 20, "Tibalt's controller did not cast it");
+    assert_eq!(
+        life(&t.runner, P0),
+        20,
+        "Tibalt's controller did not cast it"
+    );
     assert_eq!(zone(&t.runner, t.windfall), Zone::Graveyard);
     let library = &t.runner.state().players[P1.0 as usize].library;
     assert_eq!(library.front().copied(), Some(t.filler));
@@ -196,7 +216,9 @@ fn tibalts_trickery_declined_cast_bottoms_every_exiled_card() {
         .expect("decline the free cast");
     for _ in 0..16 {
         if !t.runner.state().stack.is_empty() {
-            t.runner.act(GameAction::PassPriority).expect("pass priority");
+            t.runner
+                .act(GameAction::PassPriority)
+                .expect("pass priority");
         }
     }
     assert_eq!(life(&t.runner, P1), 20, "nothing was cast");
