@@ -1752,6 +1752,22 @@ fn follows_subtype_status_qualifier(haystack: &str, pos: usize) -> bool {
         .any(|qualifier| last_word.eq_ignore_ascii_case(qualifier))
 }
 
+/// CR 205.3j + CR 201.5c: a subtype-word occurrence right after a population
+/// quantifier ("each Garruk you control", "another Sliver") counts objects of
+/// that TYPE; a card's own name is never quantified, so it stays literal. The
+/// bare "target <name>" form is left alone: it can be the card naming itself
+/// ("that target Cloud", Cloud, Planet's Champion).
+fn follows_population_quantifier(haystack: &str, pos: usize) -> bool {
+    let before = haystack[..pos].trim_end();
+    let last_word = before
+        .rsplit(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or("");
+    ["each", "another", "other"]
+        .iter()
+        .any(|quantifier| last_word.eq_ignore_ascii_case(quantifier))
+}
+
 /// nom combinator: match the type-addition marker
 /// "in addition to {pronoun} other [colors and ][creature ]types".
 ///
@@ -1858,6 +1874,7 @@ fn replace_all_words_case_sensitive_preserving_subtype_status_refs(
             && at_word_end
             && pos >= last_end
             && !follows_subtype_status_qualifier(haystack, pos)
+            && !follows_population_quantifier(haystack, pos)
             && !precedes_type_addition_clause(haystack, end)
             && !precedes_core_type_word(haystack, end)
             && !precedes_attachment_qualifier(haystack, end)
@@ -2825,9 +2842,17 @@ pub fn normalize_card_name_refs_reporting(
     // additional untap step" on Untap, Upkeep, Draw) or a keyword ("has storm"
     // on Storm, Force of Nature; CR 702.40a). A multi-word short name stays
     // case-insensitive, like a multi-word full name.
+    // CR 205.3j: a single-word short name that is also a subtype ("Garruk,
+    // Cursed Huntsman" — a planeswalker type) keeps its type-reference
+    // occurrences literal ("each Garruk you control"), as the full-name and
+    // "of"-name paths do.
     if let Some(short_name) = comma_short_self_name(card_name) {
         result = if short_name.contains(' ') {
             replace_all_words(&result, short_name, "~")
+        } else if is_subtype_word(&short_name.to_lowercase()) {
+            replace_all_words_case_sensitive_preserving_subtype_status_refs(
+                &result, short_name, "~",
+            )
         } else {
             replace_all_words_case_sensitive(&result, short_name, "~")
         };

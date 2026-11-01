@@ -37144,11 +37144,12 @@ pub enum ReplacementCondition {
     /// effect-driven (free) turn-up never publishes one. Payment-fact sibling
     /// of `CastVariantPaid` / `CastViaEscape` / `CastViaKicker`.
     TurnUpCostSourcePaid { source: TurnUpCostSource },
-    /// CR 603.4: "if you cast it from [zone]" — replacement applies only when
-    /// the source object was cast from the specified zone (e.g., Myojin's
-    /// "enters with an indestructible counter on it if you cast it from your
-    /// hand"). Evaluated against `GameObject.cast_from_zone`.
-    CastFromZone { zone: Zone },
+    /// CR 603.4: "if you cast it [from <zone>]" — replacement applies only when
+    /// the source object was cast, from the specified zone when one is printed
+    /// (Myojin's "enters with an indestructible counter on it if you cast it
+    /// from your hand"; `None` for Nine-Lives Familiar's bare "if you cast
+    /// it"). Evaluated against `GameObject.cast_from_zone`.
+    CastFromZone { zone: Option<Zone> },
     /// CR 614.1d + CR 601: Gates a replacement on how the *entering* object
     /// (the event's `affected_object_id`) arrived — NOT the replacement source.
     /// Both halves reference the entering object, which distinguishes this from

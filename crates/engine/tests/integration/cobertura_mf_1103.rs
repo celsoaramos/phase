@@ -10,6 +10,13 @@
 //!   cast from the command zone this game" — X é a contagem DESSE comandante
 //!   (incluindo esta conjuração), não a soma com o parceiro (o lote 1031 lia a
 //!   soma).
+//! - Garruk, Cursed Huntsman (CR 201.5c + CR 205.3j + CR 606.3): o token Lobo
+//!   "put a loyalty counter on each Garruk you control" — "Garruk" é o nome
+//!   curto da carta mas também subtipo de planeswalker; cada Garruk que você
+//!   controla ganha o marcador, e um planeswalker de outro subtipo não.
+//! - Nine-Lives Familiar (CR 614.1c + CR 601.2): "enters with eight revival
+//!   counters on it if you cast it" — conjurada de qualquer zona entra com 8;
+//!   posta no campo sem ser conjurada entra sem nenhum.
 
 use engine::game::commander::record_commander_cast;
 use engine::game::effects::attach;
@@ -17,6 +24,7 @@ use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{Effect, TargetRef};
 use engine::types::actions::GameAction;
+use engine::types::counter::{parse_counter_type, CounterType};
 use engine::types::game_state::{CastPaymentMode, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaType, ManaUnit};
@@ -171,4 +179,137 @@ fn study_hall_scries_by_that_commanders_own_cast_count() {
         "scry 2: the earlier cast plus this one; the partner's three casts don't count"
     );
     assert_eq!(runner.state().objects[&commander].zone, Zone::Battlefield);
+}
+
+fn drain_stack(runner: &mut engine::game::scenario::GameRunner) {
+    for _ in 0..16 {
+        if runner.state().stack.is_empty() {
+            return;
+        }
+        runner.act(GameAction::PassPriority).expect("pass priority");
+    }
+    panic!("stack did not empty: {:?}", runner.state().waiting_for);
+}
+
+fn counter_count(
+    runner: &engine::game::scenario::GameRunner,
+    id: ObjectId,
+    kind: &CounterType,
+) -> u32 {
+    runner.state().objects[&id]
+        .counters
+        .get(kind)
+        .copied()
+        .unwrap_or(0)
+}
+
+const GARRUK: &str = "[0]: Create two 2/2 black and green Wolf creature tokens with \"When this \
+    token dies, put a loyalty counter on each Garruk you control.\"\n[\u{2212}3]: Destroy target \
+    creature. Draw a card.\n[\u{2212}6]: You get an emblem with \"Creatures you control get +3/+3 \
+    and have trample.\"";
+
+#[test]
+fn garruk_wolf_death_adds_loyalty_to_each_garruk_you_control() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let garruk = scenario
+        .add_planeswalker_from_oracle(P0, "Garruk, Cursed Huntsman", "Garruk", 5, GARRUK)
+        .id();
+    let other_garruk = scenario
+        .add_planeswalker_from_oracle(P0, "Garruk Stand-in", "Garruk", 3, "")
+        .id();
+    let jace = scenario
+        .add_planeswalker_from_oracle(P0, "Jace Stand-in", "Jace", 3, "")
+        .id();
+    let enemy_garruk = scenario
+        .add_planeswalker_from_oracle(P1, "Enemy Garruk", "Garruk", 3, "")
+        .id();
+    let bolt = scenario.add_bolt_to_hand(P0);
+    let mut runner = scenario.build();
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: garruk,
+            ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("activate Garruk's [0]");
+    drain_stack(&mut runner);
+    let wolves: Vec<ObjectId> = runner
+        .state()
+        .battlefield
+        .iter()
+        .copied()
+        .filter(|id| runner.state().objects[id].name.contains("Wolf"))
+        .collect();
+    assert_eq!(wolves.len(), 2, "the [0] makes two Wolf tokens");
+
+    let loyalty = CounterType::Loyalty;
+    assert_eq!(counter_count(&runner, garruk, &loyalty), 5);
+    runner.cast(bolt).target_object(wolves[0]).resolve();
+    drain_stack(&mut runner);
+    assert!(
+        !runner.state().battlefield.contains(&wolves[0]),
+        "the bolted Wolf died"
+    );
+    assert_eq!(counter_count(&runner, garruk, &loyalty), 6, "Garruk itself");
+    assert_eq!(
+        counter_count(&runner, other_garruk, &loyalty),
+        4,
+        "every Garruk you control, not only the source"
+    );
+    assert_eq!(counter_count(&runner, jace, &loyalty), 3, "not a Garruk");
+    assert_eq!(
+        counter_count(&runner, enemy_garruk, &loyalty),
+        3,
+        "a Garruk you don't control"
+    );
+}
+
+const NINE_LIVES_FAMILIAR: &str = "This creature enters with eight revival counters on it if you \
+    cast it.\nWhen this creature dies, if it had a revival counter on it, return it to the \
+    battlefield with one fewer revival counter on it at the beginning of the next end step.";
+
+#[test]
+fn nine_lives_familiar_gets_revival_counters_only_when_cast() {
+    let revival = parse_counter_type("revival");
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let cast_one = scenario
+        .add_creature_to_hand_from_oracle(P0, "Nine-Lives Familiar", 1, 1, NINE_LIVES_FAMILIAR)
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(cast_one).resolve();
+    drain_stack(&mut runner);
+    assert_eq!(runner.state().objects[&cast_one].zone, Zone::Battlefield);
+    assert_eq!(
+        counter_count(&runner, cast_one, &revival),
+        8,
+        "cast from hand: enters with eight revival counters"
+    );
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let reanimated = scenario
+        .add_creature_to_graveyard(P0, "Nine-Lives Familiar", 1, 1)
+        .from_oracle_text(NINE_LIVES_FAMILIAR)
+        .id();
+    let reanimate = scenario
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Reanimate Stand-in",
+            false,
+            "Return target creature card from your graveyard to the battlefield.",
+        )
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(reanimate).target_object(reanimated).resolve();
+    drain_stack(&mut runner);
+    assert_eq!(runner.state().objects[&reanimated].zone, Zone::Battlefield);
+    assert_eq!(
+        counter_count(&runner, reanimated, &revival),
+        0,
+        "put onto the battlefield without being cast: no revival counters"
+    );
 }

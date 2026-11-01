@@ -7013,27 +7013,32 @@ fn parse_lower_mana_cost(cost_text: &str) -> Option<ManaCost> {
 /// Composable: any zone that the runtime tracks via `cast_from_zone` can
 /// be matched here. We currently parse `your hand`, `your graveyard`,
 /// and `exile` since those are the textually attested forms.
-fn extract_cast_from_zone_suffix(work_text: &str) -> Option<Zone> {
+fn extract_cast_from_zone_suffix(work_text: &str) -> Option<Option<Zone>> {
     use crate::parser::oracle_nom::error::OracleError;
     use nom::bytes::complete::tag;
     // Locate the suffix.
-    let (rest, _) = take_until::<_, _, OracleError<'_>>("if you cast it from ")
+    let (rest, _) = take_until::<_, _, OracleError<'_>>("if you cast it")
         .parse(work_text)
         .ok()?;
-    let (rest, _) = tag::<_, _, OracleError<'_>>("if you cast it from ")
+    let (rest, _) = tag::<_, _, OracleError<'_>>("if you cast it")
         .parse(rest)
         .ok()?;
-    // Match the zone tail.
-    let zone = if let Ok((_, _)) = tag::<_, _, OracleError<'_>>("your hand").parse(rest) {
-        Zone::Hand
-    } else if let Ok((_, _)) = tag::<_, _, OracleError<'_>>("your graveyard").parse(rest) {
-        Zone::Graveyard
-    } else if let Ok((_, _)) = tag::<_, _, OracleError<'_>>("exile").parse(rest) {
-        Zone::Exile
-    } else {
-        return None;
-    };
-    Some(zone)
+    // The zone tail, or the bare form ending the sentence ("…eight revival
+    // counters on it if you cast it." — Nine-Lives Familiar).
+    alt((
+        preceded(
+            tag::<_, _, OracleError<'_>>(" from "),
+            alt((
+                value(Some(Zone::Hand), tag("your hand")),
+                value(Some(Zone::Graveyard), tag("your graveyard")),
+                value(Some(Zone::Exile), tag("exile")),
+            )),
+        ),
+        value(None, (opt(tag(".")), eof)),
+    ))
+    .parse(rest)
+    .ok()
+    .map(|(_, zone)| zone)
 }
 
 /// CR 207.2c (Raid): Detect a trailing "if you attacked this turn" gate
