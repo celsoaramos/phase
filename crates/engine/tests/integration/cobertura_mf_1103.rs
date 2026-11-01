@@ -15,9 +15,9 @@ use engine::game::commander::record_commander_cast;
 use engine::game::effects::attach;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
-use engine::types::ability::Effect;
+use engine::types::ability::{Effect, TargetRef};
 use engine::types::actions::GameAction;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{CastPaymentMode, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaType, ManaUnit};
 use engine::types::phase::Phase;
@@ -25,6 +25,13 @@ use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
 const DEVOUT_HARPIST: &str = "{T}: Destroy target Aura attached to a creature.";
+
+fn aura(scenario: &mut GameScenario, owner: PlayerId, name: &str, oracle: &str) -> ObjectId {
+    scenario
+        .add_enchantment_from_oracle(owner, name, oracle)
+        .with_subtypes(vec!["Aura"])
+        .id()
+}
 
 #[test]
 fn devout_harpist_targets_only_auras_attached_to_creatures() {
@@ -35,26 +42,59 @@ fn devout_harpist_targets_only_auras_attached_to_creatures() {
         .from_oracle_text(DEVOUT_HARPIST)
         .id();
     let ogre = scenario.add_creature(P1, "Enemy Ogre", 3, 3).id();
+    let bear = scenario.add_creature(P0, "Ally Bear", 2, 2).id();
     let field = scenario
         .add_land_from_oracle(P1, "Field", "{T}: Add {G}.")
         .id();
     let on_ogre = aura(&mut scenario, P1, "Aura On Ogre", "Enchant creature");
+    let on_bear = aura(&mut scenario, P0, "Aura On Bear", "Enchant creature");
     let on_field = aura(&mut scenario, P1, "Aura On Field", "Enchant land");
     let mut runner = scenario.build();
     attach::attach_to(runner.state_mut(), on_ogre, ogre);
+    attach::attach_to(runner.state_mut(), on_bear, bear);
     attach::attach_to(runner.state_mut(), on_field, field);
 
-    assert!(
-        runner
-            .activate(harpist, 0)
-            .target_object(on_field)
-            .try_resolve()
-            .is_err(),
-        "an Aura attached to a land is not a legal target"
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: harpist,
+            ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("activate Devout Harpist");
+    let WaitingFor::TargetSelection { target_slots, .. } = runner.state().waiting_for.clone()
+    else {
+        panic!(
+            "expected a target prompt, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    let mut legal: Vec<ObjectId> = target_slots
+        .iter()
+        .flat_map(|slot| slot.legal_targets.iter())
+        .filter_map(|target| match target {
+            TargetRef::Object(id) => Some(*id),
+            TargetRef::Player(_) => None,
+        })
+        .collect();
+    legal.sort();
+    let mut expected = vec![on_ogre, on_bear];
+    expected.sort();
+    assert_eq!(
+        legal, expected,
+        "only the Auras attached to creatures are legal targets, not the one on a land"
     );
-    assert_eq!(runner.state().objects[&on_field].zone, Zone::Battlefield);
 
-    runner.activate(harpist, 0).target_object(on_ogre).resolve();
+    runner
+        .act(GameAction::SelectTargets {
+            targets: vec![TargetRef::Object(on_ogre)],
+        })
+        .expect("target the Aura on the Ogre");
+    for _ in 0..8 {
+        if runner.state().stack.is_empty() {
+            break;
+        }
+        runner.act(GameAction::PassPriority).expect("pass priority");
+    }
     assert_eq!(runner.state().objects[&on_ogre].zone, Zone::Graveyard);
     assert_eq!(runner.state().objects[&on_field].zone, Zone::Battlefield);
 }
