@@ -1736,6 +1736,46 @@ fn bind_that_many_to_chosen_number(def: &mut AbilityDefinition, prev: Option<&Ab
     }
 }
 
+/// CR 608.2d + CR 122.1: "Choose a counter on target permanent [or player].
+/// Put/Give … counter of that kind …" (Ichormoon Gauntlet, Animation Module).
+/// The declared-target sentence lowers to a `TargetOnly` designation: it binds
+/// the target when the ability is put on the stack but chooses no kind, while
+/// the "that kind" placement reads the kind a counter-kind choice bound. Insert
+/// that choice, made on the designated target as the ability resolves, between
+/// the two. A chain that already chooses a kind keeps its own choice.
+fn insert_counter_kind_choice_after_target_designation(
+    defs: &mut Vec<AbilityDefinition>,
+    def: &AbilityDefinition,
+) {
+    let places_chosen_kind_on_target = matches!(
+        &*def.effect,
+        Effect::PutChosenCounter {
+            target: TargetFilter::ParentTarget,
+            ..
+        }
+    );
+    let follows_designation = matches!(
+        defs.last().map(|prev| &*prev.effect),
+        Some(Effect::TargetOnly { .. })
+    );
+    let chain_chooses_kind = defs
+        .iter()
+        .any(|prev| matches!(&*prev.effect, Effect::ChooseCounterKind { .. }));
+    if !places_chosen_kind_on_target || !follows_designation || chain_chooses_kind {
+        return;
+    }
+    let mut choice = AbilityDefinition::new(
+        def.kind,
+        Effect::ChooseCounterKind {
+            target: TargetFilter::ParentTarget,
+            domain: Default::default(),
+            chooser: Default::default(),
+        },
+    );
+    choice.sub_link = def.sub_link;
+    defs.push(choice);
+}
+
 /// CR 608.2c + CR 608.2d (+ CR 603.7b/d/e for the deferred window): Which player
 /// announces a clause-local "may", when the clause NAMES that player instead of
 /// leaving the choice with the ability's controller.
@@ -3014,6 +3054,7 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
         // number the earlier player selection was made by (Itazura).
         bind_chosen_number_anaphor(&mut def, &defs);
         bind_that_many_to_chosen_number(&mut def, defs.last());
+        insert_counter_kind_choice_after_target_designation(&mut defs, &def);
         if let Some(prev) = defs.last() {
             if def.sub_link == SubAbilityLink::ContinuationStep
                 && prev.sub_ability.is_none()

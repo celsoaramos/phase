@@ -58743,7 +58743,7 @@ mod tests {
             "Counter Target".to_string(),
             Zone::Battlefield,
         );
-        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun);
+        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun.into());
         state
             .objects
             .get_mut(&target)

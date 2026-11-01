@@ -13905,6 +13905,26 @@ pub(super) fn parse_imperative_family_ast(
         return Some(ImperativeFamilyAst::GainKeyword(effect));
     }
 
+    // CR 122.1 + CR 122.6: "give <anaphor> another counter of that kind" — the
+    // give-phrased form of the chosen-kind placement (Animation Module). An
+    // anchored nom production beside `recruit` / `assimilate` for the same
+    // family (B) reason: no new string-literal `match first_word` arm.
+    if let Some(Effect::PutChosenCounter {
+        target,
+        count,
+        target_condition,
+    }) = nom_on_lower(text, lower, |i| value((), tag("give ")).parse(i))
+        .and_then(|((), rest)| super::counter::try_parse_give_chosen_counter(&rest.to_lowercase()))
+    {
+        return Some(ImperativeFamilyAst::ZoneCounter(
+            ZoneCounterImperativeAst::PutChosenCounter {
+                target,
+                count,
+                target_condition,
+            },
+        ));
+    }
+
     // CR 724.1: "end the turn" (Time Stop, Sundial of the Infinite, Obeka,
     // Glorious End, Discontinuity, Day's Undoing). Whole-phrase imperative
     // with no target; parse it as an anchored nom production rather than a

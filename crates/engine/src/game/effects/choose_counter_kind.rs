@@ -2,7 +2,8 @@
 //!
 //! Resolves `Effect::ChooseCounterKind` ("choose a counter on it" — The Caves
 //! of Androzani II/III). The distinct counter kinds present on the resolved
-//! target object are enumerated at resolution time, then:
+//! target object — or targeted player (Animation Module, CR 122.1) — are
+//! enumerated at resolution time, then:
 //!   * 0 kinds → no-op (CR 608.2d: a player can't choose an impossible option),
 //!   * 1 kind  → auto-select (bind directly, no prompt),
 //!   * 2+ kinds → an interactive `WaitingFor::NamedChoice` reusing the shared
@@ -15,12 +16,13 @@
 
 use crate::types::ability::{
     ChoiceType, CounterKindChooser, CounterKindDomain, Effect, EffectError, EffectKind,
-    ResolvedAbility, TargetFilter,
+    ResolvedAbility, TargetFilter, TargetRef,
 };
-use crate::types::counter::CounterType;
+use crate::types::counter::CounterKind;
 use crate::types::events::GameEvent;
 use crate::types::game_state::RandomDraw;
 use crate::types::game_state::{GameState, WaitingFor};
+use crate::types::player::PlayerCounterType;
 
 /// CR 608.2d + CR 122.1: Resolve `Effect::ChooseCounterKind`.
 pub fn resolve(
@@ -81,9 +83,20 @@ pub fn resolve(
     // set, and an exclusion clause narrows THAT set before anything is chosen —
     // never after, or a random draw could pick an already-present kind and then
     // place nothing.
-    let kinds: Vec<CounterType> = match kind_source {
+    let kinds: Vec<CounterKind> = match kind_source {
+        // CR 122.1: players have counters too — "a counter on target permanent
+        // or player" (Animation Module) offers the kinds on whichever was
+        // targeted.
         CounterKindDomain::OnTarget => {
             crate::game::quantity::distinct_counter_kinds_among(state, kind_domain, &filter_ctx)
+                .into_iter()
+                .map(CounterKind::Object)
+                .chain(
+                    player_counter_kinds_on_targets(state, ability, kind_domain)
+                        .into_iter()
+                        .map(CounterKind::Player),
+                )
+                .collect()
         }
         CounterKindDomain::Printed {
             kinds,
@@ -98,7 +111,7 @@ pub fn resolve(
                 );
                 candidates.retain(|kind| !present.contains(kind));
             }
-            candidates
+            candidates.into_iter().map(CounterKind::Object).collect()
         }
     };
 
@@ -170,11 +183,40 @@ pub fn resolve(
     Ok(())
 }
 
+/// CR 122.1 + CR 608.2c: The distinct kinds of counters the targeted players
+/// have, for a choice made on the instruction's own target ("it", "that
+/// permanent or player"). Typed populations ("a permanent you control") name
+/// objects only, so they contribute no player kinds.
+fn player_counter_kinds_on_targets(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    filter: &TargetFilter,
+) -> Vec<PlayerCounterType> {
+    if !matches!(
+        filter,
+        TargetFilter::ParentTarget | TargetFilter::ParentTargetSlot { .. }
+    ) {
+        return Vec::new();
+    }
+    let players: Vec<&crate::types::player::Player> =
+        crate::game::targeting::resolved_targets(ability, filter, state)
+            .into_iter()
+            .filter_map(|target| match target {
+                TargetRef::Player(id) => state.players.iter().find(|p| p.id == id),
+                TargetRef::Object(_) => None,
+            })
+            .collect();
+    PlayerCounterType::ALL
+        .into_iter()
+        .filter(|kind| players.iter().any(|player| kind.count_on(player) > 0))
+        .collect()
+}
+
 /// CR 608.2c + CR 122.1: Read the counter kind selected by the immediately
 /// preceding counter-kind instruction. This dedicated resolution result is the
 /// only authority: a source object, its LKI, and `last_named_choice` may all
 /// describe older state once an iteration has advanced or the source left.
-pub(crate) fn chosen_counter_kind(state: &GameState) -> Option<CounterType> {
+pub(crate) fn chosen_counter_kind(state: &GameState) -> Option<CounterKind> {
     state.chosen_counter_kind_this_resolution.clone()
 }
 
@@ -183,6 +225,7 @@ mod tests {
     use super::*;
     use crate::types::ability::{ControllerRef, FilterProp, TargetFilter, TargetRef, TypedFilter};
     use crate::types::card_type::CoreType;
+    use crate::types::counter::CounterType;
     use crate::types::identifiers::ObjectId;
     use crate::types::player::PlayerId;
 
@@ -482,7 +525,7 @@ mod tests {
         );
         assert_eq!(
             state.chosen_counter_kind_this_resolution,
-            Some(CounterType::Stun),
+            Some(CounterType::Stun.into()),
             "auto-selection records the same explicit resolution result as an interactive answer"
         );
     }
@@ -493,7 +536,7 @@ mod tests {
         let mut state = GameState::new_two_player(1);
         // A prior iteration or departed source may have selected this kind. The
         // zero-kind branch must clear it before the following put can observe it.
-        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun);
+        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun.into());
         let obj = crate::game::zones::create_object(
             &mut state,
             crate::types::identifiers::CardId(1),

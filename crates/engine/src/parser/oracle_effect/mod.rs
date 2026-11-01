@@ -9402,6 +9402,19 @@ pub(crate) fn is_for_each_opponent_choose_controlled(lower: &str) -> bool {
     imperative::is_for_each_opponent_choose_controlled(lower)
 }
 
+/// CR 701.34a + CR 122.1 + CR 608.2d: Is this clause a per-kind iteration over
+/// the counters on one declared target ("for each kind of counter on target
+/// permanent or player, give that permanent or player another counter of that
+/// kind" — Powerful Broker; "… put another counter of that kind on it or remove
+/// one from it" — Dramatist's Puppet)? Its recognizers need the whole clause, so
+/// the two `for each` repeat peels (the chunk loop and
+/// `clause_shell::peel_clause`) keep the prefix on the text. Peeled, the target
+/// would be lost and the body read as a single "that kind" placement.
+pub(crate) fn is_targeted_counter_kind_iteration(text: &str) -> bool {
+    try_parse_proliferate_target(text).is_some()
+        || try_parse_for_each_counter_kind_adjust_target(text).is_some()
+}
+
 pub(crate) fn parse_effect_clause(text: &str, ctx: &mut ParseContext) -> ParsedEffectClause {
     // CR 612.1: "Change the text of <target> by replacing all instances of ..." owns its
     // own duration, so it must run before the clause shell peels a trailing one.
@@ -21072,15 +21085,7 @@ fn try_parse_proliferate_target(text: &str) -> Option<Effect> {
         .trim_end_matches(['.', ' '])
         .to_string();
     let (rem, _) = tag::<_, _, E>("give ").parse(rem_lower.as_str()).ok()?;
-    let (rem, _) = alt((
-        tag::<_, _, E>("that permanent or player"),
-        tag("that permanent"),
-        tag("that player"),
-        tag("them"),
-        tag("it"),
-    ))
-    .parse(rem)
-    .ok()?;
+    let (rem, _) = counter::parse_counter_recipient_anaphor(rem).ok()?;
     let (rem, _) = tag::<_, _, E>(" another counter of that kind")
         .parse(rem)
         .ok()?;
@@ -46097,8 +46102,7 @@ fn parse_effect_chain_ir_body(
         // from it" — Dramatist's Puppet, Quarry Hauler), whose target and choice
         // would likewise be dropped by the generic strip.
         let (repeat_for, text, for_each_reference_target, repeat_for_difference) =
-            if try_parse_proliferate_target(&text).is_some()
-                || try_parse_for_each_counter_kind_adjust_target(&text).is_some()
+            if is_targeted_counter_kind_iteration(&text)
                 // CR 102.2 + CR 608.2c: "for each opponent, choose … that player
                 // controls" is a per-opponent choice, not a repeat count; peeling
                 // the prefix would lose the population "that player" refers to.

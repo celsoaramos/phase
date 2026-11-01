@@ -608,6 +608,49 @@ pub(super) fn try_parse_put_chosen_counter(input: &str) -> Option<Effect> {
     })
 }
 
+/// CR 122.1: The anaphor naming the permanent or player whose counters an
+/// earlier clause read — "that permanent or player" (Animation Module, Skyship
+/// Plunderer), "that permanent", "that creature", "that player", "them", "it".
+/// Longest match first, so "that permanent or player" is not cut short at
+/// "that permanent".
+pub(super) fn parse_counter_recipient_anaphor(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        alt((
+            tag("that permanent or player"),
+            tag("that permanent"),
+            tag("that creature"),
+            tag("that player"),
+            tag("them"),
+            tag("it"),
+        )),
+    )
+    .parse(input)
+}
+
+/// CR 122.1 + CR 122.6: "give <anaphor> another counter of that kind" — the
+/// give-phrased sibling of `try_parse_put_chosen_counter` (Animation Module:
+/// "Give that permanent or player another counter of that kind."). The kind is
+/// the one the preceding counter-kind choice bound, and the recipient is that
+/// choice's permanent or player. `input` has already had the leading "give "
+/// stripped and is lowercase.
+pub(super) fn try_parse_give_chosen_counter(input: &str) -> Option<Effect> {
+    all_consuming((
+        parse_counter_recipient_anaphor,
+        tag(" "),
+        alt((tag("another"), tag("an additional"))),
+        tag(" counter of that kind"),
+        opt(tag(".")),
+    ))
+    .parse(input.trim())
+    .ok()?;
+    Some(Effect::PutChosenCounter {
+        target: TargetFilter::ParentTarget,
+        count: QuantityExpr::Fixed { value: 1 },
+        target_condition: None,
+    })
+}
+
 pub(super) fn try_parse_put_counter<'a>(
     lower: &str,
     text: &'a str,

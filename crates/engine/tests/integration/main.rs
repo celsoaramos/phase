@@ -44,6 +44,7 @@ mod ancient_cellarspawn_cost_matrix;
 mod ancient_copper_dragon_roll_d20;
 mod angels_grace;
 mod angels_grace_2hg;
+mod animation_module_player_counters;
 mod announce_locked_x_runtime;
 mod announced_counter_recipient_set;
 mod announced_target_set_placement;

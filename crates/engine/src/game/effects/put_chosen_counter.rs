@@ -8,16 +8,20 @@
 //! all counter placement — replacement effects, evolve triggers, distribution —
 //! flows through one code path.
 //!
+//! A kind chosen on a player (Animation Module) goes to the targeted player
+//! instead, through the replacement-aware player-counter additions.
+//!
 //! No-op when no counter kind was chosen (the `ChooseCounterKind` was skipped
 //! because the object had no counters, per CR 608.2d).
 
 use crate::types::ability::{
-    ChosenCounterCountCondition, Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter,
-    TargetRef,
+    ChosenCounterCountCondition, Effect, EffectError, EffectKind, QuantityExpr, ResolvedAbility,
+    TargetFilter, TargetRef,
 };
-use crate::types::counter::CounterType;
+use crate::types::counter::{CounterKind, CounterType};
 use crate::types::events::GameEvent;
-use crate::types::game_state::GameState;
+use crate::types::game_state::{GameState, PendingEffectResolved};
+use crate::types::player::{PlayerCounterType, PlayerId};
 
 /// CR 608.2c + CR 122.1: Return the resolved objects that independently satisfy
 /// the predicate against their count of the counter kind chosen earlier in
@@ -84,14 +88,88 @@ pub(crate) fn target_condition_is_satisfied(
     state: &GameState,
     ability: &ResolvedAbility,
     target: &TargetFilter,
-    chosen_kind: &CounterType,
+    chosen_kind: &CounterKind,
     condition: Option<&ChosenCounterCountCondition>,
 ) -> bool {
     let Some(condition) = condition else {
         return true;
     };
-    let targets = resolved_counter_targets(state, ability, target);
-    !targets_satisfying_condition(state, ability, &targets, chosen_kind, condition).is_empty()
+    match chosen_kind {
+        CounterKind::Object(counter_type) => {
+            let targets = resolved_counter_targets(state, ability, target);
+            !targets_satisfying_condition(state, ability, &targets, counter_type, condition)
+                .is_empty()
+        }
+        CounterKind::Player(kind) => {
+            !players_satisfying_condition(state, ability, target, *kind, Some(condition)).is_empty()
+        }
+    }
+}
+
+/// CR 122.1 + CR 608.2c: The targeted players that receive a counter of a kind
+/// chosen on a player, keeping only those that independently satisfy the
+/// optional predicate against their own count of that kind.
+fn players_satisfying_condition(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    target: &TargetFilter,
+    kind: PlayerCounterType,
+    condition: Option<&ChosenCounterCountCondition>,
+) -> Vec<PlayerId> {
+    crate::game::targeting::resolved_targets(ability, target, state)
+        .into_iter()
+        .filter_map(|target| match target {
+            TargetRef::Player(id) => state.players.iter().find(|p| p.id == id),
+            TargetRef::Object(_) => None,
+        })
+        .filter(|player| {
+            condition.is_none_or(|condition| {
+                let count = crate::game::arithmetic::u32_to_i32_saturating(kind.count_on(player));
+                let mut per_target_ability = ability.clone();
+                per_target_ability.set_unpinned_targets(vec![TargetRef::Player(player.id)]);
+                let rhs = crate::game::quantity::resolve_quantity_for_ability_condition(
+                    state,
+                    &condition.rhs,
+                    &per_target_ability,
+                );
+                condition.comparator.evaluate(count, rhs)
+            })
+        })
+        .map(|player| player.id)
+        .collect()
+}
+
+/// CR 122.1 + CR 614.1: Give each resolved player another counter of a kind
+/// chosen on a player ("give that permanent or player another counter of that
+/// kind" — Animation Module). Named kinds and energy go through the same
+/// replacement-aware addition plan proliferate uses.
+fn resolve_player_kind(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    target: &TargetFilter,
+    count: &QuantityExpr,
+    kind: PlayerCounterType,
+    condition: Option<&ChosenCounterCountCondition>,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    let amount =
+        crate::game::quantity::resolve_quantity_with_targets(state, count, ability).max(0) as u32;
+    let additions: Vec<_> = players_satisfying_condition(state, ability, target, kind, condition)
+        .into_iter()
+        .map(|player_id| {
+            super::proliferate::player_counter_addition(ability.controller, player_id, kind, amount)
+        })
+        .collect();
+    let completion =
+        PendingEffectResolved::new(EffectKind::from(&ability.effect), ability.source_id);
+    if super::proliferate::apply_counter_addition_plan(state, &additions, completion, events) {
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+            subject: None,
+        });
+    }
+    Ok(())
 }
 
 /// CR 122.1 + CR 122.6: Resolve `Effect::PutChosenCounter`.
@@ -114,15 +192,31 @@ pub fn resolve(
     // incarnation cannot supply a stale counter kind here.
     let chosen_kind = crate::game::effects::choose_counter_kind::chosen_counter_kind(state);
 
-    let Some(counter_type) = chosen_kind else {
-        // CR 608.2d: the counter-kind choice was skipped (no counters on the
-        // object) — there is no "that kind", so nothing is added.
-        events.push(GameEvent::EffectResolved {
-            kind: EffectKind::from(&ability.effect),
-            source_id: ability.source_id,
-            subject: None,
-        });
-        return Ok(());
+    let counter_type = match chosen_kind {
+        Some(CounterKind::Object(counter_type)) => counter_type,
+        // CR 122.1: the kind was chosen on a player, so the counter goes to
+        // the player.
+        Some(CounterKind::Player(kind)) => {
+            return resolve_player_kind(
+                state,
+                ability,
+                &target,
+                &count,
+                kind,
+                target_condition,
+                events,
+            );
+        }
+        None => {
+            // CR 608.2d: the counter-kind choice was skipped (no counters on
+            // the object) — there is no "that kind", so nothing is added.
+            events.push(GameEvent::EffectResolved {
+                kind: EffectKind::from(&ability.effect),
+                source_id: ability.source_id,
+                subject: None,
+            });
+            return Ok(());
+        }
     };
 
     // CR 608.2c: Later text can condition this instruction on each resolved
@@ -224,7 +318,7 @@ mod tests {
     #[test]
     fn adds_one_counter_of_chosen_kind() {
         let (mut state, source, target) = setup();
-        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun);
+        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun.into());
         state
             .objects
             .get_mut(&target)
@@ -267,7 +361,7 @@ mod tests {
     #[test]
     fn target_condition_allows_absent_chosen_kind() {
         let (mut state, source, target) = setup();
-        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun);
+        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun.into());
 
         resolve(
             &mut state,
@@ -286,7 +380,7 @@ mod tests {
     #[test]
     fn target_condition_blocks_present_chosen_kind() {
         let (mut state, source, target) = setup();
-        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun);
+        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun.into());
         state
             .objects
             .get_mut(&target)
@@ -320,7 +414,7 @@ mod tests {
             "Second Target".to_string(),
             crate::types::zones::Zone::Battlefield,
         );
-        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun);
+        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun.into());
         state
             .objects
             .get_mut(&second)
@@ -359,7 +453,7 @@ mod tests {
             "Second Target".to_string(),
             crate::types::zones::Zone::Battlefield,
         );
-        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun);
+        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun.into());
         state
             .objects
             .get_mut(&second)
@@ -427,7 +521,7 @@ mod tests {
     #[test]
     fn placement_uses_counter_replacement_pipeline() {
         let (mut state, source, target) = setup();
-        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun);
+        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun.into());
         let doubler = crate::game::zones::create_object(
             &mut state,
             CardId(3),
@@ -465,7 +559,7 @@ mod tests {
             .unwrap()
             .chosen_attributes
             .push(crate::types::ability::ChosenAttribute::Counter(
-                CounterType::Stun,
+                CounterType::Stun.into(),
             ));
         state
             .objects

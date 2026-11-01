@@ -8,33 +8,32 @@ use crate::types::game_state::{
     GameState, PendingCounterAddition, PendingEffectResolved, WaitingFor,
 };
 use crate::types::identifiers::ObjectId;
-use crate::types::player::{Player, PlayerCounterKind, PlayerId};
+use crate::types::player::{PlayerCounterType, PlayerId};
 use crate::types::proposed_event::ProposedEvent;
 use crate::types::resolution::PendingProliferateActions;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PlayerCounterSource {
-    Kind(PlayerCounterKind),
-    Energy,
-}
-
-const PLAYER_COUNTER_KINDS: [PlayerCounterKind; 4] = [
-    PlayerCounterKind::Poison,
-    PlayerCounterKind::Experience,
-    PlayerCounterKind::Rad,
-    PlayerCounterKind::Ticket,
-];
-
-fn proliferatable_player_counters(player: &Player) -> Vec<PlayerCounterSource> {
-    let mut counters: Vec<_> = PLAYER_COUNTER_KINDS
-        .into_iter()
-        .filter(|kind| player.player_counter(kind) > 0)
-        .map(PlayerCounterSource::Kind)
-        .collect();
-    if player.energy > 0 {
-        counters.push(PlayerCounterSource::Energy);
+/// CR 122.1: The pending addition that gives `player_id` `count` counters of
+/// `kind`. Energy is stored apart from the named kinds, so it has its own
+/// addition item.
+pub(crate) fn player_counter_addition(
+    actor: PlayerId,
+    player_id: PlayerId,
+    kind: PlayerCounterType,
+    count: u32,
+) -> PendingCounterAddition {
+    match kind {
+        PlayerCounterType::Kind(counter_kind) => PendingCounterAddition::Player {
+            actor,
+            player_id,
+            counter_kind,
+            count,
+        },
+        PlayerCounterType::Energy => PendingCounterAddition::Energy {
+            actor,
+            player_id,
+            count,
+        },
     }
-    counters
 }
 
 /// Outcome of routing proliferate through the CR 614 replacement pipeline.
@@ -66,7 +65,7 @@ fn collect_proliferate_eligible(state: &GameState) -> Vec<TargetRef> {
     // that have a counter" — a CHOICE, not a target (CR 115.10a), so the seat is judged by
     // the existence authority and NOT by the targeting-only exclusions.
     for player in &state.players {
-        if !proliferatable_player_counters(player).is_empty()
+        if !PlayerCounterType::present_on(player).is_empty()
             && crate::game::players::player_exists_for_choice(state, player.id)
         {
             eligible.push(TargetRef::Player(player.id));
@@ -340,7 +339,19 @@ pub fn apply_proliferate(
     }
 
     let additions = proliferate_addition_plan(state, actor, selected);
+    apply_counter_addition_plan(state, &additions, completion, events)
+}
 
+/// CR 122.1 + CR 614.1: Apply each counter addition through its replacement
+/// pipeline, in order. Returns `false` when a replacement opened a choice; the
+/// remaining additions and `completion` are then parked on a `CounterAdditions`
+/// frame and resume through `drain_pending_counter_additions`.
+pub(crate) fn apply_counter_addition_plan(
+    state: &mut GameState,
+    additions: &[PendingCounterAddition],
+    completion: PendingEffectResolved,
+    events: &mut Vec<GameEvent>,
+) -> bool {
     for (index, addition) in additions.iter().cloned().enumerate() {
         if !apply_counter_addition_plan_item(state, addition, events) {
             super::counters::stash_pending_counter_additions(
@@ -383,27 +394,11 @@ fn proliferate_addition_plan(
                     .players
                     .iter()
                     .find(|p| p.id == *pid)
-                    .map(proliferatable_player_counters)
+                    .map(PlayerCounterType::present_on)
                     .unwrap_or_default();
 
                 for counter in counters {
-                    match counter {
-                        PlayerCounterSource::Kind(kind) => {
-                            additions.push(PendingCounterAddition::Player {
-                                actor,
-                                player_id: *pid,
-                                counter_kind: kind,
-                                count: 1,
-                            });
-                        }
-                        PlayerCounterSource::Energy => {
-                            additions.push(PendingCounterAddition::Energy {
-                                actor,
-                                player_id: *pid,
-                                count: 1,
-                            });
-                        }
-                    }
+                    additions.push(player_counter_addition(actor, *pid, counter, 1));
                 }
             }
         }
@@ -463,7 +458,7 @@ mod tests {
     };
     use crate::types::game_state::{PendingCounterPostAction, PendingEffectResolutionEvent};
     use crate::types::identifiers::{CardId, ObjectId};
-    use crate::types::player::PlayerId;
+    use crate::types::player::{PlayerCounterKind, PlayerId};
     use crate::types::replacements::ReplacementEvent;
     use crate::types::zones::Zone;
 

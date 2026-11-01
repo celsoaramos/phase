@@ -15,7 +15,7 @@ use super::ability_visit::{
 };
 use super::card::{PrintedCardRef, PrintedLoyalty};
 use super::card_type::{CardType, CoreType, SubtypeSet, Supertype};
-use super::counter::{CounterMatch, CounterType};
+use super::counter::{CounterKind, CounterMatch, CounterType};
 use super::event_kinds::{ActivatedAbilityKind, BendingType, ClashResult, PlayerActionKind};
 use super::game_state::{CastOccurrence, LKISnapshot, MayTriggerOrigin, TriggerSourceContext};
 use super::game_state_kinds::{DistributionUnit, RetargetScope, TargetSelectionConstraint};
@@ -1171,14 +1171,14 @@ pub enum ChoiceType {
     },
     /// CR 608.2d + CR 122.1: "choose a counter on it" — pick one of the distinct
     /// counter kinds currently present on a specific object (The Caves of
-    /// Androzani II/III). The concrete `options` list is enumerated at
-    /// resolution from the target object's counters (mirroring the runtime-baked
-    /// `Keyword { options }` template idiom), so the same interactive
-    /// `WaitingFor::NamedChoice` seam renders it. The chosen kind is retained
-    /// only in resolution-local state for a downstream
+    /// Androzani II/III) or player (Animation Module). The concrete `options`
+    /// list is enumerated at resolution from the target's counters (mirroring
+    /// the runtime-baked `Keyword { options }` template idiom), so the same
+    /// interactive `WaitingFor::NamedChoice` seam renders it. The chosen kind
+    /// is retained only in resolution-local state for a downstream
     /// `Effect::PutChosenCounter` ("put an additional counter of that kind").
     CounterKind {
-        options: Vec<CounterType>,
+        options: Vec<CounterKind>,
     },
 }
 
@@ -1658,7 +1658,7 @@ impl<'de> Deserialize<'de> for ChoiceType {
                 count: usize,
             },
             CounterKind {
-                options: Vec<CounterType>,
+                options: Vec<CounterKind>,
             },
         }
 
@@ -3002,7 +3002,7 @@ pub enum ChosenAttribute {
     /// `Effect::PutChosenCounter` ("put an additional counter of that kind on
     /// that permanent") to add one counter of the chosen kind. Replace-on-rechoose
     /// (the per-iteration bind clears the prior `Counter` — see `bind_named_choice`).
-    Counter(CounterType),
+    Counter(CounterKind),
     /// CR 607.2d: The chosen seat direction (left/right) for a directional
     /// "choose left or right" ability linked to a "the [last] chosen direction"
     /// static (Pramikon, Sky Rampart; Mystic Barrier; Teyo, Geometric
@@ -3168,7 +3168,7 @@ pub enum ChoiceValue {
     /// CR 608.2d + CR 122.1: typed counter-kind choice from a
     /// `ChoiceType::CounterKind` option list (The Caves of Androzani). Retained
     /// only for the current resolution for later `PutChosenCounter` resolution.
-    Counter(CounterType),
+    Counter(CounterKind),
 }
 
 impl ChoiceValue {

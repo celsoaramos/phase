@@ -231,9 +231,11 @@ fn peel_inner(text: String, mut ctx: ClauseContext) -> (String, ClauseContext) {
     // Repeat-for: "for each [qty], " leading prefix (CR 608.2c: the instruction is
     // followed as written, once per counted iteration). CR 102.2: "for each
     // opponent, choose … that player controls" is a per-opponent choice, not a
-    // repeat count, and keeps its prefix.
+    // repeat count, and keeps its prefix; so does a per-kind iteration over one
+    // target's counters (CR 701.34a + CR 122.1).
     if ctx.repeat_for.is_none()
         && !super::oracle_effect::is_for_each_opponent_choose_controlled(&text.to_lowercase())
+        && !super::oracle_effect::is_targeted_counter_kind_iteration(&text)
     {
         let (qty, rest) = peel_for_each_prefix(&text);
         if qty.is_some() {

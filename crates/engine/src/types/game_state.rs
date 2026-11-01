@@ -37,7 +37,7 @@ use super::actions::{DebugCardCreationKind, GameAction, ResolveAllScope};
 use super::attribution::ObjectAttribution;
 use super::card::{CardFace, PrintedCardRef, TokenImageRef};
 use super::card_type::{CoreType, Supertype};
-use super::counter::{counter_map_serde, CounterMatch, CounterType};
+use super::counter::{counter_map_serde, CounterKind, CounterMatch, CounterType};
 use super::events::{
     EventAttachmentSnapshot, EventCombatSnapshot, EventObjectHistorySnapshot,
     EventObjectRelationSnapshot, EventObjectSnapshot, GameEvent, PlayerActionKind, Targeter,
@@ -24231,7 +24231,7 @@ declare_game_state! {
     /// counter-kind instruction (including its zero-option path), so a later
     /// `PutChosenCounter` cannot read a stale source or prior-iteration answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chosen_counter_kind_this_resolution: Option<CounterType>,
+    pub chosen_counter_kind_this_resolution: Option<CounterKind>,
 
     /// CR 608.2d: the colour a PERSISTING chooser bound during the current
     /// resolution. Separate from `last_named_choice` (set for every named choice,
@@ -44688,7 +44688,7 @@ mod tests {
     fn loop_fingerprint_reflects_resolution_counter_choice() {
         let mut state = GameState::new_two_player(7);
         let before = state.loop_fingerprint();
-        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun);
+        state.chosen_counter_kind_this_resolution = Some(CounterType::Stun.into());
         assert_ne!(
             before,
             state.loop_fingerprint(),
