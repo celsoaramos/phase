@@ -36259,12 +36259,9 @@ fn parse_number_enumeration(rest: &str) -> Option<(u32, u32)> {
         alt((tag(", or "), tag(", "), tag(" or "))).parse(input)
     }
     let rest = rest.trim_end_matches('.').trim_end();
-    // CR 608.2d (override): a trailing "at random" ("Choose 1, 2, or 3 at
-    // random" — Tibalt's Trickery) qualifies WHO selects, not the candidate
-    // set; the dispatcher reads it as `TargetSelectionMode::Random`.
-    let items = match all_consuming(terminated(
-        nom::multi::separated_list1(separator, nom_primitives::parse_number),
-        opt(tag(" at random")),
+    let items = match all_consuming(nom::multi::separated_list1(
+        separator,
+        nom_primitives::parse_number,
     ))
     .parse(rest)
     {
@@ -49098,7 +49095,10 @@ fn parse_effect_chain_ir_body(
         // hoisted clear was a no-op for it and this arm fires unimpeded.
         // A mandatory "its controller <act>" sentence arms it too (Tibalt's
         // Trickery: "Its controller mills … They may cast that card …" —
-        // the next sentence's "they" is that same player).
+        // the next sentence's "they" is that same player) — but only when it
+        // INTRODUCES the antecedent. A chunk that consumed the seeded scope
+        // ("If they do, they draw a card", Gix) does not re-arm it for a later
+        // independent "that player".
         // A subject-less ", then <act>" continuation inherits the armed
         // subject (Tibalt's Trickery: "Its controller mills …, then exiles …"),
         // so the antecedent survives it for the following sentence's "they".
@@ -49114,6 +49114,7 @@ fn parse_effect_chain_ir_body(
             || matches!(
                 leading_subject_application.as_ref(),
                 Some(app) if app.affected == TargetFilter::ParentTargetController
+                    && (app.is_optional || !seeded_parent_target_controller_this_chunk)
             )
         {
             chain_parent_target_controller_scope = Some(ControllerRef::ParentTargetController);

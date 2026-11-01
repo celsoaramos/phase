@@ -5033,6 +5033,21 @@ pub(super) fn parse_choose_ast(
             selection,
         });
     }
+    // CR 608.2d (override): an "at random" qualifier after an `all_consuming`
+    // object phrase ("Choose 1, 2, or 3 at random" — Tibalt's Trickery) hides
+    // the choice from the phrase table. Retry on the clause with the qualifier
+    // excised by the shared authority (the one the as-enters Haktos builder
+    // uses); the excision only succeeds when "at random" is present, so the
+    // game makes the selection.
+    if let Some(choice_type) = super::excise_selection_qualifier(lower).and_then(|excised| {
+        super::try_parse_named_choice_with_provenance(&excised, has_number_choice)
+    }) {
+        ctx.pending_choice_type = Some(choice_type.clone());
+        return Some(ChooseImperativeAst::NamedChoice {
+            choice_type,
+            selection: TargetSelectionMode::Random,
+        });
+    }
 
     if nom_on_lower(text, lower, |input| value((), tag("choose ")).parse(input)).is_some()
         && nom_primitives::scan_contains(lower, "card from it")
