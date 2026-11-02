@@ -364,5 +364,14 @@
   },
   {
     "branch": "ai/mf-flags-1101-attack"
+  },
+  {
+    "branch": "card/spend-any-color-to-cast-spell-class"
+  },
+  {
+    "branch": "card/grant-abilities-mana-concession-rider"
+  },
+  {
+    "branch": "card/counter-prohibition-kind-and-controller"
   }
 ]
