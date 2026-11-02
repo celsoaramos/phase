@@ -160,7 +160,7 @@
     "branch": "ai/focus-fire-damage-triggers"
   },
   {
-    "branch": "fix/damage-to-counters-substitution",
+    "branch": "fix/damage-to-counters-substitution-mf",
     "pr": 9670
   },
   {
