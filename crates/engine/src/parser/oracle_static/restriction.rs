@@ -3646,12 +3646,16 @@ pub(crate) fn try_parse_spend_any_color_to_activate_abilities(
     )
 }
 
-/// CR 609.4b: Parse the spell-class-filtered any-type-mana spend static —
+/// CR 609.4b: Parse the spell-class-filtered mana-spend static —
 /// "You (may|can) spend mana of any type to cast <spell-filter> spells."
-/// (Vizier of the Menagerie: "creature spells"). Lowers to
+/// (Vizier of the Menagerie: "creature spells") and "You may spend mana as
+/// though it were mana of any color to cast <spell-filter> spells." (Oath of
+/// Nissa: "planeswalker spells"). Lowers to
 /// `StaticMode::SpendManaAsAnyColor { spell_filter: Some(filter) }`, scoping the
-/// any-type-mana concession to spells the controller casts that match the filter
-/// (CR 609.4b: the concession changes only how a cost is paid, never the cost).
+/// concession to spells the controller casts that match the filter (CR 609.4b:
+/// the concession changes only how a cost is paid, never the cost). The printed
+/// wording is the concession axis: "mana of any type" → `AnyTypeOrColor` (CR
+/// 118.14, also pays `{C}`), "as though it were mana of any color" → `AnyColor`.
 ///
 /// The unfiltered board-wide form ("you may spend mana as though it were mana of
 /// any color", Chromatic Orrery) is handled separately in `dispatch.rs` and
@@ -3666,11 +3670,30 @@ pub(crate) fn try_parse_filtered_spend_any_type_to_cast(
     text: &str,
     lower: &str,
 ) -> Option<StaticDefinition> {
-    // CR 609.4b + CR 118.14: "you may"/"you can" surface, then "spend mana of
-    // any type to cast ". The "mana of any type" wording (vs "any color") is the
-    // spell-cast any-type concession: at payment it also covers `{C}`.
-    let rest = nom_tag_lower(text, lower, "you may spend mana of any type to cast ")
-        .or_else(|| nom_tag_lower(text, lower, "you can spend mana of any type to cast "))?;
+    // CR 609.4b + CR 118.14: "you may"/"you can" surface, then the concession
+    // wording, then "to cast ". "mana of any type" is the spell-cast any-type
+    // concession (at payment it also covers `{C}`); "as though it were mana of
+    // any color" is the colored-only concession. One alt per axis (surface ×
+    // wording), never the cross-product spelled out.
+    use crate::types::ability::ManaSpendPermission;
+    let (rest, concession) = nom_tag_lower(text, lower, "you may spend mana of any type to cast ")
+        .or_else(|| nom_tag_lower(text, lower, "you can spend mana of any type to cast "))
+        .map(|rest| (rest, ManaSpendPermission::AnyTypeOrColor))
+        .or_else(|| {
+            nom_tag_lower(
+                text,
+                lower,
+                "you may spend mana as though it were mana of any color to cast ",
+            )
+            .or_else(|| {
+                nom_tag_lower(
+                    text,
+                    lower,
+                    "you can spend mana as though it were mana of any color to cast ",
+                )
+            })
+            .map(|rest| (rest, ManaSpendPermission::AnyColor))
+        })?;
 
     // Trailing period is optional; strip it so the type phrase is clean.
     let rest = rest.trim_end().trim_end_matches('.').trim_end();
@@ -3713,8 +3736,9 @@ pub(crate) fn try_parse_filtered_spend_any_type_to_cast(
         StaticDefinition::new(StaticMode::SpendManaAsAnyColor {
             spell_filter: Some(filter),
             activation_source_filter: None,
-            // CR 118.14: "mana of any type" — colorless included.
-            concession: crate::types::ability::ManaSpendPermission::AnyTypeOrColor,
+            // CR 118.14: "mana of any type" — colorless included; "as though it
+            // were mana of any color" — colored requirements only.
+            concession,
         })
         // For the filtered (`Some`) path `affected` is documentation-only:
         // controller-scoping is enforced at runtime by the explicit
@@ -4325,6 +4349,72 @@ mod spend_any_color_to_activate_abilities_tests {
                 concession: crate::types::ability::ManaSpendPermission::AnyColor,
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod filtered_spend_to_cast_tests {
+    use super::*;
+    use crate::types::ability::{ManaSpendPermission, TargetFilter, TypeFilter};
+
+    fn spell_filter_types(def: &StaticDefinition) -> (Vec<TypeFilter>, ManaSpendPermission) {
+        match &def.mode {
+            StaticMode::SpendManaAsAnyColor {
+                spell_filter: Some(TargetFilter::Typed(typed)),
+                activation_source_filter: None,
+                concession,
+            } => (typed.type_filters.clone(), *concession),
+            other => panic!("expected spell-filtered SpendManaAsAnyColor, got {other:?}"),
+        }
+    }
+
+    /// CR 609.4b: Oath of Nissa — "as though it were mana of any color to cast
+    /// planeswalker spells" is the colored-only concession scoped to the
+    /// planeswalker spell class, never the board-wide form.
+    #[test]
+    fn parses_any_color_wording_to_cast_planeswalker_spells() {
+        let text =
+            "You may spend mana as though it were mana of any color to cast planeswalker spells.";
+        let def = try_parse_filtered_spend_any_type_to_cast(text, &text.to_ascii_lowercase())
+            .expect("Oath of Nissa spend line must parse");
+        let (types, concession) = spell_filter_types(&def);
+        assert_eq!(types, vec![TypeFilter::Planeswalker]);
+        assert_eq!(concession, ManaSpendPermission::AnyColor);
+    }
+
+    /// CR 609.4b + CR 118.14: Vizier of the Menagerie keeps the any-type
+    /// concession (it also pays `{C}`) — the wording axis must not collapse.
+    #[test]
+    fn parses_any_type_wording_to_cast_creature_spells() {
+        let text = "You can spend mana of any type to cast creature spells.";
+        let def = try_parse_filtered_spend_any_type_to_cast(text, &text.to_ascii_lowercase())
+            .expect("Vizier of the Menagerie spend line must parse");
+        let (types, concession) = spell_filter_types(&def);
+        assert_eq!(types, vec![TypeFilter::Creature]);
+        assert_eq!(concession, ManaSpendPermission::AnyTypeOrColor);
+    }
+
+    /// The board-wide phrasing has no "to cast <X> spells" scope and must stay
+    /// out of this handler (it is Chromatic Orrery's `spell_filter: None` form).
+    #[test]
+    fn board_wide_wording_is_not_claimed() {
+        let text = "You may spend mana as though it were mana of any color.";
+        assert!(
+            try_parse_filtered_spend_any_type_to_cast(text, &text.to_ascii_lowercase()).is_none()
+        );
+    }
+
+    /// End to end through the static router: the Oath of Nissa line is a
+    /// static, not a `static_structure` gap.
+    #[test]
+    fn oath_of_nissa_line_parses_as_static() {
+        let def = crate::parser::oracle_static::parse_static_line(
+            "You may spend mana as though it were mana of any color to cast planeswalker spells.",
+        )
+        .expect("Oath of Nissa line must parse as a static");
+        let (types, concession) = spell_filter_types(&def);
+        assert_eq!(types, vec![TypeFilter::Planeswalker]);
+        assert_eq!(concession, ManaSpendPermission::AnyColor);
     }
 }
 
