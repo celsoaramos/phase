@@ -10704,6 +10704,73 @@ fn locus_cap_via_standard_oracle_dispatch() {
     );
 }
 
+/// CR 613.1f + CR 609.4b: Drana and Linvala parses through the STANDARD dispatch —
+/// sentence 1 via the ordinary grant source parser ("all creatures your opponents
+/// control"), sentence 2 ("You may spend mana as though it were mana of any color
+/// to activate those abilities.") folded by the shared mana-concession rider into
+/// an activation-scoped `SpendManaAsAnyColor` static anchored on the host.
+#[test]
+fn drana_and_linvala_grant_and_mana_concession_rider_via_standard_dispatch() {
+    use crate::parser::oracle::parse_oracle_text;
+    use crate::types::ability::{ControllerRef, ManaSpendPermission, TargetFilter};
+    use crate::types::statics::StaticMode;
+    let parsed = parse_oracle_text(
+        "Drana and Linvala has all activated abilities of all creatures your opponents control. You may spend mana as though it were mana of any color to activate those abilities.",
+        "Drana and Linvala",
+        &[],
+        &["Creature".into()],
+        &["Vampire".into(), "Angel".into()],
+    );
+    assert_eq!(
+        parsed.statics.len(),
+        2,
+        "expected the grant static plus the concession static, got {:?}",
+        parsed.statics
+    );
+    match &parsed.statics[0].modifications[..] {
+        [ContinuousModification::GrantAllActivatedAbilitiesOf {
+            source: TargetFilter::Typed(typed),
+            cap: None,
+            kind: None,
+        }] => {
+            assert_eq!(typed.controller, Some(ControllerRef::Opponent));
+        }
+        other => panic!("expected the opponents'-creatures grant, got {other:?}"),
+    }
+    assert_eq!(parsed.statics[1].affected, Some(TargetFilter::Player));
+    assert!(
+        matches!(
+            parsed.statics[1].mode,
+            StaticMode::SpendManaAsAnyColor {
+                spell_filter: None,
+                activation_source_filter: Some(TargetFilter::SelfRef),
+                concession: ManaSpendPermission::AnyColor,
+            }
+        ),
+        "expected the host-scoped any-color concession, got {:?}",
+        parsed.statics[1].mode
+    );
+}
+
+/// The rider has no antecedent on its own: without a preceding activated-ability
+/// grant it stays unclaimed (the line defers instead of emitting a stray concession).
+#[test]
+fn mana_concession_rider_without_grant_is_not_claimed() {
+    use crate::parser::oracle::parse_oracle_text;
+    let parsed = parse_oracle_text(
+        "Flying. You may spend mana as though it were mana of any color to activate those abilities.",
+        "Test Card",
+        &[],
+        &["Creature".into()],
+        &[],
+    );
+    assert!(
+        parsed.statics.is_empty(),
+        "no grant antecedent means no concession static, got {:?}",
+        parsed.statics
+    );
+}
+
 /// CR 613.1f + CR 607.2a + CR 205.2a: "all creature cards exiled with it/~" narrows
 /// the granted set to creature cards only (Agatha's Soul Cauldron) — the source
 /// filter intersects `ExiledBySource` with the Creature type filter.

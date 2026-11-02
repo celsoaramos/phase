@@ -1927,6 +1927,13 @@ fn parse_multi_sentence_statics(text: &str) -> Option<Vec<StaticDefinition>> {
             if fold_grant_cap_rider(segment, &mut defs) {
                 continue;
             }
+            // CR 609.4b: The "spend mana as though it were mana of any color to
+            // activate those abilities" rider (Drana and Linvala) is the other
+            // grant rider: it adds the activation-scoped concession static next
+            // to the grant it refers back to.
+            if fold_grant_mana_concession_rider(segment, &mut defs) {
+                continue;
+            }
             // A non-static sentence (or one the static pipeline can't classify)
             // means this isn't a pure sibling-static line — defer the whole
             // line to the single-sentence fallback rather than emitting a
