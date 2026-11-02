@@ -1965,6 +1965,7 @@ fn legacy_trigger_condition(x: &TriggerCondition) -> bool {
         // identical either way (the read-vs-no-read divergence is only in
         // `rw_trigger_condition` above).
         | TriggerCondition::FirstTimeObjectCountersAddedThisTurn
+        | TriggerCondition::FirstTimeObjectCountersOfTypeAddedThisTurn { .. }
         | TriggerCondition::WasType { .. }
         | TriggerCondition::AttackedThisTurn
         | TriggerCondition::ChoseOtherRingBearer
@@ -7096,7 +7097,8 @@ fn rw_trigger_condition(x: &TriggerCondition) -> RwProfile {
         // fix: it must declare a board read here, NOT land in the terminal
         // `RwProfile::empty()` group with the tapped sibling (which reads a
         // count-map that is classified as no-read).
-        TriggerCondition::FirstTimeObjectCountersAddedThisTurn => {
+        TriggerCondition::FirstTimeObjectCountersAddedThisTurn
+        | TriggerCondition::FirstTimeObjectCountersOfTypeAddedThisTurn { .. } => {
             reads_board_of(StateKind::ObjectCounters)
         }
         TriggerCondition::SourceIsTapped => reads_src_of(StateKind::TapState),

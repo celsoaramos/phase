@@ -4360,7 +4360,8 @@ fn scan_trigger_condition(x: &TriggerCondition, mode: ScanMode) -> Axes {
         // board ledger) — `projected: true`. NOT the tapped sibling's `Axes::NONE`;
         // this condition reads the counter journal, so the coverability/ordering
         // detector must see the projected read (fail-open otherwise).
-        TriggerCondition::FirstTimeObjectCountersAddedThisTurn => Axes {
+        TriggerCondition::FirstTimeObjectCountersAddedThisTurn
+        | TriggerCondition::FirstTimeObjectCountersOfTypeAddedThisTurn { .. } => Axes {
             event: false,
             sibling: false,
             projected: true,

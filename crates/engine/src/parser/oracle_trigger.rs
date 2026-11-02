@@ -7172,10 +7172,23 @@ fn parse_first_time_counters_intervening_if(input: &str) -> OracleResult<'_, Tri
         tag("if it is the first time "),
     ))
     .parse(input)?;
+    // CR 122.1: an optional counter kind ("first time +1/+1 counters", Botanical
+    // Brawler) narrows the first-time check to placements of that kind.
+    let (rest, counter_type) = opt(terminated(
+        nom_primitives::parse_strict_counter_type,
+        tag(" "),
+    ))
+    .parse(rest)?;
     let (rest, _) = tag("counters have been put on ").parse(rest)?;
     let (rest, _) = alt((tag("that creature"), tag("that permanent"), tag("it"))).parse(rest)?;
     let (rest, _) = tag(" this turn").parse(rest)?;
-    Ok((rest, TriggerCondition::FirstTimeObjectCountersAddedThisTurn))
+    let condition = match counter_type {
+        Some(counter_type) => {
+            TriggerCondition::FirstTimeObjectCountersOfTypeAddedThisTurn { counter_type }
+        }
+        None => TriggerCondition::FirstTimeObjectCountersAddedThisTurn,
+    };
+    Ok((rest, condition))
 }
 
 /// CR 603.4 + CR 607.1c: "if you haven't added mana with this ability this turn" —

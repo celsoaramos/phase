@@ -4953,6 +4953,12 @@ fn fmt_trigger_condition(
         TC::FirstTimeObjectCountersAddedThisTurn => {
             "first time counters put on it this turn".into()
         }
+        TC::FirstTimeObjectCountersOfTypeAddedThisTurn { counter_type } => {
+            format!(
+                "first time {} counters put on it this turn",
+                counter_type.as_str()
+            )
+        }
         TC::WasType { card_type } => format!("was a {}", fmt_core_type(card_type)),
         TC::LifeTotalGE { minimum } => format!("life ≥ {minimum}"),
         TC::ControlCount { minimum, filter } => {
@@ -10405,6 +10411,7 @@ fn extract_trigger_condition_features(
         | TriggerCondition::DealtDamageThisTurnBySource { .. }
         | TriggerCondition::FirstTimeObjectTappedThisTurn
         | TriggerCondition::FirstTimeObjectCountersAddedThisTurn
+        | TriggerCondition::FirstTimeObjectCountersOfTypeAddedThisTurn { .. }
         | TriggerCondition::WasType { .. }
         | TriggerCondition::LifeTotalGE { .. }
         | TriggerCondition::ControlCount { .. }

@@ -36526,6 +36526,16 @@ pub enum TriggerCondition {
     /// `FirstTimeObjectTappedThisTurn`, but it reads the counter board ledger, so
     /// its fail-open walker classifications mirror `CounterAddedThisTurn`.
     FirstTimeObjectCountersAddedThisTurn,
+    /// CR 122.1 + CR 603.4: "if it's the first time <kind> counters have been put
+    /// on that permanent this turn" (Botanical Brawler: "first time +1/+1
+    /// counters"). Kind-qualified sibling of `FirstTimeObjectCountersAddedThisTurn`:
+    /// the subject is the object carried by the `CounterAdded` event, and only
+    /// placements of `counter_type` count — a -1/-1 or lifelink counter put on it
+    /// earlier this turn does not spend the "first time". Reads the
+    /// `counter_added_this_turn` board ledger (one record per kind per placement),
+    /// so exactly one matching record means this placement is the first; checked
+    /// at both trigger time and resolution (CR 603.4).
+    FirstTimeObjectCountersOfTypeAddedThisTurn { counter_type: CounterType },
 
     /// CR 400.7 + CR 603.10: "if it was a [type]" — true when the trigger source's
     /// last known information includes the specified core type. Used by the Glimmer cycle
@@ -36954,6 +36964,7 @@ impl TriggerCondition {
             | TriggerCondition::DealtDamageThisTurnBySource { .. }
             | TriggerCondition::FirstTimeObjectTappedThisTurn
             | TriggerCondition::FirstTimeObjectCountersAddedThisTurn
+            | TriggerCondition::FirstTimeObjectCountersOfTypeAddedThisTurn { .. }
             | TriggerCondition::WasType { .. }
             | TriggerCondition::LifeTotalGE { .. }
             | TriggerCondition::ControlCount { .. }

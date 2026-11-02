@@ -16786,6 +16786,34 @@ fn evaluate_trigger_condition_with_source(
                     .copied()
                     == Some(1)
             }),
+        // CR 122.1 + CR 603.4: "if it's the first time +1/+1 counters have been
+        // put on that permanent this turn" (Botanical Brawler) — the kind-qualified
+        // sibling. Same subject (the object carried by the `CounterAdded` event),
+        // but only placements of `counter_type` count: a -1/-1 counter put on it
+        // earlier this turn must not spend the "first time". The
+        // `counter_added_this_turn` ledger holds one record per kind per placement
+        // (pushed when the counters land, before trigger collection), so exactly
+        // one matching record means this placement is the first of that kind. A
+        // later placement of the same kind before resolution adds a second record
+        // and the CR 603.4 re-check fizzles — which also keeps the payload from
+        // self-retriggering when the source's own counter matches.
+        TriggerCondition::FirstTimeObjectCountersOfTypeAddedThisTurn { counter_type } => {
+            trigger_event
+                .and_then(|e| match e {
+                    GameEvent::CounterAdded { object_id, .. } => Some(*object_id),
+                    _ => None,
+                })
+                .is_some_and(|id| {
+                    state
+                        .counter_added_this_turn
+                        .iter()
+                        .filter(|record| {
+                            record.object_id == id && record.counter_type == *counter_type
+                        })
+                        .count()
+                        == 1
+                })
+        }
         // CR 400.7 + CR 603.10: "if it was a [type]" — check LKI for the source's
         // core types at the time it left the battlefield.
         TriggerCondition::WasType { card_type } => source_context.is_some_and(|source| {

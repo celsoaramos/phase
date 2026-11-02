@@ -9991,6 +9991,7 @@ fn trigger_condition_reads_filter_population(
         | TriggerCondition::DealtDamageBySourceThisTurn
         | TriggerCondition::FirstTimeObjectTappedThisTurn
         | TriggerCondition::FirstTimeObjectCountersAddedThisTurn
+        | TriggerCondition::FirstTimeObjectCountersOfTypeAddedThisTurn { .. }
         | TriggerCondition::WasType { .. }
         | TriggerCondition::LifeTotalGE { .. }
         | TriggerCondition::AttackedThisTurn
