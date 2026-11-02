@@ -13372,7 +13372,15 @@ fn parse_global_object_counter_prohibition(
 /// CR 614.17 + CR 614.6 + CR 122.1: Parse inverted type-scoped counter
 /// prohibitions such as "Creatures can't have counters put on them." Lowers to
 /// the same `AddCounter` + `Prevent` replacement as Solemnity's object-counter
-/// line, scoped to a single permanent type on the battlefield.
+/// line, scoped to the named permanent type(s) on the battlefield.
+///
+/// Two optional axes narrow the class without a sibling arm each:
+/// - a controller clause after the type list ("Creatures **you control** can't
+///   have …" — Melira, Sylvok Outcast / Darksteel Angel), lowered to the typed
+///   filter's `controller` (CR 614.17 scopes the "can't" to those permanents);
+/// - a counter kind before "counters" ("can't have **-1/-1** counters put on
+///   them"), lowered to `counter_match: OfType(kind)` (CR 122.1a) so other
+///   kinds are still placed — the same scoping Hardened Scales' "+1/+1" uses.
 fn parse_inverted_typed_counter_prohibition(
     lower: &str,
     original_text: &str,
@@ -13384,30 +13392,62 @@ fn parse_inverted_typed_counter_prohibition(
     // combinators and covers every permanent type (and comma/or-separated
     // lists) in one arm.
     let mut combinator = all_consuming(terminated(
-        terminated(
+        (
             separated_list1(
                 parse_counter_prohibition_type_separator,
                 parse_counter_prohibition_type,
             ),
-            tag::<_, _, OracleError<'_>>(" can't have counters put on them"),
+            opt(preceded(tag(" "), parse_counter_prohibition_controller)),
+            tag::<_, _, OracleError<'_>>(" can't have "),
+            // A RECOGNIZED kind followed by "counters" (CR 122.1a): the strict
+            // primitive rejects unknown tokens — the open-ended typed one would
+            // swallow "counters" itself on the unscoped form and map a made-up
+            // name to `Generic`.
+            opt(terminated(
+                nom_primitives::parse_strict_counter_type,
+                (tag(" "), nom::combinator::peek(tag("counters"))),
+            )),
+            tag("counters put on them"),
         ),
         opt(tag(".")),
     ));
-    let (_rest, type_filters) = combinator.parse(lower.trim()).ok()?;
+    let (_rest, (type_filters, controller, _, counter_type, _)) =
+        combinator.parse(lower.trim()).ok()?;
     let type_filter = match type_filters.as_slice() {
         [single] => single.clone(),
         _ => TypeFilter::AnyOf(type_filters),
     };
+    let mut typed = TypedFilter::new(type_filter);
+    if let Some(controller) = controller {
+        typed = typed.controller(controller);
+    }
 
-    Some(
-        ReplacementDefinition::new(ReplacementEvent::AddCounter)
-            .valid_card(attach_zone_to_filter(
-                TargetFilter::Typed(TypedFilter::new(type_filter)),
-                Zone::Battlefield,
-            ))
-            .quantity_modification(QuantityModification::Prevent)
-            .description(original_text.to_string()),
-    )
+    let mut def = ReplacementDefinition::new(ReplacementEvent::AddCounter)
+        .valid_card(attach_zone_to_filter(
+            TargetFilter::Typed(typed),
+            Zone::Battlefield,
+        ))
+        .quantity_modification(QuantityModification::Prevent)
+        .description(original_text.to_string());
+    if let Some(ct) = counter_type {
+        def = def.counter_match(CounterMatch::OfType(ct));
+    }
+    Some(def)
+}
+
+/// CR 614.17: The controller clause of a type-scoped counter prohibition's
+/// subject ("creatures **you control**" / "**your opponents control**" / "**an
+/// opponent controls**"). One leaf per controller reference, shared by the
+/// subject-form prohibition.
+fn parse_counter_prohibition_controller(input: &str) -> OracleResult<'_, ControllerRef> {
+    alt((
+        value(ControllerRef::You, tag("you control")),
+        value(
+            ControllerRef::Opponent,
+            alt((tag("your opponents control"), tag("an opponent controls"))),
+        ),
+    ))
+    .parse(input)
 }
 
 fn parse_counter_prohibition_type_separator(input: &str) -> OracleResult<'_, &str> {
@@ -27540,6 +27580,83 @@ mod tests {
                     TypeFilter::Creature,
                     TypeFilter::Artifact,
                 ])]
+        ));
+    }
+
+    /// CR 614.17 + CR 122.1a: Melira, Sylvok Outcast / Darksteel Angel —
+    /// "Creatures you control can't have -1/-1 counters put on them." narrows
+    /// the inverted prohibition on two axes: the controller clause lands on
+    /// the typed filter and the named kind lands on `counter_match`, so +1/+1
+    /// counters and the opponents' creatures are untouched.
+    #[test]
+    fn inverted_typed_counter_prohibition_scopes_controller_and_counter_kind() {
+        let def = parse_replacement_line(
+            "Creatures you control can't have -1/-1 counters put on them.",
+            "Darksteel Angel",
+        )
+        .expect("controller- and kind-scoped counter prohibition must parse");
+        assert_eq!(def.event, ReplacementEvent::AddCounter);
+        assert_eq!(
+            def.quantity_modification,
+            Some(QuantityModification::Prevent)
+        );
+        assert_eq!(
+            def.counter_match,
+            Some(CounterMatch::OfType(CounterType::Minus1Minus1))
+        );
+        assert!(
+            matches!(
+                &def.valid_card,
+                Some(TargetFilter::Typed(tf))
+                    if tf.type_filters == vec![TypeFilter::Creature]
+                        && tf.controller == Some(ControllerRef::You)
+                        && tf.properties.iter().any(|p| matches!(
+                            p,
+                            FilterProp::InZone { zone: Zone::Battlefield }
+                        ))
+            ),
+            "must scope to creatures you control on the battlefield, got {:?}",
+            def.valid_card
+        );
+    }
+
+    /// Each axis is independent: a kind without a controller clause, and a
+    /// controller clause without a kind, both parse; the unscoped form keeps
+    /// `counter_match: None` (every kind) and `controller: None` (every
+    /// controller), so Solemnity-class lines are unchanged.
+    #[test]
+    fn inverted_typed_counter_prohibition_axes_are_independent() {
+        let kind_only =
+            parse_replacement_line("Creatures can't have +1/+1 counters put on them.", "T")
+                .expect("kind-only prohibition must parse");
+        assert_eq!(
+            kind_only.counter_match,
+            Some(CounterMatch::OfType(CounterType::Plus1Plus1))
+        );
+        assert!(matches!(
+            &kind_only.valid_card,
+            Some(TargetFilter::Typed(tf)) if tf.controller.is_none()
+        ));
+
+        let controller_only = parse_replacement_line(
+            "Artifacts your opponents control can't have counters put on them.",
+            "T",
+        )
+        .expect("controller-only prohibition must parse");
+        assert_eq!(controller_only.counter_match, None);
+        assert!(matches!(
+            &controller_only.valid_card,
+            Some(TargetFilter::Typed(tf))
+                if tf.type_filters == vec![TypeFilter::Artifact]
+                    && tf.controller == Some(ControllerRef::Opponent)
+        ));
+
+        let unscoped = parse_replacement_line("Creatures can't have counters put on them.", "T")
+            .expect("unscoped prohibition must still parse");
+        assert_eq!(unscoped.counter_match, None);
+        assert!(matches!(
+            &unscoped.valid_card,
+            Some(TargetFilter::Typed(tf)) if tf.controller.is_none()
         ));
     }
 

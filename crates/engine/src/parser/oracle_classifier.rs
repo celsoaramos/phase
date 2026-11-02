@@ -1198,11 +1198,27 @@ pub(crate) fn is_as_enters_becomes_choice_pattern(lower: &str) -> bool {
 fn is_counter_prohibition_replacement_pattern(lower: &str) -> bool {
     // CR 614.17 + CR 122.1: Counter-prohibition effects lack "would" or
     // "instead" but still route through the replacement pipeline.
+    // CR 122.1a: the prohibited counters may name a kind ("can't have -1/-1
+    // counters put on them" — Melira, Sylvok Outcast / Darksteel Angel); the
+    // kind token is the shared counter-type primitive, never a literal list.
     nom_primitives::scan_at_word_boundaries(lower, |input| {
         alt((
-            tag::<_, _, OracleError>("can't have counters put on"),
-            tag("players can't get counters"),
-            tag("counters can't be put on"),
+            value(
+                (),
+                (
+                    tag::<_, _, OracleError>("can't have "),
+                    // A RECOGNIZED kind followed by "counters": the strict
+                    // primitive rejects unknown tokens (the open-ended typed one
+                    // would swallow "counters" itself on the unscoped form).
+                    opt(terminated(
+                        nom_primitives::parse_strict_counter_type,
+                        (tag(" "), peek(tag("counters"))),
+                    )),
+                    tag("counters put on"),
+                ),
+            ),
+            value((), tag("players can't get counters")),
+            value((), tag("counters can't be put on")),
         ))
         .parse(input)
     })
@@ -1551,6 +1567,19 @@ mod tests {
         ));
         assert!(!is_cast_spells_alternative_cost_pattern(
             "you may pay {0} rather than pay the mana cost for zombie creature spells you cast."
+        ));
+    }
+
+    /// CR 614.17 + CR 122.1a: a counter prohibition that names the kind
+    /// ("-1/-1 counters" — Melira, Sylvok Outcast / Darksteel Angel) is still
+    /// a replacement-classified line; the kind token must not break the head.
+    #[test]
+    fn classifies_kind_scoped_counter_prohibition_as_replacement() {
+        assert!(is_replacement_pattern(
+            "creatures you control can't have -1/-1 counters put on them."
+        ));
+        assert!(is_replacement_pattern(
+            "creatures can't have counters put on them."
         ));
     }
 

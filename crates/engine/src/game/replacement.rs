@@ -25842,6 +25842,73 @@ mod tests {
         );
     }
 
+    /// CR 614.17 + CR 122.1a: the PARSED Darksteel Angel / Melira line
+    /// ("Creatures you control can't have -1/-1 counters put on them.") reaches
+    /// the runtime as an `AddCounter` prevention that fires only for -1/-1
+    /// counters on the controller's creatures — +1/+1 counters on them and
+    /// -1/-1 counters on an opponent's creature are placed normally.
+    #[test]
+    fn parsed_controller_and_kind_scoped_counter_prohibition_applies_at_runtime() {
+        use crate::types::counter::CounterType;
+
+        let source = ObjectId(1);
+        let own = ObjectId(2);
+        let theirs = ObjectId(3);
+
+        let repl = crate::parser::oracle_replacement::parse_replacement_line(
+            "Creatures you control can't have -1/-1 counters put on them.",
+            "Darksteel Angel",
+        )
+        .expect("Darksteel Angel line must parse as a replacement");
+        let mut state = test_state_with_object(source, Zone::Battlefield, vec![repl]);
+        for (id, card, controller) in [(own, 2, PlayerId(0)), (theirs, 3, PlayerId(1))] {
+            let mut creature = crate::game::game_object::GameObject::new(
+                id,
+                CardId(card),
+                controller,
+                "C".into(),
+                Zone::Battlefield,
+            );
+            creature
+                .card_types
+                .core_types
+                .push(crate::types::card_type::CoreType::Creature);
+            state.objects.insert(id, creature);
+            state.battlefield.push_back(id);
+        }
+        let registry = build_replacement_registry();
+        let event = |object_id: ObjectId, counter_type: CounterType| ProposedEvent::AddCounter {
+            placement: CounterPlacement::Object {
+                actor: PlayerId(1),
+                object_id,
+                counter_type,
+            },
+            count: 1,
+            applied: HashSet::new(),
+        };
+
+        assert_eq!(
+            find_applicable_replacements(&state, &event(own, CounterType::Minus1Minus1), &registry)
+                .len(),
+            1,
+            "-1/-1 counters on the controller's creature must be prevented"
+        );
+        assert!(
+            find_applicable_replacements(&state, &event(own, CounterType::Plus1Plus1), &registry)
+                .is_empty(),
+            "+1/+1 counters on the controller's creature are not named by the line"
+        );
+        assert!(
+            find_applicable_replacements(
+                &state,
+                &event(theirs, CounterType::Minus1Minus1),
+                &registry
+            )
+            .is_empty(),
+            "the opponent's creatures are outside \"creatures you control\""
+        );
+    }
+
     /// CR 122.1a + CR 614.1a: Vizier of Remedies's "-1/-1 counters"
     /// replacement must fire on a -1/-1 counter addition, but not on a
     /// +1/+1 counter addition. Mirrors the Hardened Scales test in the
