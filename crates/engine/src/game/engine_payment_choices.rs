@@ -1,8 +1,9 @@
 use crate::game::filter;
 use crate::game::replacement::{self, ReplacementResult};
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, Effect, EffectKind, EffectScope, ResolvedAbility,
-    SacrificeRequirement, SubAbilityLink, TapStateChange, TargetFilter, TargetRef,
+    AbilityCondition, AbilityCost, ControllerRef, Effect, EffectKind, EffectScope,
+    OpponentMayScope, ResolvedAbility, SacrificeRequirement, SubAbilityLink, TapStateChange,
+    TargetFilter, TargetRef,
 };
 use crate::types::events::{GameEvent, PlayerActionKind};
 use crate::types::game_state::{
@@ -426,6 +427,7 @@ fn handle_opponent_may_choice_inner(
                 return Ok(state.waiting_for.clone());
             }
 
+            let any_opponent = ability.optional_for == Some(OpponentMayScope::AnyOpponent);
             ability.optional = false;
             ability.optional_for = None;
 
@@ -447,6 +449,16 @@ fn handle_opponent_may_choice_inner(
                             ..
                         }
                     );
+                    // CR 608.2d: "any opponent may sacrifice a creature of their choice"
+                    // (Desecration Demon) carries `controller: Opponent`, which the
+                    // sacrifice resolver reads relative to the ABILITY'S controller
+                    // (`resolve_sacrifice_scope`) — and that is right there. Here the
+                    // filter context is the promptee, so the same stamp would mean
+                    // "the Demon's controller" and the accepting opponent would never
+                    // have a legal creature. The `obj.controller == promptee`
+                    // pre-filter already confines the choice to the promptee's own
+                    // permanents, and an `AnyOpponent` promptee IS an opponent.
+                    let target = &promptee_relative_filter(target, any_opponent);
                     let legal: Vec<ObjectId> = state
                         .objects
                         .iter()
@@ -578,6 +590,21 @@ fn handle_opponent_may_choice_inner(
 /// may" choice (see `GameEvent::OptionalEffectDeclined`).
 fn push_declined(events: &mut Vec<GameEvent>, player: PlayerId, source_id: ObjectId) {
     events.push(GameEvent::OptionalEffectDeclined { player, source_id });
+}
+
+/// For `AnyOpponent` prompts, drops a top-level `controller: Opponent` stamp from the
+/// sacrifice/tap filter so it is not re-read relative to the accepting player.
+fn promptee_relative_filter(target: &TargetFilter, any_opponent: bool) -> TargetFilter {
+    match target {
+        TargetFilter::Typed(typed)
+            if any_opponent && typed.controller == Some(ControllerRef::Opponent) =>
+        {
+            let mut typed = typed.clone();
+            typed.controller = None;
+            TargetFilter::Typed(typed)
+        }
+        other => other.clone(),
+    }
 }
 
 fn resolve_all_declined_opponent_may(
