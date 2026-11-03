@@ -33723,6 +33723,7 @@ impl GameState {
                 | GameEvent::AttackerBecameBlockedByFilteredBlocker { .. }
                 | GameEvent::CombatTaxPaid { .. }
                 | GameEvent::CombatTaxDeclined { .. }
+                | GameEvent::OptionalEffectDeclined { .. }
                 | GameEvent::BecomesTarget { .. }
                 | GameEvent::VehicleCrewed { .. }
                 | GameEvent::Stationed { .. }

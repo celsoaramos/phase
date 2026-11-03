@@ -1105,6 +1105,7 @@ fn count_matching_trigger_event_subjects(
         | GameEvent::AttackerBecameBlockedByFilteredBlocker { .. }
         | GameEvent::CombatTaxPaid { .. }
         | GameEvent::CombatTaxDeclined { .. }
+        | GameEvent::OptionalEffectDeclined { .. }
         | GameEvent::VehicleCrewed { .. }
         | GameEvent::Stationed { .. }
         | GameEvent::Saddled { .. }

@@ -1465,6 +1465,14 @@ pub enum GameEvent {
         player: PlayerId,
         dropped: Vec<ObjectId>,
     },
+    /// CR 608.2d: a player offered an "any opponent/player may" choice did not
+    /// perform it (declined, or had nothing that could be chosen). Narration
+    /// only: without it, a trigger like Desecration Demon's resolves with no
+    /// line in the log and reads as "never triggered".
+    OptionalEffectDeclined {
+        player: PlayerId,
+        source_id: ObjectId,
+    },
     BecomesTarget {
         target: TargetRef,
         source_id: ObjectId,

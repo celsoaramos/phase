@@ -3611,6 +3611,7 @@ pub fn parse_type_phrase_folding_with_ctx<'a>(
 
     // Check "with power N or less/greater" suffix
     if let Some((prop, consumed)) = parse_mana_value_suffix(&lower[pos..], ctx) {
+        let prop = rebind_that_player_population(prop, &controller, &lower[pos..pos + consumed]);
         properties.push(prop);
         pos += consumed;
     }
@@ -3632,6 +3633,7 @@ pub fn parse_type_phrase_folding_with_ctx<'a>(
 
     // Check "with power N or less/greater" suffix
     if let Some((prop, consumed)) = parse_power_suffix(&lower[pos..], ctx) {
+        let prop = rebind_that_player_population(prop, &controller, &lower[pos..pos + consumed]);
         properties.push(prop);
         pos += consumed;
     }
@@ -4097,6 +4099,7 @@ pub fn parse_type_phrase_folding_with_ctx<'a>(
     // `additional_cost_instead_spell_has_legal_targets`; `game/casting.rs`'s
     // pre-target deferral gates.
     if let Some((prop, consumed)) = parse_mana_value_suffix(&lower[pos..], ctx) {
+        let prop = rebind_that_player_population(prop, &controller, &lower[pos..pos + consumed]);
         properties.push(prop);
         pos += consumed;
     }
@@ -6730,6 +6733,80 @@ fn parse_power_suffix(text: &str, ctx: &mut ParseContext) -> Option<(FilterProp,
     // combinator's remainder (`text.len() - rest.len()`).
     let (rest, prop) = nom_filter::parse_pt_comparison(trimmed).ok()?;
     Some((prop, text.len() - rest.len()))
+}
+
+/// CR 608.2c: "a creature an opponent controls with the greatest power among
+/// creatures that player controls" (Kraven the Hunter). "That player" is the
+/// opponent the head already named, but the shared controller-phrase grammar
+/// reads "that player controls" as the iterated player of an "each player" loop
+/// (`You`, rebound at resolution — Crackling Doom). A trigger/target subject has
+/// no such loop, so `You` there ranked the opponent's creature against the
+/// ABILITY CONTROLLER's creatures and the trigger never fired. Rebind the
+/// population to the head's controller. Exact in two-player games; with more
+/// players the census widens to every opponent's creatures, since no
+/// candidate-relative controller reference exists.
+fn rebind_that_player_population(
+    prop: FilterProp,
+    head: &Option<ControllerRef>,
+    suffix: &str,
+) -> FilterProp {
+    let Some(head @ ControllerRef::Opponent) = head else {
+        return prop;
+    };
+    if !nom_primitives::scan_contains(suffix, "that player control") {
+        return prop;
+    }
+    let rebind = |value: &QuantityExpr| -> Option<QuantityExpr> {
+        let QuantityExpr::Ref {
+            qty: QuantityRef::PropertyAggregate(aggregate),
+        } = value
+        else {
+            return None;
+        };
+        let CardTypeSetSource::Objects {
+            filter: TargetFilter::Typed(typed),
+        } = aggregate.source()
+        else {
+            return None;
+        };
+        if typed.controller != Some(ControllerRef::You) {
+            return None;
+        }
+        let mut typed = typed.clone();
+        typed.controller = Some(head.clone());
+        let aggregate = PropertyAggregate::new(
+            aggregate.function(),
+            aggregate.property(),
+            CardTypeSetSource::Objects {
+                filter: TargetFilter::Typed(typed),
+            },
+        )
+        .ok()?;
+        Some(QuantityExpr::Ref {
+            qty: QuantityRef::PropertyAggregate(aggregate),
+        })
+    };
+    match prop {
+        FilterProp::PtComparison {
+            stat,
+            scope,
+            comparator,
+            value,
+        } => {
+            let value = rebind(&value).unwrap_or(value);
+            FilterProp::PtComparison {
+                stat,
+                scope,
+                comparator,
+                value,
+            }
+        }
+        FilterProp::Cmc { comparator, value } => {
+            let value = rebind(&value).unwrap_or(value);
+            FilterProp::Cmc { comparator, value }
+        }
+        other => other,
+    }
 }
 
 /// Canonical object-membership predicate for a superlative aggregate. Shared

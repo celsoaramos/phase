@@ -534,6 +534,7 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
             | GameEvent::AttackerBecameBlockedByFilteredBlocker { .. }
             | GameEvent::CombatTaxPaid { .. }
             | GameEvent::CombatTaxDeclined { .. }
+            | GameEvent::OptionalEffectDeclined { .. }
             | GameEvent::BecomesTarget { .. }
             | GameEvent::VehicleCrewed { .. }
             | GameEvent::Stationed { .. }

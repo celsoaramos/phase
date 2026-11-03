@@ -1242,6 +1242,7 @@ mod mindblade_render_warrior_intervening_if_2867;
 mod mirror_march_copy_token_exile;
 mod mirror_strike_redirect;
 mod mizzixs_mastery;
+mod mf_relatos_20261103;
 mod mjolnir_hammer_double_damage;
 mod modal_spell_without_legal_mode;
 mod mogg_fanatic_target_before_cost;

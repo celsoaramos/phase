@@ -9384,6 +9384,91 @@ fn object_pt_value(obj: &GameObject, stat: PtStat, scope: PtValueScope) -> i32 {
     }
 }
 
+/// CR 603.10a: a leaves-the-battlefield trigger "looks back in time" — a
+/// battlefield superlative in its subject filter ("a creature an opponent
+/// controls with the greatest power among creatures that player controls dies",
+/// Kraven the Hunter) is measured on the battlefield as it stood immediately
+/// before the event. The live census no longer holds the departing object nor
+/// anything that left with it (`ZoneChangeRecord::co_departed`), so a lone
+/// opponent creature dying compared its power against an empty population (0)
+/// and the trigger never fired. Those departures are folded back in from the
+/// record and their last-known information; every other threshold resolves
+/// exactly as before.
+fn resolve_departure_threshold(
+    state: &GameState,
+    value: &QuantityExpr,
+    record: &ZoneChangeRecord,
+    source: &SourceContext<'_>,
+) -> i32 {
+    let live = resolve_filter_threshold(state, value, source);
+    let QuantityExpr::Ref {
+        qty: QuantityRef::PropertyAggregate(aggregate),
+    } = value
+    else {
+        return live;
+    };
+    let function = aggregate.function();
+    if !matches!(
+        function,
+        crate::types::ability::AggregateFunction::Max
+            | crate::types::ability::AggregateFunction::Min
+    ) || record.from_zone != Some(Zone::Battlefield)
+    {
+        return live;
+    }
+    let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+        return live;
+    };
+    let zones = filter.extract_zones();
+    if !zones.is_empty() && zones != [Zone::Battlefield] {
+        return live;
+    }
+    let Some(controller) = source.controller else {
+        return live;
+    };
+    let ctx = FilterContext::from_source_with_controller(source.id, controller);
+    let property_of = |power: Option<i32>, toughness: Option<i32>, mana_value: u32| match aggregate
+        .property()
+    {
+        crate::types::ability::ObjectProperty::Power => power,
+        crate::types::ability::ObjectProperty::Toughness => toughness,
+        crate::types::ability::ObjectProperty::ManaValue => {
+            Some(i32::try_from(mana_value).unwrap_or(i32::MAX))
+        }
+        crate::types::ability::ObjectProperty::ManaSymbolCount(_) => None,
+    };
+    let mut departed: Vec<i32> = Vec::new();
+    if matches_target_filter_on_zone_change_record(state, record, filter, &ctx) {
+        departed.extend(property_of(record.power, record.toughness, record.mana_value));
+    }
+    for id in &record.co_departed {
+        let Some(lki) = state.lki_cache.get(id) else {
+            continue;
+        };
+        if matches_target_filter_on_departed_battlefield_lki(state, *id, lki, filter, &ctx) {
+            departed.extend(property_of(lki.power, lki.toughness, lki.mana_value));
+        }
+    }
+    if departed.is_empty() {
+        return live;
+    }
+    // An empty live census reduces to 0, which is not a member value: fold it in
+    // only when something that matches is still on the battlefield.
+    let census = QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCount {
+            filter: filter.clone(),
+        },
+    };
+    if resolve_filter_threshold(state, &census, source) > 0 {
+        departed.push(live);
+    }
+    match function {
+        crate::types::ability::AggregateFunction::Min => departed.into_iter().min(),
+        _ => departed.into_iter().max(),
+    }
+    .unwrap_or(live)
+}
+
 fn zone_change_pt_value(record: &ZoneChangeRecord, stat: PtStat, scope: PtValueScope) -> i32 {
     match scope {
         PtValueScope::Current => pt_value_from_pair(stat, record.power, record.toughness),
@@ -10674,7 +10759,7 @@ fn zone_change_record_matches_property(
             value,
         } => comparator.evaluate(
             zone_change_pt_value(record, *stat, *scope),
-            resolve_filter_threshold(state, value, source),
+            resolve_departure_threshold(state, value, record, source),
         ),
         // CR 202.3: Mana value threshold on the event-time object.
         FilterProp::Cmc { comparator, value } => comparator.evaluate(

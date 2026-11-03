@@ -651,7 +651,9 @@ pub(crate) fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         // "whenever ~ becomes blocked" triggers are indexed for it.
         GameEvent::AttackerBecameBlockedByEffect { .. } => push(TriggerEventKey::Blocks),
         GameEvent::AttackerBecameBlockedByFilteredBlocker { .. } => push(TriggerEventKey::Blocks),
-        GameEvent::CombatTaxPaid { .. } | GameEvent::CombatTaxDeclined { .. } => {}
+        GameEvent::CombatTaxPaid { .. }
+        | GameEvent::CombatTaxDeclined { .. }
+        | GameEvent::OptionalEffectDeclined { .. } => {}
         GameEvent::BecomesTarget { .. } => push(TriggerEventKey::BecomesTarget),
         GameEvent::VehicleCrewed { .. }
         | GameEvent::Stationed { .. }

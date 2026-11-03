@@ -3053,6 +3053,7 @@ pub(crate) fn extract_target_object_from_event(
         | GameEvent::AttackerBecameBlockedByFilteredBlocker { .. }
         | GameEvent::CombatTaxPaid { .. }
         | GameEvent::CombatTaxDeclined { .. }
+        | GameEvent::OptionalEffectDeclined { .. }
         | GameEvent::VehicleCrewed { .. }
         | GameEvent::Stationed { .. }
         | GameEvent::Saddled { .. }
