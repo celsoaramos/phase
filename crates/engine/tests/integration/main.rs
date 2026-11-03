@@ -1668,6 +1668,7 @@ mod waiting_for_actor_authority_census;
 mod ward_discard_cost_shapes;
 mod ward_of_bones_relative_count_cast_prohibition;
 mod ward_of_bones_relative_count_land_prohibition;
+mod ward_sibling_trigger_targets;
 mod warning_source_shield_persists_across_damage_steps;
 mod warped_space_alt_cost_from_exile;
 mod wba_fodder_multiset;

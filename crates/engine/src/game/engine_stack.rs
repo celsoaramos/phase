@@ -31,6 +31,7 @@ pub(super) fn finalize_trigger_target_selection(
     ability: Box<ResolvedAbility>,
     events: &mut Vec<GameEvent>,
 ) -> WaitingFor {
+    let announcement_start = events.len();
     let assigned_targets = declared_targets_in_chain(&ability);
     let crime_candidate =
         casting::targets_commit_crime(state, &assigned_targets, trigger.controller);
@@ -111,6 +112,7 @@ pub(super) fn finalize_trigger_target_selection(
     }
 
     casting::commit_crime_after_stack_placement(state, crime_candidate, controller, events);
+    let announcement_end = events.len();
 
     priority::clear_priority_passes(state);
     // CR 113.2c + CR 603.2 + CR 603.3b: After the active trigger is on the
@@ -125,9 +127,40 @@ pub(super) fn finalize_trigger_target_selection(
     if let Some(waiting_for) =
         triggers::drain_deferred_triggers_after_trigger_construction(state, events)
     {
+        if !matches!(waiting_for, WaitingFor::Priority { .. }) {
+            collect_paused_announcement_triggers(
+                state,
+                events,
+                announcement_start,
+                announcement_end,
+            );
+        }
         return waiting_for;
     }
     WaitingFor::Priority { player: controller }
+}
+
+/// CR 603.2 + CR 603.3b + CR 702.21a: this trigger's targets became targets
+/// (and a crime may have been committed) as it was put on the stack, but the
+/// action now ends on a sibling's construction prompt instead of priority, so
+/// the post-action pipeline never scans `events[start..end]`. Ward and every
+/// other "becomes the target" trigger would be lost. Collect them into the
+/// deferred queue — the sibling's own finalization drains it, putting them on
+/// the stack with the rest of the batch — and claim the occurrences so no later
+/// ordinary scan collects them again (CR 603.2c).
+fn collect_paused_announcement_triggers(
+    state: &mut GameState,
+    events: &[GameEvent],
+    start: usize,
+    end: usize,
+) {
+    if start >= end {
+        return;
+    }
+    let announced = &events[..end];
+    let unclaimed = super::announcement_triggers::unclaimed_events(state, announced, start);
+    triggers::collect_triggers_into_deferred(state, &unclaimed);
+    triggers::claim_events_for_ordinary_collection(state, announced, start);
 }
 
 /// CR 706.2 + CR 603.12: Re-stamp the pending trigger's carried die-roll
