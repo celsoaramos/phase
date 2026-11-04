@@ -22524,7 +22524,9 @@ declare_game_state! {
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub liminal_entries: HashMap<ObjectId, LiminalEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_liminal_entry_resume: Option<PendingLiminalEntryResume>,
+    /// Boxed: populated only while a liminal entry waits on a copy choice,
+    /// and 184 B inline (stack budget, `game_state_size.rs`).
+    pub pending_liminal_entry_resume: Option<Box<PendingLiminalEntryResume>>,
     /// CR 303.4f + CR 614.12: see [`EnteringAuraAuthority`]. Written only by
     /// `zone_pipeline::apply_entering_aura_hosts` when it hands an entering
     /// Aura's host choice to a player and the deciding seam judged legality
