@@ -7453,7 +7453,7 @@ pub fn card_face_has_unimplemented_parts(face: &CardFace) -> bool {
             .any(static_has_unimplemented_parts)
 }
 
-fn static_has_unimplemented_parts(def: &StaticDefinition) -> bool {
+pub(crate) fn static_has_unimplemented_parts(def: &StaticDefinition) -> bool {
     let mut has_unimplemented_parts = false;
     let _ = def.walk_self_and_granted(&mut |static_def| {
         has_unimplemented_parts |= static_definition_has_unimplemented_parts(static_def);

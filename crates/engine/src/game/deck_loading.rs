@@ -1202,6 +1202,10 @@ pub fn load_deck_into_state(state: &mut GameState, payload: &DeckPayload) {
         }
     }
 
+    // House-rule emblems ("regra da semana"): one command-zone emblem per
+    // `FormatConfig::house_emblems` text, before the first turn (CR 114.1).
+    crate::game::house_emblems::grant_house_emblems(state);
+
     // Collect all creature subtypes for Changeling CDA expansion.
     // CR 205.2b + CR 205.3m + CR 308.1: creature subtypes are shared by Creature
     // and Kindred (legacy Tribal) faces. Subtype categories are disjoint, so a

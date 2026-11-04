@@ -781,6 +781,17 @@ pub struct FormatConfig {
     /// Immutable for the life of the session.
     #[serde(default)]
     pub allow_debug_actions: bool,
+    /// House-rule emblems (MagicFinder "regra da semana"): Oracle texts that
+    /// become game-start emblems in the command zone (CR 114.1 / CR 114.4),
+    /// one emblem per text, before the first turn. Each text runs through the
+    /// engine's own Oracle parser and must compile to static abilities only —
+    /// `FormatConfig::deserialize` rejects any text the parser does not fully
+    /// understand (`game::house_emblems::compile_house_emblems`), so a payload
+    /// can never yield an empty emblem that silently plays a normal game.
+    /// Like `allow_debug_actions`, a per-session host choice orthogonal to
+    /// format. Empty (the serde default) for every payload that predates it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub house_emblems: Vec<String>,
     /// Present only when `format == GameFormat::Custom(id)` (and then `id`
     /// must equal `custom_rules.id` — see
     /// `custom_format::validate_custom_rules_consistency`). `None` for every
@@ -1262,6 +1273,9 @@ fn built_in_axes_no_looser_than_rules(config: &FormatConfig) -> Result<(), Strin
     // allow_debug_actions: HostChoice — session capability, orthogonal to
     // format. Free.
 
+    // house_emblems: HostChoice — per-session house rule, orthogonal to
+    // format. Validated for parseability in `FormatConfig::deserialize`.
+
     // custom_rules: Locked (None) — the built-in arm is defined by
     // custom_rules == None; the biconditional is established upstream by
     // validate_custom_rules_consistency.
@@ -1276,6 +1290,12 @@ impl<'de> Deserialize<'de> for FormatConfig {
     {
         let config = Self::deserialize(deserializer)?;
         crate::types::custom_format::validate_custom_rules_consistency(&config)
+            .map_err(serde::de::Error::custom)?;
+        // House-rule emblems: every text must compile through the engine's
+        // Oracle parser to static abilities only. Fail the whole config (and
+        // with it game initialization) rather than admit an emblem that
+        // would silently play a normal game.
+        crate::game::house_emblems::compile_house_emblems(&config.house_emblems)
             .map_err(serde::de::Error::custom)?;
         // `validate_custom_rules_consistency` has already established the
         // `format == Custom(id) <=> custom_rules == Some(rules with that id)`
@@ -1310,6 +1330,8 @@ impl<'de> Deserialize<'de> for FormatConfig {
                 // orthogonal to format, chosen per game rather than declared
                 // by the ruleset. Every other field must match exactly.
                 expected.allow_debug_actions = config.allow_debug_actions;
+                // `house_emblems` is likewise a per-session host choice.
+                expected.house_emblems = config.house_emblems.clone();
                 if config != expected {
                     // Reports the derived target values rather than dumping
                     // both whole structs: `custom_rules.legality`'s
@@ -2976,6 +2998,7 @@ impl FormatConfig {
             default_deck_copy_limit: GameFormat::Standard.default_deck_copy_limit(),
             supplies_fixed_deck: false,
             allow_debug_actions: false,
+            house_emblems: Vec::new(),
             custom_rules: None,
         }
     }
@@ -2998,6 +3021,7 @@ impl FormatConfig {
             default_deck_copy_limit: GameFormat::Commander.default_deck_copy_limit(),
             supplies_fixed_deck: false,
             allow_debug_actions: false,
+            house_emblems: Vec::new(),
             custom_rules: None,
         }
     }
@@ -3037,6 +3061,7 @@ impl FormatConfig {
             default_deck_copy_limit: GameFormat::CommanderDraft.default_deck_copy_limit(),
             supplies_fixed_deck: false,
             allow_debug_actions: false,
+            house_emblems: Vec::new(),
             custom_rules: None,
         }
     }
@@ -3131,6 +3156,7 @@ impl FormatConfig {
             default_deck_copy_limit: GameFormat::TinyLeaders.default_deck_copy_limit(),
             supplies_fixed_deck: false,
             allow_debug_actions: false,
+            house_emblems: Vec::new(),
             custom_rules: None,
         }
     }
@@ -3157,6 +3183,7 @@ impl FormatConfig {
             default_deck_copy_limit: GameFormat::Oathbreaker.default_deck_copy_limit(),
             supplies_fixed_deck: false,
             allow_debug_actions: false,
+            house_emblems: Vec::new(),
             custom_rules: None,
         }
     }
@@ -3218,6 +3245,7 @@ impl FormatConfig {
             default_deck_copy_limit: GameFormat::FreeformCommander.default_deck_copy_limit(),
             supplies_fixed_deck: false,
             allow_debug_actions: false,
+            house_emblems: Vec::new(),
             custom_rules: None,
         }
     }
@@ -3242,6 +3270,7 @@ impl FormatConfig {
             default_deck_copy_limit: GameFormat::Brawl.default_deck_copy_limit(),
             supplies_fixed_deck: false,
             allow_debug_actions: false,
+            house_emblems: Vec::new(),
             custom_rules: None,
         }
     }
@@ -3275,6 +3304,7 @@ impl FormatConfig {
             default_deck_copy_limit: GameFormat::FreeForAll.default_deck_copy_limit(),
             supplies_fixed_deck: false,
             allow_debug_actions: false,
+            house_emblems: Vec::new(),
             custom_rules: None,
         }
     }
@@ -3299,6 +3329,7 @@ impl FormatConfig {
             default_deck_copy_limit: GameFormat::Limited.default_deck_copy_limit(),
             supplies_fixed_deck: false,
             allow_debug_actions: false,
+            house_emblems: Vec::new(),
             custom_rules: None,
         }
     }
@@ -3326,6 +3357,7 @@ impl FormatConfig {
             default_deck_copy_limit: GameFormat::Momir.default_deck_copy_limit(),
             supplies_fixed_deck: true,
             allow_debug_actions: false,
+            house_emblems: Vec::new(),
             custom_rules: None,
         }
     }
@@ -3351,6 +3383,7 @@ impl FormatConfig {
             default_deck_copy_limit: GameFormat::Dandan.default_deck_copy_limit(),
             supplies_fixed_deck: true,
             allow_debug_actions: false,
+            house_emblems: Vec::new(),
             custom_rules: None,
         }
     }
@@ -3373,6 +3406,7 @@ impl FormatConfig {
             default_deck_copy_limit: GameFormat::TwoHeadedGiant.default_deck_copy_limit(),
             supplies_fixed_deck: false,
             allow_debug_actions: false,
+            house_emblems: Vec::new(),
             custom_rules: None,
         }
     }
@@ -3398,6 +3432,7 @@ impl FormatConfig {
             default_deck_copy_limit: GameFormat::Planechase.default_deck_copy_limit(),
             supplies_fixed_deck: false,
             allow_debug_actions: false,
+            house_emblems: Vec::new(),
             custom_rules: None,
         }
     }
@@ -3422,6 +3457,7 @@ impl FormatConfig {
             default_deck_copy_limit: GameFormat::Archenemy.default_deck_copy_limit(),
             supplies_fixed_deck: false,
             allow_debug_actions: false,
+            house_emblems: Vec::new(),
             custom_rules: None,
         }
     }
@@ -3589,6 +3625,7 @@ impl FormatConfig {
             sideboard_policy: structural.sideboard_policy,
             default_deck_copy_limit: structural.default_deck_copy_limit,
             allow_debug_actions: false,
+            house_emblems: Vec::new(),
             custom_rules: Some(Box::new(rules.clone())),
         }
     }
@@ -3712,6 +3749,7 @@ mod tests {
             sideboard_policy: _,
             default_deck_copy_limit: _,
             allow_debug_actions: _,
+            house_emblems: _,
             custom_rules: _,
         } = config;
     }
