@@ -4574,7 +4574,15 @@ fn one_sided_fight_subject(
     ability: &ResolvedAbility,
     sub: &ResolvedAbility,
 ) -> Option<OneSidedFightSubject> {
-    match first_object_target(&ability.targets) {
+    // CR 701.3b + CR 608.2c: after an attach, "that creature" names the object
+    // the attachments became attached to — the HOST — not the attach's first
+    // object target, which is an attachment ("attach any number of target
+    // Equipment you control to target creature you control. … that creature
+    // deals damage equal to its power …" — Thorin, Mountain-king).
+    let attach_host = matches!(ability.effect, Effect::Attach { .. })
+        .then(|| ability.attach_host_target().map(|host| host.object_id))
+        .flatten();
+    match attach_host.or_else(|| first_object_target(&ability.targets)) {
         // The child already leads with the subject — contract intact.
         Some(source) if first_object_target(&sub.targets) == Some(source) => None,
         // A FILTER-BASED batch child (`DamageAll`: Chandra's Ignition, Alpha

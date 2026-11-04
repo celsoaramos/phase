@@ -26909,6 +26909,80 @@ fn bind_anaphoric_damage_subject_keep_recipient(effect: &mut Effect) -> bool {
     true
 }
 
+/// CR 115.1 + CR 120.1 + CR 608.2c: "That creature deals damage equal to its
+/// power to [up to one] target creature" (Thorin, Mountain-king). The
+/// demonstrative is the clause's SUBJECT — the object dealing the damage — and
+/// the word "target" introduces a NEW declared target, which can never be the
+/// demonstrative's referent. Bind the source to the antecedent (`Target`, the
+/// one-sided-fight descent) and keep the recipient. Without this, a typed
+/// recipient with no controller (`target_filter_is_distinct_recipient` only
+/// admits an opponent's or an "another" one) was collapsed to `ParentTarget`,
+/// so the antecedent "dealt" damage to itself from the ability's source.
+///
+/// The subject must be the demonstrative itself ("that creature deals"), never
+/// the card ("~ deals damage equal to that creature's power to target
+/// creature", whose source is the card, CR 201.5) nor a bare "it". Inside a
+/// zone-change trigger the subject parser first binds the demonstrative to the
+/// triggering object (`TriggeringSource`); these anaphor gates run only when an
+/// earlier instruction of the same ability declared a typed referent and the
+/// trigger has no typed subject, so the demonstrative names that referent
+/// (CR 608.2c) — "When Thorin enters, attach … to target creature you control.
+/// … that creature deals damage …" is the chosen creature, not Thorin.
+fn bind_demonstrative_subject_damage_to_fresh_target(effect: &mut Effect, lower: &str) -> bool {
+    if !matches!(
+        effect,
+        Effect::DealDamage {
+            target: TargetFilter::Typed(_),
+            damage_source: None | Some(DamageSource::TriggeringSource),
+            ..
+        }
+    ) {
+        return false;
+    }
+    // The chunk text can still carry a reflexive head ("when one or more
+    // equipment become attached to that creature this way, that creature deals
+    // …"), so find the subject at a word boundary — the last one, nearest the
+    // recipient.
+    let Some(((), rest)) = nom_primitives::scan_last_at_word_boundaries(lower, |input| {
+        value(
+            (),
+            (
+                alt((
+                    tag::<_, _, OracleError<'_>>("that creature "),
+                    tag("that permanent "),
+                )),
+                alt((tag("deals damage "), tag("deals "))),
+            ),
+        )
+        .parse(input)
+    }) else {
+        return false;
+    };
+    // `scan_contains` tries the phrase at each word start, so the phrases carry
+    // no leading space.
+    let fresh_target = nom_primitives::scan_contains(rest, "to target ")
+        || nom_primitives::scan_contains(rest, "to up to ");
+    if !fresh_target {
+        return false;
+    }
+    set_damage_clause_source_only(effect, DamageSource::Target);
+    if let Effect::DealDamage { amount, .. } = effect {
+        rebind_object_scope_amount(
+            amount,
+            ObjectScope::Source,
+            ObjectScope::Anaphoric,
+            SourceRefRebind::AllObjectRefs,
+        );
+        rebind_object_scope_amount(
+            amount,
+            ObjectScope::EventSource,
+            ObjectScope::Anaphoric,
+            SourceRefRebind::AllObjectRefs,
+        );
+    }
+    true
+}
+
 /// Check if an effect has a `Typed(...)` target filter (not SelfRef/ParentTarget/Any).
 /// Used to guard anaphoric replacement scope — prevents false positives when a
 /// pronoun clause follows a conditional effect without a typed target.
@@ -47624,6 +47698,10 @@ fn parse_effect_chain_ir_body(
                 &mut clause.effect,
             )
             && !bind_self_ref_damage_subject(&mut clause.effect)
+            && !bind_demonstrative_subject_damage_to_fresh_target(
+                &mut clause.effect,
+                &recipient_anaphor_lower,
+            )
         {
             replace_target_with_parent(&mut clause.effect);
         }
@@ -47695,6 +47773,10 @@ fn parse_effect_chain_ir_body(
             // clobbering the recipient (Throw from the Saddle, Wolf Strike,
             // Burrog Barrage — conditional-boost head).
             && !bind_anaphoric_damage_subject_keep_recipient(&mut clause.effect)
+            && !bind_demonstrative_subject_damage_to_fresh_target(
+                &mut clause.effect,
+                &recipient_anaphor_lower,
+            )
         {
             replace_target_with_parent(&mut clause.effect);
         }
@@ -47717,6 +47799,10 @@ fn parse_effect_chain_ir_body(
             // clobbering the recipient (Ambuscade, Clear Shot, Rabid Gnaw —
             // unconditional-boost head).
             && !bind_anaphoric_damage_subject_keep_recipient(&mut clause.effect)
+            && !bind_demonstrative_subject_damage_to_fresh_target(
+                &mut clause.effect,
+                &recipient_anaphor_lower,
+            )
         {
             replace_target_with_parent(&mut clause.effect);
         }

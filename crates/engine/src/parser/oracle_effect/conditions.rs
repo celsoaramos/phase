@@ -1033,11 +1033,45 @@ pub(super) fn strip_if_you_do_conditional_with_head(
     ))
     .parse(lower.as_str())
     {
+        // CR 603.12 + CR 701.3b: "When one or more Equipment become attached to
+        // that creature this way, <body>" (Thorin, Mountain-king) is the
+        // reflexive trigger on the preceding attach — exactly "when you do". An
+        // attach that attached nothing did not happen (the `WhenYouDo`
+        // parent-performed check reads the attach's own outcome).
+        if matches!(connector, ThisWayConnector::When) {
+            if let Ok((after_clause, ())) = parse_attached_this_way_head(rest) {
+                let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+                let offset = text.len() - body_lower.len();
+                return (
+                    Some(AbilityCondition::WhenYouDo),
+                    None,
+                    text[offset..].to_string(),
+                );
+            }
+        }
         if let (Some(condition), head, body) = strip_this_way_head(text, rest) {
             return (Some(connector.gate(condition)), head, body);
         }
     }
     (None, None, text.to_string())
+}
+
+/// CR 701.3b + CR 603.12: "[one or more|a|an] <attachments> become[s] attached
+/// to <that creature|it|that permanent> this way" — the head after "when ". The
+/// attachment phrase is not re-read: the preceding attach names what attaches,
+/// and its performed outcome is what the reflexive keys on.
+fn parse_attached_this_way_head(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        (
+            opt(alt((tag("one or more "), tag("an "), tag("a ")))),
+            take_until(" become"),
+            alt((tag(" becomes attached to "), tag(" become attached to "))),
+            alt((tag("that creature"), tag("that permanent"), tag("it"))),
+            tag(" this way"),
+        ),
+    )
+    .parse(input)
 }
 
 /// The connector word in front of a "… this way" head.
