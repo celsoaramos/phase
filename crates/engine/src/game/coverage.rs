@@ -283,6 +283,15 @@ pub(crate) fn is_data_carrying_static(mode: &StaticMode) -> bool {
             // enforcement is in turns.rs::counter_removal_blocked. Not
             // registry-keyed.
             | StaticMode::CountersCantBeRemoved { .. }
+    ) || matches!(
+        mode,
+        // CR 118.9: a free alternative keyword cost on a tagged activation
+        // (equip, cycling) is applied at runtime by
+        // casting.rs::alternative_keyword_activation_cost. A non-free one, or one
+        // on an untagged activation (crew), stays a gap.
+        StaticMode::AlternativeKeywordCost { keyword, cost, .. }
+            if super::casting::alternative_keyword_cost_tag(*keyword).is_some()
+                && super::casting::alternative_keyword_cost_is_free(cost)
     )
 }
 
@@ -23323,24 +23332,55 @@ have been revealed, Aggressive Detective deals 2 damage to each opponent.";
     }
 
     #[test]
+    fn free_alternative_keyword_cost_on_tagged_activation_is_supported() {
+        for keyword in [KeywordKind::Cycling, KeywordKind::Equip] {
+            let mut face = make_face();
+            face.oracle_text = Some("You may pay {0} rather than pay cycling costs.".to_string());
+            face.static_abilities.push(
+                StaticDefinition::new(StaticMode::AlternativeKeywordCost {
+                    keyword,
+                    cost: AbilityCost::Mana {
+                        cost: ManaCost::generic(0),
+                    },
+                    frequency: None,
+                })
+                .description("You may pay {0} rather than pay cycling costs.".to_string()),
+            );
+            let gaps = card_face_gaps(&face);
+            assert!(
+                !gaps
+                    .iter()
+                    .any(|gap| gap.starts_with("Static:AlternativeKeywordCost")),
+                "a free {keyword:?} alternative cost is applied at runtime: {gaps:?}"
+            );
+        }
+    }
+
+    #[test]
     fn alternative_keyword_cost_static_remains_runtime_coverage_gap() {
         let mut face = make_face();
-        face.oracle_text = Some("You may pay {0} rather than pay cycling costs.".to_string());
+        face.oracle_text = Some(
+            "You may remove a loyalty counter from a planeswalker you control rather than pay this Vehicle's crew cost."
+                .to_string(),
+        );
         face.static_abilities.push(
             StaticDefinition::new(StaticMode::AlternativeKeywordCost {
-                keyword: KeywordKind::Cycling,
+                keyword: KeywordKind::Crew,
                 cost: AbilityCost::Mana {
                     cost: ManaCost::generic(0),
                 },
                 frequency: None,
             })
-            .description("You may pay {0} rather than pay cycling costs.".to_string()),
+            .description(
+                "You may remove a loyalty counter from a planeswalker you control rather than pay this Vehicle's crew cost."
+                    .to_string(),
+            ),
         );
 
         let gaps = card_face_gaps(&face);
         assert!(
             gaps.iter()
-                .any(|gap| gap == "Static:AlternativeKeywordCost(Cycling)"),
+                .any(|gap| gap == "Static:AlternativeKeywordCost(Crew)"),
             "runtime-deferred AlternativeKeywordCost must remain a coverage gap: {gaps:?}"
         );
 

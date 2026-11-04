@@ -161,7 +161,8 @@ pub(crate) fn is_pay_life_as_colored_mana_pattern(lower: &str) -> bool {
 
 /// CR 118.9 + CR 702.29a + CR 702.122a: Alternative keyword-cost grant static —
 /// "[As long as <cond>, ]You may [cost] rather than pay [card-ref's] [keyword] cost[s]."
-/// New Perspectives (cycling) / Heart of Kiran (crew) / Gavi class. Accepts an
+/// New Perspectives (cycling) / Heart of Kiran (crew) / Gavi class / Kíli the
+/// Resourceful (equip). Accepts an
 /// optional leading "as long as " gate (New Perspectives); the lowering
 /// (`parse_alternative_keyword_cost`) splits and types the condition, strict-failing
 /// when the gate is unrecognized.
@@ -170,7 +171,9 @@ pub(crate) fn is_alternative_keyword_cost_pattern(lower: &str) -> bool {
     (lower_starts_with(lower, "you may ")
         || (lower_starts_with(lower, "as long as ") && scan_contains(lower, "you may ")))
         && scan_contains(lower, "rather than pay")
-        && (scan_contains(lower, "cycling cost") || scan_contains(lower, "crew cost"))
+        && (scan_contains(lower, "cycling cost")
+            || scan_contains(lower, "crew cost")
+            || scan_contains(lower, "equip cost"))
 }
 
 /// CR 118.9: Alternative-cost grant — "You may cast [filter] by paying {cost}

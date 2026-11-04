@@ -27692,6 +27692,9 @@ pub(crate) fn activation_verdict(
     else {
         return ActivationVerdict::Illegal;
     };
+    // CR 118.9: an alternative keyword cost replaces the printed cost before
+    // anything prices it (Kíli the Resourceful's free first equip).
+    apply_alternative_keyword_activation_cost(state, &mut ability_def, player);
     if !matches!(
         activation_structural_eligibility(state, player, source_id, &ability_def),
         ActivationStructuralEligibility::Eligible
@@ -29189,6 +29192,11 @@ fn activate_with_cost_carrier(
             "Invalid ability index".to_string(),
         ));
     };
+    // CR 118.9: an alternative keyword cost replaces the printed cost before
+    // anything prices it. A resumed activation carries its cost in `carrier`.
+    if carrier.is_none() {
+        apply_alternative_keyword_activation_cost(state, &mut ability_def, player);
+    }
     match activation_structural_eligibility(state, player, source_id, &ability_def) {
         ActivationStructuralEligibility::Eligible => {}
         ActivationStructuralEligibility::WrongActivator => {
@@ -33583,6 +33591,95 @@ fn activation_totals_canonical_search(x: u32, steps: &[(u32, u32)]) -> Vec<(u32,
         .collect()
 }
 
+/// CR 118.9 + CR 602.2b: the alternative cost an `AlternativeKeywordCost`
+/// static (Kíli the Resourceful, Forge Anew, Gavi Nest Warden, New
+/// Perspectives) offers `player` for activating `ability_def`, or `None` when
+/// none applies. The ability's printed cost stays the cost otherwise.
+///
+/// Applies when the static's controller is the activating player ("you may
+/// pay"), its condition holds (`battlefield_active_statics` filters it — Kíli's
+/// "as long as you have an enduring story"), the ability carries the keyword's
+/// tag, and, for a first-per-turn grant (CR 602.2b + CR 611.3a), no ability
+/// with that tag was already activated by the player this turn — the turn's
+/// first such activation is spent whether or not it took the alternative.
+///
+/// Only a FREE alternative (`{0}`) is applied, and it is applied without a
+/// prompt: CR 118.9 makes it optional, but `{0}` never costs more than the
+/// printed cost and the first-per-turn window is consumed either way, so
+/// declining it is never a better play. A non-free alternative (Heart of
+/// Kiran's loyalty counter) is a real choice and stays unapplied.
+pub(crate) fn alternative_keyword_activation_cost(
+    state: &GameState,
+    ability_def: &AbilityDefinition,
+    player: PlayerId,
+) -> Option<AbilityCost> {
+    let tag = ability_def.ability_tag?;
+    if !static_kind_present(state, StaticModeKind::AlternativeKeywordCost) {
+        return None;
+    }
+    let already_used_this_turn = || {
+        state
+            .abilities_activated_this_turn_by_player
+            .get(&player)
+            .is_some_and(|rows| rows.iter().any(|row| row.ability_tag == Some(tag)))
+    };
+    super::functioning_abilities::battlefield_active_statics(state).find_map(|(source, def)| {
+        let StaticMode::AlternativeKeywordCost {
+            keyword,
+            cost,
+            frequency,
+        } = &def.mode
+        else {
+            return None;
+        };
+        let applies = source.controller == player
+            && alternative_keyword_cost_tag(*keyword) == Some(tag)
+            && alternative_keyword_cost_is_free(cost)
+            && match frequency {
+                None | Some(CastFrequency::Unlimited) => true,
+                Some(CastFrequency::OncePerTurn) => !already_used_this_turn(),
+                // The parser never writes a per-permanent-type scope here; an
+                // unknown scope is refused, never widened to every activation.
+                Some(CastFrequency::OncePerTurnPerPermanentType) => false,
+            };
+        applies.then(|| cost.clone())
+    })
+}
+
+/// CR 702.6a + CR 702.29a: the activated-ability tag a keyword's alternative
+/// cost replaces. `None` for a keyword whose activation carries no tag (crew is
+/// a keyword action of its own path, CR 702.122a), so its grant stays unapplied.
+pub(crate) fn alternative_keyword_cost_tag(keyword: KeywordKind) -> Option<AbilityTag> {
+    match keyword {
+        KeywordKind::Equip => Some(AbilityTag::Equip),
+        KeywordKind::Cycling => Some(AbilityTag::Cycling),
+        _ => None,
+    }
+}
+
+/// CR 118.9: a `{0}` alternative cost — the only kind applied without asking.
+pub(crate) fn alternative_keyword_cost_is_free(cost: &AbilityCost) -> bool {
+    matches!(cost, AbilityCost::Mana { cost } if *cost == ManaCost::zero())
+}
+
+/// CR 118.9 + CR 602.2b: replace `ability_def`'s printed cost with the
+/// alternative keyword cost `player` gets for it, when one applies. Run on the
+/// definition before any cost is priced, so the legality read-out and the
+/// activation itself see the same base cost; modifiers then apply to it as to
+/// any alternative cost (CR 601.2f).
+pub(crate) fn apply_alternative_keyword_activation_cost(
+    state: &GameState,
+    ability_def: &mut AbilityDefinition,
+    player: PlayerId,
+) {
+    if ability_def.cost.is_none() {
+        return;
+    }
+    if let Some(cost) = alternative_keyword_activation_cost(state, ability_def, player) {
+        ability_def.cost = Some(cost);
+    }
+}
+
 fn collect_static_activated_ability_cost_modifiers(
     state: &GameState,
     ability_def: &AbilityDefinition,
@@ -33982,6 +34079,29 @@ pub(crate) fn cost_observable_activation_journal(
                           affected: Option<&TargetFilter>,
                           static_source_id: ObjectId,
                           static_controller: PlayerId| {
+        // CR 118.9 + CR 602.2b: a first-per-turn alternative keyword cost
+        // (Kíli the Resourceful, Gavi) reads the activator's first row carrying
+        // the keyword's tag (`alternative_keyword_activation_cost`).
+        if let StaticMode::AlternativeKeywordCost {
+            keyword,
+            frequency: Some(CastFrequency::OncePerTurn),
+            ..
+        } = reduce_mode
+        {
+            let Some(tag) = alternative_keyword_cost_tag(*keyword) else {
+                return;
+            };
+            if let Some(row) = state
+                .abilities_activated_this_turn_by_player
+                .get(&static_controller)
+                .and_then(|rows| rows.iter().find(|row| row.ability_tag == Some(tag)))
+            {
+                if !kept.iter().any(|seen| std::ptr::eq(*seen, row)) {
+                    kept.push(row);
+                }
+            }
+            return;
+        }
         let StaticMode::ReduceAbilityCost {
             keyword,
             exemption,
@@ -34064,6 +34184,9 @@ fn is_first_activation_modifier(mode: &StaticMode) -> bool {
     matches!(
         mode,
         StaticMode::ReduceAbilityCost {
+            frequency: Some(CastFrequency::OncePerTurn),
+            ..
+        } | StaticMode::AlternativeKeywordCost {
             frequency: Some(CastFrequency::OncePerTurn),
             ..
         }
