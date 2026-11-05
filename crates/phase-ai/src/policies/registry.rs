@@ -143,6 +143,9 @@ pub enum PolicyId {
     XValue,
     LandAnimation,
     MillTargeting,
+    /// CR 701.34a: proliferate only what helps the proliferating player
+    /// (never the opponent's energy or +1/+1 counters).
+    ProliferateChoice,
     MillPayoff,
     EnergyPayoff,
     ChaliceAvoidance,
@@ -174,9 +177,6 @@ pub enum PolicyId {
     /// CR 205.3m: pick a creature type the AI actually has members of, instead
     /// of the alphabetically first option the engine offers.
     CreatureTypeChoice,
-    /// CR 701.34a: proliferate only what helps the proliferating player
-    /// (never the opponent's energy or +1/+1 counters).
-    ProliferateChoice,
     /// CR 601.2a + CR 601.2b: announce the graveyard permission whose
     /// commitments (slot, extra cost, counter) give up least.
     GraveyardAuthority,
@@ -435,6 +435,7 @@ impl Default for PolicyRegistry {
             Box::new(super::control_change_awareness::ControlChangeAwarenessPolicy),
             Box::new(super::land_animation::LandAnimationPolicy),
             Box::new(super::mill_targeting::MillTargetingPolicy),
+            Box::new(super::proliferate_choice::ProliferateChoicePolicy),
             Box::new(PayoffPolicy::new(&MILL_PAYOFF)),
             Box::new(PayoffPolicy::new(&ENERGY_PAYOFF)),
             Box::new(ChaliceAvoidancePolicy),
@@ -451,7 +452,6 @@ impl Default for PolicyRegistry {
             Box::new(super::discard_payoff::DiscardPayoffPolicy),
             Box::new(super::vehicle_deployment::VehicleDeploymentPolicy),
             Box::new(CreatureTypeChoicePolicy),
-            Box::new(super::proliferate_choice::ProliferateChoicePolicy),
             Box::new(GraveyardAuthorityPolicy),
             Box::new(super::pile_partition::PilePartitionPolicy),
             Box::new(super::ritual_sink::RitualSinkPolicy),
