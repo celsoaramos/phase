@@ -5,6 +5,7 @@ mod copy;
 mod evoke;
 pub mod filter;
 mod payment_continuation;
+mod proliferate;
 mod prospective_mana;
 mod shortcut_efficacy;
 mod swarm;
@@ -82,6 +83,7 @@ pub use payment_continuation::{
 pub use payment_continuation::{
     witness_payment_continuations_with_counters, PaymentContinuationWitnessCounters,
 };
+pub use proliferate::{proliferate_helpful_subset, proliferate_target_helps};
 pub use prospective_mana::{
     certify_fetch_then_cast, certify_pact_plan, controls_exact_fetchland, is_pact_payment_ability,
     is_pact_payment_cast, CertifiedFetchFollowUp, CertifiedFetchPrompt, CertifiedPactPlan,

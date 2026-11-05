@@ -3091,6 +3091,17 @@ pub fn candidate_actions_broad_with_probe(
                     Some(*player),
                 ));
             }
+            // The subset that helps the proliferating player (its own permanents
+            // with good counters, the opponents' with bad ones). Offered only when
+            // it differs from "all", "none" and the singletons above.
+            let helpful = super::proliferate::proliferate_helpful_subset(state, *player, eligible);
+            if helpful.len() >= 2 && helpful.len() < eligible.len() {
+                actions.push(candidate(
+                    GameAction::SelectTargets { targets: helpful },
+                    TacticalClass::Selection,
+                    Some(*player),
+                ));
+            }
             actions
         }
         // CR 701.56a: Time travel — choose any subset of eligible objects for the

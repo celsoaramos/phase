@@ -51,6 +51,7 @@ mod pile_partition;
 mod planeswalker_loyalty;
 mod plus_one_counters;
 mod poison;
+mod proliferate_choice;
 mod ramp_timing;
 mod reactive_self_protection;
 mod recursion_awareness;
