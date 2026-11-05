@@ -391,5 +391,8 @@
   },
   {
     "branch": "ai/bigboard-target-offers"
+  },
+  {
+    "branch": "ai/proliferate-own-side"
   }
 ]
