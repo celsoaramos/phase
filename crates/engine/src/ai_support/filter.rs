@@ -526,6 +526,55 @@ impl FilterPipeline {
             .collect()
     }
 
+    /// [`Self::apply`] that gives up early: `None` as soon as MORE than `limit`
+    /// accepted candidates satisfy `counted`, without validating the rest.
+    ///
+    /// Every verdict is per-candidate (the memo only shares one verdict between
+    /// candidates with the same [`LegalityKey`]), so when this returns `Some` it is
+    /// exactly what [`Self::apply`] returns, in the same order. MagicFinder
+    /// (2026-11-04): a caller that only explores up to `limit` branches was
+    /// validating ~465 `ChooseTarget` children — one reducer simulation each over
+    /// a 465-permanent state — and then discarding them all for exceeding the
+    /// limit; seconds per AI decision on a token-heavy board.
+    pub fn apply_bounded<I>(
+        &self,
+        state: &GameState,
+        candidates: I,
+        counted: impl Fn(&CandidateAction) -> bool,
+        limit: usize,
+    ) -> Option<Vec<CandidateAction>>
+    where
+        I: IntoIterator<Item = CandidateAction>,
+    {
+        let poison = LegalityPoisonGates::compute(state);
+        let mut memo: HashMap<LegalityKey, bool> = HashMap::new();
+        let mut interner = FingerprintInterner::default();
+        let mut accepted = Vec::new();
+        let mut counted_so_far = 0usize;
+        for c in candidates {
+            if !self.cheap_filters_accept_with_probe(state, &c, None) {
+                continue;
+            }
+            let ok = match legality_equivalence_key(state, &c.action, &poison, &mut interner) {
+                Some(key) => *memo
+                    .entry(key)
+                    .or_insert_with(|| self.expensive_verdict_with_probe(state, &c, None)),
+                None => self.expensive_verdict_with_probe(state, &c, None),
+            };
+            if !ok {
+                continue;
+            }
+            if counted(&c) {
+                counted_so_far += 1;
+                if counted_so_far > limit {
+                    return None;
+                }
+            }
+            accepted.push(c);
+        }
+        Some(accepted)
+    }
+
     /// Run every non-`Expensive` filter (the cheap, per-candidate checks).
     /// First rejection wins, mirroring `accepts()`.
     fn cheap_filters_accept_with_probe(

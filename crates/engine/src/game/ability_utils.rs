@@ -8623,6 +8623,13 @@ fn target_filter_has_another_target_marker(filter: &TargetFilter) -> bool {
 /// it to over-share. This is a deliberate scoping choice, not an enforcement
 /// gap: distinctness lives in the spec-aware lattice that the multi_target path
 /// (Mothman et al.) actually flows through.
+#[cfg(test)]
+thread_local! {
+    /// How many times [`legal_targets_for_selected_slot`] built a slot's list —
+    /// the unit [`SharedSlotTargets`] keeps linear (test-only).
+    static SELECTED_SLOT_TARGET_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn legal_targets_for_selected_slot(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -8630,6 +8637,8 @@ fn legal_targets_for_selected_slot(
     prior_specs: &[TargetSlotSpec],
     selected_slots: &[Option<TargetRef>],
 ) -> Vec<TargetRef> {
+    #[cfg(test)]
+    SELECTED_SLOT_TARGET_BUILDS.with(|c| c.set(c.get() + 1));
     // CR 120.3a + CR 603.7c: The companion `TargetFilter::Player` slot for a
     // damage-to-player trigger binds "that player" to the damaged player carried
     // by the triggering event, not a free choice among every player. This is the
@@ -9522,6 +9531,51 @@ fn legal_targets_for_spec_slot(
     legal_targets_for_selected_slot(state, ability, spec, &specs[..current_slot], selected_slots)
 }
 
+/// Memo of [`legal_targets_for_selected_slot`] for the levels every candidate of
+/// one [`legal_targets_for_slot_with_specs`] call shares: the slot being filled
+/// and the slots before it. The function is pure in (slot spec, prior
+/// selections) for one state and ability, so a hit returns exactly what a fresh
+/// call would.
+///
+/// MagicFinder (2026-11-04): without it, offering the targets of "fights another
+/// target creature" (Brash Taunter) against ~465 permanents rebuilt the full
+/// legal-target list once per candidate to confirm the candidate was in it —
+/// twice (prefix validation, then the completion leaf): O(N²) filter matches,
+/// hundreds of ms per activation replay and seconds per AI decision.
+struct SharedSlotTargets {
+    /// Slots at or below this index have a selection prefix every candidate
+    /// shares; deeper slots depend on the candidate and are computed directly.
+    max_index: usize,
+    entries: Vec<(usize, Vec<Option<TargetRef>>, std::collections::HashSet<TargetRef>)>,
+}
+
+impl SharedSlotTargets {
+    fn contains(
+        &mut self,
+        state: &GameState,
+        ability: &ResolvedAbility,
+        specs: &[TargetSlotSpec],
+        index: usize,
+        prefix: &[Option<TargetRef>],
+        target: &TargetRef,
+    ) -> bool {
+        if let Some((_, _, set)) = self
+            .entries
+            .iter()
+            .find(|(i, p, _)| *i == index && p.as_slice() == prefix)
+        {
+            return set.contains(target);
+        }
+        let set: std::collections::HashSet<TargetRef> =
+            legal_targets_for_selected_slot(state, ability, &specs[index], &specs[..index], prefix)
+                .into_iter()
+                .collect();
+        let found = set.contains(target);
+        self.entries.push((index, prefix.to_vec(), set));
+        found
+    }
+}
+
 fn legal_targets_for_slot_with_specs(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -9531,38 +9585,54 @@ fn legal_targets_for_slot_with_specs(
     current_slot: usize,
     selected_slots: &[Option<TargetRef>],
 ) -> Vec<TargetRef> {
-    legal_targets_for_spec_slot(
+    let candidates = legal_targets_for_spec_slot(
         state,
         ability,
         specs,
         target_slots,
         current_slot,
         selected_slots,
-    )
-    .into_iter()
-    .filter(|target| {
-        let mut next_slots = selected_slots.to_vec();
-        next_slots.push(Some(target.clone()));
-        validate_selected_slots_with_specs(
-            state,
-            ability,
-            specs,
-            target_slots,
-            &next_slots,
-            constraints,
-        )
-        .is_ok()
-            && has_legal_completion_with_specs(
+    );
+    let mut shared = SharedSlotTargets {
+        max_index: current_slot,
+        entries: Vec::new(),
+    };
+    // The candidates ARE this slot's legal targets for this prefix: seed the memo
+    // so neither validation below recomputes them.
+    if current_slot < specs.len() {
+        shared.entries.push((
+            current_slot,
+            selected_slots.to_vec(),
+            candidates.iter().cloned().collect(),
+        ));
+    }
+    candidates
+        .into_iter()
+        .filter(|target| {
+            let mut next_slots = selected_slots.to_vec();
+            next_slots.push(Some(target.clone()));
+            validate_selected_slots_with_specs_shared(
                 state,
                 ability,
                 specs,
                 target_slots,
-                constraints,
-                current_slot + 1,
                 &next_slots,
+                constraints,
+                Some(&mut shared),
             )
-    })
-    .collect()
+            .is_ok()
+                && has_legal_completion_with_specs_shared(
+                    state,
+                    ability,
+                    specs,
+                    target_slots,
+                    constraints,
+                    current_slot + 1,
+                    &next_slots,
+                    Some(&mut shared),
+                )
+        })
+        .collect()
 }
 
 /// The five units of work in the target-completion walk. The walk charges each
@@ -9742,6 +9812,7 @@ pub fn walk_target_completions<V: CompletionVisitor>(
         constraints,
         visitor,
         budget,
+        shared: None,
     }
     .frame(0, &[], false)
 }
@@ -9754,6 +9825,8 @@ struct TargetCompletionWalk<'a, V> {
     constraints: &'a [TargetSelectionConstraint],
     visitor: &'a mut V,
     budget: &'a mut WorkBudget,
+    /// Shared-prefix legal-target memo of the caller ([`SharedSlotTargets`]).
+    shared: Option<&'a mut SharedSlotTargets>,
 }
 
 impl<V: CompletionVisitor> TargetCompletionWalk<'_, V> {
@@ -9823,13 +9896,14 @@ impl<V: CompletionVisitor> TargetCompletionWalk<'_, V> {
             record_walk_work(WalkOp::PrefixValidation);
             let mut next_slots = selected_slots.to_vec();
             next_slots.push(Some(target));
-            if validate_selected_slots_with_specs(
+            if validate_selected_slots_with_specs_shared(
                 self.state,
                 self.ability,
                 self.specs,
                 target_slots,
                 &next_slots,
                 self.constraints,
+                self.shared.as_deref_mut(),
             )
             .is_err()
             {
@@ -9851,13 +9925,14 @@ impl<V: CompletionVisitor> TargetCompletionWalk<'_, V> {
             return WalkOutcome::BudgetExhausted;
         }
         record_walk_work(WalkOp::LeafValidation);
-        if validate_selected_slots_with_specs(
+        if validate_selected_slots_with_specs_shared(
             self.state,
             self.ability,
             self.specs,
             self.target_slots,
             completed_slots,
             self.constraints,
+            self.shared.as_deref_mut(),
         )
         .is_err()
         {
@@ -9886,6 +9961,29 @@ fn has_legal_completion_with_specs(
     index: usize,
     selected_slots: &[Option<TargetRef>],
 ) -> bool {
+    has_legal_completion_with_specs_shared(
+        state,
+        ability,
+        specs,
+        target_slots,
+        constraints,
+        index,
+        selected_slots,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn has_legal_completion_with_specs_shared(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    specs: &[TargetSlotSpec],
+    target_slots: &[TargetSelectionSlot],
+    constraints: &[TargetSelectionConstraint],
+    index: usize,
+    selected_slots: &[Option<TargetRef>],
+    shared: Option<&mut SharedSlotTargets>,
+) -> bool {
     let mut budget = WorkBudget::unlimited();
     let found = TargetCompletionWalk {
         state,
@@ -9895,6 +9993,7 @@ fn has_legal_completion_with_specs(
         constraints,
         visitor: &mut ExistenceVisitor,
         budget: &mut budget,
+        shared,
     }
     .frame(index, selected_slots, false)
         == WalkOutcome::Accepted;
@@ -9902,6 +10001,9 @@ fn has_legal_completion_with_specs(
     // existence visitor provably keeps upstream's exact answers.
     #[cfg(test)]
     {
+        // The reference walk below is the test-only oracle: its own list builds
+        // are not this walk's work, so they stay out of the build counter.
+        let builds_before = SELECTED_SLOT_TARGET_BUILDS.with(|c| c.get());
         let reference = has_legal_completion_with_specs_reference(
             state,
             ability,
@@ -9911,6 +10013,7 @@ fn has_legal_completion_with_specs(
             index,
             selected_slots,
         );
+        SELECTED_SLOT_TARGET_BUILDS.with(|c| c.set(builds_before));
         tests::record_existence_walk_differential();
         assert_eq!(
             found, reference,
@@ -10102,6 +10205,28 @@ fn validate_selected_slots_with_specs(
     selected_slots: &[Option<TargetRef>],
     constraints: &[TargetSelectionConstraint],
 ) -> Result<(), EngineError> {
+    validate_selected_slots_with_specs_shared(
+        state,
+        ability,
+        specs,
+        target_slots,
+        selected_slots,
+        constraints,
+        None,
+    )
+}
+
+/// [`validate_selected_slots_with_specs`] that answers the per-slot membership
+/// of the shared levels from `shared` ([`SharedSlotTargets`]).
+fn validate_selected_slots_with_specs_shared(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    specs: &[TargetSlotSpec],
+    target_slots: &[TargetSelectionSlot],
+    selected_slots: &[Option<TargetRef>],
+    constraints: &[TargetSelectionConstraint],
+    mut shared: Option<&mut SharedSlotTargets>,
+) -> Result<(), EngineError> {
     if selected_slots.len() > target_slots.len() {
         return Err(EngineError::InvalidAction(
             "Too many targets selected".to_string(),
@@ -10118,23 +10243,30 @@ fn validate_selected_slots_with_specs(
 
         match selected_slot {
             Some(target) => {
-                let legal_targets = specs
-                    .get(index)
-                    .map(|spec| {
-                        // CR 601.2c + CR 115.3: `&specs[..index]` (prior specs)
-                        // lines up one-for-one with `&selected_slots[..index]`
-                        // (prior selections), so validation enforces the same
-                        // per-instance distinctness as the offered-set path.
-                        legal_targets_for_selected_slot(
-                            state,
-                            ability,
-                            spec,
-                            &specs[..index],
-                            &selected_slots[..index],
-                        )
-                    })
-                    .unwrap_or_else(|| slot.legal_targets.clone());
-                if !legal_targets.contains(target) {
+                let is_legal = match (specs.get(index), shared.as_deref_mut()) {
+                    (Some(_), Some(memo)) if index <= memo.max_index => memo.contains(
+                        state,
+                        ability,
+                        specs,
+                        index,
+                        &selected_slots[..index],
+                        target,
+                    ),
+                    // CR 601.2c + CR 115.3: `&specs[..index]` (prior specs)
+                    // lines up one-for-one with `&selected_slots[..index]`
+                    // (prior selections), so validation enforces the same
+                    // per-instance distinctness as the offered-set path.
+                    (Some(spec), _) => legal_targets_for_selected_slot(
+                        state,
+                        ability,
+                        spec,
+                        &specs[..index],
+                        &selected_slots[..index],
+                    )
+                    .contains(target),
+                    (None, _) => slot.legal_targets.contains(target),
+                };
+                if !is_legal {
                     return Err(EngineError::InvalidAction(
                         "Illegal target selected".to_string(),
                     ));
@@ -27461,6 +27593,63 @@ mod tests {
             source,
             PlayerId(0),
         )
+    }
+
+    /// MagicFinder 2026-11-04 (Brash Taunter, "fights another target creature",
+    /// against ~465 permanents): offering a slot's targets must build that slot's
+    /// legal list a fixed number of times, not once per candidate. Before
+    /// `SharedSlotTargets`, every candidate rebuilt the full list twice (prefix
+    /// validation + completion leaf) to confirm it was in it — O(N²) filter
+    /// matches, seconds per AI decision on a token board.
+    #[test]
+    fn offering_one_slot_builds_its_legal_targets_a_fixed_number_of_times() {
+        let mut state = GameState::new_two_player(42);
+        let mut creatures = Vec::new();
+        for i in 0..60u64 {
+            let id = create_object(
+                &mut state,
+                CardId(1000 + i),
+                PlayerId((i % 2) as u8),
+                format!("Token {i}"),
+                Zone::Battlefield,
+            );
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+            creatures.push(id);
+        }
+        let ability = ResolvedAbility::new(
+            Effect::DealDamage {
+                amount: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Typed(TypedFilter::creature()),
+                damage_source: None,
+                excess: None,
+            },
+            vec![],
+            ObjectId(900),
+            PlayerId(0),
+        );
+        let target_slots = build_target_slots(&state, &ability).expect("slot builds");
+        let specs = target_slot_specs(&state, &ability);
+
+        SELECTED_SLOT_TARGET_BUILDS.with(|c| c.set(0));
+        let offered =
+            legal_targets_for_slot_with_specs(&state, &ability, &specs, &target_slots, &[], 0, &[]);
+        let builds = SELECTED_SLOT_TARGET_BUILDS.with(|c| c.get());
+
+        let offered: std::collections::HashSet<_> = offered.into_iter().collect();
+        let expected: std::collections::HashSet<_> =
+            creatures.iter().map(|id| TargetRef::Object(*id)).collect();
+        assert_eq!(offered, expected, "every creature stays a legal target");
+        assert!(
+            builds <= 2,
+            "the slot's legal list was built {builds} times for {} candidates",
+            creatures.len()
+        );
     }
 
     /// T2 (Units A+B): the static union's fix for symptom 1 — slot B must

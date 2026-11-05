@@ -5,7 +5,10 @@
 //! the AI supplies an issued candidate, while this module preserves interaction
 //! ownership, replays the reducer, and reads the fully-bound pending ability.
 
-use crate::ai_support::{validated_candidate_actions_for_semantic_owner, CandidateAction};
+use crate::ai_support::{
+    validated_candidate_actions_for_semantic_owner,
+    validated_candidate_actions_for_semantic_owner_bounded, CandidateAction,
+};
 use crate::game::effects::resolve_ability_chain;
 use crate::game::engine::apply_interaction_for_simulation;
 use crate::game::game_object::ObjectIncarnationRefExt;
@@ -597,7 +600,24 @@ fn explore_target_children(
         return TargetedExchangeVerdict::Indeterminate;
     };
     budget.candidate_enumerations += 1;
-    let candidates = validated_candidate_actions_for_semantic_owner(state, owner);
+    // More than MAX_WITNESS_BRANCHES target children is Indeterminate below, so
+    // stop validating at the first one past the cap: validating every child is a
+    // reducer simulation each, and a token-heavy board has hundreds of targets
+    // (MagicFinder 2026-11-04: Brash Taunter against ~465 permanents, seconds
+    // per AI decision for a verdict that was always Indeterminate).
+    let Some(candidates) = validated_candidate_actions_for_semantic_owner_bounded(
+        state,
+        owner,
+        |candidate| {
+            matches!(
+                candidate.action,
+                GameAction::ChooseTarget { target: Some(_) }
+            )
+        },
+        MAX_WITNESS_BRANCHES,
+    ) else {
+        return TargetedExchangeVerdict::Indeterminate;
+    };
     if candidates
         .iter()
         .any(|candidate| matches!(candidate.action, GameAction::ChooseTarget { target: None }))

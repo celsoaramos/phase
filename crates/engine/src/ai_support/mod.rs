@@ -127,6 +127,27 @@ pub fn validated_candidate_actions_for_semantic_owner(
     actions
 }
 
+/// [`validated_candidate_actions_for_semantic_owner`] that stops validating once
+/// more than `limit` accepted candidates satisfy `counted` (`None`). When it
+/// returns `Some`, the list is identical to the unbounded one
+/// ([`FilterPipeline::apply_bounded`]).
+pub fn validated_candidate_actions_for_semantic_owner_bounded(
+    state: &GameState,
+    semantic_owner: PlayerId,
+    counted: impl Fn(&CandidateAction) -> bool,
+    limit: usize,
+) -> Option<Vec<CandidateAction>> {
+    let pipeline = FilterPipeline::default_pipeline();
+    let mut actions = pipeline.apply_bounded(
+        state,
+        candidates::candidate_actions_for_semantic_owner_with_probe(state, semantic_owner, None),
+        counted,
+        limit,
+    )?;
+    actions.sort_by(|a, b| a.action.cmp_stable(&b.action));
+    Some(actions)
+}
+
 pub fn validated_candidate_actions_with_probe(
     state: &GameState,
     probe: Option<&crate::game::casting::PriorityCastProbe>,
