@@ -7956,12 +7956,25 @@ pub fn is_landwalk_unblockable(
     // (battlefield + command zone) iterates both controllers' statics; the
     // static is global (`affected = None`), so a canceller under either
     // player's control suppresses the qualifier symmetrically.
-    let cancelled: HashSet<&str> = super::functioning_abilities::game_active_statics(state)
-        .filter_map(|(_src, sd)| match &sd.mode {
-            StaticMode::IgnoreLandwalkForBlocking { qualifier: Some(q) } => Some(q.as_str()),
-            _ => None,
-        })
-        .collect();
+    //
+    // O(1) presence gate first (the index is built from every functioning
+    // static, a superset of the active ones, so it has no false negatives):
+    // this runs once per attacker × blocker pair, and the full statics sweep
+    // per pair was ~6% of an AI decision on a ~465-permanent board
+    // (MagicFinder 2026-11-04, Goblin King's mountainwalk against Mountains).
+    let cancelled: HashSet<&str> = if super::functioning_abilities::static_kind_present(
+        state,
+        StaticModeKind::IgnoreLandwalkForBlocking,
+    ) {
+        super::functioning_abilities::game_active_statics(state)
+            .filter_map(|(_src, sd)| match &sd.mode {
+                StaticMode::IgnoreLandwalkForBlocking { qualifier: Some(q) } => Some(q.as_str()),
+                _ => None,
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
 
     #[cfg(debug_assertions)]
     for q in &cancelled {
