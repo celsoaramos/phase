@@ -388,5 +388,8 @@
   },
   {
     "branch": "card/house-emblems"
+  },
+  {
+    "branch": "ai/bigboard-target-offers"
   }
 ]
