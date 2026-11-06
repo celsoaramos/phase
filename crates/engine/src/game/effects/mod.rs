@@ -22439,6 +22439,14 @@ fn resolve_chain_body(
             .is_some_and(|key| state.may_trigger_same_card_choice_available(key));
         if let Some(ref key) = may_trigger_key {
             if let Some(choice) = state.may_trigger_auto_choice_for_live_prompt(key) {
+                // CR 603.5 + CR 608.2c: a stored answer stands in for the player's
+                // decision, so it starts from the same clean slate the prompted answer
+                // does (`handle_optional_effect_choice_inner` clears this flag before
+                // resolving). Otherwise an "if you do" gate after the accepted
+                // instruction reads a payment failure left by an EARLIER resolution —
+                // a prior Cultivator Colossus whose last pass had no land to put — and
+                // the second Colossus stops after one land.
+                state.cost_payment_failed_flag = false;
                 progress = resolve_optional_effect_decision_step(
                     state,
                     ability_with_event_context_targets(state, ability),

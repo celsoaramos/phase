@@ -2125,6 +2125,7 @@ mod issue_9886_dralnus_pet;
 mod keyword_activation_cancel;
 mod partner_family_keyword_remainder;
 mod rally_the_righteous_radiance_pump;
+mod remembered_may_repeat_process;
 mod repeat_directive_gate;
 mod resolution_tap_x_binding;
 mod starting_intensity_keyword;
