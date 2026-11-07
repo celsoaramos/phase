@@ -62,7 +62,11 @@ use engine::util::Deadline;
 
 use crate::combat_ai::{choose_blockers_with_profile, crackback_damage, latent_blockers};
 use crate::config::AiProfile;
-use crate::eval::{evaluate_state, EvalWeights};
+use crate::eval::{evaluate_creature, evaluate_state, EvalWeights};
+use engine::types::ability::{DelayedTriggerCondition, Effect, TargetFilter};
+use engine::types::keywords::Keyword;
+use engine::types::triggers::TriggerMode;
+use engine::types::zones::Zone;
 
 /// Reducer steps one replay may take before it gives up (passes, blocks, tax).
 const MAX_REPLAY_STEPS: usize = 32;
@@ -86,6 +90,12 @@ pub(crate) const SWITCH_MARGIN: f64 = 1.0;
 /// Penalty for a board the opponent can kill next swing (≈ four creatures:
 /// well below a real loss, well above any trade).
 const LETHAL_NEXT_SWING: f64 = 30.0;
+/// Below this life total every point costs more than the board shows (CR 704.5a
+/// is one swing away). Flag 343d16d7 (04/11/2026, MagicFinder): at 14 life
+/// facing an 11/10 lifelink the replay kept its 1/1 home and went to 3 — the
+/// next-swing term saw the 1/1 still able to chump NEXT turn, so the 11 life
+/// cost only its evaluation weight. The floor prices the life itself.
+const LOW_LIFE_FLOOR: i32 = 8;
 /// `evaluate_state` returns ±10_000 for a decided game.
 const DECIDED: f64 = 9_000.0;
 
@@ -242,10 +252,15 @@ fn advance(
             }
             _ => match answer_prompt(input, state) {
                 Some(action) => action,
-                None => return Reached::Unsupported,
+                None => {
+                    trace(|| format!("combat_sim unsupported prompt {:?}", state.waiting_for.variant_name()));
+                    return Reached::Unsupported;
+                }
             },
         };
+        let described = format!("{action:?}");
         if apply_as_current_for_simulation(state, action).is_err() {
+            trace(|| format!("combat_sim replay refused {described} at {:?}", state.waiting_for.variant_name()));
             return Reached::Unsupported;
         }
     }
@@ -254,13 +269,40 @@ fn advance(
 
 /// A mid-replay prompt the loop above has no rule for. The simulating player's
 /// own prompt gets the AI's quick choice; the other player's only a forced one.
+/// Opponent prompts with more than one answer the replay still measures: each
+/// answer is applied and the one that leaves the AI WORST off is taken (the
+/// CR 509.1 worst-case stance the attack branch already uses). Above this many
+/// answers the line is dropped as before — a Krenko board's trigger targets
+/// would otherwise multiply the replays. "Any target" on a two-player board
+/// with a handful of creatures is a dozen answers.
+const MAX_OPPONENT_PROMPT_ANSWERS: usize = 16;
+
 fn answer_prompt(input: &CombatSimInput<'_>, state: &GameState) -> Option<GameAction> {
     if state.waiting_for.acting_player() == Some(input.player) {
         return (input.answer)(state);
     }
-    let mut actions = legal_actions(state).into_iter();
-    match (actions.next(), actions.next()) {
-        (Some(only), None) => Some(only),
+    let actions = legal_actions(state);
+    match actions.len() {
+        0 => None,
+        1 => actions.into_iter().next(),
+        n if n <= MAX_OPPONENT_PROMPT_ANSWERS => {
+            // Flag 58ef961d (31/10/2026): two doomed 3/1s gang-blocking a 5/5
+            // whose death trigger ("deals 3 damage to any target") asks the
+            // opponent for a target — the only block that killed it was the
+            // one the replay could not measure.
+            let mut worst: Option<(f64, GameAction)> = None;
+            for action in actions {
+                let mut branch = state.clone();
+                if apply_as_current_for_simulation(&mut branch, action.clone()).is_err() {
+                    continue;
+                }
+                let value = evaluate_state(&branch, input.player, input.weights);
+                if worst.as_ref().is_none_or(|(w, _)| value < *w) {
+                    worst = Some((value, action));
+                }
+            }
+            worst.map(|(_, action)| action)
+        }
         _ => None,
     }
 }
@@ -350,6 +392,20 @@ fn finish_with_trick(
         _ => return None,
     }
     let plain_value = position_value(&plain, input.player, opponent, input.weights, untap_mine);
+    trace(|| {
+        let board: Vec<String> = plain
+            .battlefield
+            .iter()
+            .filter_map(|id| plain.objects.get(id))
+            .filter(|o| o.card_types.core_types.contains(&engine::types::card_type::CoreType::Creature))
+            .map(|o| format!("{}@{} {}/{} dmg{}{}", o.name, o.controller.0, o.power.unwrap_or(0), o.toughness.unwrap_or(0), o.damage_marked, if o.tapped { " T" } else { "" }))
+            .collect();
+        format!(
+            "combat_sim     after combat life {}×{} value {plain_value:.3} board {board:?}",
+            plain.players[input.player.0 as usize].life,
+            plain.players[opponent.0 as usize].life
+        )
+    });
     let Some(trick) = input.trick else {
         return Some(plain_value);
     };
@@ -400,6 +456,99 @@ fn next_swing(
     crackback_damage(&view, defender, &[attacker], &[], None)
 }
 
+/// Quadratic cost of ending the combat at `life` below [`LOW_LIFE_FLOOR`]:
+/// 0 at the floor, 12.5 at 3, 24.5 at 1. Zero at or below 0 (the game is decided
+/// and `evaluate_state` already says so).
+pub(crate) fn low_life_penalty(life: i32) -> f64 {
+    if life <= 0 || life >= LOW_LIFE_FLOOR {
+        return 0.0;
+    }
+    let short = f64::from(LOW_LIFE_FLOOR - life);
+    0.5 * short * short
+}
+
+/// CR 603.7 + CR 514.2: a creature its own end-step trigger, or a delayed
+/// trigger, sacrifices or exiles "at the beginning of the (next) end step" is
+/// gone before it can ever block or attack again (Ball Lightning, Elemental
+/// tokens from "sacrifice it at the beginning of the next end step"). Flag
+/// 58ef961d (31/10/2026): two such 3/1s stayed home while a 5/5 walked in — the
+/// replay counted them as survivors worth keeping. Fail open: a doomed creature
+/// the engine represents some other way is simply priced as a normal one.
+pub(crate) fn doomed_at_end_step(state: &GameState, id: ObjectId) -> bool {
+    let Some(object) = state.objects.get(&id) else {
+        return false;
+    };
+    let dooms_self = |effect: &Effect| -> bool {
+        match effect {
+            Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                ..
+            }
+            | Effect::ChangeZone {
+                destination: Zone::Exile | Zone::Graveyard,
+                target: TargetFilter::SelfRef,
+                ..
+            } => true,
+            _ => false,
+        }
+    };
+    let own_trigger = object.trigger_definitions.iter_unchecked().any(|entry| {
+        let def = &entry.definition;
+        matches!(def.mode, TriggerMode::Phase)
+            && matches!(def.phase, Some(Phase::End))
+            && def
+                .execute
+                .as_deref()
+                .is_some_and(|execute| crate::cast_facts::collect_definition_effects(execute).into_iter().any(dooms_self))
+    });
+    if own_trigger {
+        return true;
+    }
+    let names_me = |filter: &TargetFilter| -> bool {
+        match filter {
+            TargetFilter::SpecificObject { id: named } => *named == id,
+            TargetFilter::LastCreated => state.last_created_token_ids.contains(&id),
+            _ => false,
+        }
+    };
+    state.delayed_triggers.iter().any(|delayed| {
+        let at_end = matches!(
+            delayed.condition,
+            DelayedTriggerCondition::AtNextPhase { phase: Phase::End }
+                | DelayedTriggerCondition::AtNextPhaseForPlayer { phase: Phase::End, .. }
+        );
+        at_end
+            && crate::policies::context::collect_ability_effects(&delayed.ability)
+                .into_iter()
+                .any(|effect| match effect {
+                    Effect::Sacrifice { target, .. } => names_me(target),
+                    Effect::ChangeZone {
+                        destination: Zone::Exile | Zone::Graveyard,
+                        target,
+                        ..
+                    } => names_me(target),
+                    _ => false,
+                })
+    })
+}
+
+/// Evaluation the board credits `player` for creatures that will not survive the
+/// turn: subtracted from the position so a doomed body spent in combat costs
+/// nothing and one kept home buys nothing.
+fn doomed_value(state: &GameState, player: PlayerId) -> f64 {
+    state
+        .battlefield
+        .iter()
+        .filter(|id| {
+            state
+                .objects
+                .get(id)
+                .is_some_and(|object| object.controller == player && doomed_at_end_step(state, **id))
+        })
+        .map(|id| evaluate_creature(state, *id))
+        .sum()
+}
+
 /// Evaluation-unit cost of facing `threat` damage at `life`. Concave: the last
 /// points of life are worth more than the first.
 pub(crate) fn survival_penalty(life: i32, threat: i32, life_weight: f64) -> f64 {
@@ -420,7 +569,21 @@ fn position_value(
     weights: &EvalWeights,
     untap_mine: bool,
 ) -> f64 {
-    let base = evaluate_state(state, player, weights);
+    // CR 502.3: every permanent untaps in its controller's next untap step, so
+    // the tapped state a combat leaves is transient — but `evaluate_creature`
+    // charges `tapped_penalty` for it, and only the ATTACKER's creatures are
+    // tapped after combat (blockers don't tap). Read the board untapped on both
+    // sides; the next-swing terms below already carry who untaps first. Flag
+    // 21537628 (28/10/2026): a 3/4 trample stayed home against a lone 3/3
+    // because attacking cost it the tapped discount and nothing else.
+    let mut untapped = state.clone();
+    let battlefield: Vec<ObjectId> = untapped.battlefield.iter().copied().collect();
+    for id in battlefield {
+        if let Some(object) = untapped.objects.get_mut(&id) {
+            object.tapped = false;
+        }
+    }
+    let base = evaluate_state(&untapped, player, weights);
     if base.abs() >= DECIDED {
         return base;
     }
@@ -446,7 +609,48 @@ fn position_value(
         opponent_life,
         next_swing(state, opponent, player, !untap_mine),
         weights.life,
-    )
+    ) - low_life_penalty(life)
+        + low_life_penalty(opponent_life)
+        - doomed_value(state, player)
+        + doomed_value(state, opponent)
+}
+
+/// Blockers that together kill `attacker`, doomed bodies first, then the biggest
+/// hitters — the smallest such group of two or more. `None` when no group kills
+/// it or one blocker already does (the one-change alternatives cover that).
+fn gang_block(
+    state: &GameState,
+    attacker: ObjectId,
+    blockers: &[ObjectId],
+) -> Option<Vec<ObjectId>> {
+    let target = state.objects.get(&attacker)?;
+    if target.has_keyword(&Keyword::Indestructible) {
+        return None;
+    }
+    let toughness = target.toughness? - i32::try_from(target.damage_marked).unwrap_or(0);
+    if toughness <= 0 {
+        return None;
+    }
+    let power = |id: &ObjectId| state.objects.get(id).and_then(|o| o.power).unwrap_or(0);
+    let mut ordered: Vec<ObjectId> = blockers.to_vec();
+    ordered.sort_by(|a, b| {
+        doomed_at_end_step(state, *b)
+            .cmp(&doomed_at_end_step(state, *a))
+            .then_with(|| power(b).cmp(&power(a)))
+    });
+    let mut group = Vec::new();
+    let mut total = 0;
+    for id in ordered {
+        if power(&id) <= 0 {
+            continue;
+        }
+        group.push(id);
+        total += power(&id);
+        if total >= toughness {
+            break;
+        }
+    }
+    (total >= toughness && group.len() >= 2 && group.len() <= 4).then_some(group)
 }
 
 /// Every legal block declaration for `defender`, if there are at most `cap`
@@ -562,7 +766,9 @@ fn attack_value(
         // The defender's answer led to a prompt the replay will not answer
         // (a trigger target, a damage-assignment order): this attack can't be
         // measured honestly.
-        let value = finish_with_trick(input, opponent, &branch, turn, true, budget)?;
+        let measured = finish_with_trick(input, opponent, &branch, turn, true, budget);
+        trace(|| format!("combat_sim   defender answer {answer:?} => {measured:?}"));
+        let value = measured?;
         worst = Some(worst.map_or(value, |w: f64| w.min(value)));
     }
     worst
@@ -648,7 +854,9 @@ pub(crate) fn refine_attack(
         replays: 0,
         deadline: input.deadline,
     };
-    let Some(incumbent_value) = attack_value(input, opponent, &incumbent, &mut budget) else {
+    let incumbent_measured = attack_value(input, opponent, &incumbent, &mut budget);
+    trace(|| format!("combat_sim attack incumbent {incumbent:?} => {incumbent_measured:?}"));
+    let Some(incumbent_value) = incumbent_measured else {
         return incumbent;
     };
     if incumbent_value >= DECIDED {
@@ -664,7 +872,9 @@ pub(crate) fn refine_attack(
         if action == incumbent || best.as_ref().is_some_and(|(_, b)| *b == action) {
             continue;
         }
-        let Some(value) = attack_value(input, opponent, &action, &mut budget) else {
+        let measured = attack_value(input, opponent, &action, &mut budget);
+        trace(|| format!("combat_sim attack alternative {action:?} => {measured:?}"));
+        let Some(value) = measured else {
             continue;
         };
         if best.as_ref().is_none_or(|(b, _)| value > *b) {
@@ -725,6 +935,29 @@ fn block_alternatives(
             }
         }
     }
+    // Gang blocks (CR 509.1a lets several creatures block one attacker): the
+    // one-blocker changes above never reach "these two together kill it", which
+    // is exactly the block two doomed 3/1s owed a 5/5 (flag 58ef961d).
+    let mut attackers: Vec<ObjectId> = targets.values().flatten().copied().collect();
+    attackers.sort_unstable();
+    attackers.dedup();
+    for attacker in attackers {
+        let able: Vec<ObjectId> = targets
+            .iter()
+            .filter(|(_, legal)| legal.contains(&attacker))
+            .map(|(blocker, _)| *blocker)
+            .collect();
+        let Some(group) = gang_block(state, attacker, &able) else {
+            continue;
+        };
+        let mut declaration: Vec<(ObjectId, ObjectId)> = incumbent
+            .iter()
+            .copied()
+            .filter(|(b, _)| !group.contains(b))
+            .collect();
+        declaration.extend(group.iter().map(|b| (*b, attacker)));
+        out.push(declaration);
+    }
     let mut seen: Vec<Vec<(ObjectId, ObjectId)>> = Vec::new();
     out.retain(|declaration| {
         let mut key = declaration.clone();
@@ -737,6 +970,14 @@ fn block_alternatives(
         }
     });
     out
+}
+
+/// `COMBAT_SIM_TRACE=1` prints every alternative's value (native only; the
+/// browser has no environment and stays silent).
+fn trace(message: impl FnOnce() -> String) {
+    if std::env::var_os("COMBAT_SIM_TRACE").is_some() {
+        eprintln!("{}", message());
+    }
 }
 
 /// Measure the heuristic block against its alternatives and return the one to
@@ -769,7 +1010,9 @@ pub(crate) fn refine_block(
         replays: 0,
         deadline: input.deadline,
     };
-    let Some(incumbent_value) = block_value(input, opponent, &incumbent, &mut budget) else {
+    let incumbent_measured = block_value(input, opponent, &incumbent, &mut budget);
+    trace(|| format!("combat_sim block incumbent {incumbent:?} => {incumbent_measured:?}"));
+    let Some(incumbent_value) = incumbent_measured else {
         return incumbent;
     };
 
@@ -783,7 +1026,9 @@ pub(crate) fn refine_block(
         if action == incumbent || best.as_ref().is_some_and(|(_, b)| *b == action) {
             continue;
         }
-        let Some(value) = block_value(input, opponent, &action, &mut budget) else {
+        let measured = block_value(input, opponent, &action, &mut budget);
+        trace(|| format!("combat_sim block alternative {action:?} => {measured:?}"));
+        let Some(value) = measured else {
             continue;
         };
         if best.as_ref().is_none_or(|(b, _)| value > *b) {
@@ -799,6 +1044,91 @@ pub(crate) fn refine_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn low_life_penalty_prices_the_last_points_and_nothing_above_the_floor() {
+        assert_eq!(low_life_penalty(LOW_LIFE_FLOOR), 0.0);
+        assert_eq!(low_life_penalty(20), 0.0);
+        assert_eq!(low_life_penalty(0), 0.0);
+        assert!(low_life_penalty(7) > 0.0);
+        assert!(low_life_penalty(3) > low_life_penalty(7));
+        // Flag 343d16d7: 14 → 3 must cost more than a 1/1 chump blocker (~3).
+        assert!(low_life_penalty(3) > 6.0);
+    }
+
+    #[test]
+    fn end_step_sacrifice_trigger_marks_the_creature_doomed() {
+        use engine::game::scenario::{GameScenario, P0, P1};
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        let bolt = s
+            .add_creature(P0, "Ball Lightning", 6, 1)
+            .from_oracle_text("Trample, haste\nAt the beginning of the end step, sacrifice this creature.")
+            .id();
+        let bear = s.add_creature(P0, "Bear", 2, 2).id();
+        let theirs = s.add_creature(P1, "Ogre", 5, 5).id();
+        let r = s.build();
+        assert!(doomed_at_end_step(r.state(), bolt));
+        assert!(!doomed_at_end_step(r.state(), bear));
+        assert!(!doomed_at_end_step(r.state(), theirs));
+        // The doomed body is worth nothing to the position it leaves.
+        assert!(doomed_value(r.state(), P0) > 0.0);
+        assert_eq!(doomed_value(r.state(), P1), 0.0);
+    }
+
+    #[test]
+    fn gang_block_groups_the_doomed_first_and_only_when_the_group_kills() {
+        use engine::game::scenario::{GameScenario, P0, P1};
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        let a = s
+            .add_creature(P0, "Elemental A", 3, 1)
+            .from_oracle_text("At the beginning of the end step, sacrifice this creature.")
+            .id();
+        let b = s
+            .add_creature(P0, "Elemental B", 3, 1)
+            .from_oracle_text("At the beginning of the end step, sacrifice this creature.")
+            .id();
+        let mage = s.add_creature(P0, "Guildmage", 2, 2).id();
+        let omnath = s.add_creature(P1, "Omnath", 5, 5).id();
+        let yargle = s.add_creature(P1, "Yargle", 18, 6).id();
+        let r = s.build();
+        // 3 + 3 ≥ 5: the two doomed bodies, not the Guildmage.
+        assert_eq!(gang_block(r.state(), omnath, &[mage, a, b]), Some(vec![a, b]));
+        // 3 + 3 = 6 ≥ 6: the two doomed bodies kill the 18/6 too; the Guildmage stays out.
+        assert_eq!(gang_block(r.state(), yargle, &[mage, a, b]), Some(vec![a, b]));
+        // A 7-toughness body needs all three (3 + 3 + 2 = 8).
+        let big = s_big();
+        assert_eq!(gang_block(big.state(), big_target(&big), &big_blockers(&big)).map(|g| g.len()), Some(3));
+        // One blocker alone is the one-change alternative's job.
+        assert_eq!(gang_block(r.state(), omnath, &[yargle]), None);
+        // Nothing kills it: no group.
+        assert_eq!(gang_block(r.state(), yargle, &[mage]), None);
+    }
+
+    fn s_big() -> engine::game::scenario::GameRunner {
+        use engine::game::scenario::{GameScenario, P0, P1};
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        s.add_creature(P0, "Elemental A", 3, 1)
+            .from_oracle_text("At the beginning of the end step, sacrifice this creature.");
+        s.add_creature(P0, "Elemental B", 3, 1)
+            .from_oracle_text("At the beginning of the end step, sacrifice this creature.");
+        s.add_creature(P0, "Guildmage", 2, 2);
+        s.add_creature(P1, "Wurm", 7, 7);
+        s.build()
+    }
+    fn big_target(r: &engine::game::scenario::GameRunner) -> ObjectId {
+        *r.state().battlefield.iter().find(|id| r.state().objects[*id].name == "Wurm").unwrap()
+    }
+    fn big_blockers(r: &engine::game::scenario::GameRunner) -> Vec<ObjectId> {
+        r.state()
+            .battlefield
+            .iter()
+            .copied()
+            .filter(|id| r.state().objects[id].controller == PlayerId(0))
+            .collect()
+    }
 
     #[test]
     fn survival_penalty_is_concave_and_capped_at_a_lethal_swing() {
