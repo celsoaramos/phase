@@ -19,6 +19,7 @@ use engine::game::casting::{
 };
 use engine::game::combat::AttackTarget;
 use engine::game::engine::apply_interaction_for_simulation;
+use engine::game::filter::{matches_target_filter, FilterContext};
 use engine::game::functioning_abilities::{
     active_replacements, active_trigger_definitions, battlefield_active_triggers,
     game_active_statics, game_functioning_statics,
@@ -38,8 +39,9 @@ use engine::game::triggers::{
 };
 use engine::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction,
-    ContinuousModification, CostCategory, Effect, PtValue, ResolvedAbility, TargetFilter,
-    TargetRef, TargetSelectionMode, TypeFilter, TypedFilter,
+    CombatDamageScope, ContinuousModification, CostCategory, Effect, FilterProp, GameRestriction,
+    PreventionAmount, PtValue, ReplacementDefinition, ReplacementMode, ResolvedAbility, ShieldKind,
+    TargetFilter, TargetRef, TargetSelectionMode, TypeFilter, TypedFilter,
 };
 use engine::types::ability_visit::visit_ability_def;
 use engine::types::actions::GameAction;
@@ -52,6 +54,7 @@ use engine::types::keywords::{Keyword, KeywordKind};
 use engine::types::mana::{ManaSourcePenalty, ManaType};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
+use engine::types::replacements::ReplacementEvent;
 use engine::types::statics::{AdditionalCostTaxAction, StaticMode};
 use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
@@ -292,6 +295,14 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject;
     }
 
+    if cast_targets_are_all_futile(ctx) {
+        return GateDecision::Reject;
+    }
+
+    if cast_damage_is_provably_prevented(ctx) {
+        return GateDecision::Reject;
+    }
+
     // CR 601.2c + CR 608.2c: Target-sourced self-damage and fight exchanges are
     // evaluated from reducer-issued, fully-bound target paths before scoring.
     // `Indeterminate` stays fail-open: this is a proof-backed veto only.
@@ -364,9 +375,27 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject;
     }
 
+    // Before the empty-effects early return: an Aura such as Aether Meltdown
+    // has no spell effect of its own, and it is the case that was reported.
+    if own_beginning_phase_cast_is_dominated(ctx) {
+        return GateDecision::Reject;
+    }
+
     let effects = ctx.effects();
     if effects.is_empty() {
         return GateDecision::Allow;
+    }
+
+    if is_proven_damage_whiff(ctx, &effects) {
+        return GateDecision::Reject;
+    }
+
+    if is_proven_conditional_destroy_whiff(ctx) {
+        return GateDecision::Reject;
+    }
+
+    if is_proven_mass_whiff(ctx) {
+        return GateDecision::Reject;
     }
 
     if is_redundant_creature_only_removal(ctx, &effects) {
@@ -1171,30 +1200,432 @@ fn type_filter_is_proven_disjoint_from_spell(
 /// Hard-reject targets that are provably futile (e.g., destroy vs indestructible).
 /// Called before `target_choice_penalty` so these never reach scoring.
 fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<GateDecision> {
-    let TargetRef::Object(object_id) = target else {
-        return None;
-    };
     let effects = ctx.effects();
-
-    // CR 701.6a: with several legal targets the choice reaches this gate
-    // (see `counter_reaches_nothing_foreign` for the single-target case).
-    // Choosing the AI's own SPELL with a plain counter only throws away two of
-    // its cards. Narrower than the cast-time check on purpose: here a foreign
-    // target exists, so only the choice is wrong — and countering its own
-    // ability (Stifle on an upkeep cost) or redirecting its own spell (Memory
-    // Lapse) stays a judgment call.
-    if is_pure_counter_payload(&effects) && is_own_stack_spell(ctx.state, ctx.ai_player, *object_id)
-    {
+    if target_is_provably_futile(ctx, &effects, target) {
         return Some(GateDecision::Reject);
     }
+    None
+}
 
-    let object = ctx.state.objects.get(object_id)?;
+/// CR 601.2c: announcing a spell commits the caster — the rules provide no
+/// strategic rewind. When a spell has a SINGLE legal target the engine binds it
+/// at announcement, so no `ChooseTarget` candidate is ever scored and
+/// [`reject_futile_target`] never runs: the cast is the only decision there is.
+///
+/// That is the seam a field report walked through (2026-09-17). The AI cast
+/// Stroke of Midnight — "Destroy target nonland permanent. Its controller
+/// creates a 1/1 white Human creature token." — on an indestructible Darksteel
+/// Angel. Targeting it is legal (CR 115.2; indestructible is not hexproof), the
+/// destroy then does nothing (CR 702.12b), and the rider hands the OPPONENT a
+/// free 1/1. A strict loss, repeated four times in one game.
+///
+/// Scoring alone cannot prevent it, and that matters for why this is a hard
+/// reject rather than a penalty. Measured on that game with the engine's own
+/// decision receipt, the AI ranked the cast LAST of four candidates, behind
+/// `PassPriority` (-10.64 against -8.36) — and played it anyway, because
+/// selection samples the candidate pool rather than taking the top rank (7.8%
+/// for that cast, per priority window, with ten copies in hand over 27 turns).
+/// Lowering a score lowers the odds; only removing the candidate removes the
+/// play. [`reject_futile_target`] is a hard reject for the same reason.
+///
+/// Conservative in every direction it cannot prove: only effects whose
+/// futility [`target_is_provably_futile`] can demonstrate are considered, the
+/// spell must actually have legal targets, and one non-futile candidate
+/// anywhere leaves the cast alone.
+fn cast_targets_are_all_futile(ctx: &PolicyContext<'_>) -> bool {
+    let GameAction::CastSpell { object_id, .. } = &ctx.candidate.action else {
+        return false;
+    };
+    let Some(object) = ctx.state.objects.get(object_id) else {
+        return false;
+    };
+    // CR 601.2b: a modal spell has not chosen its mode at announcement, so
+    // `effects()` reports every printed mode at once. "Every target is futile"
+    // would be a claim about a spell that has not been assembled yet.
+    if object.modal.is_some() {
+        return false;
+    }
+    // CR 107.3a + CR 601.2b + CR 601.2c: X is announced before targets. A
+    // target set computed with X still unbound is not the set the caster will
+    // choose from, so it proves nothing (same guard as
+    // `counter_reaches_nothing_foreign`).
+    if modal_spell_mode_ability_refs(object).any(|definition| {
+        let resolved = build_resolved_from_def(definition, *object_id, ctx.ai_player);
+        ability_target_legality_needs_chosen_x(&resolved, definition.distribute.as_ref())
+    }) {
+        return false;
+    }
+
+    let effects = ctx.effects();
+    let mut proved_any = false;
+    for effect in &effects {
+        if !matches!(
+            effect,
+            Effect::Destroy { .. } | Effect::DealDamage { .. } | Effect::Counter { .. }
+        ) {
+            continue;
+        }
+        let Some(filter) = effect.target_filter() else {
+            continue;
+        };
+        let targets = find_legal_targets(ctx.state, filter, ctx.ai_player, *object_id);
+        // No legal target at all is a different question (the engine decides
+        // whether the spell is castable); this proof is only about a target set
+        // that exists and is worthless.
+        if targets.is_empty() {
+            return false;
+        }
+        if !targets
+            .iter()
+            .all(|target| target_is_provably_futile(ctx, &effects, target))
+        {
+            return false;
+        }
+        proved_any = true;
+    }
+    proved_any
+}
+
+/// CR 615.1a: a prevention shield does not make a creature an illegal target —
+/// it makes the damage never happen. Field report (2026-09-21): with a
+/// Prismatic Strands shield up on red ("Prevent all damage that sources of the
+/// color of your choice would deal this turn"), the AI kept casting red burn
+/// into it. The player read it as a targeting bug; the engine was right and the
+/// AI was simply spending cards for nothing.
+///
+/// This is the same class as [`cast_targets_are_all_futile`] and a hard reject
+/// for the same measured reason (see that function's note): selection SAMPLES
+/// the candidate pool, so a low score lowers the odds of a wasted cast but
+/// never removes it.
+///
+/// It is a separate proof rather than another arm of
+/// [`target_is_provably_futile`] because the futility is not a property of any
+/// target: an untargeted, recipient-unrestricted shield prevents this spell's
+/// damage to creatures and players alike, so there is no target that would
+/// rescue the cast. Per-target shields (a Circle of Protection, an object-hosted
+/// "prevent all damage that would be dealt to it") are deliberately NOT proven
+/// here — they leave other recipients live, and that judgment belongs to the
+/// per-target gate.
+fn cast_damage_is_provably_prevented(ctx: &PolicyContext<'_>) -> bool {
+    let GameAction::CastSpell { object_id, .. } = &ctx.candidate.action else {
+        return false;
+    };
+    let Some(object) = ctx.state.objects.get(object_id) else {
+        return false;
+    };
+    if object.controller != ctx.ai_player {
+        return false;
+    }
+    // CR 601.2b: a modal spell has chosen no mode at announcement, so
+    // `effects()` reports every printed mode at once. "All of it is damage"
+    // would be a claim about a spell that has not been assembled yet.
+    if object.modal.is_some() {
+        return false;
+    }
+
+    // The whole payload must be damage. A single rider that resolves anyway —
+    // life gained, a counter placed, a card drawn — makes the cast a real play
+    // even with every point of its damage prevented.
+    let effects = ctx.effects();
+    if effects.is_empty()
+        || !effects
+            .iter()
+            .all(|effect| matches!(effect, Effect::DealDamage { .. }))
+    {
+        return false;
+    }
+
+    // ...and the card must carry nothing beyond that payload. Any keyword,
+    // trigger, replacement or static on the spell itself is a consequence this
+    // proof does not model, so it fails open.
+    if !object.trigger_definitions.as_slice().is_empty()
+        || !object.replacement_definitions.as_slice().is_empty()
+        || !object.static_definitions.as_slice().is_empty()
+        || !object.parse_warnings.is_empty()
+        || spell_has_effective_keywords(ctx.state, *object_id)
+        || has_relevant_functioning_trigger(ctx.state, *object_id)
+    {
+        return false;
+    }
+
+    // Casting can itself be the point. The trigger check above already covers
+    // the triggered half of that (prowess, magecraft, any "whenever you cast");
+    // this covers the cast LEDGER — Surge, a day/night flip, a permission or
+    // static that reads how many spells have been cast.
+    if cast_event_has_its_own_payoff(ctx.state, ctx.ai_player, *object_id) {
+        return false;
+    }
+
+    // CR 615.12: "damage can't be prevented" turns every shield below off.
+    // Scope is not inspected — any live restriction of this kind is enough to
+    // abandon the proof.
+    if ctx.state.restrictions.iter().any(|restriction| {
+        matches!(
+            restriction,
+            GameRestriction::DamagePreventionDisabled { .. }
+        )
+    }) {
+        return false;
+    }
+
+    ctx.state
+        .pending_damage_replacements
+        .iter()
+        .any(|shield| floating_shield_prevents_every_point_from(ctx.state, shield, *object_id))
+}
+
+/// CR 614.1a + CR 615.1a: does this floating shield provably prevent EVERY
+/// point of damage this spell could deal, to EVERY recipient?
+///
+/// Modelled on the damage-time scan in `game::replacement` that decides the
+/// same question for a real `ProposedEvent::Damage`, and conservative wherever
+/// it cannot reproduce that scan's answer from the shield alone. Each rejection
+/// below names the loophole it closes.
+fn floating_shield_prevents_every_point_from(
+    state: &GameState,
+    shield: &ReplacementDefinition,
+    spell_id: ObjectId,
+) -> bool {
+    if shield.is_consumed || shield.event != ReplacementEvent::DamageDone {
+        return false;
+    }
+    // CR 615.7: only `All` prevents an unbounded amount. `Next(n)` and `AllBut(n)`
+    // deplete, so what survives depends on ordering and on damage already dealt.
+    if !matches!(
+        shield.shield_kind,
+        ShieldKind::Prevention {
+            amount: PreventionAmount::All
+        }
+    ) {
+        return false;
+    }
+    // CR 614.9: redirected damage is still dealt, just somewhere else.
+    if shield.redirect_target.is_some() {
+        return false;
+    }
+    // CR 614.12a: an optional shield can be declined, so it proves nothing.
+    if !matches!(shield.mode, ReplacementMode::Mandatory) {
+        return false;
+    }
+    // A condition is evaluated against the damage event this proof does not
+    // build, and a rider is a consequence it does not model.
+    if shield.condition.is_some() || shield.execute.is_some() || shield.runtime_execute.is_some() {
+        return false;
+    }
+    // The recipient axis has to be unrestricted. With any recipient scope the
+    // shield covers only part of the board, and some other target would rescue
+    // the cast — which is the per-target gate's question, not this one.
+    if shield.damage_target_filter.is_some()
+        || shield.valid_card.is_some()
+        || shield.valid_player.is_some()
+    {
+        return false;
+    }
+    // CR 614.1a: a combat-only shield (a Fog) never touches a spell's damage.
+    if matches!(shield.combat_scope, Some(CombatDamageScope::CombatOnly)) {
+        return false;
+    }
+
+    match shield.damage_source_filter.as_ref() {
+        // No source constraint: every source is covered, this spell included.
+        // `Any` is the same statement — it is what `resolve_source_filter`
+        // leaves behind for a leg carrying no damage-time constraint.
+        None | Some(TargetFilter::Any) => true,
+        Some(filter) => {
+            // The filter is evaluated against the card in HAND, while the real
+            // scan evaluates the spell on the STACK. Restricting the proof to
+            // color-only shapes is what makes those two the same answer: an
+            // object's color (CR 105.2) does not depend on its zone. Every
+            // other shape — a zone property, a controller scope, a type line,
+            // a pinned identity — fails open rather than being guessed at.
+            if !source_filter_is_color_only(filter) {
+                return false;
+            }
+            // Built exactly as the damage-time pending scan builds it, so the
+            // two cannot answer differently for the shapes admitted above.
+            let host = shield.source_object.unwrap_or(ObjectId(0));
+            let filter_ctx = match shield.source_controller {
+                Some(player) => FilterContext::from_source_with_controller(host, player),
+                None => FilterContext::from_source(state, host),
+            };
+            matches_target_filter(state, spell_id, filter, &filter_ctx)
+        }
+    }
+}
+
+/// Whether a damage-source filter constrains nothing but color, so evaluating
+/// it against a card in hand answers for the spell on the stack (CR 105.2 —
+/// color is zone-independent). This is the Prismatic Strands / "sources of the
+/// color of your choice" shape after `resolve_source_filter` has turned
+/// `IsChosenColor` into a concrete `HasColor`.
+fn source_filter_is_color_only(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(typed) => {
+            typed.type_filters.is_empty()
+                && typed.controller.is_none()
+                && !typed.properties.is_empty()
+                && typed
+                    .properties
+                    .iter()
+                    .all(|property| matches!(property, FilterProp::HasColor { .. }))
+        }
+        TargetFilter::Or { filters } => {
+            !filters.is_empty() && filters.iter().all(source_filter_is_color_only)
+        }
+        _ => false,
+    }
+}
+
+/// Does the CAST EVENT pay off on its own, independently of the payload that
+/// [`cast_damage_is_provably_prevented`] has already proven prevented?
+///
+/// Deliberately NOT [`cast_has_relevant_payoff`], and the difference is the
+/// whole reason this function exists. That predicate serves
+/// [`zero_direct_spell_is_safe_to_reject`], whose claim is that the spell does
+/// NOTHING AT ALL; it therefore fails open on anything that could make the cast
+/// ledger unstable, including every live `pending_damage_replacements` entry —
+/// which is unconditionally true here, since the prevention shield is the very
+/// thing being proven.
+///
+/// Measured on the board from the 2026-09-21 field report, it is also too broad
+/// in a way that would have left that game unchanged: it answers "yes" for a
+/// Voldaren Epicure, whose only ability is "when this creature enters, create a
+/// Blood token" — a fact about a token's abilities, with no bearing on whether
+/// casting burn into a prevention shield is worth a card.
+///
+/// What this gate actually needs is narrower and is covered by three existing
+/// authorities: [`has_relevant_functioning_trigger`], called separately, sees
+/// every trigger that could fire off this cast (including prowess, which is a
+/// bare keyword here rather than a trigger definition, via the engine's
+/// synthetic hook); and the clauses below see the cast-HISTORY consumers — the
+/// spell count itself.
+///
+/// Nothing else the spell could do survives the proof: its whole payload is
+/// damage and every point of it is prevented, so a trigger or a payoff keyed on
+/// damage, death or life total cannot fire.
+fn cast_event_has_its_own_payoff(state: &GameState, caster: PlayerId, spell_id: ObjectId) -> bool {
+    let casting_side: Vec<PlayerId> = std::iter::once(caster)
+        .chain(engine::game::players::teammates(state, caster))
+        .collect();
+
+    // CR 502.2a: the cast can flip day to night. Copied from
+    // [`cast_has_relevant_payoff`] rather than re-derived, including its
+    // team-awareness caveat.
+    let casts_this_turn = state
+        .spells_cast_this_turn_by_player
+        .get(&caster)
+        .map_or(0, |spells| spells.len());
+    if state.day_night.is_some() && casting_side.len() > 1 {
+        return true;
+    }
+    if caster == state.active_player
+        && matches!(
+            (state.day_night, casts_this_turn),
+            (Some(DayNight::Day), 0) | (Some(DayNight::Night), 1)
+        )
+    {
+        return true;
+    }
+
+    // CR 702.117a: a cast-history keyword (Surge) on a spell the casting side
+    // could still cast this turn is bought by the cast itself.
+    if casting_side.iter().any(|player| {
+        spell_objects_available_to_cast(state, *player)
+            .into_iter()
+            .filter_map(|id| state.objects.get(&id))
+            .filter(|object| object.id != spell_id)
+            .filter(|object| spell_identity_is_available_to_caster(state, caster, object))
+            .any(|object| object_has_cast_history_keyword(state, object))
+    }) {
+        return true;
+    }
+
+    // A casting permission or a game-level static that reads the cast ledger
+    // ("if you've cast a spell this turn ...") is bought the same way.
+    state.objects.values().any(|object| {
+        spell_identity_is_available_to_caster(state, caster, object)
+            && has_potentially_authorizing_object_cast_permission(object, caster)
+            && object
+                .casting_permissions
+                .iter()
+                .any(|permission| !casting_permission_is_cast_stable_for_pre_cast(permission))
+    }) || game_functioning_statics(state)
+        .any(|(_, definition)| !static_definition_is_cast_stable_for_pre_cast(definition))
+}
+
+/// The per-target futility proof, shared by the `ChooseTarget`/`SelectTargets`
+/// gate and by the cast-time gate below. Everything it cannot prove is left
+/// alone: this decides that an action is WASTED, never that it is merely weak.
+fn target_is_provably_futile(
+    ctx: &PolicyContext<'_>,
+    effects: &[&Effect],
+    target: &TargetRef,
+) -> bool {
+    let TargetRef::Object(object_id) = target else {
+        return false;
+    };
+
+    // CR 701.6a: countering a spell removes it from the stack. When the spell
+    // is the AI's own, a counter can only cost it two cards — its own spell and
+    // the counter — and hand the opponent whatever that spell was answering.
+    // Field report (2026-09-25): the AI cast Counterspell on the player's
+    // creature spell, then Spell Pierce ("counter target noncreature spell") —
+    // whose only legal target was that same Counterspell — and countered its
+    // own counter, letting the creature resolve.
+    //
+    // Proven only for a payload that is nothing but counters with no redirect
+    // (Remand/Memory Lapse send the spell back to be recast, and a rider such as
+    // Arcane Denial's draw is a consequence this proof does not weigh), and only
+    // for SPELLS: countering its own trigger (Stifle on an upkeep cost) is a
+    // real play.
+    // `is_own_stack_spell` reads the live stack-object controller (CR 112.2 +
+    // CR 613.1b: Commandeer moves control of a spell without touching the
+    // `StackEntry`'s caster).
+    if is_pure_counter_payload(effects) && is_own_stack_spell(ctx.state, ctx.ai_player, *object_id)
+    {
+        return true;
+    }
+
+    let Some(object) = ctx.state.objects.get(object_id) else {
+        return false;
+    };
+
+    // CR 608.2c: a target the conditional removal won't destroy (Fatal Push
+    // on a 3-drop without revolt) is futile while another opposing target
+    // WOULD die. Only then — with no live alternative, rejecting every target
+    // would just force a cancel.
+    if let Some(source) = ctx.source_object() {
+        if let Some(nodes) = conditional_destroy_nodes(source) {
+            let kills = |id: ObjectId| conditional_destroy_kills(ctx.state, source, &nodes, id);
+            let live_alternative = || {
+                ctx.decision.candidates.iter().any(|candidate| {
+                    matches!(
+                        candidate.action,
+                        GameAction::ChooseTarget {
+                            target: Some(TargetRef::Object(other)),
+                        } if other != *object_id
+                            && ctx.state.objects.get(&other).is_some_and(|o| {
+                                engine::game::players::is_opponent(
+                                    ctx.state,
+                                    ctx.ai_player,
+                                    o.controller,
+                                )
+                            })
+                            && kills(other)
+                    )
+                })
+            };
+            if !kills(*object_id) && live_alternative() {
+                return true;
+            }
+        }
+    }
 
     // CR 701.8 + CR 702.12b: destroy-based removal can't destroy an
     // indestructible permanent.
     let is_destroy = effects.iter().any(|e| matches!(e, Effect::Destroy { .. }));
     if is_destroy && object.has_keyword(&Keyword::Indestructible) {
-        return Some(GateDecision::Reject);
+        return true;
     }
 
     // CR 702.12b: an indestructible creature ignores the lethal-damage SBA
@@ -1203,10 +1634,10 @@ fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<G
     // 0 kills via CR 704.5f (which indestructible does not prevent), and two
     // shrink spells can combine, so those stay in the judgment layer.
     if object.has_keyword(&Keyword::Indestructible)
-        && deals_damage(&effects)
-        && !has_toughness_shrink(&effects)
+        && deals_damage(effects)
+        && !has_toughness_shrink(effects)
     {
-        return Some(GateDecision::Reject);
+        return true;
     }
 
     // CR 702.21a: targeting a warded permanent triggers ward; if the AI can't
@@ -1215,13 +1646,13 @@ fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<G
     for keyword in &object.keywords {
         if let Keyword::Ward(ward) = keyword {
             if !can_pay_ward_cost(ctx, ward, object) {
-                return Some(GateDecision::Reject);
+                return true;
             }
             break;
         }
     }
 
-    None
+    false
 }
 
 /// A plain counter that can only hit the AI's own spells costs it both spells
@@ -1842,6 +2273,308 @@ fn is_redundant_creature_only_removal(ctx: &PolicyContext<'_>, effects: &[&Effec
     saw_creature_only_harm
 }
 
+/// A spell whose ONLY effects are damage to target creatures, none of which the
+/// damage can kill (CR 704.5f/g/h) — 3 damage to a 6/6 attacker, with no
+/// blocker of ours to add combat damage. Casting it changes nothing that lasts
+/// past cleanup (CR 514.2 removes the marked damage) and burns the card.
+///
+/// `AntiSelfHarm` already charges a whiff penalty for this, but on the search
+/// path a root's policy score is weighted at 0.1 against the board evaluation,
+/// so the penalty is erased by a horizon artifact: with the spell on the stack
+/// the continuation can end before combat damage, and the burn line "saves" the
+/// life the pass line loses. Rejecting the proven whiff here, alongside
+/// `is_redundant_creature_only_removal`, is what keeps it off the table.
+///
+/// Fail-open by construction: any non-damage effect (a cantrip, scry, a
+/// destroy line), an unknowable amount (X) or source, or a cast payoff of the
+/// caster's that could care about this spell (prowess, "whenever you cast")
+/// keeps the cast available to policy scoring.
+fn is_proven_damage_whiff(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> bool {
+    let GameAction::CastSpell { object_id, .. } = &ctx.candidate.action else {
+        return false;
+    };
+    let damage_only = !effects.is_empty()
+        && effects.iter().all(|effect| {
+            matches!(effect, Effect::DealDamage { .. })
+                && matches!(effect_polarity(effect), EffectPolarity::Harmful)
+                && targets_creatures_only(effect)
+        });
+    damage_only
+        && !ctx.can_kill_any_legal_target()
+        && !caster_has_cast_payoff(ctx.state, *object_id)
+}
+
+/// A spell whose ONLY effects are creature-only `Destroy`, gated at resolution
+/// on what the target is (CR 608.2c) — Fatal Push: "Destroy target creature if
+/// it has mana value 2 or less. Revolt — ... mana value 4 or less instead if a
+/// permanent you controlled left the battlefield this turn." Targeting checks
+/// only "target creature" (CR 601.2c), so a 3-drop without revolt is a legal
+/// target that the spell then fails to destroy: the card is spent for nothing.
+///
+/// Field report (2026-10-17): the bot pushed Ezuri, Renegade Leader (mana
+/// value 3) with no permanent of its own gone that turn; Ezuri stayed.
+///
+/// The condition is evaluated by the ENGINE (`evaluate_condition`) against a
+/// hypothetical resolution with each legal target, so Revolt, mana value and
+/// any other leaf are read exactly as resolution will read them. Evaluated on
+/// the CURRENT state: a permanent that leaves between cast and resolution
+/// (a fetch cracked in response) is not anticipated.
+fn is_proven_conditional_destroy_whiff(ctx: &PolicyContext<'_>) -> bool {
+    let GameAction::CastSpell { object_id, .. } = &ctx.candidate.action else {
+        return false;
+    };
+    let Some(source) = ctx.source_object() else {
+        return false;
+    };
+    let Some(nodes) = conditional_destroy_nodes(source) else {
+        return false;
+    };
+    let Some(filter) = extract_target_filter(&nodes[0].node.effect) else {
+        return false;
+    };
+    !ctx.has_legal_opponent_creature_target(filter, source.id, |id| {
+        conditional_destroy_kills(ctx.state, source, &nodes, id)
+    }) && !caster_has_cast_payoff(ctx.state, *object_id)
+}
+
+/// A spell cast in the AI's OWN upkeep or draw step with nothing on the stack
+/// is dominated by the same spell in the main phase that follows (CR 503,
+/// CR 504, CR 505): the mana is the same (CR 502.3 untapped it already), the
+/// opponent can answer it the same way, and waiting adds the drawn card to the
+/// decision. Casting early only spends the mana a sorcery-speed play of that
+/// main phase needed.
+///
+/// Field report (2026-11-01): the bot cast Aether Meltdown in its own upkeep,
+/// on one of two identical 1/1 deathtouch creatures, with its 2 lands; the
+/// same turn's Harnessed Lightning was the same kind of early cast.
+///
+/// Fail-open: any effect that touches a library (draw, scry, surveil, dig,
+/// search, mill, a zone move to or from a library) in the spell or in a trigger
+/// of the permanent — the upkeep before the draw is exactly when those are
+/// played (Mystical Tutor, Brainstorm).
+fn own_beginning_phase_cast_is_dominated(ctx: &PolicyContext<'_>) -> bool {
+    let GameAction::CastSpell { object_id, .. } = &ctx.candidate.action else {
+        return false;
+    };
+    if !ctx.state.stack.is_empty()
+        || !matches!(ctx.state.phase, Phase::Upkeep | Phase::Draw)
+        || engine::game::turn_control::turn_decision_maker(ctx.state) != ctx.ai_player
+    {
+        return false;
+    }
+    let Some(object) = ctx.state.objects.get(object_id) else {
+        return false;
+    };
+    let spell_touches_library = object
+        .abilities
+        .iter()
+        .any(ability_touches_library);
+    let trigger_touches_library = object
+        .trigger_definitions
+        .as_slice()
+        .iter()
+        .any(|entry| entry.definition.execute.as_deref().is_some_and(ability_touches_library));
+    !spell_touches_library && !trigger_touches_library
+}
+
+fn ability_touches_library(ability: &AbilityDefinition) -> bool {
+    let mut touches = false;
+    let _ = visit_ability_def(ability, &mut |effect| {
+        let library = match effect {
+            Effect::Draw { .. }
+            | Effect::Mill { .. }
+            | Effect::Scry { .. }
+            | Effect::Surveil { .. }
+            | Effect::Dig { .. }
+            | Effect::Explore
+            | Effect::SearchLibrary { .. }
+            | Effect::RevealTop { .. }
+            | Effect::Discover { .. }
+            | Effect::Cascade
+            | Effect::PutOnTopOrBottom { .. }
+            | Effect::ManifestDread => true,
+            Effect::ChangeZone {
+                origin,
+                destination,
+                ..
+            }
+            | Effect::ChangeZoneAll {
+                origin,
+                destination,
+                ..
+            } => *origin == Some(Zone::Library) || *destination == Zone::Library,
+            _ => false,
+        };
+        if library {
+            touches = true;
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    touches
+}
+
+/// A spell whose ONLY effects are mass removal with a provably empty
+/// population (CR 115.10a) — Aetherize ("Return all attacking creatures to
+/// their owner's hand") cast with no creature attacking. The card is spent for
+/// nothing.
+///
+/// Field report (2026-11-01): the bot cast Aetherize in the opponent's upkeep,
+/// before any combat, and lost the card while facing 10 power at 10 life.
+fn is_proven_mass_whiff(ctx: &PolicyContext<'_>) -> bool {
+    let GameAction::CastSpell { object_id, .. } = &ctx.candidate.action else {
+        return false;
+    };
+    ctx.mass_removal_population_is_empty() && !caster_has_cast_payoff(ctx.state, *object_id)
+}
+
+/// One `Destroy` node of a Fatal Push-class chain, with the conditions of the
+/// condition-only frames it sits under (`gates`). Since v0.118.0 the revolt line
+/// lowers to a `NoOp` frame carrying the `ConditionInstead` revolt check, with
+/// "destroy that creature if it has mana value 4 or less" beneath it: that
+/// `Destroy` happens only when its own condition AND every gate above it hold.
+struct ConditionalDestroyNode<'a> {
+    node: &'a AbilityDefinition,
+    gates: Vec<&'a AbilityCondition>,
+}
+
+/// The chain (root, sub, else) of a Fatal Push-class spell, or `None` outside
+/// the class. Fail-open: modal spells, more than one spell ability, any node
+/// that is neither a harmful creature-only `Destroy` nor a condition-only frame
+/// below the root, or no node whose condition reads the target keep the spell
+/// out.
+fn conditional_destroy_nodes(
+    source: &engine::game::game_object::GameObject,
+) -> Option<Vec<ConditionalDestroyNode<'_>>> {
+    let mut spells = source
+        .abilities
+        .iter()
+        .filter(|ability| ability.kind == AbilityKind::Spell);
+    let root = spells.next()?;
+    if spells.next().is_some() {
+        return None;
+    }
+    let mut nodes: Vec<ConditionalDestroyNode<'_>> = Vec::new();
+    let mut reads_target = false;
+    let mut pending = vec![(root, Vec::new())];
+    while let Some((node, gates)) = pending.pop() {
+        if node.modal.is_some() || !node.mode_abilities.is_empty() {
+            return None;
+        }
+        reads_target |= node.condition.as_ref().is_some_and(condition_reads_target);
+        let effect = node.effect.as_ref();
+        // CR 608.2c: a condition-only frame below the root ("Revolt — … instead
+        // if …") does nothing itself; it gates the instructions under it.
+        if matches!(effect, Effect::NoOp) && !nodes.is_empty() {
+            let condition = node.condition.as_ref()?;
+            let mut inner = gates.clone();
+            inner.push(condition);
+            pending.extend(node.sub_ability.as_deref().map(|sub| (sub, inner.clone())));
+            pending.extend(node.else_ability.as_deref().map(|other| (other, gates)));
+            continue;
+        }
+        // The root picks the target; a sub/else leg may destroy "that
+        // creature" (`ParentTarget`) — Fatal Push's revolt line.
+        let destroys_the_target = match effect {
+            Effect::Destroy {
+                target: TargetFilter::ParentTarget,
+                ..
+            } => !nodes.is_empty(),
+            Effect::Destroy { .. } => {
+                matches!(effect_polarity(effect), EffectPolarity::Harmful)
+                    && targets_creatures_only(effect)
+            }
+            _ => false,
+        };
+        if !destroys_the_target {
+            return None;
+        }
+        pending.extend(node.sub_ability.as_deref().map(|sub| (sub, gates.clone())));
+        pending.extend(
+            node.else_ability
+                .as_deref()
+                .map(|other| (other, gates.clone())),
+        );
+        nodes.push(ConditionalDestroyNode { node, gates });
+    }
+    reads_target.then_some(nodes)
+}
+
+fn condition_reads_target(condition: &AbilityCondition) -> bool {
+    match condition {
+        AbilityCondition::TargetMatchesFilter { .. } => true,
+        AbilityCondition::ConditionInstead { inner } => condition_reads_target(inner),
+        AbilityCondition::Not { condition } => condition_reads_target(condition),
+        AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
+            conditions.iter().any(condition_reads_target)
+        }
+        _ => false,
+    }
+}
+
+/// Would some node of the chain destroy `target` if the spell resolved now?
+/// A node destroys when its own condition (none = unconditional) and every
+/// gate above it hold; an `else` leg counts as a possible destroy too
+/// (over-approximation = fail-open).
+fn conditional_destroy_kills(
+    state: &GameState,
+    source: &engine::game::game_object::GameObject,
+    nodes: &[ConditionalDestroyNode<'_>],
+    target: ObjectId,
+) -> bool {
+    nodes.iter().any(|entry| {
+        let resolved = engine::game::ability_utils::build_resolved_from_def_with_targets(
+            entry.node,
+            source.id,
+            source.controller,
+            vec![TargetRef::Object(target)],
+        );
+        entry
+            .gates
+            .iter()
+            .copied()
+            .chain(entry.node.condition.as_ref())
+            .all(|condition| engine::game::effects::evaluate_condition(condition, state, &resolved))
+    })
+}
+
+/// Does a permanent the spell's caster controls trigger on casting it?
+///
+/// CR 702.108a: prowess triggers on a noncreature spell its controller casts;
+/// CR 603.2: a "whenever you cast" trigger (`SpellCast`, `SpellCastOrCopy`,
+/// `SpellAbilityCast`, `PlayCard`) fires on the cast itself, independent of
+/// what the spell's effect accomplishes — such a cast is never wasted outright.
+/// Only a type requirement the spell provably fails rules a hook out
+/// (`trigger_is_proven_irrelevant`); anything else counts.
+///
+/// Narrower than `has_relevant_functioning_trigger` on purpose: that test also
+/// counts every unrelated battlefield trigger (an opponent's landfall, an
+/// attack trigger), which would keep almost every real board from proving a
+/// whiff. An opponent's cast hook is a reason NOT to cast, never a payoff.
+fn caster_has_cast_payoff(state: &GameState, spell_id: ObjectId) -> bool {
+    let Some(spell) = state.objects.get(&spell_id) else {
+        return true;
+    };
+    let caster = spell.controller;
+    if state.battlefield.iter().copied().any(|source_id| {
+        synthetic_keyword_spell_cast_trigger_applies(state, source_id, caster, spell_id)
+    }) {
+        return true;
+    }
+    battlefield_active_triggers(state).any(|(source, active)| {
+        source.controller == caster
+            && matches!(
+                active.definition.mode,
+                TriggerMode::SpellCast
+                    | TriggerMode::SpellCastOrCopy
+                    | TriggerMode::SpellAbilityCast
+                    | TriggerMode::PlayCard
+            )
+            && !trigger_is_proven_irrelevant(spell, active.definition)
+    })
+}
+
 fn pure_fixed_pump_bonus(effects: &[&Effect]) -> Option<(i32, i32)> {
     if effects.is_empty()
         || !effects
@@ -2233,6 +2966,7 @@ mod tests {
         SpellCastingOption, StaticCondition, StaticDefinition, SubAbilityLink, TargetFilter,
         TurnJournalKind, REMOVE_COUNTER_COST_X,
     };
+    use engine::types::ability::{ChosenAttribute, PreventionScope};
     use engine::types::ability::{
         IllegalTargetsDisposition, QuantityModification, ReplacementDefinition,
         ReplacementPlayerScope,
@@ -2248,7 +2982,7 @@ mod tests {
     use engine::types::identifiers::CardId;
     use engine::types::keywords::{Keyword, WardCost};
     use engine::types::mana::{
-        ManaCost, ManaCostShard, ManaSourceOutput, ManaSpellGrant, ManaUnit,
+        ManaColor, ManaCost, ManaCostShard, ManaSourceOutput, ManaSpellGrant, ManaUnit,
     };
     use engine::types::replacements::ReplacementEvent;
     use engine::types::statics::CastFrequency;
@@ -7728,6 +8462,300 @@ mod tests {
             },
             metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Target),
         }
+    }
+
+    const STROKE_OF_MIDNIGHT_ORACLE: &str =
+        "Destroy target nonland permanent. Its controller creates a 1/1 white Human creature token.";
+
+    /// Put Stroke of Midnight in P0's hand and return its id.
+    fn stroke_of_midnight_in_hand(scenario: &mut GameScenario) -> ObjectId {
+        scenario
+            .add_spell_to_hand_from_oracle(
+                P0,
+                "Stroke of Midnight",
+                true,
+                STROKE_OF_MIDNIGHT_ORACLE,
+            )
+            .id()
+    }
+
+    /// CR 702.12b + CR 601.2c: the only legal target can't be destroyed, so the
+    /// destroy half does nothing and the rider hands the OPPONENT a 1/1. With a
+    /// single legal target the engine binds it at announcement — there is no
+    /// `ChooseTarget` candidate for `reject_futile_target` to veto, so the cast
+    /// itself has to be the one rejected.
+    #[test]
+    fn rejects_cast_whose_only_legal_target_is_indestructible() {
+        let mut scenario = GameScenario::new();
+        scenario
+            .add_creature(P1, "Darksteel Angel", 4, 4)
+            .with_keyword(Keyword::Indestructible);
+        let spell = stroke_of_midnight_in_hand(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+
+        assert_eq!(gate_cast(state, spell), GateDecision::Reject);
+    }
+
+    /// Non-vacuity, and the boundary that keeps the proof honest: one
+    /// destructible permanent anywhere in the legal target set makes the cast a
+    /// real removal play again. Without this the gate could reject every
+    /// targeted removal spell and the first test would still pass.
+    #[test]
+    fn allows_cast_when_any_legal_target_is_destructible() {
+        let mut scenario = GameScenario::new();
+        scenario
+            .add_creature(P1, "Darksteel Angel", 4, 4)
+            .with_keyword(Keyword::Indestructible);
+        scenario.add_creature(P1, "Grizzly Bears", 2, 2);
+        let spell = stroke_of_midnight_in_hand(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+
+        assert_ne!(gate_cast(state, spell), GateDecision::Reject);
+    }
+
+    /// The ordinary case: nothing indestructible in sight, nothing to prove.
+    #[test]
+    fn allows_cast_against_an_ordinary_board() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature(P1, "Grizzly Bears", 2, 2);
+        let spell = stroke_of_midnight_in_hand(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+
+        assert_ne!(gate_cast(state, spell), GateDecision::Reject);
+    }
+
+    // ---- CR 615.1a: burn into an active prevention shield ----
+
+    /// Install the shield Prismatic Strands installs, through the engine's own
+    /// resolver rather than by hand. The payload is the card's printed one, read
+    /// from the shipped card data: `PreventDamage { amount: All, target: Any,
+    /// scope: AllDamage, damage_source_filter: Typed[IsChosenColor] }`. Writing a
+    /// `ReplacementDefinition` literal here instead would assert this file's
+    /// assumption about the shield's shape rather than the shape the engine
+    /// actually installs — and the shape is exactly what the gate reads.
+    fn install_chosen_color_prevention(
+        state: &mut GameState,
+        source: ObjectId,
+        controller: PlayerId,
+        color: ManaColor,
+        scope: PreventionScope,
+    ) {
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .chosen_attributes
+            .push(ChosenAttribute::Color(color));
+        let ability = ResolvedAbility::new(
+            Effect::PreventDamage {
+                amount: PreventionAmount::All,
+                amount_dynamic: None,
+                target: TargetFilter::Any,
+                recipient_scope: engine::types::ability::EffectScope::Single,
+                scope,
+                damage_source_filter: Some(TargetFilter::Typed(
+                    TypedFilter::default().properties(vec![FilterProp::IsChosenColor]),
+                )),
+                prevention_duration: None,
+            },
+            vec![],
+            source,
+            controller,
+        );
+        let mut events = Vec::new();
+        engine::game::effects::prevent_damage::resolve(state, &ability, &mut events)
+            .expect("the prevention shield installs");
+    }
+
+    /// A red Lightning Bolt in P0's hand, and a permanent of P1's to host the
+    /// opponent's chosen color. Returns the bolt and the host.
+    fn red_burn_and_shield_host(scenario: &mut GameScenario) -> (ObjectId, ObjectId) {
+        let host = scenario.add_creature(P1, "Shield Host", 1, 1).id();
+        let bolt = scenario.add_bolt_to_hand(P0);
+        (bolt, host)
+    }
+
+    /// CR 105.2 + CR 615.1a: the spell is red, the shield prevents all damage
+    /// from red sources, and nothing on the card survives that. Field report
+    /// (2026-09-21): the AI kept casting burn into a Prismatic Strands.
+    #[test]
+    fn rejects_red_burn_into_a_red_prevention_shield() {
+        let mut scenario = GameScenario::new();
+        let (bolt, host) = red_burn_and_shield_host(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        state.objects.get_mut(&bolt).unwrap().color = vec![ManaColor::Red];
+        install_chosen_color_prevention(
+            state,
+            host,
+            P1,
+            ManaColor::Red,
+            PreventionScope::AllDamage,
+        );
+
+        assert_eq!(gate_cast(state, bolt), GateDecision::Reject);
+    }
+
+    /// The color check is real: the same board with white chosen leaves a red
+    /// bolt dealing its damage. Without this, a gate that rejected every burn
+    /// spell while any shield was up would still pass the test above.
+    #[test]
+    fn allows_red_burn_when_the_shield_names_another_color() {
+        let mut scenario = GameScenario::new();
+        let (bolt, host) = red_burn_and_shield_host(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        state.objects.get_mut(&bolt).unwrap().color = vec![ManaColor::Red];
+        install_chosen_color_prevention(
+            state,
+            host,
+            P1,
+            ManaColor::White,
+            PreventionScope::AllDamage,
+        );
+
+        assert_ne!(gate_cast(state, bolt), GateDecision::Reject);
+    }
+
+    /// CR 614.1a: a combat-only shield (the Fog class) never touches a spell's
+    /// damage, so the same red bolt is a real play.
+    #[test]
+    fn allows_red_burn_under_a_combat_only_shield() {
+        let mut scenario = GameScenario::new();
+        let (bolt, host) = red_burn_and_shield_host(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        state.objects.get_mut(&bolt).unwrap().color = vec![ManaColor::Red];
+        install_chosen_color_prevention(
+            state,
+            host,
+            P1,
+            ManaColor::Red,
+            PreventionScope::CombatDamage,
+        );
+
+        assert_ne!(gate_cast(state, bolt), GateDecision::Reject);
+    }
+
+    /// The payload rule: a rider that resolves anyway keeps the cast worth
+    /// making even with every point of its damage prevented.
+    #[test]
+    fn allows_a_prevented_burn_spell_whose_rider_still_resolves() {
+        let mut scenario = GameScenario::new();
+        let host = scenario.add_creature(P1, "Shield Host", 1, 1).id();
+        let helix = scenario
+            .add_spell_to_hand_from_oracle(
+                P0,
+                "Lightning Helix",
+                true,
+                "Lightning Helix deals 3 damage to any target. You gain 3 life.",
+            )
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        state.objects.get_mut(&helix).unwrap().color = vec![ManaColor::Red];
+        install_chosen_color_prevention(
+            state,
+            host,
+            P1,
+            ManaColor::Red,
+            PreventionScope::AllDamage,
+        );
+
+        assert_ne!(gate_cast(state, helix), GateDecision::Reject);
+    }
+
+    /// The ordinary case: no shield anywhere, nothing to prove.
+    #[test]
+    fn allows_red_burn_with_no_shield_in_play() {
+        let mut scenario = GameScenario::new();
+        let (bolt, _host) = red_burn_and_shield_host(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        state.objects.get_mut(&bolt).unwrap().color = vec![ManaColor::Red];
+
+        assert_ne!(gate_cast(state, bolt), GateDecision::Reject);
+    }
+
+    /// The board the field report actually had under the AI: red creatures whose
+    /// only abilities are self enters-the-battlefield triggers (Burning-Tree
+    /// Emissary, Voldaren Epicure, Goblin Bushwhacker). None of them can fire off
+    /// a cast whose every point of damage is prevented, and
+    /// `has_relevant_functioning_trigger` proves that shape irrelevant — so the
+    /// gate still fires. Without this, the proof could be correct on an empty
+    /// board and never reach a real one.
+    #[test]
+    fn rejects_red_burn_on_the_reported_board() {
+        let mut scenario = GameScenario::new();
+        scenario.add_creature_from_oracle(
+            P0,
+            "Burning-Tree Emissary",
+            2,
+            2,
+            "When this creature enters, add {R}{G}.",
+        );
+        scenario.add_creature_from_oracle(
+            P0,
+            "Voldaren Epicure",
+            1,
+            1,
+            "When this creature enters, create a Blood token.",
+        );
+        let host = scenario.add_creature(P1, "Shield Host", 1, 1).id();
+        let bolt = scenario.add_bolt_to_hand(P0);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        state.objects.get_mut(&bolt).unwrap().color = vec![ManaColor::Red];
+        install_chosen_color_prevention(
+            state,
+            host,
+            P1,
+            ManaColor::Red,
+            PreventionScope::AllDamage,
+        );
+
+        assert_eq!(gate_cast(state, bolt), GateDecision::Reject);
+    }
+
+    /// CR 702.108a: prowess pays off the CAST, not the damage, so a bolt that
+    /// will never deal a point is still worth casting to pump an attacker. The
+    /// carve-out that keeps this play is `has_relevant_functioning_trigger`,
+    /// which consults the engine's synthetic prowess hook — prowess is a bare
+    /// keyword here, not a trigger definition, so a scan of trigger definitions
+    /// alone would miss it and this test would fail.
+    #[test]
+    fn allows_prevented_burn_that_would_trigger_prowess() {
+        let mut scenario = GameScenario::new();
+        scenario
+            .add_creature(P0, "Monastery Swiftspear", 1, 2)
+            .with_keyword(Keyword::Prowess);
+        let host = scenario.add_creature(P1, "Shield Host", 1, 1).id();
+        let bolt = scenario.add_bolt_to_hand(P0);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_priority_window(state, Phase::PreCombatMain, P0);
+        state.objects.get_mut(&bolt).unwrap().color = vec![ManaColor::Red];
+        install_chosen_color_prevention(
+            state,
+            host,
+            P1,
+            ManaColor::Red,
+            PreventionScope::AllDamage,
+        );
+
+        assert_ne!(gate_cast(state, bolt), GateDecision::Reject);
     }
 
     /// CR 702.12b: a damage-only spell can never kill an indestructible creature.

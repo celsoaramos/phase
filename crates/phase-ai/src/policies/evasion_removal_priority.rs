@@ -1,9 +1,16 @@
-use engine::types::ability::TargetRef;
+use std::ops::ControlFlow;
+
+use engine::types::ability::{
+    AbilityDefinition, Effect, TargetFilter, TargetRef, TriggerDefinition,
+};
+use engine::types::ability_visit::visit_ability_def;
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{GameState, WaitingFor};
 use engine::types::keywords::Keyword;
 use engine::types::player::PlayerId;
+use engine::types::triggers::TriggerMode;
+use engine::types::zones::Zone;
 
 use crate::eval::opponent_battlefield_creature_threat_value;
 use crate::features::DeckFeatures;
@@ -66,8 +73,64 @@ impl EvasionRemovalPriorityPolicy {
         // damage is actually lethal (CR 704.5g) so a clean kill outranks a whiff.
         let lethality_bonus = super::removal_lethality::lethality_bonus(ctx, *target_id, target);
 
-        target_quality_bonus + evasion_bonus + velocity_bonus + lethality_bonus
+        let engine_bonus = engine_card_score(target);
+
+        target_quality_bonus + evasion_bonus + velocity_bonus + lethality_bonus + engine_bonus
     }
+}
+
+/// Removal-target bonus for the card that keeps producing value (CR 603.2): a
+/// nontoken creature with a trigger that fires again and creates tokens or
+/// draws cards — Scute Swarm, Young Pyromancer — is worth more dead than the
+/// tokens it already made. Equal bodies otherwise tie on stats alone.
+///
+/// Field report (2026-11-01): Harnessed Lightning killed an Insect token next
+/// to the Scute Swarm that made it. Its own "when this enters" trigger has
+/// already done its work and does not count.
+const ENGINE_CARD_BONUS: f64 = 0.75;
+/// A token is the OUTPUT of something; between bodies of equal value the card
+/// is the better removal target.
+const TOKEN_TARGET_DISCOUNT: f64 = 0.25;
+
+fn engine_card_score(target: &engine::game::game_object::GameObject) -> f64 {
+    if target.is_token {
+        return -TOKEN_TARGET_DISCOUNT;
+    }
+    let repeats_value = target.trigger_definitions.as_slice().iter().any(|entry| {
+        let trigger = &entry.definition;
+        !is_own_enters_trigger(trigger)
+            && trigger.execute.as_deref().is_some_and(produces_cards_or_tokens)
+    });
+    if repeats_value {
+        ENGINE_CARD_BONUS
+    } else {
+        0.0
+    }
+}
+
+fn is_own_enters_trigger(trigger: &TriggerDefinition) -> bool {
+    trigger.mode == TriggerMode::ChangesZone
+        && trigger.destination == Some(Zone::Battlefield)
+        && matches!(trigger.valid_card, Some(TargetFilter::SelfRef))
+}
+
+fn produces_cards_or_tokens(ability: &AbilityDefinition) -> bool {
+    let mut produces = false;
+    let _ = visit_ability_def(ability, &mut |effect| {
+        if matches!(
+            effect,
+            Effect::Token { .. }
+                | Effect::CopyTokenOf { .. }
+                | Effect::CreateTokenCopyFromPool { .. }
+                | Effect::Draw { .. }
+        ) {
+            produces = true;
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    produces
 }
 
 /// CR 601.2d: is this candidate an opposing CREATURE that the divided-damage

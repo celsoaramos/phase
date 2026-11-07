@@ -269,40 +269,31 @@ fn does_not_cast_slash_of_light_for_nonlethal_damage() {
         state.waiting_for = WaitingFor::Priority { player: P0 };
     }
 
-    // Easy, Hard, and Very Hard: the whiff guard deterministically ranks the
-    // wasteful cast BELOW passing its priority. Assert via `score_candidates`
-    // (the deterministic policy-registry ranking) rather than `choose_action`
-    // (which applies softmax temperature + search pre-emptions and is therefore
-    // difficulty-stochastic at the argmax boundary). The discriminating signal
-    // for the cast-commit gate is that the whiff burn is deprioritized below
-    // passing.
-    //
-    // Medium is deliberately NOT asserted here: at difficulty Medium the cast
-    // decision goes through the search path which projects casting Slash of Light
-    // as a ~WIN_SCORE (10000) line whether or not the whiff penalty is applied —
-    // a search/terminal-eval artifact orthogonal to the cast-commit whiff guard.
+    // Every difficulty: the proven whiff is rejected by the tactical gate
+    // (`is_proven_damage_whiff`), so the burn never reaches scoring at all.
+    // Medium used to be exempt here — its search projected the cast as a
+    // ~WIN_SCORE line and the 0.1-weighted policy penalty could not outvote
+    // the board evaluation; the gate is what makes the guard hold on the
+    // search path too.
     for diff in [
         AiDifficulty::Easy,
+        AiDifficulty::Medium,
         AiDifficulty::Hard,
         AiDifficulty::VeryHard,
     ] {
         let config = create_config(diff, Platform::Native);
         let scored = phase_ai::score_candidates(runner.state(), P0, &config);
-        let cast = scored
-            .iter()
-            .find(|(a, _)| matches!(a, GameAction::CastSpell { .. }))
-            .map(|(_, s)| *s);
-        let pass = scored
-            .iter()
-            .find(|(a, _)| matches!(a, GameAction::PassPriority))
-            .map(|(_, s)| *s);
-        let (Some(cast), Some(pass)) = (cast, pass) else {
-            panic!("{diff:?}: expected both CastSpell and PassPriority candidates, got {scored:?}");
-        };
         assert!(
-            cast < pass,
-            "{diff:?}: the wasteful Slash of Light cast ({cast:.3}) must rank below \
-             passing ({pass:.3}) — the whiff guard did not deprioritize the burn"
+            scored
+                .iter()
+                .any(|(a, _)| matches!(a, GameAction::PassPriority)),
+            "{diff:?}: passing must stay available, got {scored:?}"
+        );
+        assert!(
+            !scored
+                .iter()
+                .any(|(a, _)| matches!(a, GameAction::CastSpell { .. })),
+            "{diff:?}: the wasteful Slash of Light cast must be gated out, got {scored:?}"
         );
     }
 }
@@ -360,18 +351,30 @@ fn very_hard_slash_of_light_does_not_commit_or_ping_the_3_3() {
         state.waiting_for = WaitingFor::Priority { player: P0 };
     }
 
-    // Reach-guard (tier 1): the exact Slash of Light cast must be offered as a
-    // candidate to the Very Hard scorer. A vacuous "no candidates" pass would
-    // satisfy the outcome asserts below for the wrong reason. Read-only — no
-    // borrow survives past this block.
+    // Reach-guard (tier 1): the engine offers the cast (it is legal and
+    // affordable), and the Very Hard scorer gates exactly that candidate out
+    // while keeping the pass — the decision path did reach the whiff gate.
+    // Read-only — no borrow survives past this block.
+    assert!(
+        engine::ai_support::build_decision_context(runner.state())
+            .candidates
+            .iter()
+            .any(|c| matches!(
+                c.action,
+                GameAction::CastSpell { object_id, .. } if object_id == slash
+            )),
+        "Slash of Light must be a legal CastSpell candidate"
+    );
     let config = create_config(AiDifficulty::VeryHard, Platform::Native);
     let scored = phase_ai::score_candidates(runner.state(), P0, &config);
     assert!(
-        scored.iter().any(|(a, _)| matches!(
+        !scored.iter().any(|(a, _)| matches!(
             a,
             GameAction::CastSpell { object_id, .. } if *object_id == slash
-        )),
-        "Slash of Light must be offered as a CastSpell candidate, got {scored:?}"
+        )) && scored
+            .iter()
+            .any(|(a, _)| matches!(a, GameAction::PassPriority)),
+        "the non-lethal Slash of Light cast must be gated out (pass kept), got {scored:?}"
     );
 
     let ai_players = HashSet::from([P0]);
@@ -515,7 +518,14 @@ fn mixed_damage_and_destroy_is_not_penalized_as_a_damage_whiff() {
     // AI's single creature makes the dynamic ObjectCount amount resolve to 1
     // (Slash-of-Light-shaped); the opponent's 3/3 survives 1 damage but Destroy
     // kills it (CR 701.8a).
-    scenario.add_creature(P0, "My Bear", 2, 1);
+    // Prowess on the AI's creature keeps the pure-burn comparator OUT of the
+    // tactical gate's proven-whiff rejection (a cast payoff makes the cast
+    // not a provable waste), so it still reaches scoring and carries the
+    // -8 `wasted_cast_penalty` this differential measures. Both spells get
+    // the same prowess credit, so the inequality is unchanged.
+    scenario
+        .add_creature(P0, "My Bear", 2, 1)
+        .with_keyword(Keyword::Prowess);
     scenario.add_creature(P1, "Opponent Bear", 3, 3);
 
     let mut my_filter = TypedFilter::creature();
@@ -616,7 +626,14 @@ fn mixed_damage_and_gain_control_is_not_penalized_as_a_damage_whiff() {
     // AI's single creature makes the dynamic ObjectCount amount resolve to 1
     // (Slash-of-Light-shaped); the opponent's 3/3 survives 1 damage but the
     // Island is a legal, useful GainControl permanent target (CR 613.1b).
-    scenario.add_creature(P0, "My Bear", 2, 1);
+    // Prowess on the AI's creature keeps the pure-burn comparator OUT of the
+    // tactical gate's proven-whiff rejection (a cast payoff makes the cast
+    // not a provable waste), so it still reaches scoring and carries the
+    // -8 `wasted_cast_penalty` this differential measures. Both spells get
+    // the same prowess credit, so the inequality is unchanged.
+    scenario
+        .add_creature(P0, "My Bear", 2, 1)
+        .with_keyword(Keyword::Prowess);
     scenario.add_creature(P1, "Opponent Bear", 3, 3);
     scenario.add_basic_land(P1, engine::types::mana::ManaColor::Blue);
 
@@ -720,7 +737,14 @@ fn mixed_damage_and_destroy_all_is_not_penalized_as_a_damage_whiff() {
     // (Slash-of-Light-shaped); the opponent's 3/3 survives 1 damage but is in
     // the wipe's default all-creatures population (CR 701.8, destroy.rs
     // `resolve_all`).
-    scenario.add_creature(P0, "My Bear", 2, 1);
+    // Prowess on the AI's creature keeps the pure-burn comparator OUT of the
+    // tactical gate's proven-whiff rejection (a cast payoff makes the cast
+    // not a provable waste), so it still reaches scoring and carries the
+    // -8 `wasted_cast_penalty` this differential measures. Both spells get
+    // the same prowess credit, so the inequality is unchanged.
+    scenario
+        .add_creature(P0, "My Bear", 2, 1)
+        .with_keyword(Keyword::Prowess);
     scenario.add_creature(P1, "Opponent Bear", 3, 3);
 
     let mut my_filter = TypedFilter::creature();
@@ -2676,4 +2700,437 @@ fn mana_dork_outvalues_a_bigger_body_when_trading() {
          i.e. about −6.007; got {}",
         keep_dork_reverted - keep_body_reverted
     );
+}
+
+// ── Non-lethal burn into combat (Focus Fire, field report 2026-10-15) ──────
+
+const FOCUS_FIRE_ORACLE: &str = "Focus Fire deals X damage to target attacking or blocking creature, where X is 2 plus the number of creatures you control.";
+
+/// The opponent (P1) attacks the AI (P0) with a 6/6; no blockers are declared.
+/// The AI controls `ai_creatures` (power, toughness) bodies and holds Focus
+/// Fire with {W} floating. Returns the runner, the attacker and Focus Fire.
+fn focus_fire_into_attacker(
+    ai_creatures: &[(i32, i32)],
+    blocked_by_first: bool,
+    prowess_on_first: bool,
+) -> (engine::game::scenario::GameRunner, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::DeclareBlockers);
+    let mut mine = Vec::new();
+    for (i, (power, toughness)) in ai_creatures.iter().enumerate() {
+        let mut builder =
+            scenario.add_creature(P0, &format!("AI Creature {i}"), *power, *toughness);
+        if i == 0 && prowess_on_first {
+            builder.with_keyword(Keyword::Prowess);
+        }
+        mine.push(builder.id());
+    }
+    let attacker = scenario.add_creature(P1, "Big Attacker", 6, 6).id();
+    let focus_fire = scenario
+        .add_spell_to_hand_from_oracle(P0, "Focus Fire", true, FOCUS_FIRE_ORACLE)
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![ManaUnit::new(
+            ManaType::White,
+            ObjectId(9_999),
+            false,
+            vec![],
+        )],
+    );
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P0;
+        let mut info = AttackerInfo::attacking_player(attacker, P0);
+        let mut combat = CombatState::default();
+        if blocked_by_first {
+            let blocker = mine[0];
+            info.blocked = true;
+            combat.blocker_assignments.insert(attacker, vec![blocker]);
+            combat.blocker_to_attacker.insert(blocker, vec![attacker]);
+        }
+        combat.attackers = vec![info];
+        state.combat = Some(combat);
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+    }
+    (runner, attacker, focus_fire)
+}
+
+fn offers_cast(
+    state: &engine::types::game_state::GameState,
+    diff: AiDifficulty,
+    spell: ObjectId,
+) -> bool {
+    let config = create_config(diff, Platform::Native);
+    phase_ai::score_candidates(state, P0, &config)
+        .iter()
+        .any(|(a, _)| matches!(a, GameAction::CastSpell { object_id, .. } if *object_id == spell))
+}
+
+/// Field report: the bot had one creature, so Focus Fire dealt 2 + 1 = 3 to an
+/// unblocked 6/6 attacker — the damage went away at cleanup (CR 514.2) and the
+/// 6 combat damage still landed. CR 704.5g: 3 marked damage never reaches 6
+/// toughness, and with no blocker nothing adds to it. Before the gate, Medium
+/// and up scored the cast ABOVE the pass (-10.8 vs -11.8): the 0.1-weighted
+/// whiff penalty lost to a search horizon where the burn line ends before
+/// combat damage.
+#[test]
+fn does_not_cast_focus_fire_for_nonlethal_damage_to_an_unblocked_attacker() {
+    let (runner, _attacker, focus_fire) = focus_fire_into_attacker(&[(2, 2)], false, false);
+    assert!(
+        engine::ai_support::build_decision_context(runner.state())
+            .candidates
+            .iter()
+            .any(|c| matches!(c.action, GameAction::CastSpell { object_id, .. } if object_id == focus_fire)),
+        "Focus Fire must be a legal, affordable cast — otherwise the test is vacuous"
+    );
+    for diff in [
+        AiDifficulty::Easy,
+        AiDifficulty::Medium,
+        AiDifficulty::Hard,
+        AiDifficulty::VeryHard,
+    ] {
+        assert!(
+            !offers_cast(runner.state(), diff, focus_fire),
+            "{diff:?}: a 3-damage Focus Fire on an unblocked 6/6 must be gated out"
+        );
+        let action = ai_choose(runner.state(), diff);
+        assert!(
+            matches!(action, GameAction::PassPriority),
+            "{diff:?}: the AI must pass instead of whiffing Focus Fire, chose {action:?}"
+        );
+    }
+}
+
+/// Sibling: the same 3 damage is lethal once the attacker is BLOCKED by the
+/// AI's 4/4 — CR 510.1 + CR 120.6, 3 marked + 4 combat damage = 7 ≥ 6. The
+/// gate must not take away the card's real job.
+#[test]
+fn focus_fire_stays_available_when_the_blocker_finishes_the_attacker() {
+    let (runner, _attacker, focus_fire) = focus_fire_into_attacker(&[(4, 4)], true, false);
+    for diff in [AiDifficulty::Easy, AiDifficulty::VeryHard] {
+        assert!(
+            offers_cast(runner.state(), diff, focus_fire),
+            "{diff:?}: Focus Fire plus the blocker's combat damage kills the 6/6"
+        );
+    }
+}
+
+/// Sibling: a prowess creature on the AI's side gets value from the cast
+/// itself (CR 702.108a), so the whiff is not provable and stays to scoring.
+#[test]
+fn focus_fire_whiff_stays_available_with_a_prowess_payoff() {
+    let (runner, _attacker, focus_fire) = focus_fire_into_attacker(&[(2, 2)], false, true);
+    assert!(
+        offers_cast(runner.state(), AiDifficulty::Easy, focus_fire),
+        "a prowess payoff makes the cast not a provable whiff"
+    );
+}
+
+// ── Conditional removal that can't kill (Fatal Push, field report 2026-10-17) ──
+
+const FATAL_PUSH_ORACLE: &str = "Destroy target creature if it has mana value 2 or less.\nRevolt — Destroy that creature if it has mana value 4 or less instead if a permanent you controlled left the battlefield this turn.";
+
+/// The AI (P0) is in its first main phase holding Fatal Push with {B}
+/// floating; the opponent controls one creature per entry of `opposing_mv`.
+/// Returns the runner, the opposing creatures and Fatal Push.
+fn fatal_push_board(
+    opposing_mv: &[u32],
+    revolt: bool,
+) -> (engine::game::scenario::GameRunner, Vec<ObjectId>, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let fodder = scenario.add_creature(P0, "AI Fodder", 1, 1).id();
+    let mut theirs = Vec::new();
+    for (i, mv) in opposing_mv.iter().enumerate() {
+        theirs.push(
+            scenario
+                .add_creature(P1, &format!("Opposing {mv}-drop {i}"), 2, 2)
+                .with_mana_cost(ManaCost::generic(*mv))
+                .id(),
+        );
+    }
+    let fatal_push = scenario
+        .add_spell_to_hand_from_oracle(P0, "Fatal Push", true, FATAL_PUSH_ORACLE)
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![ManaUnit::new(
+            ManaType::Black,
+            ObjectId(9_999),
+            false,
+            vec![],
+        )],
+    );
+    let mut runner = scenario.build();
+    if revolt {
+        // CR 700.12 (Revolt): a permanent the AI controlled left the battlefield.
+        engine::game::zones::move_to_zone(
+            runner.state_mut(),
+            fodder,
+            engine::types::zones::Zone::Graveyard,
+            &mut Vec::new(),
+        );
+    }
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+    (runner, theirs, fatal_push)
+}
+
+fn assert_fatal_push_castable(state: &engine::types::game_state::GameState, spell: ObjectId) {
+    assert!(
+        engine::ai_support::build_decision_context(state)
+            .candidates
+            .iter()
+            .any(|c| matches!(c.action, GameAction::CastSpell { object_id, .. } if object_id == spell)),
+        "Fatal Push must be a legal, affordable cast — otherwise the test is vacuous"
+    );
+}
+
+/// Field report: the bot pushed Ezuri, Renegade Leader (mana value 3) with no
+/// permanent of its own gone that turn. Fatal Push targets "target creature"
+/// (CR 601.2c) and checks mana value only on resolution (CR 608.2c), so the
+/// card resolved and Ezuri stayed. Without revolt nothing here can die.
+#[test]
+fn does_not_cast_fatal_push_at_a_three_drop_without_revolt() {
+    let (runner, _theirs, fatal_push) = fatal_push_board(&[3], false);
+    assert_fatal_push_castable(runner.state(), fatal_push);
+    for diff in [
+        AiDifficulty::Easy,
+        AiDifficulty::Medium,
+        AiDifficulty::Hard,
+        AiDifficulty::VeryHard,
+    ] {
+        assert!(
+            !offers_cast(runner.state(), diff, fatal_push),
+            "{diff:?}: Fatal Push can't destroy a 3-drop without revolt"
+        );
+    }
+}
+
+/// Sibling: with revolt on, the 3-drop is inside "mana value 4 or less".
+#[test]
+fn fatal_push_stays_available_at_a_three_drop_with_revolt() {
+    let (runner, _theirs, fatal_push) = fatal_push_board(&[3], true);
+    assert_fatal_push_castable(runner.state(), fatal_push);
+    assert!(
+        offers_cast(runner.state(), AiDifficulty::Easy, fatal_push),
+        "revolt makes the 3-drop a real Fatal Push target"
+    );
+}
+
+/// Sibling: a 2-drop on the other side keeps the cast, and the target choice
+/// goes to the creature that dies, never the 3-drop.
+#[test]
+fn fatal_push_targets_the_two_drop_not_the_three_drop() {
+    let (mut runner, theirs, fatal_push) = fatal_push_board(&[3, 2], false);
+    let (three_drop, two_drop) = (theirs[0], theirs[1]);
+    assert!(
+        offers_cast(runner.state(), AiDifficulty::Easy, fatal_push),
+        "a 2-drop is a real Fatal Push target"
+    );
+    let cast = engine::ai_support::build_decision_context(runner.state())
+        .candidates
+        .into_iter()
+        .find(|c| matches!(c.action, GameAction::CastSpell { object_id, .. } if object_id == fatal_push))
+        .expect("cast candidate")
+        .action;
+    runner.act(cast).expect("cast Fatal Push");
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ),
+        "two legal targets → the engine asks, got {:?}",
+        runner.state().waiting_for
+    );
+    for diff in [AiDifficulty::Easy, AiDifficulty::VeryHard] {
+        let action = ai_choose(runner.state(), diff);
+        assert!(
+            !matches!(
+                action,
+                GameAction::ChooseTarget { target: Some(TargetRef::Object(id)) } if id == three_drop
+            ),
+            "{diff:?}: must not push the 3-drop, chose {action:?}"
+        );
+        assert!(
+            matches!(
+                action,
+                GameAction::ChooseTarget { target: Some(TargetRef::Object(id)) } if id == two_drop
+            ),
+            "{diff:?}: expected the 2-drop, chose {action:?}"
+        );
+    }
+}
+
+// ── Bot flags of 2026-11-01 ──────────────────────────────────────────────
+
+const AETHERIZE_ORACLE: &str = "Return all attacking creatures to their owner's hand.";
+const SHOCK_ORACLE: &str = "Shock deals 2 damage to any target.";
+const OPT_ORACLE: &str = "Scry 1.\nDraw a card.";
+const SCUTE_SWARM_ORACLE: &str = "Landfall — Whenever a land you control enters, create a 1/1 green Insect creature token. If you control six or more lands, create a token that's a copy of Scute Swarm instead.";
+
+/// The AI (P0) holds `spell` with one generic mana floating, in `phase` of its
+/// own turn; the opponent has a 3/3. Returns the runner and the spell.
+fn instant_in_hand_board(
+    phase: Phase,
+    name: &str,
+    oracle: &str,
+) -> (engine::game::scenario::GameRunner, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(phase);
+    scenario.add_creature(P1, "Opposing Bear", 3, 3);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, name, true, oracle)
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![ManaUnit::new(ManaType::Red, ObjectId(9_999), false, vec![])],
+    );
+    let mut runner = scenario.build();
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+    (runner, spell)
+}
+
+fn assert_castable(state: &engine::types::game_state::GameState, spell: ObjectId) {
+    assert!(
+        engine::ai_support::build_decision_context(state)
+            .candidates
+            .iter()
+            .any(|c| matches!(c.action, GameAction::CastSpell { object_id, .. } if object_id == spell)),
+        "the spell must be a legal, affordable cast — otherwise the test is vacuous"
+    );
+}
+
+/// Field report: the bot cast Aetherize in the opponent's upkeep, before any
+/// combat. CR 115.10a: "all attacking creatures" is matched at resolution, and
+/// with no creature attacking the card is spent for nothing.
+#[test]
+fn does_not_cast_aetherize_with_no_attacking_creature() {
+    let (runner, aetherize) =
+        instant_in_hand_board(Phase::PreCombatMain, "Aetherize", AETHERIZE_ORACLE);
+    assert_castable(runner.state(), aetherize);
+    for diff in [
+        AiDifficulty::Easy,
+        AiDifficulty::Medium,
+        AiDifficulty::Hard,
+        AiDifficulty::VeryHard,
+    ] {
+        assert!(
+            !offers_cast(runner.state(), diff, aetherize),
+            "{diff:?}: Aetherize returns nothing when no creature is attacking"
+        );
+    }
+}
+
+/// Field report: the bot cast Aether Meltdown in its own upkeep. With nothing
+/// on the stack, the main phase that follows offers the same mana and the drawn
+/// card besides (CR 503-505), so a removal spell is held.
+#[test]
+fn holds_removal_in_its_own_upkeep() {
+    let (runner, shock) = instant_in_hand_board(Phase::Upkeep, "Shock", SHOCK_ORACLE);
+    assert_castable(runner.state(), shock);
+    for diff in [AiDifficulty::Hard, AiDifficulty::VeryHard] {
+        assert!(
+            !offers_cast(runner.state(), diff, shock),
+            "{diff:?}: Shock in its own upkeep is dominated by the main phase"
+        );
+    }
+}
+
+/// Negative control: a spell that touches the library is exactly what the
+/// upkeep before the draw is for, so the gate leaves it alone.
+#[test]
+fn own_upkeep_gate_leaves_library_spells_alone() {
+    let (runner, opt) = instant_in_hand_board(Phase::Upkeep, "Opt", OPT_ORACLE);
+    assert_castable(runner.state(), opt);
+    assert!(
+        offers_cast(runner.state(), AiDifficulty::VeryHard, opt),
+        "Opt in the upkeep must stay a candidate"
+    );
+}
+
+/// Field report: Harnessed Lightning killed an Insect token next to the Scute
+/// Swarm that made it. Same 1/1 body, but the Swarm makes another one on every
+/// land drop (CR 603.2) and the token is only its output.
+#[test]
+fn removal_targets_the_token_maker_not_its_token() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let swarm = scenario
+        .add_creature_from_oracle(P1, "Scute Swarm", 1, 1, SCUTE_SWARM_ORACLE)
+        .id();
+    let insect = scenario.add_creature(P1, "Insect", 1, 1).id();
+    let shock = scenario
+        .add_spell_to_hand_from_oracle(P0, "Shock", true, SHOCK_ORACLE)
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![ManaUnit::new(ManaType::Red, ObjectId(9_999), false, vec![])],
+    );
+    let mut runner = scenario.build();
+    runner.state_mut().objects.get_mut(&insect).unwrap().is_token = true;
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+    let card_id = runner.state().objects[&shock].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: shock,
+            card_id,
+            targets: Vec::new(),
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("Shock should reach target selection");
+
+    let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+    let scored = phase_ai::score_candidates(runner.state(), P0, &config);
+    let score_of = |id: ObjectId| {
+        scored
+            .iter()
+            .find(|(a, _)| {
+                matches!(a, GameAction::ChooseTarget { target: Some(TargetRef::Object(t)) } if *t == id)
+            })
+            .map(|(_, s)| *s)
+            .unwrap_or_else(|| panic!("no ChooseTarget candidate for {id:?}: {scored:?}"))
+    };
+    let (swarm_score, insect_score) = (score_of(swarm), score_of(insect));
+    assert!(
+        swarm_score > insect_score,
+        "Scute Swarm ({swarm_score}) must outrank its Insect token ({insect_score})"
+    );
+}
+
+const AETHER_MELTDOWN_ORACLE: &str = "Flash\nEnchant creature or Vehicle\nWhen Aether Meltdown enters, you get {E}{E}.\nEnchanted permanent gets -4/-0.";
+
+/// The reported card itself: a flash Aura has no spell effect of its own, so
+/// the upkeep gate has to run before the empty-effects early return.
+#[test]
+fn holds_a_flash_aura_in_its_own_upkeep() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::Upkeep);
+    scenario.add_creature(P1, "Opposing Bear", 3, 3);
+    let meltdown = scenario
+        .add_spell_to_hand(P0, "Aether Meltdown", true)
+        .as_enchantment()
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(ManaCost::generic(1))
+        .from_oracle_text_with_keywords(&["Flash"], AETHER_MELTDOWN_ORACLE)
+        .with_keyword(<Keyword as std::str::FromStr>::from_str("Enchant:creature").unwrap())
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![ManaUnit::new(ManaType::Blue, ObjectId(9_999), false, vec![])],
+    );
+    let mut runner = scenario.build();
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+    assert_castable(runner.state(), meltdown);
+    for diff in [AiDifficulty::Hard, AiDifficulty::VeryHard] {
+        assert!(
+            !offers_cast(runner.state(), diff, meltdown),
+            "{diff:?}: a flash Aura in its own upkeep is dominated by the main phase"
+        );
+    }
 }
