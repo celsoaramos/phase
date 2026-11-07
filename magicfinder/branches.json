@@ -406,5 +406,11 @@
   },
   {
     "branch": "card/mf-relatos-20261107-05"
+  },
+  {
+    "branch": "ai/mf-flags-1107"
+  },
+  {
+    "branch": "ai/mf-flags-1107-combat"
   }
 ]
