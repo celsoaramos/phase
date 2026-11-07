@@ -4739,7 +4739,7 @@ fn hydraulic_helper_full_card_supported_with_artifact_spend_restriction() {
         restrictions,
         &[ManaSpendRestriction::SpellTypeOrAbilityActivation {
             spell_type: "Artifact".to_string(),
-            ability: AbilityActivationScope::Any,
+            ability: AbilityActivationScope::NonSpellUnrestricted,
         }],
         "negative nonartifact restriction must lower to \
              SpellTypeOrAbilityActivation so ability activation stays unrestricted"
@@ -10617,7 +10617,7 @@ fn jetfire_front_face_activated_ability() {
         restrictions,
         &vec![ManaSpendRestriction::SpellTypeOrAbilityActivation {
             spell_type: "Artifact".to_string(),
-            ability: AbilityActivationScope::Any,
+            ability: AbilityActivationScope::NonSpellUnrestricted,
         }],
         "the following sentence must fold in the 'nonartifact' spend restriction"
     );
@@ -20189,7 +20189,7 @@ fn mana_spend_restriction_negative_nonartifact() {
             .then(|| restrictions.pop().expect("one restriction"))),
         Some(ManaSpendRestriction::SpellTypeOrAbilityActivation {
             spell_type: "Artifact".to_string(),
-            ability: AbilityActivationScope::Any,
+            ability: AbilityActivationScope::NonSpellUnrestricted,
         })
     );
 }
@@ -20208,7 +20208,7 @@ fn mana_spend_restriction_negative_article_singular_nonartifact() {
         Some(
             crate::types::ability::ManaSpendRestriction::SpellTypeOrAbilityActivation {
                 spell_type: "Artifact".to_string(),
-                ability: crate::types::mana::AbilityActivationScope::Any,
+                ability: crate::types::mana::AbilityActivationScope::NonSpellUnrestricted,
             }
         )
     );
@@ -20228,7 +20228,7 @@ fn mana_spend_restriction_negative_noncreature() {
             .then(|| restrictions.pop().expect("one restriction"))),
         Some(ManaSpendRestriction::SpellTypeOrAbilityActivation {
             spell_type: "Creature".to_string(),
-            ability: AbilityActivationScope::Any,
+            ability: AbilityActivationScope::NonSpellUnrestricted,
         })
     );
 }
@@ -20255,7 +20255,7 @@ At the beginning of your upkeep, add {C} for each artifact you control. This man
         if let Effect::Mana { restrictions, .. } = effect {
             if restrictions.contains(&ManaSpendRestriction::SpellTypeOrAbilityActivation {
                 spell_type: "Artifact".to_string(),
-                ability: AbilityActivationScope::Any,
+                ability: AbilityActivationScope::NonSpellUnrestricted,
             }) {
                 *found = true;
             }

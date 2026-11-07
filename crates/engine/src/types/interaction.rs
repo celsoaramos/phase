@@ -306,6 +306,7 @@ pub enum InteractionManaComparator {
 pub enum InteractionManaAbilityActivationScope {
     OfSpellType,
     Any,
+    NonSpellUnrestricted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

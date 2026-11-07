@@ -504,6 +504,15 @@ pub enum AbilityActivationScope {
     /// "… or to activate an ability" — any ability activation is permitted
     /// (e.g. Sage of the Unknowable, "a colorless spell or to activate an ability").
     Any,
+    /// CR 106.6: the negative "this mana can't be spent to cast non[TYPE]
+    /// spells" reading (powerstones, The Mightstone and Weakstone, Karn,
+    /// Legacy Reforged). Only spell casting is constrained: every payment that
+    /// is not a spell cast — ability activation, a cost paid while a spell or
+    /// ability resolves ("you may pay {2}", Ultron, Artificial Malevolence), a
+    /// special action — stays unrestricted. Distinct from [`Self::Any`], whose
+    /// positive "only to … or to activate an ability" reading still forbids
+    /// resolution-time payments.
+    NonSpellUnrestricted,
 }
 
 /// CR 106.6 + CR 400.7: Whether a zone-gated spend restriction names the zone a
@@ -1084,6 +1093,7 @@ fn ability_activation_scope_rank(value: AbilityActivationScope) -> u8 {
     match value {
         AbilityActivationScope::OfSpellType => 0,
         AbilityActivationScope::Any => 1,
+        AbilityActivationScope::NonSpellUnrestricted => 2,
     }
 }
 
@@ -1312,7 +1322,7 @@ impl ManaRestriction {
                     spell_type,
                     source_types.iter().chain(source_subtypes.iter()),
                 ),
-                AbilityActivationScope::Any => true,
+                AbilityActivationScope::Any | AbilityActivationScope::NonSpellUnrestricted => true,
             },
             // Activation-only mana always allows ability activation.
             ManaRestriction::OnlyForActivation => true,
@@ -1345,7 +1355,13 @@ impl ManaRestriction {
                 mana_color_constraint: _,
             } => self.allows_activation(source_types, source_subtypes, *ability_tag),
             PaymentContext::Effect => match self {
-                ManaRestriction::CannotCastSpellFromZone(_) => true,
+                // CR 106.6: a restriction that only prohibits a class of spell
+                // casts leaves resolution-time cost payments unrestricted.
+                ManaRestriction::CannotCastSpellFromZone(_)
+                | ManaRestriction::OnlyForTypeSpellsOrAbilities {
+                    ability: AbilityActivationScope::NonSpellUnrestricted,
+                    ..
+                } => true,
                 ManaRestriction::OnlyForAny(subs) => subs.iter().any(|r| r.allows(ctx)),
                 _ => false,
             },
@@ -1365,7 +1381,11 @@ impl ManaRestriction {
     pub fn allows_special_action(&self, action: SpecialAction) -> bool {
         match self {
             ManaRestriction::OnlyForSpecialAction(allowed) => *allowed == action,
-            ManaRestriction::CannotCastSpellFromZone(_) => true,
+            ManaRestriction::CannotCastSpellFromZone(_)
+            | ManaRestriction::OnlyForTypeSpellsOrAbilities {
+                ability: AbilityActivationScope::NonSpellUnrestricted,
+                ..
+            } => true,
             ManaRestriction::OnlyForAny(subs) => {
                 subs.iter().any(|r| r.allows_special_action(action))
             }

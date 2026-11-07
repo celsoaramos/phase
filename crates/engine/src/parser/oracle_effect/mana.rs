@@ -1543,8 +1543,9 @@ fn parse_restricted_spell_type_phrase(spell_part: &str) -> Option<String> {
 /// (`spells from your hand` -> `CannotCastSpellFromZone(Hand)`, Karolina Dean).
 /// An already-negative "from anywhere other than" clause is rejected rather
 /// than double-negated.
-/// The existing `non<TYPE>` form lowers to `SpellTypeOrAbilityActivation`, leaving
-/// ability payments unrestricted (Karn, Legacy Reforged; Hydraulic Helper).
+/// The existing `non<TYPE>` form lowers to `SpellTypeOrAbilityActivation` with the
+/// `NonSpellUnrestricted` scope, leaving every non-cast payment unrestricted
+/// (Karn, Legacy Reforged; Hydraulic Helper; The Mightstone and Weakstone).
 fn parse_negative_mana_spend_restriction(lower: &str) -> Option<ManaSpendRestriction> {
     let (_, rest) = nom_on_lower(lower, lower, |i| {
         // MTGJSON Oracle text is not apostrophe-normalized, so accept both the
@@ -1573,7 +1574,7 @@ fn parse_negative_mana_spend_restriction(lower: &str) -> Option<ManaSpendRestric
     let spell_type = parse_restricted_spell_type_phrase(rest)?;
     Some(ManaSpendRestriction::SpellTypeOrAbilityActivation {
         spell_type,
-        ability: AbilityActivationScope::Any,
+        ability: AbilityActivationScope::NonSpellUnrestricted,
     })
 }
 
@@ -1706,9 +1707,10 @@ pub(crate) fn parse_mana_spend_restriction(
     // cast non<TYPE>") is the spell-side equivalent of "only to cast <TYPE>",
     // but — unlike the positive "spend this mana only …" form — it places NO
     // restriction on ability activation: the clause forbids only the *casting*
-    // of non-<TYPE> spells. Lower it to `SpellTypeOrAbilityActivation` (any
-    // ability stays payable) rather than `SpellType` (spells-only), which would
-    // wrongly forbid paying for abilities.
+    // of non-<TYPE> spells. Lower it to `SpellTypeOrAbilityActivation` with
+    // the `NonSpellUnrestricted` scope (every non-cast payment stays payable,
+    // including a cost paid while an ability resolves) rather than `SpellType`
+    // (spells-only), which would wrongly forbid paying for abilities.
     if let Some(restriction) = parse_negative_mana_spend_restriction(lower) {
         return Some((vec![restriction], vec![]));
     }
@@ -4448,7 +4450,7 @@ mod tests {
             restriction,
             vec![ManaSpendRestriction::SpellTypeOrAbilityActivation {
                 spell_type: "Artifact".to_string(),
-                ability: AbilityActivationScope::Any,
+                ability: AbilityActivationScope::NonSpellUnrestricted,
             }]
         );
         assert!(grants.is_empty());
@@ -4466,7 +4468,7 @@ mod tests {
             restriction,
             vec![ManaSpendRestriction::SpellTypeOrAbilityActivation {
                 spell_type: "Artifact".to_string(),
-                ability: AbilityActivationScope::Any,
+                ability: AbilityActivationScope::NonSpellUnrestricted,
             }]
         );
     }
@@ -4482,7 +4484,7 @@ mod tests {
             restriction,
             vec![ManaSpendRestriction::SpellTypeOrAbilityActivation {
                 spell_type: "Creature".to_string(),
-                ability: AbilityActivationScope::Any,
+                ability: AbilityActivationScope::NonSpellUnrestricted,
             }]
         );
     }
