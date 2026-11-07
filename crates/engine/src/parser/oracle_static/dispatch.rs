@@ -315,6 +315,22 @@ fn parse_each_other_players_untap_step_suffix(input: &str) -> OracleResult<'_, (
     .parse(input)
 }
 
+/// CR 502.3: Whether every permanent `filter` describes is controlled by "you"
+/// — a typed "<type> you control" subject, or a compound list whose every
+/// disjunct is one ("creatures and lands you control", Prophet of Kruphix;
+/// `parse_type_phrase_folding` distributes the trailing controller over each
+/// leg of the `Or`). A subject that reaches another player's permanents isn't
+/// Seedborn semantics.
+fn is_controlled_by_you(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(tf) => tf.controller == Some(ControllerRef::You),
+        TargetFilter::Or { filters } => {
+            !filters.is_empty() && filters.iter().all(is_controlled_by_you)
+        }
+        _ => false,
+    }
+}
+
 /// CR 502.3 + CR 611.3a: Single authority for the Seedborn-class untap static —
 /// "untap <subject> during each other player's untap step". Handles both the
 /// typed "untap all <type> you control" form (Seedborn Muse) and the
@@ -348,11 +364,7 @@ fn parse_untaps_during_each_other_players_untap_step(
             parse_each_other_players_untap_step_suffix,
         )
         .is_some();
-        let controller_is_you = matches!(
-            &filter,
-            TargetFilter::Typed(tf) if tf.controller == Some(ControllerRef::You)
-        );
-        if during_ok && controller_is_you {
+        if during_ok && is_controlled_by_you(&filter) {
             return Some(
                 StaticDefinition::new(StaticMode::UntapsDuringEachOtherPlayersUntapStep)
                     .affected(filter)
