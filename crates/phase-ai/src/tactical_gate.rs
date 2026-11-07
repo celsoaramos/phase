@@ -78,6 +78,8 @@ use crate::policies::stack_awareness::{
 use crate::policies::strategy_helpers::can_pay_ward_cost;
 use crate::search::ability_is_temporary_combat_modifier;
 
+mod mf_flags_1107;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateDecision {
     Reject,
@@ -291,6 +293,13 @@ fn assess_candidate(ctx: &PolicyContext<'_>) -> GateDecision {
 }
 
 fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
+    // 07/11/2026: the gates from the "jogada ruim do robô" flags (redundant keyword
+    // change, loyalty with nothing to put, lethal life loss on resolution, flash in
+    // the opponent's upkeep, mana grant outside its window). Proof-backed only.
+    if let Some(decision) = mf_flags_1107::assess_pre_cast(ctx) {
+        return decision;
+    }
+
     if zero_direct_spell_is_safe_to_reject(ctx) {
         return GateDecision::Reject;
     }
@@ -1204,6 +1213,14 @@ fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<G
     if target_is_provably_futile(ctx, &effects, target) {
         return Some(GateDecision::Reject);
     }
+    // 07/11/2026 (flags): redundant Aura keyword, removal that hands back a basic
+    // land, burn that misses its kill while another target dies, boon on the
+    // opponent's object with an own alternative. Runs for every legal target in
+    // `cast_targets_are_all_futile` too, so a spell with only such targets is
+    // not cast.
+    if mf_flags_1107::reject_target(ctx, target) {
+        return Some(GateDecision::Reject);
+    }
     None
 }
 
@@ -1275,10 +1292,10 @@ fn cast_targets_are_all_futile(ctx: &PolicyContext<'_>) -> bool {
         if targets.is_empty() {
             return false;
         }
-        if !targets
-            .iter()
-            .all(|target| target_is_provably_futile(ctx, &effects, target))
-        {
+        if !targets.iter().all(|target| {
+            target_is_provably_futile(ctx, &effects, target)
+                || mf_flags_1107::reject_target(ctx, target)
+        }) {
             return false;
         }
         proved_any = true;
@@ -2576,6 +2593,26 @@ fn caster_has_cast_payoff(state: &GameState, spell_id: ObjectId) -> bool {
 }
 
 fn pure_fixed_pump_bonus(effects: &[&Effect]) -> Option<(i32, i32)> {
+    // CR 303.4k: a Role token created "attached to that creature" (Monstrous
+    // Rage's Monster Role) is a rider ON the pumped creature — it lands wherever
+    // the pump lands and has the same window. Without this the three flagged
+    // Monstrous Rage casts (precombat main, begin combat, end step) never
+    // reached the pump window gate at all.
+    let is_attached_role_rider = |effect: &&Effect| {
+        matches!(
+            effect,
+            Effect::Token {
+                attach_to: Some(_),
+                types,
+                ..
+            } if types.iter().any(|t| t == "Role" || t == "Aura")
+        )
+    };
+    let effects: Vec<&Effect> = effects
+        .iter()
+        .copied()
+        .filter(|effect| !is_attached_role_rider(effect))
+        .collect();
     if effects.is_empty()
         || !effects
             .iter()

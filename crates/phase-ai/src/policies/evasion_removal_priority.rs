@@ -730,11 +730,22 @@ mod tests {
              killable 2/2={killable_delta}, unkillable 7/7={unkillable_delta}"
         );
 
+        // 07/11/2026 (MagicFinder flag 7b16cf64, Chain Lightning at a 6/6 beside a
+        // 2/2): the soft preference above was not enough — the sampled pick still
+        // went to the body that survives. `tactical_gate::mf_flags_1107::
+        // nonlethal_burn_target_with_lethal_alternative` now REMOVES a creature
+        // target the burn cannot kill while another legal creature target dies,
+        // so the complete scorer carries the killable body and not the 7/7.
         let scores = crate::search::score_candidates(state, P0, &config);
+        let _ = full_score_for_target(&scores, killable);
         assert!(
-            full_score_for_target(&scores, killable) > full_score_for_target(&scores, unkillable),
-            "the complete Very Hard scorer must carry the lethality preference through to the \
-             final target ranking"
+            !scores.iter().any(|(action, _)| matches!(
+                action,
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(id)),
+                } if *id == unkillable
+            )),
+            "the 7/7 the Bolt cannot kill must be gated out while the 2/2 dies, got {scores:?}"
         );
 
         // The #6582 misplay itself: whatever else Very Hard does with a Bolt

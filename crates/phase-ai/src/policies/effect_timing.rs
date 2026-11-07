@@ -985,12 +985,16 @@ mod tests {
         let receipt = selection
             .receipt
             .expect("reach guard: the ranked chooser must emit a receipt");
+        // 07/11/2026: the opponent-controlled cell (`blocker`) is gated out by
+        // `tactical_gate::mf_flags_1107::beneficial_target_on_opponent_with_own_alternative`
+        // — "can't be blocked" is a boon, and the AI has legal targets of its own.
+        // Four candidates remain below the beam width.
         assert_eq!(
             receipt.candidates.len(),
-            5,
-            "reach guard: nothing was gated out below the beam width. This canNOT detect a \
-             sixth candidate -- the root beam truncates to max_branching before the receipt \
-             is built; current_legal_targets.len() is the guard for that"
+            4,
+            "reach guard: only the opponent's creature is gated out below the beam width. This \
+             canNOT detect a sixth candidate -- the root beam truncates to max_branching before \
+             the receipt is built; current_legal_targets.len() is the guard for that"
         );
         let row = receipt
             .candidates

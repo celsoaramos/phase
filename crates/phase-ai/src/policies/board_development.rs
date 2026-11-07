@@ -1,5 +1,6 @@
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
+use engine::types::zones::Zone;
 use engine::types::game_state::GameState;
 use engine::types::player::PlayerId;
 
@@ -103,6 +104,12 @@ fn score_cast(ctx: &PolicyContext<'_>) -> f64 {
     } else {
         0.04
     };
+    // CR 903.8: the commander is the deck's build-around and comes back to the
+    // command zone when it dies. Flags of 29/10–06/11 (MagicFinder): the AI
+    // passed, or cast a filler creature, with its commander castable and the
+    // scores within 0.3 of each other. A fixed tiebreak toward casting it from
+    // the command zone — never enough to beat a genuinely better play.
+    let commander_tiebreak = if object.zone == Zone::Command { 1.5 } else { 0.0 };
 
-    0.12 + mana_scale + presence + etb_discount
+    0.12 + mana_scale + presence + etb_discount + commander_tiebreak
 }
