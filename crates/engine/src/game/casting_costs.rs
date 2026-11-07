@@ -12904,6 +12904,14 @@ enum ReturnedCreatureCostMove {
     Delivered,
 }
 
+/// The objects a spell being cast targets, for the automatic mana payment to
+/// tap last (see `collect_sorted_auto_tap_source_options`). CR 601.2c: targets
+/// are announced before CR 601.2g-h pays the cost.
+fn spell_payment_targets(ability: &ResolvedAbility) -> Vec<ObjectId> {
+    let targets = super::ability_utils::flatten_targets_in_chain(ability);
+    super::targeting::object_targets(&targets).collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_cast_with_phyrexian_choices_inner(
     state: &mut GameState,
@@ -13011,6 +13019,7 @@ fn finalize_cast_with_phyrexian_choices_inner(
 
     if prepaid_actual_mana_spent.is_none() {
         let resume_at_resolution_depth = state.resolution_stack.len();
+        let payment_targets = spell_payment_targets(&ability);
         match super::casting::pay_mana_cost_with_choices_and_resume(
             state,
             player,
@@ -13019,6 +13028,7 @@ fn finalize_cast_with_phyrexian_choices_inner(
             phyrexian_choices,
             mana_resume,
             events,
+            &payment_targets,
         )? {
             super::casting::ManaCostPayment::Paid(()) => {}
             super::casting::ManaCostPayment::Paused {
@@ -14608,6 +14618,7 @@ pub(super) fn auto_tap_mana_sources_excluding(
         None,
         None,
         AutoTapRowPolicy::Choose,
+        &[],
     );
 }
 
@@ -14652,6 +14663,7 @@ pub(super) fn auto_tap_mana_sources_with_context_and_resume(
         None,
         resume,
         None,
+        &[],
     );
 }
 
@@ -14669,6 +14681,7 @@ pub(super) fn auto_tap_mana_sources_with_context_excluding_and_resume(
     excluded_penalty: Option<mana_sources::ManaSourcePenalty>,
     resume: Option<&ManaAbilityResume>,
     parent: Option<&ManaAbilityCostParent>,
+    payment_targets: &[ObjectId],
 ) {
     auto_tap_mana_sources_inner(
         state,
@@ -14684,6 +14697,7 @@ pub(super) fn auto_tap_mana_sources_with_context_excluding_and_resume(
         resume,
         parent,
         AutoTapRowPolicy::Choose,
+        payment_targets,
     );
 }
 
@@ -14710,6 +14724,7 @@ pub(super) fn auto_tap_mana_sources_with_context_excluding(
         None,
         None,
         AutoTapRowPolicy::Choose,
+        &[],
     );
 }
 
@@ -14742,6 +14757,7 @@ pub(super) fn auto_tap_non_sacrificial_mana_sources(
         None,
         None,
         AutoTapRowPolicy::Choose,
+        &[],
     );
 }
 
@@ -14878,7 +14894,14 @@ pub(super) fn build_auto_tap_source_cache(
     crate::game::perf_counters::record_auto_tap_source_cache_build();
     AutoTapSourceCache {
         player,
-        sources: collect_sorted_auto_tap_source_options(state, player, None, &HashSet::new(), None),
+        sources: collect_sorted_auto_tap_source_options(
+            state,
+            player,
+            None,
+            &HashSet::new(),
+            None,
+            &[],
+        ),
     }
 }
 
@@ -14907,15 +14930,23 @@ pub(super) fn auto_tap_mana_sources_with_context_excluding_cached(
         None,
         None,
         AutoTapRowPolicy::Choose,
+        &[],
     );
 }
 
+/// `payment_targets` — the objects the paid spell or ability targets. Heuristic
+/// (no CR): CR 601.2c announces targets before CR 601.2g-h pays the cost, so a
+/// permanent the spell targets is still a legal mana source when the cost is
+/// paid — but tapping it usually defeats the spell (Hydroform animates the land
+/// it targets into a 3/3 flier; tapped, it can't block, CR 509.1a). They sort
+/// with the deprioritized source: tapped only when nothing else pays.
 fn collect_sorted_auto_tap_source_options(
     state: &GameState,
     player: PlayerId,
     deprioritize_source: Option<ObjectId>,
     excluded_sources: &HashSet<ObjectId>,
     excluded_penalty: Option<mana_sources::ManaSourcePenalty>,
+    payment_targets: &[ObjectId],
 ) -> Vec<ManaSourceOption> {
     use crate::types::card_type::{CoreType, Supertype};
 
@@ -14989,7 +15020,7 @@ fn collect_sorted_auto_tap_source_options(
     //     1 = other land row; 2 = non-land non-creature rock (Signet);
     //     3 = non-land creature dork (preserve as blocker); 4 = land-creature
     //     manland (preserve as blocker); 5 = deprioritized source (spell's own
-    //     source).
+    //     source) and the permanents the paid spell/ability targets.
     //   inner (priority_amount): penalty sub-tier + fixed-amount tiebreak
     //     (e.g. painland-1 < painland-2 < painland-None). Replaces the
     //     collapsed `harms_controller` bool — amounts now rank.
@@ -15003,7 +15034,9 @@ fn collect_sorted_auto_tap_source_options(
             obj.is_some_and(|o| o.card_types.core_types.contains(&CoreType::Creature));
         let row_is_free_colorless =
             option.atomic_combination.is_none() && option.mana_type == ManaType::Colorless;
-        let card_tier: u32 = if deprioritize_source == Some(option.object_id) {
+        let card_tier: u32 = if deprioritize_source == Some(option.object_id)
+            || payment_targets.contains(&option.object_id)
+        {
             5
         } else if is_land && is_creature {
             // CR 509.1a: a chosen blocker must be untapped. An animated manland
@@ -15063,6 +15096,7 @@ fn cached_auto_tap_sources<'a>(
     excluded_sources: &HashSet<ObjectId>,
     excluded_penalty: Option<mana_sources::ManaSourcePenalty>,
     sub_cost_demand: Option<&crate::game::mana_payment::ColorDemand>,
+    payment_targets: &[ObjectId],
 ) -> Option<&'a [ManaSourceOption]> {
     let cache = source_cache?;
     if cache.is_for_player(player)
@@ -15070,6 +15104,9 @@ fn cached_auto_tap_sources<'a>(
         && excluded_penalty.is_none()
         && sub_cost_demand.is_none()
         && deprioritize_source.is_none_or(|source_id| !cache.contains_source(source_id))
+        && payment_targets
+            .iter()
+            .all(|target| !cache.contains_source(*target))
     {
         crate::game::perf_counters::record_cached_auto_tap_source_reuse();
         Some(cache.sources())
@@ -15094,6 +15131,7 @@ fn auto_tap_mana_sources_inner(
     resume: Option<&crate::types::game_state::ManaAbilityResume>,
     parent: Option<&ManaAbilityCostParent>,
     row_policy: AutoTapRowPolicy,
+    payment_targets: &[ObjectId],
 ) {
     use crate::types::mana::ManaCost;
 
@@ -15159,6 +15197,7 @@ fn auto_tap_mana_sources_inner(
         excluded_sources,
         excluded_penalty,
         sub_cost_demand,
+        payment_targets,
     ) {
         cached
     } else {
@@ -15169,6 +15208,7 @@ fn auto_tap_mana_sources_inner(
             deprioritize_source,
             excluded_sources,
             excluded_penalty,
+            payment_targets,
         );
         &available_buf
     };
@@ -15339,6 +15379,7 @@ fn auto_tap_mana_sources_inner(
                         resume,
                         parent,
                         nested_row_policy,
+                        payment_targets,
                     );
                     if super::casting::mana_ability_cost_payment_is_paused(state) {
                         state.active_auto_tap_row_policy = enclosing_row_policy;
@@ -17313,6 +17354,7 @@ fn finalize_mana_payment_with_resume(
                     None,
                     Some(&mana_resume),
                     events,
+                    &spell_payment_targets(&pending.ability),
                 )? {
                     pending.cost = ManaCost::NoCost;
                     pending.prepaid_actual_mana_spent =
@@ -17762,6 +17804,7 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
                     Some(phyrexian_choices),
                     Some(&mana_resume),
                     events,
+                    &spell_payment_targets(&pending.ability),
                 )? {
                     pending.cost = ManaCost::NoCost;
                     pending.prepaid_actual_mana_spent =
@@ -18006,6 +18049,7 @@ pub(super) fn maybe_pause_for_phyrexian_choice(
             None,
             resume,
             None,
+            &[],
         );
     }
     // CR 605.3b + CR 616.1: A costed mana source can suspend auto-tap on a
