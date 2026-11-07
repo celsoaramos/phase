@@ -180,7 +180,7 @@ fn take_announcing(
 /// which [`stage_announcement_trigger_events`] takes custody. `Some` holds the
 /// first index the announcement owns (`start`, or later when the announcement
 /// began part-way through the span).
-fn announcement_owned_from(state: &GameState, start: usize) -> Option<usize> {
+pub(crate) fn announcement_owned_from(state: &GameState, start: usize) -> Option<usize> {
     let AnnouncementEventScope::From { start: owned_from } = state.announcement_event_scope else {
         return None;
     };

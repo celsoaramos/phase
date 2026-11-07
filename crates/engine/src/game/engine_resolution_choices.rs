@@ -951,6 +951,39 @@ fn unclaimed_observer_events(
     )
 }
 
+/// CR 603.6a + CR 614.12a: resuming a parked `MayCost` replacement after its
+/// interactive cost (The Mimeoplasm's "exile two creature cards from
+/// graveyards", Mox Diamond's discard) finishes the permanent's entry — a zone
+/// change of its own, separate from the cost's move. The cost's observers are
+/// collected from the cost's bounded slice by
+/// [`batch_or_drain_observer_triggers`], which deliberately leaves
+/// continuation-produced zone moves out; nothing else rescans this action, so
+/// the entry's own observers ("When ~ enters", read against the copy the
+/// permanent entered as — CR 707.2) are collected here, from `entry_start` up
+/// to where a live announcement takes custody of the buffer.
+fn collect_resumed_replacement_entry_triggers(
+    state: &mut GameState,
+    events: &[GameEvent],
+    entry_start: usize,
+) {
+    let entry_end = super::announcement_triggers::announcement_owned_from(state, entry_start)
+        .unwrap_or(events.len())
+        .min(events.len());
+    let entry_events: Vec<GameEvent> =
+        unclaimed_observer_events(state, events, entry_start, entry_end)
+            .into_iter()
+            // `batch_or_drain_observer_triggers` already chains the completed
+            // action's `PlayerPerformedAction` from this span.
+            .filter(|ev| {
+                !matches!(
+                    ev,
+                    GameEvent::PhaseChanged { .. } | GameEvent::PlayerPerformedAction { .. }
+                )
+            })
+            .collect();
+    super::triggers::collect_triggers_into_deferred(state, &entry_events);
+}
+
 /// CR 603.2 + CR 603.3b: After a resolution-choice handler has moved objects
 /// (sacrifice, change-zone, bounce, discard) and resolved any reflexive
 /// continuation, dispatch the observer triggers (dies-, discarded-, etc.)
@@ -6341,8 +6374,10 @@ pub(super) fn handle_resolution_choice(
                 .as_ref()
                 .is_some_and(|pending| pending.may_cost_paid)
             {
+                let entry_start = events.len();
                 let waiting_for =
                     super::engine_replacement::handle_replacement_choice(state, 0, events)?;
+                collect_resumed_replacement_entry_triggers(state, events, entry_start);
                 if let Some(outcome) = batch_or_drain_observer_triggers(
                     state,
                     events,
@@ -7790,8 +7825,10 @@ pub(super) fn handle_resolution_choice(
                         .as_ref()
                         .is_some_and(|pending| pending.may_cost_paid)
                     {
+                        let entry_start = events.len();
                         let waiting_for =
                             super::engine_replacement::handle_replacement_choice(state, 0, events)?;
+                        collect_resumed_replacement_entry_triggers(state, events, entry_start);
                         if let Some(outcome) = batch_or_drain_observer_triggers(
                             state,
                             events,

@@ -7,8 +7,13 @@
 //!    resolves is not a spell cast. The parser lowered it to "only artifact
 //!    spells or ability activations", which also rejected resolution-time
 //!    payments, so accepting the trigger paid nothing and created no token.
+//! 2. The Mimeoplasm entering as a copy of Archon of Cruelty did not trigger
+//!    Archon's "Whenever Archon of Cruelty enters or attacks". With three or more
+//!    creature cards in graveyards the exile cost is an interactive choice; the
+//!    resumed replacement finished the entry, but only the exile cost's events
+//!    were collected for triggers (CR 603.6a + CR 614.12a + CR 707.2).
 
-use engine::game::scenario::{GameRunner, GameScenario, P0};
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::actions::GameAction;
 use engine::types::game_state::WaitingFor;
@@ -21,6 +26,12 @@ use crate::support::shared_card_db;
 
 const MIGHTSTONE: &str = "The Mightstone and Weakstone";
 const ULTRON: &str = "Ultron, Artificial Malevolence";
+const ARCHON: &str = "Archon of Cruelty";
+const MIMEOPLASM: &str =
+    "As ~ enters, you may exile two creature cards from graveyards. If you do, \
+it enters as a copy of one of those cards with a number of additional +1/+1 counters on it equal \
+to the power of the other card.";
+
 fn cast(runner: &mut GameRunner, object_id: ObjectId) {
     let card_id = runner.state().objects[&object_id].card_id;
     runner
@@ -144,4 +155,85 @@ fn negative_spell_type_restriction_only_gates_spell_casts() {
     };
     assert!(!positive.allows(&PaymentContext::Effect));
     assert!(!positive.allows(&PaymentContext::Spell(&spell_meta(&["Instant"]))));
+}
+
+/// Stack entries whose source is `source` (the Mimeoplasm-as-Archon trigger).
+fn triggers_on_stack_from(runner: &GameRunner, source: ObjectId) -> usize {
+    runner
+        .state()
+        .stack
+        .iter()
+        .filter(|entry| entry.source_id == source)
+        .count()
+}
+
+/// Casts The Mimeoplasm with `extra_creatures` creature cards beside Archon and
+/// the Grizzly Bears in P0's graveyard, exiles Archon (copied) and the Bears
+/// (counters), and stops at the first priority after it enters.
+fn mimeoplasm_enters_as_archon(extra_creatures: usize) -> (GameRunner, ObjectId) {
+    let db = shared_card_db().expect("integration card fixture must load");
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let archon = scenario.add_real_card(P0, ARCHON, Zone::Graveyard, db);
+    let bears = scenario
+        .add_creature_to_graveyard(P0, "Grizzly Bears", 2, 2)
+        .id();
+    for i in 0..extra_creatures {
+        scenario.add_creature_to_graveyard(P0, &format!("Hill Giant {i}"), 3, 3);
+    }
+    scenario.add_creature(P1, "Opposing Bear", 2, 2);
+    let mimeo = scenario
+        .add_creature_to_hand_from_oracle(P0, "The Mimeoplasm", 0, 0, MIMEOPLASM)
+        .id();
+    let mut runner = scenario.build();
+
+    cast(&mut runner, mimeo);
+    for _ in 0..16 {
+        if runner.state().objects[&mimeo].zone == Zone::Battlefield
+            && matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+        {
+            break;
+        }
+        match runner.state().waiting_for.clone() {
+            WaitingFor::ReplacementChoice { .. } => {
+                runner
+                    .act(GameAction::ChooseReplacement { index: 0 })
+                    .expect("accept the exile");
+            }
+            WaitingFor::EffectZoneChoice { .. } => {
+                runner
+                    .act(GameAction::SelectCards {
+                        cards: vec![archon, bears],
+                    })
+                    .expect("exile Archon and the Bears");
+            }
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass");
+            }
+            other => panic!("unexpected prompt {other:?}"),
+        }
+    }
+    let obj = &runner.state().objects[&mimeo];
+    assert_eq!(obj.zone, Zone::Battlefield);
+    assert_eq!(obj.name, ARCHON, "CR 707.2: it enters as a copy of Archon");
+    (runner, mimeo)
+}
+
+#[test]
+fn mimeoplasm_interactive_exile_copy_of_archon_triggers_on_entering() {
+    let (runner, mimeo) = mimeoplasm_enters_as_archon(1);
+    assert_eq!(
+        triggers_on_stack_from(&runner, mimeo),
+        1,
+        "CR 603.6a + CR 707.2: entering as a copy of Archon of Cruelty triggers its \
+         enters ability exactly once, also when the exile cost was chosen"
+    );
+}
+
+#[test]
+fn mimeoplasm_forced_exile_copy_of_archon_triggers_once() {
+    // Only two creature cards: the exile is forced (no choice). Guard that the
+    // already-working path still triggers exactly once.
+    let (runner, mimeo) = mimeoplasm_enters_as_archon(0);
+    assert_eq!(triggers_on_stack_from(&runner, mimeo), 1);
 }
