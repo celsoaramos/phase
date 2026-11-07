@@ -3862,6 +3862,22 @@ fn score_candidates_core_for_root(
             services.context.opponent_threat.as_ref(),
             Some(services.deadline),
         ) {
+            let action = if config.combat_simulation {
+                refine_root_combat(
+                    state,
+                    ai_player,
+                    config,
+                    session,
+                    services.context.opponent_threat.as_ref(),
+                    services
+                        .context
+                        .adjusted_weights
+                        .for_turn(state.turn_number),
+                    action,
+                )
+            } else {
+                action
+            };
             return vec![(action, 1.0)];
         }
     }
@@ -4974,6 +4990,116 @@ pub(crate) fn deterministic_choice(
     }
 
     None
+}
+
+/// The combat trick the root combat replay plays against: the probability
+/// comes from the difficulty-gated threat profile (never the real hand) — the
+/// same source the heuristic's `defender_trick_risk` reads, without its turn
+/// gate: the attacker may pump its own creature after our blocks, too.
+fn combat_trick_risk(
+    state: &GameState,
+    ai_player: PlayerId,
+    config: &AiConfig,
+    opponent_threat: Option<&ThreatProfile>,
+) -> Option<crate::combat_sim::TrickRisk> {
+    let opponents = engine::game::players::opponents(state, ai_player);
+    let [opponent] = opponents.as_slice() else {
+        return None;
+    };
+    let opponent = *opponent;
+    if state.players[opponent.0 as usize].hand.is_empty() {
+        return None;
+    }
+    let open_mana = crate::zone_eval::available_mana(state, opponent);
+    let raw = match opponent_threat {
+        Some(threat) if threat.pool_size > 0 => {
+            crate::threat_profile::castable_probabilities(threat, state, opponent).combat_trick
+        }
+        Some(threat) => threat.probabilities.combat_trick,
+        None => (f64::from(open_mana.saturating_sub(1)) * 0.08).min(0.25),
+    };
+    crate::combat_sim::TrickRisk::from_probability(raw, config.profile.trick_risk_scale, open_mana)
+}
+
+/// Wall-clock guard for the combat replays in interactive play. Combat is the
+/// decision a person watches the AI take, so it gets more than a priority pass.
+const COMBAT_SIM_BUDGET_MS: u32 = 1200;
+
+/// MagicFinder (2026-10-26): replay the heuristic's root combat declaration
+/// against a few alternatives through the reducer (`combat_sim`) and keep the
+/// best measured one. Only the root decision: rollouts keep the heuristic.
+fn refine_root_combat(
+    state: &GameState,
+    ai_player: PlayerId,
+    config: &AiConfig,
+    session: &Arc<AiSession>,
+    opponent_threat: Option<&ThreatProfile>,
+    weights: &crate::eval::EvalWeights,
+    action: GameAction,
+) -> GameAction {
+    // A prompt of ours inside the replay (Kaalia's "you may put … attacking",
+    // the card to put, its enters trigger's target) gets the AI's own answer
+    // from a small search. Without search the policies score "accept" and
+    // "decline" the same and a coin flip declined Kaalia's trigger; one ply
+    // still declined in the field position, where accepting only opens the
+    // choice of which Angel — two plies see the Angel land. No nested combat
+    // replay (cannot recurse), no rollouts and 16 nodes keep it cheap; the
+    // measurement seed keeps the replay a pure function of the state.
+    let mut quick = config.clone().into_measurement(0);
+    quick.search.max_depth = 2;
+    quick.search.max_nodes = 16;
+    quick.search.rollout_depth = 0;
+    quick.search.rollout_samples = 0;
+    quick.play_lookahead = false;
+    quick.combat_lookahead = false;
+    quick.combat_simulation = false;
+    let answer = |prompt: &GameState| {
+        choose_action_with_session(
+            prompt,
+            ai_player,
+            &quick,
+            &mut ChaCha20Rng::seed_from_u64(0),
+            session,
+        )
+    };
+    let input = crate::combat_sim::CombatSimInput {
+        state,
+        player: ai_player,
+        weights,
+        answer: &answer,
+        trick: combat_trick_risk(state, ai_player, config, opponent_threat),
+        deadline: match config.execution_mode {
+            crate::config::ExecutionMode::Measurement { .. } => None,
+            crate::config::ExecutionMode::Interactive => {
+                Some(engine::util::Deadline::after(COMBAT_SIM_BUDGET_MS))
+            }
+        },
+    };
+    match &action {
+        GameAction::DeclareAttackers { .. } => {
+            crate::combat_sim::refine_attack(&input, action, |attacks| {
+                validated_declare_attackers(state, ai_player, Some(session), attacks)
+            })
+        }
+        GameAction::DeclareBlockers { .. } => {
+            let default_features = crate::features::DeckFeatures::default();
+            let features = session
+                .features
+                .get(&ai_player)
+                .unwrap_or(&default_features);
+            crate::combat_sim::refine_block(&input, action, |assignments| {
+                let posture =
+                    crate::combat_tax::plan_block_tax(state, ai_player, features, assignments);
+                engine::game::combat::complete_blocker_proposal(
+                    state,
+                    ai_player,
+                    assignments,
+                    posture,
+                )
+            })
+        }
+        _ => action,
+    }
 }
 
 /// Handle combat decisions with an archetype-modulated profile.

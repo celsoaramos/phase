@@ -2718,7 +2718,7 @@ fn race_clock(state: &GameState, attacker: PlayerId, defender: PlayerId) -> u32 
 /// growth that would otherwise be invisible to the snapshot heuristic.
 /// Creatures removed during projection fall back to the current state's
 /// power for a conservative read.
-fn crackback_damage(
+pub(crate) fn crackback_damage(
     state: &GameState,
     player: PlayerId,
     opponents: &[PlayerId],
@@ -3327,7 +3327,7 @@ fn evaluate_block_outcome(
 /// tapped (CR 508.1a / CR 509.1a). Summoning sickness is irrelevant: CR 302.6
 /// restricts attacking and tap-abilities, never blocking, so a land animated
 /// this turn still blocks.
-fn latent_blockers(state: &GameState, defender: PlayerId) -> Vec<AnimatedBody> {
+pub(crate) fn latent_blockers(state: &GameState, defender: PlayerId) -> Vec<AnimatedBody> {
     let open_mana = available_mana(state, defender);
     if open_mana == 0 {
         return Vec::new();

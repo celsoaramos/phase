@@ -1,0 +1,375 @@
+//! Combat that simulates (MagicFinder, 2026-10-26): the root attack/block
+//! declaration is replayed against alternatives through the reducer.
+//!
+//! Each fixture is a combat the per-creature heuristic gets wrong and the
+//! replay gets right; `heuristic(..)` documents the old answer so a fixture
+//! that stops separating the two is noticed instead of passing for free.
+
+use engine::game::combat::AttackTarget;
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::types::actions::GameAction;
+use engine::types::game_state::WaitingFor;
+use engine::types::identifiers::ObjectId;
+use engine::types::phase::Phase;
+use phase_ai::choose_action;
+use phase_ai::config::{create_config, AiDifficulty, Platform};
+use rand::rngs::SmallRng;
+use rand::SeedableRng;
+
+fn choose(state: &engine::types::game_state::GameState, simulate: bool) -> GameAction {
+    let mut config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+    config.combat_simulation = simulate;
+    config = config.into_measurement(7);
+    let mut rng = SmallRng::seed_from_u64(7);
+    choose_action(state, P0, &config, &mut rng).expect("AI should act")
+}
+
+fn attackers_of(action: &GameAction) -> Vec<ObjectId> {
+    match action {
+        GameAction::DeclareAttackers { attacks, .. } => {
+            let mut ids: Vec<_> = attacks.iter().map(|(id, _)| *id).collect();
+            ids.sort_unstable();
+            ids
+        }
+        other => panic!("expected DeclareAttackers, got {other:?}"),
+    }
+}
+
+fn blocks_of(action: &GameAction) -> Vec<(ObjectId, ObjectId)> {
+    match action {
+        GameAction::DeclareBlockers { assignments } => {
+            let mut a = assignments.clone();
+            a.sort_unstable();
+            a
+        }
+        other => panic!("expected DeclareBlockers, got {other:?}"),
+    }
+}
+
+/// P0 is at its own declare-attackers step.
+fn at_attack(runner: &mut GameRunner) {
+    runner.advance_to_combat();
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::DeclareAttackers { player, .. } if player == P0),
+        "fixture must reach P0's attack declaration, got {:?}",
+        runner.state().waiting_for
+    );
+}
+
+/// P1 attacks with `attackers`; P0 must block.
+fn at_block(runner: &mut GameRunner, attackers: &[ObjectId]) {
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+    runner.advance_to_combat();
+    runner
+        .act(GameAction::DeclareAttackers {
+            attacks: attackers
+                .iter()
+                .map(|&id| (id, AttackTarget::Player(P0)))
+                .collect(),
+            bands: vec![],
+        })
+        .expect("P1 declares");
+    for _ in 0..8 {
+        if matches!(runner.state().waiting_for, WaitingFor::DeclareBlockers { player, .. } if player == P0)
+        {
+            return;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass to blocks");
+    }
+    panic!(
+        "fixture must reach P0's block declaration, got {:?}",
+        runner.state().waiting_for
+    );
+}
+
+#[test]
+fn double_block_kills_the_attacker_the_heuristic_let_through() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let bear = s.add_creature(P0, "Bear", 2, 2).id();
+    let ogre = s.add_creature(P0, "Ogre", 3, 3).id();
+    let brute = s.add_creature(P1, "Brute", 4, 4).id();
+    let mut r = s.build();
+    at_block(&mut r, &[brute]);
+
+    assert_eq!(
+        blocks_of(&choose(r.state(), false)),
+        vec![],
+        "heuristic: no block"
+    );
+    let mut want = vec![(bear, brute), (ogre, brute)];
+    want.sort_unstable();
+    assert_eq!(
+        blocks_of(&choose(r.state(), true)),
+        want,
+        "2 + 3 damage kills the 4/4 for one of ours"
+    );
+}
+
+#[test]
+fn chump_with_the_token_and_let_the_angel_eat_the_wolf() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    s.with_life(P0, 5);
+    let token = s.add_creature(P0, "Token", 1, 1).id();
+    let angel = s.add_creature(P0, "Angel", 4, 4).flying().id();
+    let rhino = s.add_creature(P1, "Rhino", 5, 5).id();
+    let wolf = s.add_creature(P1, "Wolf", 2, 2).id();
+    let mut r = s.build();
+    at_block(&mut r, &[rhino, wolf]);
+
+    // On the bare tag the heuristic blocks angel → rhino, token → wolf (the
+    // 4/4 dies and the wolf lives). The fork's `ai/combat-block-choice`
+    // ("chump with the cheapest body") already fixes it, so in the published
+    // integration both answers agree; only the replay's answer is pinned here.
+    let mut want = vec![(token, rhino), (angel, wolf)];
+    want.sort_unstable();
+    assert_eq!(blocks_of(&choose(r.state(), true)), want);
+}
+
+#[test]
+fn keeps_the_deathtouch_blocker_home_against_a_fatty() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let snake = s.add_creature(P0, "Snake", 1, 1).deathtouch().id();
+    s.add_creature(P1, "Fatty", 6, 6);
+    let mut r = s.build();
+    at_attack(&mut r);
+
+    assert_eq!(
+        attackers_of(&choose(r.state(), false)),
+        vec![snake],
+        "heuristic: pokes for 1"
+    );
+    assert_eq!(
+        attackers_of(&choose(r.state(), true)),
+        Vec::<ObjectId>::new(),
+        "tapped, the snake can't stop a 6-point swing back"
+    );
+}
+
+#[test]
+fn first_strike_attack_is_kept() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let knight = s.add_creature(P0, "Knight", 3, 2).first_strike().id();
+    s.add_creature(P1, "Bear", 3, 3);
+    let mut r = s.build();
+    at_attack(&mut r);
+    assert_eq!(attackers_of(&choose(r.state(), true)), vec![knight]);
+}
+
+#[test]
+fn lethal_alpha_is_never_second_guessed() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    s.with_life(P1, 4);
+    let a = s.add_creature(P0, "A", 2, 2).id();
+    let b = s.add_creature(P0, "B", 2, 2).id();
+    let c = s.add_creature(P0, "C", 2, 2).id();
+    s.add_creature(P1, "Wall", 0, 5);
+    let mut r = s.build();
+    at_attack(&mut r);
+    let mut all = vec![a, b, c];
+    all.sort_unstable();
+    assert_eq!(attackers_of(&choose(r.state(), true)), all);
+}
+
+/// Replays the "jogada ruim do robô" positions the MagicFinder table recorded
+/// (`npm run bot:flags -- --out <dir>` in the magic repo) through the root
+/// combat decision with the replay off and on. Not a gate — the positions live
+/// outside the repo — but the honest check that the replay answers the combat
+/// complaints people actually sent.
+///
+///   FLAG_DIR=<dir> cargo test -p phase-ai --test combat_sim flag_positions -- --ignored --nocapture
+#[test]
+#[ignore]
+fn flag_positions() {
+    use engine::types::game_state::PersistedGameState;
+    use engine::types::player::PlayerId;
+    let dir = std::env::var("FLAG_DIR").expect("FLAG_DIR");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("dir")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+    for path in files {
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let wait = raw["wait_type"].as_str().unwrap_or("");
+        if wait != "DeclareAttackers" && wait != "DeclareBlockers" {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let seat = PlayerId(raw["seat"].as_u64().unwrap_or(1) as u8);
+        let state = match serde_json::from_value::<PersistedGameState>(raw["state"].clone())
+            .map_err(|e| e.to_string())
+            .and_then(|p| p.into_game_state().map_err(|e| format!("{e:?}")))
+        {
+            Ok(state) => state,
+            Err(e) => {
+                println!("{name}: does not restore ({})", &e[..e.len().min(120)]);
+                continue;
+            }
+        };
+        let pick = |simulate: bool| {
+            let mut config = create_config(AiDifficulty::VeryHard, Platform::Wasm);
+            config.combat_simulation = simulate;
+            config.search.determinization_samples = 4;
+            let config = config.into_measurement(7);
+            let mut rng = SmallRng::seed_from_u64(7);
+            choose_action(&state, seat, &config, &mut rng)
+        };
+        let names = |action: &Option<GameAction>| -> String {
+            let n = |id: &ObjectId| {
+                state
+                    .objects
+                    .get(id)
+                    .map(|o| o.name.clone())
+                    .unwrap_or_else(|| format!("#{}", id.0))
+            };
+            match action {
+                Some(GameAction::DeclareAttackers { attacks, .. }) => {
+                    let v: Vec<String> = attacks.iter().map(|(id, _)| n(id)).collect();
+                    format!("attack [{}]", v.join(", "))
+                }
+                Some(GameAction::DeclareBlockers { assignments }) => {
+                    let v: Vec<String> = assignments
+                        .iter()
+                        .map(|(b, a)| format!("{} → {}", n(b), n(a)))
+                        .collect();
+                    format!("block [{}]", v.join(", "))
+                }
+                other => format!("{other:?}"),
+            }
+        };
+        let (old, new) = (pick(false), pick(true));
+        let me = &state.players[seat.0 as usize];
+        let opp = &state.players[1 - seat.0 as usize];
+        println!(
+            "{name} T{} life {}×{} {}\n  note: {}\n  before: {}\n  after:  {}",
+            state.turn_number,
+            me.life,
+            opp.life,
+            if old == new { "(same)" } else { "CHANGED" },
+            raw["note"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(150)
+                .collect::<String>(),
+            names(&old),
+            names(&new),
+        );
+    }
+}
+
+/// Kaalia of the Vast {1}{R}{W}{B} — verbatim Oracle text.
+const KAALIA: &str = "Flying\nWhenever Kaalia of the Vast attacks an opponent, you may put an \
+     Angel, Demon, or Dragon creature card from your hand onto the battlefield tapped and \
+     attacking.";
+
+/// Angel of Despair {3}{W}{W}{B}{B} — verbatim Oracle text.
+const ANGEL_OF_DESPAIR: &str = "Flying\nWhen this creature enters, destroy target permanent.";
+
+/// Field report (MagicFinder, 2026-10-19 and 10-29: six "bad play" flags in one
+/// game, plus "never cast its commander"): Kaalia of the Vast never attacked.
+/// Its attack trigger asks "you may put…", and the replay dropped every
+/// declaration that reached a prompt, so no Kaalia attack was ever measured and
+/// the heuristic's "stay home" stood.
+///
+/// The board mirrors the T17 flag: an opposing ground army that is lethal
+/// (28 power against 27 life) once Kaalia and whatever she brings stay tapped.
+/// With an Angel of Despair in hand the attack is right — the Angel enters,
+/// destroys the 8/8, and the crack-back drops to 20. Two cards qualify, so
+/// accepting opens a second choice: the answer must look past the accept.
+#[test]
+fn kaalia_attacks_to_put_an_angel_into_play() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    s.with_life(P0, 27);
+    let kaalia = s
+        .add_creature_from_oracle(P0, "Kaalia of the Vast", 2, 2, KAALIA)
+        .id();
+    s.add_creature_to_hand_from_oracle(P0, "Angel of Despair", 5, 5, ANGEL_OF_DESPAIR)
+        .with_subtypes(vec!["Angel"])
+        .flying();
+    s.add_creature_to_hand(P0, "Serra Angel", 4, 4)
+        .with_subtypes(vec!["Angel"])
+        .flying();
+    for (name, power, toughness) in [
+        ("Ground Titan", 8, 8),
+        ("Bonebreaker", 6, 6),
+        ("Siege Wurm", 5, 5),
+        ("Craw Wurm", 5, 5),
+        ("Hill Giant", 4, 4),
+    ] {
+        s.add_creature(P1, name, power, toughness);
+    }
+    let mut r = s.build();
+    at_attack(&mut r);
+
+    let heuristic = attackers_of(&choose(r.state(), false));
+    assert!(heuristic.is_empty(), "the heuristic keeps Kaalia home");
+    let replay = attackers_of(&choose(r.state(), true));
+    assert_eq!(
+        replay,
+        vec![kaalia],
+        "Kaalia attacks: the Angel she brings kills the 8/8"
+    );
+}
+
+/// An anthem lord: losing it shrinks every other attacker, so the trade looks
+/// worse on the board than it plays.
+const LORD: &str = "Other creatures you control get +1/+1.";
+
+/// Field report (MagicFinder, 2026-11-01, "jogada ruim do robô"): at 24 life
+/// against 5, with four attack-ready creatures facing four blockers, the robot
+/// declared nothing. Every attacker carries at least 4 power, so the defender
+/// must throw its board in front of them (CR 509.1a) — at worst the 6/6 eats
+/// the lifelink lord and three small bodies die. What that buys is the next
+/// turn: one blocker short of covering four attackers at 5 life is dead on
+/// the following swing. The replay scored the lord it loses and never the
+/// swing the attack sets up, so "stay home" won by ten points.
+#[test]
+fn attacks_into_forced_chumps_that_set_up_lethal() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    s.with_life(P0, 24);
+    s.with_life(P1, 5);
+    let lord = s
+        .add_creature_from_oracle(P0, "Questcaller", 5, 5, LORD)
+        .lifelink()
+        .id();
+    let a = s.add_creature(P0, "Warrenguard", 3, 4).id();
+    let b = s.add_creature(P0, "Scout", 3, 4).id();
+    let c = s.add_creature(P0, "Sentry", 4, 4).id();
+    s.add_creature(P0, "Host", 5, 5).with_summoning_sickness();
+    s.add_creature(P1, "Gravetide", 6, 6);
+    s.add_creature(P1, "Braider", 2, 2);
+    s.add_creature(P1, "Harbinger", 1, 1);
+    s.add_creature(P1, "Smokebraider", 1, 1);
+    let mut r = s.build();
+    at_attack(&mut r);
+
+    assert!(
+        attackers_of(&choose(r.state(), false)).is_empty(),
+        "heuristic: four blockers for four attackers, nobody swings"
+    );
+    let mut all = vec![lord, a, b, c];
+    all.sort_unstable();
+    assert_eq!(
+        attackers_of(&choose(r.state(), true)),
+        all,
+        "the forced chumps leave 5 life behind two blockers: lethal next turn"
+    );
+}

@@ -1350,6 +1350,11 @@ pub struct AiConfig {
     /// (`crate::reach`). Off only for the near-random `VeryEasy` preset.
     pub play_lookahead: bool,
     pub combat_lookahead: bool,
+    /// MagicFinder (2026-10-26): replay the root attack/block declaration and a
+    /// handful of alternatives through the reducer and keep the best measured
+    /// one (`combat_sim`). On for the tiers the MagicFinder table serves as
+    /// "Difícil" (VeryHard) and above.
+    pub combat_simulation: bool,
     pub search: SearchConfig,
     pub weights: EvalWeightSet,
     pub keyword_bonuses: KeywordBonuses,
@@ -1562,6 +1567,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
         profile,
         play_lookahead,
         combat_lookahead,
+        combat_simulation: difficulty >= AiDifficulty::VeryHard,
         search,
         weights: EvalWeightSet::learned(),
         keyword_bonuses: KeywordBonuses::default(),
