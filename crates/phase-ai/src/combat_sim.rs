@@ -479,18 +479,17 @@ pub(crate) fn doomed_at_end_step(state: &GameState, id: ObjectId) -> bool {
         return false;
     };
     let dooms_self = |effect: &Effect| -> bool {
-        match effect {
+        matches!(
+            effect,
             Effect::Sacrifice {
                 target: TargetFilter::SelfRef,
                 ..
-            }
-            | Effect::ChangeZone {
+            } | Effect::ChangeZone {
                 destination: Zone::Exile | Zone::Graveyard,
                 target: TargetFilter::SelfRef,
                 ..
-            } => true,
-            _ => false,
-        }
+            }
+        )
     };
     let own_trigger = object.trigger_definitions.iter_unchecked().any(|entry| {
         let def = &entry.definition;
