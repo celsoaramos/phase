@@ -13658,7 +13658,18 @@ fn continue_replacement_impl(
             (&proposed, post_effect.as_deref())
         {
             if is_token_replacement_choice(def) {
+                // CR 614.1a: "that many <token A> or that many <token B>" (Jinnie
+                // Fay) names the number of tokens the replaced event would have
+                // created. The applier zeroes that event's count before the
+                // chosen branch resolves, and a spell-created token event has no
+                // enclosing trigger event to read it from, so latch it here like
+                // the copy substitution below; without it every branch created
+                // zero tokens (Lorehold Command's Spirit, Raise the Alarm's
+                // Soldiers).
+                let replaced = token_count_affected_by(state, &proposed, rid, registry);
                 state.post_replacement_token_choice_applied = Some(applied.clone());
+                state.post_replacement_token_substitution_count =
+                    Some(u32_to_i32_saturating(replaced));
             } else if is_copy_token_substitution(def) {
                 // CR 614.1a + CR 616.1: Moonlit-class copy substitution. The
                 // continuation inherits this event's applied set (already carries

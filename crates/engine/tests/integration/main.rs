@@ -1316,6 +1316,7 @@ mod one_sided_fight_illegal_damage_source;
 mod one_time_boon;
 mod optional_replacement_decline_keeps_resident_drain;
 mod optional_replacement_decline_unreplaced_event;
+mod jinnie_fay_modal_token;
 mod oracle_of_the_alpha_conjure_power_nine;
 mod oracle_parser;
 mod orzhov_advokist;
