@@ -1,5 +1,3 @@
-# Tag do phase-rs em que o build do motor se apoia. Vazio = a mais recente.
-# v0.120.0 (07/11/2026) moveu os tipos de crates/engine/src/types para o crate novo
-# crates/phase-ast e dividiu os testes de integração em shards: ~27 branches nossas
-# precisam de porte. Até lá o build segue na v0.119.0. Tire o pino quando o porte entrar.
-v0.119.0
+# Tag do phase-rs em que o build do motor se apoia. Vazio (só comentários) = a mais recente.
+# 07/11/2026: fixada em v0.119.0 enquanto as branches eram portadas para a v0.120.0
+# (tipos no crate phase-ast, testes em shards). Porte feito em 08/11/2026: pino vazio.
