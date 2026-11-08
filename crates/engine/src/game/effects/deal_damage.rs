@@ -1110,6 +1110,8 @@ fn apply_combat_counter_choice_in_default_order(
         }
     }
     state.waiting_for = waiting_before;
+}
+
 /// CR 120.1: push the `DamageDealt` event and record the damage for "was
 /// dealt damage by" condition queries. `dealt_amount` gates recording (a
 /// nonzero amount actually dealt per CR 120.3/120.6); `record_amount` /
