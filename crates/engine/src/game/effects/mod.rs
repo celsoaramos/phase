@@ -5828,6 +5828,7 @@ fn resolve_optional_effect_decision_step(
                     .is_some_and(|frame| frame.ability.repeat_until == ability.repeat_until)
             {
                 ability.repeat_until = None;
+            }
             // CR 603.2h: "its source's controller" takes the indicated action: the lowering
             // guard admits only instructions the shared routing classification proves are
             // addressed to the controller. Re-check that classification against this instance's actual
