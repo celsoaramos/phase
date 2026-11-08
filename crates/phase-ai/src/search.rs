@@ -3156,7 +3156,15 @@ fn score_candidates_uncertified(
     root: RootReuse<'_>,
     prompt_answers: PromptAnswerValidation,
 ) -> Vec<(GameAction, f64)> {
-    let scored = score_candidates_uncertified_searched(root_domain, config, session, deadline, root);
+    let scored = score_candidates_uncertified_searched(
+        root_domain,
+        config,
+        session,
+        deadline,
+        root_deadline,
+        root,
+        prompt_answers,
+    );
     let (state, ai_player) = (root_domain.state, root_domain.ai_player);
     if !config.turn_simulation || !crate::turn_sim::applies(state, ai_player) {
         return scored;
@@ -3189,7 +3197,9 @@ fn score_candidates_uncertified_searched(
     config: &AiConfig,
     session: &Arc<AiSession>,
     deadline: engine::util::Deadline,
+    root_deadline: &mut RootSearchDeadline,
     root: RootReuse<'_>,
+    prompt_answers: PromptAnswerValidation,
 ) -> Vec<(GameAction, f64)> {
     let (state, ai_player) = (root_domain.state, root_domain.ai_player);
     // Attacker declarations are public-state tactical choices. Running K hidden
