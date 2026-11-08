@@ -1365,8 +1365,20 @@ fn stash_remaining_post_replacement_damage(
 /// replacements to order. When the effect still has recipients to damage, it
 /// must stop behind that prompt exactly as it does for a `NeedsChoice` pause:
 /// going on would raise the next recipient's prompt over the open one.
-fn pause_behind_continuation_prompt(state: &GameState, has_remaining: bool) -> bool {
-    has_remaining && !matches!(state.waiting_for, WaitingFor::Priority { .. })
+///
+/// `waiting_before` is the wait as the recipient loop started: only a prompt that
+/// appeared while it applied damage pauses it. A resume entered with its own
+/// prompt still recorded (the resolution-time division answered through
+/// `resume_resolution_division`) is not a new prompt, and must not stash the
+/// recipients it was asked to damage.
+fn pause_behind_continuation_prompt(
+    state: &GameState,
+    waiting_before: &WaitingFor,
+    has_remaining: bool,
+) -> bool {
+    has_remaining
+        && state.waiting_for != *waiting_before
+        && !matches!(state.waiting_for, WaitingFor::Priority { .. })
 }
 
 /// The ability whose remaining recipients a pause stashes. On a `NeedsChoice`
@@ -1811,10 +1823,12 @@ fn resolve_with_splice(
     // CR 601.2d: If the caster distributed damage among targets at cast time,
     // apply per-target amounts from ability.distribution instead of uniform damage.
     if let Some(distribution) = &ability.distribution {
+        // CR 616.1g: a prompt this loop raises is one that was not open before it.
+        let waiting_before = state.waiting_for.clone();
         for (i, (target, amount)) in distribution.iter().enumerate() {
             match apply_damage_to_target(state, &ctx, target.clone(), *amount, false, events)? {
                 DamageResult::Applied(_)
-                    if !pause_behind_continuation_prompt(state, i + 1 < distribution.len()) => {}
+                    if !pause_behind_continuation_prompt(state, &waiting_before, i + 1 < distribution.len()) => {}
                 result => {
                     // CR 120.3 + CR 616.1e: Remaining distributed targets must resume
                     // after the replacement choice resolves. Stash each as a chained
@@ -1827,11 +1841,14 @@ fn resolve_with_splice(
             }
         }
     } else {
+        // CR 616.1g: a prompt this loop raises is one that was not open before it.
+        let waiting_before = state.waiting_for.clone();
         for (i, target) in effective_targets.iter().enumerate() {
             match apply_damage_to_target(state, &ctx, target.clone(), num_dmg, false, events)? {
                 DamageResult::Applied(_)
                     if !pause_behind_continuation_prompt(
                         state,
+                        &waiting_before,
                         i + 1 < effective_targets.len(),
                     ) => {}
                 result => {
@@ -2351,6 +2368,8 @@ fn resolve_each_target_power_damage(
     // only after every replacement has resolved (true simultaneity from the
     // replacement perspective, matching the combat batch's two-pass structure).
     let mut survivors: Vec<(&DamageContext, ProposedEvent)> = Vec::with_capacity(entries.len());
+    // CR 616.1g: a prompt this loop raises is one that was not open before it.
+    let waiting_before = state.waiting_for.clone();
     for (&(idx, ctx), proposed) in entries.iter().zip(proposed_events) {
         match replacement::replace_event(state, proposed, events) {
             ReplacementResult::Execute(event) => survivors.push((ctx, event)),
@@ -2369,7 +2388,7 @@ fn resolve_each_target_power_damage(
                         // prompt. This source's event is settled; with sources
                         // left, pause exactly as the `NeedsChoice` arm below
                         // does, with the sources AFTER this one stashed.
-                        if pause_behind_continuation_prompt(state, idx + 1 < batch.len()) {
+                        if pause_behind_continuation_prompt(state, &waiting_before, idx + 1 < batch.len()) {
                             apply_batch_survivors_before_replacement_pause(
                                 state, &survivors, events,
                             );
@@ -2641,10 +2660,12 @@ pub fn resolve_all(
         })
         .collect();
 
+    // CR 616.1g: a prompt this loop raises is one that was not open before it.
+    let waiting_before = state.waiting_for.clone();
     for (i, (target, num_dmg)) in recipient_amounts.iter().enumerate() {
         match apply_damage_to_target(state, &ctx, target.clone(), *num_dmg, false, events)? {
             DamageResult::Applied(_)
-                if !pause_behind_continuation_prompt(state, i + 1 < recipient_amounts.len()) => {}
+                if !pause_behind_continuation_prompt(state, &waiting_before, i + 1 < recipient_amounts.len()) => {}
             result => {
                 // CR 120.3 + CR 616.1e: Remaining batch recipients must resume after
                 // the replacement choice resolves — chain them as DealDamage
@@ -3243,6 +3264,8 @@ pub fn resolve_each_player(
         .map(|p| p.id)
         .collect();
 
+    // CR 616.1g: a prompt this loop raises is one that was not open before it.
+    let waiting_before = state.waiting_for.clone();
     for (i, pid) in player_ids.iter().enumerate() {
         // CR 120.3: Resolve quantity scoped to this player. Thread the ability's
         // object targets so an `ObjectManaValue { scope: Target }` leaf (Lady
@@ -3260,7 +3283,7 @@ pub fn resolve_each_player(
             match apply_damage_to_target(state, &ctx, TargetRef::Player(*pid), dmg, false, events)?
             {
                 DamageResult::Applied(_)
-                    if !pause_behind_continuation_prompt(state, i + 1 < player_ids.len()) => {}
+                    if !pause_behind_continuation_prompt(state, &waiting_before, i + 1 < player_ids.len()) => {}
                 result => {
                     // CR 120.3 + CR 616.1e: Remaining players must resume after the
                     // replacement choice resolves. Pre-resolve per-player amounts now
@@ -3354,6 +3377,8 @@ pub fn resolve_each_deals_equal_to_power(
         return Ok(());
     };
 
+    // CR 616.1g: a prompt this loop raises is one that was not open before it.
+    let waiting_before = state.waiting_for.clone();
     for (i, &source_id) in source_ids.iter().enumerate() {
         // CR 113.7a + CR 208.3: power from the live object, falling back to LKI
         // when the source left the battlefield after targets were chosen.
@@ -3373,7 +3398,7 @@ pub fn resolve_each_deals_equal_to_power(
             events,
         )? {
             DamageResult::Applied(_)
-                if !pause_behind_continuation_prompt(state, i + 1 < source_ids.len()) => {}
+                if !pause_behind_continuation_prompt(state, &waiting_before, i + 1 < source_ids.len()) => {}
             result => {
                 // CR 120.3 + CR 616.1e: This source's damage paused for a
                 // replacement choice. Each remaining source deals its own power
@@ -3565,6 +3590,8 @@ pub fn resolve_each_source_deals_damage(
     // continuations (they still need the full replacement pipeline).
     let mut replaced: Vec<(DamageContext, ProposedEvent)> = Vec::new();
     let mut phase_b_pause: Option<(usize, WaitingFor, ResolvedAbility)> = None;
+    // CR 616.1g: a prompt this loop raises is one that was not open before it.
+    let waiting_before = state.waiting_for.clone();
     for (i, (_src, ctx, target, dmg)) in entries.iter().enumerate() {
         let Some(proposed) = pre_replacement_damage_gate(state, ctx, target, *dmg, false, events)
         else {
@@ -3590,7 +3617,7 @@ pub fn resolve_each_source_deals_damage(
                         // substitute raised its own prompt. Source `i` is
                         // settled; with sources left, pause Phase B behind it
                         // exactly as for a `NeedsChoice`.
-                        if pause_behind_continuation_prompt(state, i + 1 < entries.len()) {
+                        if pause_behind_continuation_prompt(state, &waiting_before, i + 1 < entries.len()) {
                             let owner = pause_stash_owner(ability, &DamageResult::Applied(0));
                             phase_b_pause = Some((i, waiting_for, owner));
                             break;
