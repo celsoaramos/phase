@@ -216,8 +216,6 @@ mod cloud_key_chosen_type_cost;
 mod coalition_relic_integration;
 mod coalition_victory_win_condition;
 mod coastal_wizard_bounce_self_and_another;
-mod cobertura_mf_1031;
-mod cobertura_mf_1101;
 mod cobertura_mf_1102;
 mod cobertura_mf_1103;
 mod code_of_constraint_addendum;
