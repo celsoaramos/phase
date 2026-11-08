@@ -4882,11 +4882,46 @@ fn resolve_they_pronoun(ctx: &mut ParseContext, consumer: AnaphorConsumer) -> Ta
                     .unwrap_or(TargetFilter::TriggeringSource)
             }
         }
+        // CR 608.2c + CR 502.3: in a body with no trigger subject, a bare "they"
+        // that is the AFFECTED OBJECT of the sentence, after an earlier mass
+        // ("all …") instruction scoped by a TARGET PLAYER, names that object
+        // population — Sleep: "Tap all creatures target player controls. They
+        // don't untap during that player's next untap step." The mass
+        // instruction chose no object, so `ParentTarget` bound the only declared
+        // target, the PLAYER, and the untap lock landed on nobody. A mass
+        // instruction with no player target keeps `ParentTarget`, which the
+        // runtime already binds to the affected objects ("put a +1/+1 counter on
+        // each creature you control and they gain vigilance"); a player-action
+        // "they" (consumer `Other`) keeps the player readings below.
+        _ if consumer == AnaphorConsumer::AffectedObject
+            && ctx
+                .chain_prior_mass_population
+                .as_ref()
+                .is_some_and(population_scoped_by_target_player) =>
+        {
+            ctx.chain_prior_mass_population
+                .clone()
+                .unwrap_or(TargetFilter::ParentTarget)
+        }
         // CR 608.2c: the nearest earlier clause announced a player; "they" is that
         // player, spelled as "that player" is.
         _ if ctx.prior_player_declaration => TargetFilter::ParentTargetController,
         // No trigger context — anaphoric reference to previously mentioned objects
         _ => TargetFilter::ParentTarget,
+    }
+}
+
+/// CR 608.2c: does this mass population read its controller from the ability's
+/// declared target PLAYER ("all creatures target player controls")? Then the
+/// player is the chain's only declared target, and `ParentTarget` cannot name
+/// the population's objects.
+fn population_scoped_by_target_player(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(tf) => tf.controller == Some(ControllerRef::TargetPlayer),
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            filters.iter().any(population_scoped_by_target_player)
+        }
+        _ => false,
     }
 }
 
