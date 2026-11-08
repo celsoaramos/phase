@@ -1991,7 +1991,7 @@ pub fn resolve_add(
         // CR 608.2c: A quantity bound to the resolved recipient (such as
         // Sovereign Okinec Ahau's "the difference") is evaluated separately
         // for each object. Source-relative quantities remain one shared value.
-        let count_uses_recipient = crate::game::quantity::quantity_expr_uses_recipient(&count);
+        let count_uses_recipient = crate::types::ability::quantity_expr_uses_recipient(&count);
         let counter_num_shared = (!count_uses_recipient).then(|| {
             // CR 107.1b: Ability-context resolve preserves the announced X for
             // source-relative counter quantities.
@@ -2294,7 +2294,7 @@ pub fn resolve_add_all(
     // re-evaluated against each object; a uniform count (the source's power —
     // Ouroboroid) is resolved once and shared. Detected via the recipient-
     // binding scope the parser stamps on per-recipient counts.
-    let count_uses_recipient = crate::game::quantity::quantity_expr_uses_recipient(&count);
+    let count_uses_recipient = crate::types::ability::quantity_expr_uses_recipient(&count);
 
     let additions: Vec<PendingCounterAddition> = matching_ids
         .into_iter()
@@ -2588,6 +2588,13 @@ pub(super) fn resolve_defined_or_targets(
         | Effect::PutCounter { target, .. } => Some(target),
         _ => None,
     };
+    // CR 608.2b: do not replace an unavailable ParentTarget announcement
+    // with an attack batch, event subject, attached host, or source.
+    if matches!(target_spec, Some(TargetFilter::ParentTarget))
+        && ability.has_authoritative_empty_binding()
+    {
+        return Vec::new();
+    }
 
     // Whether the ability carries any chosen *object* target. The branch
     // resolver in `choose_one_of::resolve_branch` injects a bookkeeping
@@ -3164,6 +3171,12 @@ fn resolve_counter_transfer_sources(
     source_filter: &TargetFilter,
     mode: CounterTransferMode,
 ) -> Vec<ObjectId> {
+    // CR 608.2b: an unavailable source announcement supplies no information.
+    if matches!(source_filter, TargetFilter::ParentTarget)
+        && ability.has_authoritative_empty_binding()
+    {
+        return Vec::new();
+    }
     if matches!(source_filter, TargetFilter::SelfRef | TargetFilter::None) {
         return match mode {
             // CR 122.8 + CR 608.2h: a triggered ability that puts "this
@@ -3208,6 +3221,12 @@ fn resolve_counter_transfer_destinations(
     source_filter: &TargetFilter,
     target_filter: &TargetFilter,
 ) -> Vec<ObjectId> {
+    // CR 608.2b: an unavailable destination cannot be replaced by event context.
+    if matches!(target_filter, TargetFilter::ParentTarget)
+        && ability.has_authoritative_empty_binding()
+    {
+        return Vec::new();
+    }
     if matches!(target_filter, TargetFilter::SelfRef | TargetFilter::None) {
         return ability.self_ref_binding(state).into_iter().collect();
     }
