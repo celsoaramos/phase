@@ -216,7 +216,6 @@ mod cloud_key_chosen_type_cost;
 mod coalition_relic_integration;
 mod coalition_victory_win_condition;
 mod coastal_wizard_bounce_self_and_another;
-mod cobertura_mf_1101;
 mod code_of_constraint_addendum;
 mod codie_prepared_spell_trigger;
 mod codie_turn14_effect_zone_wedge;
