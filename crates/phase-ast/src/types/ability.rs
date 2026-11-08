@@ -37706,6 +37706,7 @@ impl AbilityCondition {
             | AbilityCondition::HasEnduringStory
             | AbilityCondition::IsRingBearer
             | AbilityCondition::HasObjectTarget
+            | AbilityCondition::NoPlayerChosen
             | AbilityCondition::IsYourTurn
             | AbilityCondition::FirstCombatPhaseOfTurn
             | AbilityCondition::FirstEndStepOfTurn
@@ -37835,6 +37836,7 @@ impl AbilityCondition {
             | AbilityCondition::CompletedDungeon { .. }
             | AbilityCondition::TargetHasKeywordInstead { .. }
             | AbilityCondition::HasObjectTarget
+            | AbilityCondition::NoPlayerChosen
             | AbilityCondition::IsYourTurn
             | AbilityCondition::WasStartingPlayer { .. }
             | AbilityCondition::SpellCastWithVariantThisTurn { .. }
@@ -37952,6 +37954,7 @@ impl AbilityCondition {
             | AbilityCondition::DiscardedCardMatchesFilter { .. }
             | AbilityCondition::IsRingBearer
             | AbilityCondition::HasObjectTarget
+            | AbilityCondition::NoPlayerChosen
             | AbilityCondition::IsYourTurn
             | AbilityCondition::FirstCombatPhaseOfTurn
             | AbilityCondition::FirstEndStepOfTurn
@@ -38036,6 +38039,7 @@ impl AbilityCondition {
             | AbilityCondition::DiscardedCardMatchesFilter { .. }
             | AbilityCondition::IsRingBearer
             | AbilityCondition::HasObjectTarget
+            | AbilityCondition::NoPlayerChosen
             | AbilityCondition::IsYourTurn
             | AbilityCondition::FirstCombatPhaseOfTurn
             | AbilityCondition::FirstEndStepOfTurn
@@ -38275,6 +38279,7 @@ impl AbilityCondition {
             | AbilityCondition::DiscardedCardMatchesFilter { .. }
             | AbilityCondition::IsRingBearer
             | AbilityCondition::HasObjectTarget
+            | AbilityCondition::NoPlayerChosen
             | AbilityCondition::IsYourTurn
             | AbilityCondition::FirstCombatPhaseOfTurn
             | AbilityCondition::FirstEndStepOfTurn
