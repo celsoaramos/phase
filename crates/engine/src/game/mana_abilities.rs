@@ -14,10 +14,11 @@ use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::events::{ActivatedAbilityKind, BoundActivationCost, GameEvent, ManaTapState};
 use crate::types::game_state::{
     CostResume, GameState, ManaAbilityCostCursor, ManaAbilityCostParent,
-    ManaAbilityCostParentLifecycle, ManaAbilityCostResolutionMode, ManaAbilityResume, ManaChoice,
-    ManaChoiceContext, ManaChoicePrompt, ManaColorChoiceResume, ManaTriggerFixedPointResume,
-    PausedCounterCostRemoval, PayCostKind, PayableResource, PendingCostMoveResume,
-    PendingCounterRemoval, PendingManaAbility, ProductionOverride, WaitingFor,
+    ManaAbilityCostParentLifecycle, ManaAbilityCostResolutionMode, ManaAbilityResume,
+    ManaAmountComposition, ManaChoice, ManaChoiceContext, ManaChoicePrompt, ManaColorChoiceResume,
+    ManaTriggerFixedPointResume, PausedCounterCostRemoval, PayCostKind, PayableResource,
+    PendingCostMoveResume, PendingCounterRemoval, PendingManaAbility, ProductionOverride,
+    WaitingFor,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::mana::{ManaColor, ManaCost, ManaPool, ManaType, PaymentContext};
@@ -343,44 +344,18 @@ fn sole_produced_color(produced: &[ManaType]) -> Option<ManaColor> {
     Some(first)
 }
 
-/// Visit every reachable link of `ability` — head + `sub_ability` chain +
-/// `else_ability` branches at each link — and return `true` iff `pred` holds
-/// for all of them. Mirrors `chain_is_all_mana` / `chain_has_any_targets`'s
-/// single traversal shape so the two walkers stay structurally identical.
+/// Visit every live link, including coin outcomes, and require `pred` for all.
 fn visit_links_all(ability: &ResolvedAbility, pred: &dyn Fn(&ResolvedAbility) -> bool) -> bool {
-    if !pred(ability) {
-        return false;
-    }
-    if let Some(sub) = ability.sub_ability.as_deref() {
-        if !visit_links_all(sub, pred) {
-            return false;
-        }
-    }
-    if let Some(else_branch) = ability.else_ability.as_deref() {
-        if !visit_links_all(else_branch, pred) {
-            return false;
-        }
-    }
-    true
+    pred(ability)
+        && ability
+            .child_links()
+            .all(|(_, child)| visit_links_all(child, pred))
 }
 
 /// Dual of [`visit_links_all`]: returns `true` iff `pred` holds for any
 /// reachable link.
 fn visit_links_any(ability: &ResolvedAbility, pred: &dyn Fn(&ResolvedAbility) -> bool) -> bool {
-    if pred(ability) {
-        return true;
-    }
-    if let Some(sub) = ability.sub_ability.as_deref() {
-        if visit_links_any(sub, pred) {
-            return true;
-        }
-    }
-    if let Some(else_branch) = ability.else_ability.as_deref() {
-        if visit_links_any(else_branch, pred) {
-            return true;
-        }
-    }
-    false
+    super::triggers::any_reachable_link(ability, pred)
 }
 
 /// CR 605.4a: Resolve a triggered mana ability inline (stack-skipped).
@@ -1736,7 +1711,7 @@ fn deferred_spell_sacrifice_reserved(state: &GameState, object_id: ObjectId) -> 
         pending
             .deferred_sacrificed_permanents
             .iter()
-            .any(|selection| selection.object_id == object_id)
+            .any(|selection| selection.selected_object() == Some(object_id))
     })
 }
 
@@ -2035,6 +2010,7 @@ pub(crate) fn mana_ability_ready_without_simulation_gated(
                     source_id,
                     Some(ability_index),
                     super::cost_payability::ObjectLegPayment::Unguided,
+                    super::cost_payability::CostSourceRole::AbilitySource,
                 ) {
                     return false;
                 }
@@ -2277,9 +2253,12 @@ fn mana_ability_x_announcement(
                 PayableResource::Speed,
                 super::speed::effective_speed(state, pending.player) as u32,
             ),
+            // CR 107.3a + CR 602.2b: a mana ability's `{X}` leg announces X
+            // for that cost, so the chosen amount concretizes X.
             Some(AnnouncedXLeg::Mana(mana_leg)) => (
-                PayableResource::ManaGeneric {
+                PayableResource::Mana {
                     base_cost: mana_leg.clone(),
+                    composition: ManaAmountComposition::ConcretizeX,
                 },
                 mana_leg_x_cap(state, pending, mana_leg),
             ),
@@ -2507,6 +2486,7 @@ pub(super) fn advance_mana_ability_activation(
                 if !super::effects::collect_evidence::can_collect_evidence(
                     state,
                     pending.player,
+                    None,
                     amount,
                 ) {
                     return Err(EngineError::ActionNotAllowed(
@@ -4499,7 +4479,7 @@ fn run_inline_mana_subresolution(state: &mut GameState, run: impl FnOnce(&mut Ga
     state.named_color_this_resolution = outer_named_color;
 }
 
-fn contains_duplicate_object_id(ids: &[ObjectId]) -> bool {
+pub(super) fn contains_duplicate_object_id(ids: &[ObjectId]) -> bool {
     ids.iter()
         .enumerate()
         .any(|(index, id)| ids[index + 1..].contains(id))
@@ -5741,9 +5721,12 @@ fn discard_cost_choice(
         .filter(|pending| pending.ability.controller == player)
         .and_then(|pending| {
             pending
-                .deferred_random_discard_cost
+                .deferred_hand_discard_cost
                 .as_ref()
-                .map(|cost| (pending.object_id, cost.count))
+                .and_then(|cost| {
+                    cost.reserved_count()
+                        .map(|count| (pending.object_id, count))
+                })
         })
     {
         eligible.retain(|&id| id != pending_spell);
@@ -5845,7 +5828,11 @@ fn sacrifice_cost_choice(
     source_id: ObjectId,
     ability: &AbilityDefinition,
 ) -> Option<(usize, Vec<ObjectId>)> {
-    let (count, filter) = super::casting::find_non_self_sacrifice_cost(ability.cost.as_ref()?)?;
+    let sacrifice = super::casting::find_non_self_sacrifice_cost(ability.cost.as_ref()?)?;
+    let crate::types::ability::SacrificeRequirement::Count { count } = sacrifice.requirement else {
+        return None;
+    };
+    let filter = &sacrifice.target;
     let granter = ability.granting_object;
     // CR 118.10: a permanent committed to a pending spell sacrifice can't also
     // pay this cost.
@@ -7629,6 +7616,7 @@ mod tests {
                 up_to: false,
                 filter: TargetFilter::Any,
                 rest_destination: None,
+                rest_remainder: crate::types::ability::DigRestRemainder::Route,
                 rest_split_top_count: None,
                 rest_order: crate::types::ability::DigRestOrder::Preserve,
                 reveal: false,
@@ -10180,7 +10168,7 @@ mod tests {
     /// reserved source flips to `true` with 0 clones.
     #[test]
     fn self_sacrifice_reserved_for_pending_cast_still_simulates() {
-        use crate::types::game_state::{DeferredSacrificeSelection, PendingCast};
+        use crate::types::game_state::{DeferredSpellSacrifice, PendingCast};
 
         let mut state = GameState::new_two_player(42);
         let reserved =
@@ -10210,7 +10198,7 @@ mod tests {
         // must be pushed explicitly or the test passes vacuously.
         pending
             .deferred_sacrificed_permanents
-            .push(DeferredSacrificeSelection {
+            .push(DeferredSpellSacrifice::Selected {
                 object_id: reserved,
                 filter: TargetFilter::Typed(TypedFilter::permanent()),
             });
