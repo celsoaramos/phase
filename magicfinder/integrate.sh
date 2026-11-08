@@ -27,6 +27,15 @@ for b in "$@"; do
       "$M")
         python3 "$HERE/merge-matrix.py" "$(git merge-base HEAD "origin/$b")" HEAD "origin/$b" "$M"
         git add "$M"; echo "  $b: matriz CR733 mesclada campo a campo" ;;
+      crates/engine/tests/integration/main.rs|crates/engine/tests/integration/shard_*.rs)
+        # Registro dos testes (v0.120.0+: main.rs + shard_N.rs por faixa de nome): fica o da
+        # integração e entram os `mod x;` que a branch acrescentou, no shard da faixa.
+        if out=$(python3 "$HERE/merge-test-mods.py" "$(git merge-base HEAD "origin/$b")" HEAD "origin/$b" "$f"); then
+          git add $out "$f"; echo "  $b: registro de testes mesclado ($f)"
+        else
+          echo "::error::conflito de CÓDIGO em $f ao mesclar $b sobre $TAG — resolva no fork (rebase da branch)"
+          git merge --abort; exit 1
+        fi ;;
       *)
         echo "::error::conflito de CÓDIGO em $f ao mesclar $b sobre $TAG — resolva no fork (rebase da branch)"
         git merge --abort; exit 1 ;;
