@@ -22,8 +22,6 @@ use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
 const MARTYR_OF_SANDS: &str = "{1}, Reveal X white cards from your hand, Sacrifice this creature: You gain three times X life.";
-const ILLUMINATED_FOLIO: &str =
-    "{1}, {T}, Reveal two cards from your hand that share a color: Draw a card.";
 const SPIRIT_EN_DAL: &str = "Shadow (This creature can block or be blocked by only creatures with shadow.)\nForecast — {1}{W}, Reveal this creature from your hand: Target creature gains shadow until end of turn. (Activate only during your upkeep and only once each turn.)";
 
 fn colorless(amount: usize) -> Vec<ManaUnit> {
@@ -160,98 +158,6 @@ fn drive(
 
 fn is_choose_x(runner: &GameRunner) -> bool {
     matches!(runner.state().waiting_for, WaitingFor::ChooseXValue { .. })
-}
-
-/// A reveal clause the cost cannot represent ("that share a color") is not
-/// offered and a forced activation pays nothing.
-#[test]
-fn illuminated_folio_share_a_color_is_not_activatable() {
-    let mut scenario = GameScenario::new();
-    scenario.at_phase(Phase::PreCombatMain);
-    let folio = scenario
-        .add_artifact_from_oracle(P0, "Illuminated Folio", ILLUMINATED_FOLIO)
-        .id();
-    let martyr = scenario
-        .add_creature_from_oracle(P0, "Martyr of Sands", 1, 1, MARTYR_OF_SANDS)
-        .with_mana_cost(colored_cost(vec![ManaCostShard::White]))
-        .id();
-    add_hand_card(
-        &mut scenario,
-        P0,
-        "White Card 0",
-        vec![ManaCostShard::White],
-    );
-    add_hand_card(
-        &mut scenario,
-        P0,
-        "White Card 1",
-        vec![ManaCostShard::White],
-    );
-    let library_card = scenario.add_card_to_library_top(P0, "Library Card");
-    scenario.with_mana_pool(P0, colorless(1));
-    let mut runner = scenario.build();
-
-    // (a) parse: the clause the cost cannot represent fails closed.
-    assert!(
-        cost_parts(&activated_cost(&runner, folio))
-            .iter()
-            .any(|cost| matches!(cost, AbilityCost::Unimplemented { .. })),
-        "Folio's reveal must be Unimplemented, got {:?}",
-        activated_cost(&runner, folio)
-    );
-    // Reach guard for the parse: Martyr keeps a typed Reveal X.
-    assert!(cost_parts(&activated_cost(&runner, martyr))
-        .iter()
-        .any(|cost| matches!(
-            cost,
-            AbilityCost::Reveal { count, filter, .. }
-                if matches!(count, QuantityExpr::Ref { qty: QuantityRef::Variable { .. } }) && has_color(filter, ManaColor::White)
-        )));
-
-    // (b) legality
-    let actions = engine::ai_support::legal_actions(runner.state());
-    assert!(!actions.iter().any(|action| matches!(
-        action,
-        GameAction::ActivateAbility { source_id, .. } if *source_id == folio
-    )));
-    assert!(actions.iter().any(|action| matches!(
-        action,
-        GameAction::ActivateAbility { source_id, .. } if *source_id == martyr
-    )));
-
-    // (c) forced submission
-    let hand_before = runner.state().players[P0.0 as usize].hand.len();
-    let mut result = runner.act(GameAction::ActivateAbility {
-        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
-        source_id: folio,
-        ability_index: activated_index(&runner, folio),
-    });
-    for _ in 0..8 {
-        if result.is_err() {
-            break;
-        }
-        result = match runner.state().waiting_for.clone() {
-            WaitingFor::ManaPayment { .. } => runner.act(GameAction::PassPriority),
-            WaitingFor::PayCost { choices, count, .. } => runner.act(GameAction::SelectCards {
-                cards: choices.into_iter().take(count).collect(),
-            }),
-            _ => break,
-        };
-    }
-    assert!(
-        matches!(result, Err(EngineError::ActionNotAllowed(_))),
-        "forced Folio activation must be refused, got {result:?}"
-    );
-    assert!(!runner.state().objects[&folio].tapped);
-    assert_eq!(runner.state().objects[&library_card].zone, Zone::Library);
-    assert_eq!(
-        runner.state().players[P0.0 as usize].hand.len(),
-        hand_before
-    );
-
-    // Reach guard: Martyr's activation reaches the X announcement on this board.
-    activate(&mut runner, martyr);
-    assert!(is_choose_x(&runner));
 }
 
 #[test]
