@@ -4683,6 +4683,7 @@ impl FormatConfig {
             allow_debug_actions: false,
             horde_ruleset: None,
             custom_rules: None,
+            house_emblems: Vec::new(),
         }
     }
 
@@ -4738,6 +4739,7 @@ impl FormatConfig {
             allow_debug_actions: false,
             horde_ruleset: None,
             custom_rules: None,
+            house_emblems: Vec::new(),
         }
     }
 
@@ -4770,6 +4772,7 @@ impl FormatConfig {
             allow_debug_actions: false,
             horde_ruleset: None,
             custom_rules: None,
+            house_emblems: Vec::new(),
         }
     }
 
@@ -4865,6 +4868,7 @@ impl FormatConfig {
             allow_debug_actions: false,
             horde_ruleset: Some(ruleset),
             custom_rules: None,
+            house_emblems: Vec::new(),
         }
     }
 

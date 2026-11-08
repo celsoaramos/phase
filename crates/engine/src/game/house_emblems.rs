@@ -100,6 +100,7 @@ pub fn grant_house_emblems(state: &mut GameState) {
             obj.emblem_source = Some(crate::game::game_object::EmblemSource {
                 name: HOUSE_EMBLEM_SOURCE_NAME.to_string(),
                 printed_ref: None,
+                printing: Default::default(),
             });
         }
     }
