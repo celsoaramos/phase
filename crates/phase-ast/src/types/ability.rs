@@ -12479,7 +12479,7 @@ fn quantity_ref_has_unsupported_selected_ref(qty: &QuantityRef) -> bool {
         | QuantityRef::ConvokedCreatureCount
         | QuantityRef::TimesCostPaidThisResolution
         | QuantityRef::ColorsInCommandersColorIdentity
-        | QuantityRef::CommanderCastFromCommandZoneCount
+        | QuantityRef::CommanderCastFromCommandZoneCount { .. }
         | QuantityRef::Devotion { .. }
         | QuantityRef::VoteCount { .. }
         | QuantityRef::CrimesCommittedThisTurn
@@ -14370,7 +14370,7 @@ impl QuantityRef {
             | QuantityRef::TimesCostPaidThisResolution
             | QuantityRef::ManaSpentToCast { .. }
             | QuantityRef::ColorsInCommandersColorIdentity
-            | QuantityRef::CommanderCastFromCommandZoneCount
+            | QuantityRef::CommanderCastFromCommandZoneCount { .. }
             | QuantityRef::CommanderManaValue { .. }
             | QuantityRef::DistinctColorsAmong { .. }
             | QuantityRef::DistinctCounterKindsAmong { .. }
@@ -14642,7 +14642,7 @@ impl QuantityRef {
             | QuantityRef::TimesCostPaidThisResolution
             | QuantityRef::ManaSpentToCast { .. }
             | QuantityRef::ColorsInCommandersColorIdentity
-            | QuantityRef::CommanderCastFromCommandZoneCount
+            | QuantityRef::CommanderCastFromCommandZoneCount { .. }
             | QuantityRef::CommanderManaValue { .. }
             | QuantityRef::DistinctColorsAmong { .. }
             | QuantityRef::DistinctCounterKindsAmong { .. }
@@ -27864,7 +27864,7 @@ pub fn quantity_ref_recipient_read(qty: &QuantityRef) -> RecipientRead {
         | QuantityRef::ConvokedCreatureCount
         | QuantityRef::TimesCostPaidThisResolution
         | QuantityRef::ColorsInCommandersColorIdentity
-        | QuantityRef::CommanderCastFromCommandZoneCount
+        | QuantityRef::CommanderCastFromCommandZoneCount { .. }
         | QuantityRef::CommanderManaValue { .. }
         | QuantityRef::VoteCount { .. } => RecipientRead::Unread,
     }
