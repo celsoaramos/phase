@@ -135,6 +135,28 @@ impl TacticalPolicy for LandAnimationPolicy {
             // signal is weighted 0.1 at the root, and the board evaluation of
             // the temporary creature outbid it (Rakdos Keyrune tapping itself
             // for {B} every upkeep, Medium+).
+            //
+            // A repeat (the source is already a creature, or one of its
+            // activations is still on the stack) keeps the critical penalty
+            // instead: the repeat can be worth its own triggers (Elrond, a
+            // regeneration shield, counters), and `repeat_gains_nothing` above
+            // already vetoes the empty repeat.
+            let is_repeat = obj.card_types.core_types.contains(&CoreType::Creature)
+                || ctx.state.stack.iter().any(|entry| {
+                    matches!(
+                        &entry.kind,
+                        engine::types::game_state::StackEntryKind::ActivatedAbility {
+                            source_id: pending,
+                            ..
+                        } if pending == source_id
+                    )
+                });
+            if is_repeat {
+                return PolicyVerdict::critical(
+                    -super::registry::CRITICAL_MAX,
+                    PolicyReason::new("land_animation_tapped"),
+                );
+            }
             return PolicyVerdict::reject(PolicyReason::new("land_animation_tapped"));
         }
 
