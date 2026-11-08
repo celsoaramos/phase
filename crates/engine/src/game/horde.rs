@@ -1302,6 +1302,7 @@ fn free_cast_ability(card_id: ObjectId, horde: PlayerId) -> ResolvedAbility {
             mana_spend_permission: None,
             additional_cost: None,
             cast_cost_modifier: None,
+            caster: TargetFilter::Controller,
         },
         vec![TargetRef::Object(card_id)],
         card_id,
