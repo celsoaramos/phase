@@ -54,6 +54,7 @@ mod curse_of_hospitality_9213;
 mod curse_of_predation_attacks_enchanted_player_4744;
 mod cybership_combat_damage_manifest;
 mod dalkovan_encampment_attack_trigger;
+mod damage_as_counters_counter_added_trigger;
 mod dandan_custom_pile;
 mod dandan_filter_owner_axis;
 mod dandan_hand_entry_ownership;

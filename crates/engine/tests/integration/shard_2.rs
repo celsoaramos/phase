@@ -352,7 +352,6 @@ mod curse_static_effects;
 mod curse_upkeep_triggers;
 mod custom_format_schema;
 mod cut_a_deal_draw_this_way_count;
-mod damage_as_counters_counter_added_trigger;
 mod damage_done_once_by_controller_player_recipients;
 mod damage_prevention_formula;
 mod damage_redirect_target_constraints;
