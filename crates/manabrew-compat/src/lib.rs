@@ -22,6 +22,7 @@ use engine::game::turn_control;
 use engine::types::ability::TargetRef;
 use engine::types::card::CardFace;
 use engine::types::casting_costs::{CostReductionEntry, CostReductionOutcome};
+use engine::types::format::SharedZones;
 use engine::types::game_state::{
     GameState, ManaChoice, ManaChoicePrompt, MulliganDecisionPhase, PendingMulliganAction,
     ShardChoice, StackEntryKind, WaitingFor,
@@ -635,6 +636,13 @@ pub fn prepare_snapshot_with_prompt_id(
             count: raw_state.players.len(),
         });
     }
+    // `ZoneDto` is one entry per (zone, owner) pair, so a library or graveyard
+    // shared by every seat has no owner to be reported under.
+    if raw_state.format_config.format.shared_zones() != SharedZones::NONE {
+        return Err(AdapterError::UnsupportedProtocolFeature {
+            code: "upstream.shared-zone-ownership-missing",
+        });
+    }
 
     let (actions, spell_costs, legal_actions_by_object) =
         legal_actions_for_viewer(raw_state, viewer);
@@ -683,7 +691,7 @@ pub fn unsupported_protocol_capabilities() -> &'static [UnsupportedCapability] {
 /// `upstream.` = the protocol has no primitive for something the engine can do.
 /// `local.` = the protocol has the primitive but this engine cannot source it,
 /// or a documented adapter-local extension is intentionally in use.
-static UNSUPPORTED_PROTOCOL_CAPABILITIES: [UnsupportedCapability; 93] = [
+static UNSUPPORTED_PROTOCOL_CAPABILITIES: [UnsupportedCapability; 95] = [
     UnsupportedCapability {
         code: "upstream.object-selection-missing",
         area: "prompts",
@@ -1154,6 +1162,12 @@ static UNSUPPORTED_PROTOCOL_CAPABILITIES: [UnsupportedCapability; 93] = [
         suggested_protocol_extension: "Covered by the special-action kind proposed on local.planar-die-unsupported; the pre-game declaration additionally needs a prompt point before the first turn.",
     },
     UnsupportedCapability {
+        code: "local.secret-agenda-unsupported",
+        area: "actions",
+        reason: "CR 702.106a: an agenda may name any card, and the protocol has no text-answer family, so WaitingFor::SecretAgendaChoice is served as a ChooseFromSelection over GameState::all_card_names. Two cases remain refused under this code. A host that never loaded the card database has an empty name universe, so the prompt would have no legal answer and fails closed instead. GameAction::ChooseSecretAgendaNames carries the names themselves and is answered only through that prompt, so it has no ChooseAction entry.",
+        suggested_protocol_extension: "The text-answer family proposed on local.named-choice-unsupported would replace the card-name universe on the wire with a typed answer.",
+    },
+    UnsupportedCapability {
         code: "local.end-continuous-effect-unsupported",
         area: "actions",
         reason: "Phase exposes GameAction::EndContinuousEffect with the exact effect group and cost, but AvailableActionKind has no special-action kind, so the adapter cannot advertise that choice without misclassifying it as a cast or activated ability.",
@@ -1266,6 +1280,12 @@ static UNSUPPORTED_PROTOCOL_CAPABILITIES: [UnsupportedCapability; 93] = [
         area: "actions",
         reason: "ActivatableAbilityInfo::is_class_level_up has no direct engine source. GameAction::ActivateAbility carries only source_id and ability_index; classifying an activation by inspecting its lowered ability definition would re-interpret engine state in this adapter. The field is therefore left None.",
         suggested_protocol_extension: "No protocol change: have the engine include an explicit class-level-up presentation flag with each activatable ability.",
+    },
+    UnsupportedCapability {
+        code: "upstream.shared-zone-ownership-missing",
+        area: "formats",
+        reason: "Searched manabrew-protocol 5.2.0 for a table-level or ownerless zone and found none: the ZoneDto layout is documented as \"One entry per (zone, owner) pair\" and build_zones reads player.library, player.graveyard and player.hand once per seat, so a library or graveyard shared by every seat cannot be reported under any one owner without misstating the other seat's zone. MulliganOutput in 5.2.0 has the single variant MulliganDecision { keep: bool } (plus this adapter's local Serum Powder extension), so a free mulligan taken by revealing a hand has no output either. GameFormat::shared_zones() is the engine answer, and Dandan is the only built-in format whose answer is not SharedZones::NONE; prepare_snapshot refuses such a state.",
+        suggested_protocol_extension: "Add a table-level owner for a shared ZoneDto, and a reveal-hand free-mulligan output beside MulliganOutput::MulliganDecision.",
     },
 ];
 
@@ -1765,7 +1785,9 @@ fn build_prompt_input(
         // `CollectedCostModifiers::generic_only_units` as bare `{1}` multipliers
         // and never become snapshot entries, and `order_relevant_reductions`
         // additionally keeps only shard-bearing amounts. So every entry here is
-        // a `Static` or a `Defiler`, and both carry a `display_name`.
+        // a `Static`, a `Defiler` or the reduction an Emerge or Offering
+        // sacrifice earned (`SacrificedForCost`), and each carries a
+        // `display_name`.
         WaitingFor::OrderCostReductions {
             reductions,
             hybrid_symbols,
@@ -1807,6 +1829,25 @@ fn build_prompt_input(
         }
         WaitingFor::CombatTaxPayment { .. } => {
             unsupported_prompt(waiting_for, "local.pay-combat-cost-unsupported")
+        }
+        // CR 702.106a + CR 702.106f: the interaction projection publishes this
+        // choice as typed text, a shape no prompt family carries. The legal
+        // answers are still a finite list — the reducer accepts only a known card
+        // name — so the whole list is the option set. Double agenda's "two
+        // different cards" stays with the reducer, which also treats two
+        // spellings of one name as the same card.
+        WaitingFor::SecretAgendaChoice { name_count, .. } => {
+            let names = &prepared.state.all_card_names;
+            if names.is_empty() {
+                return unsupported_prompt(waiting_for, "local.secret-agenda-unsupported");
+            }
+            let name_count = usize::from(*name_count);
+            Ok(PromptInput::ChooseFromSelection(ChooseFromSelectionInput {
+                presentation: presentation("Secretly choose a card name for your agenda"),
+                options: names.iter().cloned().map(selection_option).collect(),
+                min_total: name_count,
+                max_total: name_count,
+            }))
         }
         _ => interaction_prompt(prepared, card_lookup),
     }
@@ -2504,6 +2545,21 @@ pub fn translate_response(
                     }),
                 }
             }
+            // CR 702.106a: the prompt's options are `all_card_names`, in order, so
+            // each index names a card outright. The count and the distinct-names
+            // rule are the reducer's, as they are for every other submission.
+            WaitingFor::SecretAgendaChoice { .. } => Ok(GameAction::ChooseSecretAgendaNames {
+                names: chosen_indices
+                    .iter()
+                    .map(|index| {
+                        state.all_card_names.get(*index).cloned().ok_or(
+                            AdapterError::IllegalResponseForPrompt {
+                                response_kind: "chooseFromSelection",
+                            },
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            }),
             _ => interaction_selection_action(state, context.deciding_player, &chosen_indices),
         },
         UpstreamPromptOutput::ChooseColor(ChooseColorOutput::ColorDecision { chosen_colors }) => {
@@ -2695,6 +2751,7 @@ pub fn convert_available_action(
         GameAction::ActivateAbility {
             source_id,
             ability_index,
+            ..
         } => AvailableActionConversion::Available(AvailableAction {
             id,
             kind: AvailableActionKind::ActivateAbility(ActivatableAbilityInfo {
@@ -2809,7 +2866,7 @@ pub fn convert_available_action(
         GameAction::SelectTargets { .. } | GameAction::ChooseTarget { .. } => {
             AvailableActionConversion::Skip
         }
-        GameAction::ChooseReplacement { .. } => {
+        GameAction::ChooseReplacement { .. } | GameAction::ChooseReplacementAndRemember { .. } => {
             AvailableActionConversion::Unsupported("local.replacement-choice-unsupported")
         }
         // Answered through the Reorder prompt for `WaitingFor::OrderTriggers`.
@@ -2952,6 +3009,10 @@ pub fn convert_available_action(
         GameAction::DeclareCompanion { .. } | GameAction::CompanionToHand => {
             AvailableActionConversion::Unsupported("local.companion-unsupported")
         }
+        // CR 702.106a: answered only through the agenda's own selection prompt.
+        GameAction::ChooseSecretAgendaNames { .. } => {
+            AvailableActionConversion::Unsupported("local.secret-agenda-unsupported")
+        }
         // CR 116.2c: the pay-to-end special action has no Manabrew counterpart.
         GameAction::EndContinuousEffect { .. } => {
             AvailableActionConversion::Unsupported("local.end-continuous-effect-unsupported")
@@ -2978,6 +3039,8 @@ pub fn convert_available_action(
         | GameAction::SetPriorityPassingMode { .. }
         | GameAction::SetPriorityYield { .. }
         | GameAction::SetMayTriggerAutoChoice { .. }
+        | GameAction::SetReplacementAutoChoice { .. }
+        | GameAction::UnAction { .. }
         | GameAction::SetTriggerOrderTemplate { .. } => {
             AvailableActionConversion::Unsupported("local.autopass-settings-unsupported")
         }
@@ -3162,8 +3225,13 @@ fn object_vec_from_slice<L: CardTextLookup>(
 /// `filter_state_for_viewer` conceals by rewriting the object in place — name
 /// becomes `"Hidden Card"` and `face_down` is set — rather than by removing it,
 /// which is what lets `ZoneDto::count` stay truthful.
+///
+/// CR 702.106a: a face-down conspiracy in the command zone is the one case where
+/// `face_down` says nothing about the viewer. Its controller may look at it, so
+/// the filter projects its identity for them and renames it only for everyone
+/// else, which leaves the name as the sole verdict for that zone.
 fn is_concealed(object: &GameObject) -> bool {
-    object.name == HIDDEN_CARD_NAME || object.face_down
+    object.name == HIDDEN_CARD_NAME || (object.face_down && object.zone != Zone::Command)
 }
 
 const HIDDEN_CARD_NAME: &str = "Hidden Card";
@@ -3552,7 +3620,7 @@ fn build_player_dto(
         is_human: player.id == viewer,
         life: player.life,
         counters,
-        mana_pool: mana_pool_counts(&player.mana_pool.mana),
+        mana_pool: mana_pool_counts(&player.mana_pool),
         commander_damage,
         has_city_blessing: state.city_blessing.contains(&player_id),
         has_enduring_story: state.enduring_story.contains(&player_id),
@@ -3995,6 +4063,7 @@ pub fn convert_payment_action(action: &GameAction, id: String) -> PaymentActionC
         GameAction::ActivateAbility {
             source_id,
             ability_index,
+            ..
         } => PaymentActionConversion::Available(PaymentAction {
             id,
             kind: PaymentActionKind::ActivateManaAbility(ActivatableAbilityInfo {
@@ -4585,10 +4654,10 @@ fn parse_attack_target_id(value: &str) -> Result<AttackTarget> {
 }
 
 /// CR 106.4: the viewer's floating mana, one entry per color actually held.
-fn mana_pool_counts(units: &[engine::types::mana::ManaUnit]) -> BTreeMap<ManaColorDto, u32> {
+fn mana_pool_counts(pool: &engine::types::mana::ManaPool) -> BTreeMap<ManaColorDto, u32> {
     let mut counts = BTreeMap::new();
-    for unit in units {
-        *counts.entry(mana_color_dto(unit.color)).or_insert(0) += 1;
+    for (shape, count) in pool.shapes() {
+        *counts.entry(mana_color_dto(shape.color)).or_insert(0) += count as u32;
     }
     counts
 }
@@ -4858,6 +4927,7 @@ fn waiting_for_type(waiting_for: &WaitingFor) -> &'static str {
         WaitingFor::CombatTaxPayment { .. } => "CombatTaxPayment",
         WaitingFor::ChooseManaColor { .. } => "ChooseManaColor",
         WaitingFor::PayManaAbilityMana { .. } => "PayManaAbilityMana",
+        WaitingFor::ManaAbilityManaPayment { .. } => "ManaAbilityManaPayment",
         WaitingFor::GameOver { .. } => "GameOver",
         _ => "Unsupported",
     }
@@ -4868,6 +4938,8 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    use engine::game::conspiracy::{pending_agenda_choice, start_with_conspiracy};
+    use engine::game::engine::apply_as_current;
     use engine::game::game_object::BackFaceData;
     use engine::game::interaction::bind_interaction_authority;
     use engine::game::zones::create_object;
@@ -4875,6 +4947,7 @@ mod tests {
         CounterTriggerFilter, Effect, EffectKind, ResolvedAbility, TargetFilter, TriggerDefinition,
     };
     use engine::types::card::LayoutKind;
+    use engine::types::card_type::CoreType;
     use engine::types::counter::CounterType;
     use engine::types::game_state::{
         MulliganDecisionEntry, MulliganDecisionPhase, OutsideGameChoiceEntry,
@@ -5451,6 +5524,44 @@ mod tests {
         assert_eq!(entry["damage"], 2);
         assert_eq!(entry["counters"]["P1P1"], 3);
         assert_eq!(entry["isFaceDown"], true);
+    }
+
+    /// CR 702.106a: the controller may look at their face-down conspiracy, so
+    /// only the opponent's entry is a card back. `face_down` is true on both.
+    #[test]
+    fn face_down_conspiracy_is_identified_only_for_its_controller() {
+        let mut state = GameState::new_two_player(7);
+        let id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Brago's Favor".to_string(),
+            Zone::Exile,
+        );
+        state
+            .objects
+            .get_mut(&id)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Conspiracy);
+        state.exile.retain(|object| *object != id);
+        start_with_conspiracy(&mut state, id, true);
+
+        let controller_view = zones_of(&state, PlayerId(0));
+        let controller_entry = &find_zone(&controller_view, "command", "player-0")["cards"][0];
+        assert_eq!(controller_entry["visibility"], "visible");
+        assert_eq!(controller_entry["identity"]["name"], "Brago's Favor");
+        assert_eq!(controller_entry["types"][0], "Conspiracy");
+        assert_eq!(controller_entry["isFaceDown"], true);
+
+        let opponent_view = zones_of(&state, PlayerId(1));
+        let opponent_entry = &find_zone(&opponent_view, "command", "player-0")["cards"][0];
+        assert_eq!(opponent_entry["visibility"], "visible");
+        assert_eq!(opponent_entry["identity"]["name"], "");
+        assert_eq!(opponent_entry["text"], "");
+        assert_eq!(opponent_entry["types"], serde_json::json!([]));
+        assert_eq!(opponent_entry["isFaceDown"], true);
     }
 
     /// Counter keys are the engine's serialization form ("P1P1"), not the
@@ -6045,6 +6156,13 @@ mod tests {
         let exert = prepared_for(WaitingFor::ExertChoice {
             player: PlayerId(0),
             attacker: ObjectId(1),
+            permission: engine::types::ability::TriggerDefinitionRef {
+                source: engine::types::identifiers::ObjectIncarnationRef::of(ObjectId(1), 0),
+                occurrence: engine::types::ability::TriggerDefinitionOccurrenceRef::Printed {
+                    base_set: engine::types::ability::TriggerBaseSetInstanceRef::INITIAL,
+                    printed_index: 0,
+                },
+            },
             remaining: vec![],
         });
         assert_eq!(
@@ -6088,17 +6206,20 @@ mod tests {
                 "mulligan",
                 WaitingFor::MulliganDecision {
                     pending: vec![MulliganDecisionEntry {
+                        free_reveals_taken: 0,
                         player: PlayerId(0),
                         mulligan_count: 1,
                         phase: MulliganDecisionPhase::Declare,
                     }],
                     free_first_mulligan: false,
+                    declared: Vec::new(),
                 },
             ),
             (
                 "mulliganPutBack",
                 WaitingFor::MulliganDecision {
                     pending: vec![MulliganDecisionEntry {
+                        free_reveals_taken: 0,
                         player: PlayerId(0),
                         mulligan_count: 1,
                         phase: MulliganDecisionPhase::BottomCards {
@@ -6107,6 +6228,7 @@ mod tests {
                         },
                     }],
                     free_first_mulligan: false,
+                    declared: Vec::new(),
                 },
             ),
             (
@@ -6269,6 +6391,156 @@ mod tests {
         ));
     }
 
+    const AGENDA_CARD_NAMES: [&str; 3] = ["Grizzly Bears", "Lightning Bolt", "Opt"];
+
+    /// A two-player game paused on `name_count` secret names for a face-down
+    /// conspiracy `PlayerId(0)` owns, with the card database's names loaded.
+    fn agenda_state(name_count: u8) -> (GameState, ObjectId) {
+        let mut state = GameState::new_two_player(7);
+        state.all_card_names = AGENDA_CARD_NAMES
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>()
+            .into();
+        let id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Brago's Favor".to_string(),
+            Zone::Exile,
+        );
+        let object = state.objects.get_mut(&id).unwrap();
+        object.card_types.core_types.push(CoreType::Conspiracy);
+        object.agenda_name_count = name_count;
+        state.exile.retain(|object| *object != id);
+        start_with_conspiracy(&mut state, id, true);
+        state.waiting_for = pending_agenda_choice(&state).expect("the agenda is unnamed");
+        (state, id)
+    }
+
+    fn agenda_selection(state: &GameState, chosen_indices: Vec<usize>) -> Result<GameAction> {
+        let prepared = prepare_snapshot_with_prompt_id(state, PlayerId(0), "game-a", 42).unwrap();
+        translate_response(
+            42,
+            PromptOutput::ChooseFromSelection(ChooseFromSelectionOutput::SelectionDecision {
+                chosen_indices,
+            }),
+            &prepared.prompt_context(),
+            state,
+        )
+    }
+
+    #[test]
+    fn secret_agenda_prompt_offers_every_card_name_for_the_required_count() {
+        for name_count in [1u8, 2] {
+            let (state, _) = agenda_state(name_count);
+            let prepared =
+                prepare_snapshot_with_prompt_id(&state, PlayerId(0), "game-a", 42).unwrap();
+            let prompt = build_prompt(&prepared, &lookup).unwrap();
+            let PromptInput::Upstream(UpstreamPromptInput::ChooseFromSelection(input)) =
+                prompt.input
+            else {
+                panic!("an agenda is a selection over card names");
+            };
+
+            assert_eq!(
+                input
+                    .options
+                    .iter()
+                    .map(|option| option.label.as_str())
+                    .collect::<Vec<_>>(),
+                AGENDA_CARD_NAMES,
+            );
+            assert!(input.options.iter().all(|option| !option.can_repeat));
+            assert_eq!(
+                (input.min_total, input.max_total),
+                (usize::from(name_count), usize::from(name_count)),
+            );
+        }
+    }
+
+    /// The prompt is the chooser's alone: the opponent has no prompt to read the
+    /// name universe or the count from.
+    #[test]
+    fn secret_agenda_prompt_is_served_only_to_the_chooser() {
+        let (state, _) = agenda_state(1);
+        let opponent = prepare_snapshot_with_prompt_id(&state, PlayerId(1), "game-a", 42).unwrap();
+
+        assert!(matches!(
+            build_prompt(&opponent, &lookup),
+            Err(AdapterError::NoAuthorizedPrompt { .. })
+        ));
+    }
+
+    /// With no name universe the prompt could not be answered, so it is refused
+    /// rather than served with no legal selection.
+    #[test]
+    fn secret_agenda_prompt_without_card_names_fails_closed() {
+        let (mut state, _) = agenda_state(1);
+        state.all_card_names = Vec::new().into();
+        let prepared = prepare_snapshot_with_prompt_id(&state, PlayerId(0), "game-a", 42).unwrap();
+
+        assert!(matches!(
+            build_prompt(&prepared, &lookup),
+            Err(AdapterError::UnsupportedPrompt {
+                code: "local.secret-agenda-unsupported",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn secret_agenda_selection_records_the_chosen_names_through_the_engine() {
+        let (mut state, id) = agenda_state(2);
+
+        let action = agenda_selection(&state, vec![2, 0]).unwrap();
+        assert_eq!(
+            action,
+            GameAction::ChooseSecretAgendaNames {
+                names: vec!["Opt".to_string(), "Grizzly Bears".to_string()],
+            }
+        );
+
+        apply_as_current(&mut state, action).unwrap();
+        assert_eq!(
+            state.objects[&id].secret_chosen_names,
+            vec!["Opt".to_string(), "Grizzly Bears".to_string()],
+        );
+        assert!(!matches!(
+            state.waiting_for,
+            WaitingFor::SecretAgendaChoice { .. }
+        ));
+    }
+
+    #[test]
+    fn secret_agenda_selection_outside_the_options_is_illegal() {
+        let (state, _) = agenda_state(1);
+
+        assert!(matches!(
+            agenda_selection(&state, vec![AGENDA_CARD_NAMES.len()]),
+            Err(AdapterError::IllegalResponseForPrompt {
+                response_kind: "chooseFromSelection"
+            })
+        ));
+    }
+
+    /// CR 702.106f: the adapter leaves "two different cards" and the name count to
+    /// the reducer, which is what refuses each of these.
+    #[test]
+    fn secret_agenda_reducer_rejects_a_repeated_name_and_a_short_answer() {
+        for chosen_indices in [vec![1, 1], vec![1]] {
+            let (mut state, id) = agenda_state(2);
+
+            let action = agenda_selection(&state, chosen_indices).unwrap();
+            assert!(apply_as_current(&mut state, action).is_err());
+            assert!(state.objects[&id].secret_chosen_names.is_empty());
+            assert!(matches!(
+                state.waiting_for,
+                WaitingFor::SecretAgendaChoice { .. }
+            ));
+        }
+    }
+
     /// The generic path: a waiting state with no bespoke arm is now prompted
     /// from the engine's own projection instead of being refused.
     ///
@@ -6294,6 +6566,7 @@ mod tests {
         state.waiting_for = WaitingFor::TopOrBottomChoice {
             player: PlayerId(0),
             object_id,
+            top_position: Default::default(),
         };
         bind_interaction_authority(&mut state, InteractionSessionId("generic-path".to_string()))
             .expect("valid interaction authority binding");
@@ -6327,6 +6600,39 @@ mod tests {
         )
         .expect("the echoed index resolves back through the engine");
         assert_eq!(action, GameAction::ChooseTopOrBottom { top: true });
+    }
+
+    /// CR 401.7: for "second from the top or on the bottom" the projected "top"
+    /// label must name the slot instead of reading as plain "top".
+    #[test]
+    fn nth_from_top_choice_is_labelled_with_its_position() {
+        let mut state = GameState::new_two_player(7);
+        let object_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Tucked Card".to_string(),
+            Zone::Library,
+        );
+        state.waiting_for = WaitingFor::TopOrBottomChoice {
+            player: PlayerId(0),
+            object_id,
+            top_position: engine::types::ability::LibraryPosition::NthFromTop { n: 2 },
+        };
+        bind_interaction_authority(&mut state, InteractionSessionId("nth-top".to_string()))
+            .expect("valid interaction authority binding");
+        let prepared = prepare_snapshot_with_prompt_id(&state, PlayerId(0), "game-a", 42).unwrap();
+        let prompt = build_prompt_input(&prepared, &lookup).expect("projection prompt");
+        let PromptInput::Upstream(UpstreamPromptInput::ChooseFromSelection(input)) = prompt else {
+            panic!("expected ChooseFromSelection, got {prompt:?}");
+        };
+        let labels: Vec<_> = input.options.iter().map(|o| o.label.clone()).collect();
+        assert!(
+            labels.iter().any(|l| l == "position 2 from the top")
+                && labels.iter().any(|l| l == "bottom")
+                && !labels.iter().any(|l| l == "top"),
+            "got {labels:?}"
+        );
     }
 
     /// The `Select` half of the generic path: a subset choice, not a one-of.
@@ -6770,6 +7076,7 @@ mod tests {
         state.waiting_for = WaitingFor::TopOrBottomChoice {
             player: PlayerId(0),
             object_id,
+            top_position: Default::default(),
         };
 
         let prepared = prepare_snapshot_with_prompt_id(&state, PlayerId(0), "game-a", 42).unwrap();
@@ -7901,11 +8208,13 @@ mod tests {
         let mut state = GameState::new_two_player(7);
         state.waiting_for = WaitingFor::MulliganDecision {
             pending: vec![MulliganDecisionEntry {
+                free_reveals_taken: 0,
                 player: PlayerId(0),
                 mulligan_count: 0,
                 phase: MulliganDecisionPhase::Declare,
             }],
             free_first_mulligan: false,
+            declared: Vec::new(),
         };
 
         assert!(matches!(
@@ -7955,11 +8264,13 @@ mod tests {
         );
         state.waiting_for = WaitingFor::MulliganDecision {
             pending: vec![MulliganDecisionEntry {
+                free_reveals_taken: 0,
                 player: PlayerId(0),
                 mulligan_count: 0,
                 phase: MulliganDecisionPhase::Declare,
             }],
             free_first_mulligan: false,
+            declared: Vec::new(),
         };
 
         assert!(matches!(
@@ -7979,6 +8290,7 @@ mod tests {
 
         state.waiting_for = WaitingFor::MulliganDecision {
             pending: vec![MulliganDecisionEntry {
+                free_reveals_taken: 0,
                 player: PlayerId(0),
                 mulligan_count: 1,
                 phase: MulliganDecisionPhase::BottomCards {
@@ -7987,6 +8299,7 @@ mod tests {
                 },
             }],
             free_first_mulligan: false,
+            declared: Vec::new(),
         };
         let prepared = prepare_snapshot_with_prompt_id(&state, PlayerId(0), "game-a", 7).unwrap();
         let PromptInput::MulliganPutBack(input) = build_prompt_input(&prepared, &lookup).unwrap()
@@ -8720,13 +9033,13 @@ mod tests {
     #[test]
     fn unsupported_capability_registry_is_well_formed() {
         let capabilities = unsupported_protocol_capabilities();
-        assert_eq!(capabilities.len(), 93);
+        assert_eq!(capabilities.len(), 95);
 
         let codes: HashSet<_> = capabilities
             .iter()
             .map(|capability| capability.code)
             .collect();
-        assert_eq!(codes.len(), 93, "capability codes must be unique");
+        assert_eq!(codes.len(), 95, "capability codes must be unique");
 
         for capability in capabilities {
             assert!(
@@ -8962,6 +9275,32 @@ mod tests {
         ));
     }
 
+    /// A format whose library and graveyard are shared by every seat cannot be
+    /// reported by the one-owner-per-zone protocol, so preparation refuses it
+    /// with a code the registry declares.
+    #[test]
+    fn prepare_snapshot_refuses_a_format_with_shared_zones() {
+        // Reach-guard: the same two-player state prepares under the stock
+        // format, so the refusal below is the shared-zone guard and not the
+        // player-count guard.
+        let stock = GameState::new_two_player(7);
+        assert!(prepare_snapshot(&stock, PlayerId(0), "game-x").is_ok());
+
+        let mut shared = GameState::new_two_player(7);
+        shared.format_config = engine::types::format::FormatConfig::dandan();
+        assert_eq!(shared.players.len(), 2);
+        let refusal = prepare_snapshot(&shared, PlayerId(0), "game-x").unwrap_err();
+        assert_eq!(
+            refusal,
+            AdapterError::UnsupportedProtocolFeature {
+                code: "upstream.shared-zone-ownership-missing"
+            }
+        );
+        assert!(unsupported_protocol_capabilities()
+            .iter()
+            .any(|capability| capability.code == "upstream.shared-zone-ownership-missing"));
+    }
+
     /// Both vendor extensions are deliberate, but their safety arguments differ.
     ///
     /// `excludedCardId` is genuinely additive: `MulliganPutBackInput` has no
@@ -9163,6 +9502,7 @@ mod tests {
             .act(GameAction::ActivateAbility {
                 source_id: source,
                 ability_index: 0,
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
             })
             .expect("the activation reaches its election");
         let state = runner.state().clone();

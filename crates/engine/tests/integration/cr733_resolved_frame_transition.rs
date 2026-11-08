@@ -44,11 +44,12 @@ fn coin_flip_frame() -> ResolutionFrame {
         source_id: ObjectId(91),
         controller: PlayerId(0),
         flipper: PlayerId(0),
-        targets: Vec::new(),
         win_effect: None,
         lose_effect: None,
-        kind: PendingCoinFlipKind::Single,
+        kind: PendingCoinFlipKind::Exactly { remaining: 0 },
         chain_root_targets: Vec::new(),
+        branch_context: Default::default(),
+        trigger_context: None,
     })
 }
 
@@ -58,6 +59,7 @@ fn optional_effect_frame(state: &GameState) -> ResolutionFrame {
         trigger_event: None,
         trigger_events: Vec::new(),
         trigger_match_count: None,
+        return_result_occurrence: None,
     })
 }
 
@@ -166,6 +168,7 @@ fn optional_effect_frame_cannot_survive_into_search_choice_parent_insertion() {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         }));
     state.waiting_for = WaitingFor::SearchChoice {
         player: PlayerId(0),
