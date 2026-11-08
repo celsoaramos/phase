@@ -1486,10 +1486,12 @@ fn parse_single_cost_in(text: &str, channel: CostChannel) -> AbilityCost {
                     TargetFilter::SelfRef => AbilityCost::Reveal {
                         count: QuantityExpr::Fixed { value: 1 },
                         filter: None,
+                        shared_quality: None,
                     },
                     other => AbilityCost::Reveal {
                         count: QuantityExpr::Fixed { value: 1 },
                         filter: Some(other),
+                        shared_quality: None,
                     },
                 };
             }
