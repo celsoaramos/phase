@@ -7153,6 +7153,7 @@ mod tests {
             ResolvedAbility::new(
                 Effect::CastFromZone {
                     target,
+                    caster: crate::types::ability::TargetFilter::Controller,
                     without_paying_mana_cost: true,
                     mode: CardPlayMode::Play,
                     cast_transformed: false,
