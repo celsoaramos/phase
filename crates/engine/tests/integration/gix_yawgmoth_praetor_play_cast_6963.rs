@@ -87,6 +87,7 @@ fn gix_lowers_one_play_window_over_the_exiled_batch() {
         &*nodes[1].effect,
         &Effect::CastFromZone {
             target: TargetFilter::ExiledBySource,
+            caster: TargetFilter::Controller,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Play,
             cast_transformed: false,
