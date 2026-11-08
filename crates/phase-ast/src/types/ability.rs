@@ -17354,6 +17354,7 @@ impl StaticCondition {
             | StaticCondition::Unrecognized { .. }
             | StaticCondition::DuringYourTurn
             | StaticCondition::DuringOpponentsTurn
+            | StaticCondition::DuringYourEndStep
             | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
             | StaticCondition::SourceEnteredThisTurn
             | StaticCondition::SourceHasDealtDamage
@@ -17829,6 +17830,7 @@ impl StaticCondition {
             | StaticCondition::Unrecognized { .. }
             | StaticCondition::DuringYourTurn
             | StaticCondition::DuringOpponentsTurn
+            | StaticCondition::DuringYourEndStep
             | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
             | StaticCondition::SourceEnteredThisTurn
             | StaticCondition::SourceHasDealtDamage
