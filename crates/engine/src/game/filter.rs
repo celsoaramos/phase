@@ -9430,26 +9430,27 @@ fn source_context_from_filter<'a>(
                 attachments: Vec::new(),
                 intensity: 0,
             });
+        // CR 608.2h + CR 113.7a: "enchanted/equipped creature" of a source that has
+        // left the battlefield (Uneasy Alliance sacrificed as its own cost) is the
+        // object it was attached to as it last existed there. The live back-reference
+        // was cleared by the zone-exit sever, so read the departure row instead.
+        // Only an Aura or Equipment has an "enchanted/equipped" referent, so the
+        // ledger scan is skipped for every other off-battlefield source (hand and
+        // stack spells enumerated per candidate).
+        let attached_to = match source_obj {
+            Some(source) if source.zone == Zone::Battlefield => source.attached_to,
+            _ if lki
+                .subtypes
+                .iter()
+                .any(|subtype| subtype == "Aura" || subtype == "Equipment") =>
+            {
+                departed_source_attached_to(state, source_id, ability)
+            }
+            _ => None,
+        };
         (
             lki,
-            // CR 608.2h + CR 113.7a: "enchanted/equipped creature" of a source that has
-            // left the battlefield (Uneasy Alliance sacrificed as its own cost) is the
-            // object it was attached to as it last existed there. The live back-reference
-            // was cleared by the zone-exit sever, so read the departure row instead.
-            // Only an Aura or Equipment has an "enchanted/equipped" referent, so the
-            // ledger scan is skipped for every other off-battlefield source (hand and
-            // stack spells enumerated per candidate).
-            match source_obj {
-                Some(source) if source.zone == Zone::Battlefield => source.attached_to,
-                _ if lki
-                    .subtypes
-                    .iter()
-                    .any(|subtype| subtype == "Aura" || subtype == "Equipment") =>
-                {
-                    departed_source_attached_to(state, source_id, ability)
-                }
-                _ => None,
-            },
+            attached_to,
             source_obj.map_or_else(Vec::new, |source| source.saddled_by.clone()),
             source_obj.map_or_else(Vec::new, |source| source.convoked_creatures.clone()),
         )
