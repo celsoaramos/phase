@@ -132,7 +132,7 @@ fn drive(
             }
             WaitingFor::ManaPayment { .. } => runner.act(GameAction::PassPriority),
             WaitingFor::PayCost {
-                kind: PayCostKind::Reveal,
+                kind: PayCostKind::Reveal { .. },
                 ..
             } => {
                 trace.saw_reveal_prompt = true;
@@ -204,7 +204,7 @@ fn illuminated_folio_share_a_color_is_not_activatable() {
         .iter()
         .any(|cost| matches!(
             cost,
-            AbilityCost::Reveal { count, filter }
+            AbilityCost::Reveal { count, filter, .. }
                 if matches!(count, QuantityExpr::Ref { qty: QuantityRef::Variable { .. } }) && has_color(filter, ManaColor::White)
         )));
 
@@ -288,6 +288,7 @@ fn spirit_en_dal_forecast_reveals_itself() {
         cost_parts(&cost).contains(&AbilityCost::Reveal {
             count: QuantityExpr::Fixed { value: 1 },
             filter: None,
+            shared_quality: None,
         }),
         "forecast reveals the source itself, got {cost:?}"
     );
