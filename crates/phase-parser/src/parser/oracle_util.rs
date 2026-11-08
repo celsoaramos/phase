@@ -1800,6 +1800,8 @@ fn follows_population_quantifier(haystack: &str, pos: usize) -> bool {
     ["each", "another", "other"]
         .iter()
         .any(|quantifier| last_word.eq_ignore_ascii_case(quantifier))
+}
+
 /// nom combinator: an article or quantifier that introduces a type noun phrase
 /// ("a", "an", "another", "other", "target", "each", "all", "any"). Longest
 /// match first within shared prefixes ("another"/"any"/"an" before "a").
