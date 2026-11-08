@@ -176,6 +176,7 @@ mod mana_burn;
 mod master_of_the_wild_hunt;
 mod maze_of_ith_untap_bidirectional_prevent;
 mod mbaku_attacked_monarch_intervening_if;
+mod mf_relatos_20261030b;
 mod miles_obrien_returned_to_hand;
 mod min_blocker_floor_block_candidates_7183;
 mod mindblade_render_warrior_intervening_if_2867;
