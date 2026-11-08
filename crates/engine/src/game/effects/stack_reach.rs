@@ -10,12 +10,11 @@ use crate::game::functioning_abilities::active_replacements;
 use crate::game::replacement::{find_applicable_replacements, replacement_registry};
 use crate::game::{stack, targeting};
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, Effect, EffectOutcomeSignal, EffectScope, ObjectScope,
-    ResolvedAbility, TapStateChange, TargetFilter, TargetRef,
+    AbilityCondition, Effect, EffectOutcomeSignal, EffectScope, ObjectScope, ResolvedAbility,
+    TapStateChange, TargetFilter, TargetRef,
 };
 use crate::types::game_state::{GameState, StackEntry, StackEntryKind};
 use crate::types::identifiers::ObjectId;
-use crate::types::mana::ManaCost;
 use crate::types::proposed_event::{CounterPlacement, ProposedEvent};
 use crate::types::replacements::ReplacementEvent;
 use crate::types::zones::Zone;
@@ -56,6 +55,8 @@ pub fn stack_entry_node_reach<'a>(state: &GameState, entry: &'a StackEntry) -> V
     let Some(root) = entry.ability() else {
         return Vec::new();
     };
+    #[cfg(feature = "test-support")]
+    crate::game::perf_counters::record_stack_entry_reach();
     let resolves_first: Vec<ObjectId> = state
         .stack
         .iter()
@@ -96,7 +97,7 @@ pub fn stack_entry_node_reach<'a>(state: &GameState, entry: &'a StackEntry) -> V
 /// controller), a required target that has not been chosen
 /// (`stack::has_missing_required_stack_targets`), or a CR 608.2b declared
 /// target that is no longer legal.
-fn resolution_board(
+pub(crate) fn resolution_board(
     state: &GameState,
     entry: &StackEntry,
     root: &ResolvedAbility,
@@ -252,23 +253,23 @@ impl Walk<'_> {
             node,
             acted_on: own,
         });
-        let children = [
-            (node.sub_ability.as_deref(), prepared.sub_ability.as_deref()),
-            (
-                node.else_ability.as_deref(),
-                prepared.else_ability.as_deref(),
-            ),
-        ];
-        for (index, (child, prepared_child)) in children.into_iter().enumerate() {
-            debug_assert_eq!(
-                child.is_some(),
+        for (edge, child) in node.child_links() {
+            let prepared_child = prepared
+                .child_links()
+                .find_map(|(prepared_edge, child)| (prepared_edge == edge).then_some(child));
+            debug_assert!(
                 prepared_child.is_some(),
-                "the resolution rewrites keep the chain's shape"
+                "resolution rewrites keep the chain's shape"
             );
-            let (Some(child), Some(prepared_child)) = (child, prepared_child) else {
+            let Some(prepared_child) = prepared_child else {
                 continue;
             };
-            if index == 0 && instead.is_some() {
+            let sequential = match edge {
+                crate::types::game_state::ChainStep::SubAbility => true,
+                crate::types::game_state::ChainStep::ElseAbility
+                | crate::types::game_state::ChainStep::CoinFlipBranch { .. } => false,
+            };
+            if sequential && instead.is_some() {
                 // What runs in this node's place when the swap happened. The
                 // nodes below it are not answered.
                 reaches.push(NodeReach {
@@ -278,10 +279,9 @@ impl Walk<'_> {
                 push_unanswered_below(child, reaches);
                 continue;
             }
-            // An `else_ability` runs when this node's condition is false or its
-            // "you may" is declined, and neither is answered.
+            // Neither an ordinary else nor an unselected coin outcome is answered.
             let handed = board
-                .filter(|_| index == 0)
+                .filter(|_| sequential)
                 .zip(written.clone())
                 .zip(handed_child(&performed, prepared_child));
             let Some(((child_board, written), child_bound)) = handed else {
@@ -325,20 +325,6 @@ impl Walk<'_> {
     fn runs(&self, board: &GameState, ability: &ResolvedAbility, before: &Before) -> Runs {
         if let Some(condition) = &ability.condition {
             if self.condition_holds(board, condition, ability, before) != Some(true) {
-                return Runs::No;
-            }
-        }
-        // The chain resolver treats an unless cost of {0} as paid, so a counter
-        // with one counters nothing and the rest of the entry does not run.
-        // Where no player would be asked, it counters; that answer is nothing
-        // here too.
-        if let Some(unless_pay) = &ability.unless_pay {
-            if matches!(ability.effect, Effect::Counter { .. })
-                && matches!(
-                    super::resolved_unless_cost(board, ability, &unless_pay.cost),
-                    AbilityCost::Mana { cost } if cost == ManaCost::zero()
-                )
-            {
                 return Runs::No;
             }
         }
@@ -410,10 +396,7 @@ impl Walk<'_> {
 
 /// `node`'s subtree below it, every node answering nothing.
 fn push_unanswered_below<'a>(node: &'a ResolvedAbility, reaches: &mut Vec<NodeReach<'a>>) {
-    for child in [node.sub_ability.as_deref(), node.else_ability.as_deref()]
-        .into_iter()
-        .flatten()
-    {
+    for (_, child) in node.child_links() {
         reaches.push(NodeReach {
             node: child,
             acted_on: Vec::new(),
@@ -439,15 +422,9 @@ fn resolves_once_as_bound(bound: &ResolvedAbility) -> bool {
 /// CR 608.2c: a node that replaces its parent's effect when its condition
 /// holds.
 fn is_instead_override(node: &ResolvedAbility) -> bool {
-    matches!(
-        node.condition,
-        Some(
-            AbilityCondition::AdditionalCostPaidInstead
-                | AbilityCondition::CastVariantPaidInstead { .. }
-                | AbilityCondition::TargetHasKeywordInstead { .. }
-                | AbilityCondition::ConditionInstead { .. }
-        )
-    )
+    node.condition
+        .as_ref()
+        .is_some_and(AbilityCondition::is_instead_override)
 }
 
 /// A condition that reads only what the entry's context recorded when it was
@@ -692,7 +669,7 @@ fn names_resolution_product(effect: &Effect) -> bool {
             super::filter_references_tracked_set(filter)
                 || crate::game::filter::filter_contains_last_created(filter)
                 || crate::game::filter::filter_contains_last_zone_changed(filter)
-                || crate::game::filter::filter_contains(filter, &|inner| {
+                || crate::types::ability::filter_contains(filter, &|inner| {
                     matches!(inner, TargetFilter::LastRevealed)
                 })
         })
