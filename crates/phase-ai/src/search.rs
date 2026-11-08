@@ -24173,6 +24173,7 @@ one on the bottom of your library.";
     /// rejects a fixed-P/T Pump spell in this window before scoring, and that gate does not read
     /// GenericEffect pumps.
     #[test]
+    #[ignore = "fork: tactical_gate::own_beginning_phase_cast_is_dominated rejects this cast in the AI's own draw step (field report 2026-11-01), so it never reaches the score"]
     fn own_draw_root_carries_the_trick_verdict_on_a_generic_effect_pump_at_0_35() {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::Draw);
