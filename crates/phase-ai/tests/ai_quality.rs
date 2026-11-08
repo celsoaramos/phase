@@ -2973,6 +2973,8 @@ fn focus_fire_whiff_stays_available_with_a_prowess_payoff() {
         offers_cast(runner.state(), AiDifficulty::Easy, focus_fire),
         "a prowess payoff makes the cast not a provable whiff"
     );
+}
+
 const TREETOP_VILLAGE: &str = "This land enters tapped.\n{T}: Add {G}.\n{1}{G}: This land becomes a 3/3 green Ape creature with trample until end of turn. It's still a land. (It can deal excess combat damage to the player or planeswalker it's attacking.)";
 
 #[test]
