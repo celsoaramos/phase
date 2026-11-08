@@ -9587,6 +9587,8 @@ pub(crate) fn is_for_each_opponent_choose_controlled(lower: &str) -> bool {
 pub(crate) fn is_targeted_counter_kind_iteration(text: &str) -> bool {
     try_parse_proliferate_target(text).is_some()
         || try_parse_for_each_counter_kind_adjust_target(text).is_some()
+}
+
 /// CR 608.2c: only a proven fresh damage head can authorize its population.
 /// `InheritedTargets` also represents unknown provenance: recursive defaults
 /// withhold parent-target binding. Refusal leaves the pre-existing broad,
