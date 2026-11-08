@@ -2192,6 +2192,8 @@ fn mark_independent_type_gated_counter_placements(defs: &mut [AbilityDefinition]
         }
         previous_gate = gate;
     }
+}
+
 /// CR 701.20e + CR 608.2c: In "Look at the top N cards of your library. You
 /// may put those cards on the bottom of your library in any order" (Petals of
 /// Insight / Lim-Dûl's Vault class), "those cards" names the set the look
