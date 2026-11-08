@@ -194,6 +194,7 @@ fn territorial_hellkite_parses_restriction_and_no_choice_gate() {
                     subject: AttackSubject::Source,
                     scope: CombatHistoryScope::LastCombat,
                 }),
+                relation: engine::types::ability::PlayerRelation::All,
             })),
             distinctness: Default::default(),
         }
