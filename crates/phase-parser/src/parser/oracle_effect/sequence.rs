@@ -6217,6 +6217,7 @@ pub(super) fn apply_clause_continuation(
                         enter_tapped,
                         enters_attacking,
                         source: DigSource::PriorDigRemainder,
+                        rest_remainder: Default::default(),
                     },
                 ));
                 return;
