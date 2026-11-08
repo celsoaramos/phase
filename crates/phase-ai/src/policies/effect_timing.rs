@@ -2744,6 +2744,8 @@ mod tests {
             score > -1.0,
             "a -1/-1 to the opponent's creatures is removal: {score}"
         );
+    }
+
     // ---- D1: a non-protective until-end-of-turn GenericEffect pump is a combat trick ----
 
     const COORDINATED_ASSAULT: &str = "Up to two target creatures each get +1/+0 and gain first strike until end of turn. (They deal combat damage before creatures without first strike.)";
