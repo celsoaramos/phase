@@ -53,7 +53,7 @@ for f, txt in texts.items():
 
 def home(name):
     src = show(theirs, f'{folder}/{name}.rs')
-    if re.search(r'\bcrate::(?!support\b)[a-z_]', src):
+    if re.search(r'\b(crate|super)::(?!support\b)[a-z_]', src):
         return path
     for f, lo, hi in ranges:
         if name.encode() >= lo.encode() and (hi is None or name.encode() < hi.encode()):
