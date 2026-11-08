@@ -830,6 +830,7 @@ mod tests {
         let token_def = AbilityDefinition::new(AbilityKind::Spell, Effect::Investigate); // simple stand-in
 
         let ability = ResolvedAbility {
+            coin_branches: None,
             declares_chosen_group: None,
             reads_chosen_group: None,
             declares_return_result: None,
@@ -848,6 +849,7 @@ mod tests {
             source_id: ObjectId(1),
             cast_occurrence: None,
             source_incarnation: None,
+            announced_source_incarnation: None,
             trigger_source: None,
             trigger_definition_ref: None,
             delayed_origin: None,
@@ -905,6 +907,7 @@ mod tests {
             replacement_applied: Default::default(),
             sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
             target_reads: Default::default(),
+            entry_onset: crate::types::ability::ContinuousEffectOnset::WhenFollowed,
             sibling_condition: crate::types::ability::SiblingCondition::Dependent,
             modal: None,
             mode_abilities: vec![],
@@ -912,6 +915,7 @@ mod tests {
 
             activation_cost_reduction: None,
             activation_record: None,
+            control_change_instruction: None,
         };
 
         let mut events = Vec::new();
@@ -961,6 +965,7 @@ mod tests {
             })
             .collect();
         ResolvedAbility {
+            coin_branches: None,
             declares_chosen_group: None,
             reads_chosen_group: None,
             declares_return_result: None,
@@ -979,6 +984,7 @@ mod tests {
             source_id: ObjectId(1),
             cast_occurrence: None,
             source_incarnation: None,
+            announced_source_incarnation: None,
             trigger_source: None,
             trigger_definition_ref: None,
             delayed_origin: None,
@@ -1036,12 +1042,14 @@ mod tests {
             replacement_applied: Default::default(),
             sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
             target_reads: Default::default(),
+            entry_onset: crate::types::ability::ContinuousEffectOnset::WhenFollowed,
             sibling_condition: crate::types::ability::SiblingCondition::Dependent,
             modal: None,
             mode_abilities: vec![],
             parent_target_missing_reason: None,
             activation_cost_reduction: None,
             activation_record: None,
+            control_change_instruction: None,
         }
     }
 
@@ -1253,6 +1261,7 @@ mod tests {
                     chooser: Chooser::Controller.into(),
                     candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
                     reciprocal_role: None,
+                    gather_role: None,
                     up_to: false,
                     constraint: None,
                     selection: CardSelectionMode::Chosen,
@@ -1456,6 +1465,7 @@ mod tests {
 
         // Build a ResolvedAbility from the parsed AbilityDefinition.
         let ability = ResolvedAbility {
+            coin_branches: None,
             declares_chosen_group: None,
             reads_chosen_group: None,
             declares_return_result: None,
@@ -1466,6 +1476,7 @@ mod tests {
             source_id: ObjectId(1),
             cast_occurrence: None,
             source_incarnation: None,
+            announced_source_incarnation: None,
             trigger_source: None,
             trigger_definition_ref: None,
             delayed_origin: None,
@@ -1523,6 +1534,7 @@ mod tests {
             replacement_applied: Default::default(),
             sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
             target_reads: Default::default(),
+            entry_onset: crate::types::ability::ContinuousEffectOnset::WhenFollowed,
             sibling_condition: crate::types::ability::SiblingCondition::Dependent,
             modal: None,
             mode_abilities: vec![],
@@ -1530,6 +1542,7 @@ mod tests {
 
             activation_cost_reduction: None,
             activation_record: None,
+            control_change_instruction: None,
         };
 
         // Resolution parks on VoteChoice with controller as first subject.
@@ -1636,6 +1649,7 @@ mod tests {
             })
             .collect();
         let ability = ResolvedAbility {
+            coin_branches: None,
             declares_chosen_group: None,
             reads_chosen_group: None,
             declares_return_result: None,
@@ -1654,6 +1668,7 @@ mod tests {
             source_id,
             cast_occurrence: None,
             source_incarnation: None,
+            announced_source_incarnation: None,
             trigger_source: None,
             trigger_definition_ref: None,
             delayed_origin: None,
@@ -1711,6 +1726,7 @@ mod tests {
             replacement_applied: Default::default(),
             sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
             target_reads: Default::default(),
+            entry_onset: crate::types::ability::ContinuousEffectOnset::WhenFollowed,
             sibling_condition: crate::types::ability::SiblingCondition::Dependent,
             modal: None,
             mode_abilities: vec![],
@@ -1718,6 +1734,7 @@ mod tests {
 
             activation_cost_reduction: None,
             activation_record: None,
+            control_change_instruction: None,
         };
         let mut events = Vec::new();
         resolve(&mut state, &ability, &mut events).expect("vote initiates");
