@@ -10281,6 +10281,7 @@ pub(crate) fn parse_opponent_not_attacked_by_source_last_combat(
                 subject: AttackSubject::Source,
                 scope: CombatHistoryScope::LastCombat,
             }),
+            relation: PlayerRelation::All,
         },
     ))
 }
