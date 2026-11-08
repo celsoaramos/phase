@@ -23,7 +23,13 @@ async function prMergeCommit(pr) {
   return j.merged ? j.merge_commit_sha : null
 }
 
-const tag = arg('tag') || git('tag', '-l', 'v*', '--sort=-v:refname').split('\n')[0]
+// Pino (magicfinder/tag-pin.txt, ao lado do branches.json): enquanto a tag nova do upstream
+// exige porte das branches (v0.120.0 levou os tipos para o crate phase-ast e dividiu os
+// testes em shards), o build segue na tag fixada. Vazio ou ausente = a tag mais nova.
+const pinFile = (arg('branches') || '').replace(/[^/]*$/, 'tag-pin.txt')
+const pinned = pinFile ? (await fs.readFile(pinFile, 'utf8').catch(() => '')).split('\n').map(l => l.trim()).find(l => l && !l.startsWith('#')) ?? '' : ''
+const tag = arg('tag') || pinned || git('tag', '-l', 'v*', '--sort=-v:refname').split('\n')[0]
+if (!arg('tag') && pinned) console.log(`tag fixada em ${pinFile}: ${pinned}`)
 if (!tag) throw new Error('nenhuma tag v* do upstream encontrada')
 const tagSha = git('rev-parse', `${tag}^{commit}`)
 const list = JSON.parse(await fs.readFile(arg('branches'), 'utf8'))

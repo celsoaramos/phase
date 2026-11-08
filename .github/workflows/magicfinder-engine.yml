@@ -22,6 +22,7 @@ on:
     branches: [magicfinder-ci]
     paths:
       - 'magicfinder/branches.json'
+      - 'magicfinder/tag-pin.txt'
   workflow_dispatch:
     inputs:
       force:
@@ -29,7 +30,7 @@ on:
         type: boolean
         default: false
       tag:
-        description: 'Tag do phase-rs a usar (vazio = a mais recente)'
+        description: 'Tag do phase-rs a usar (vazio = a de magicfinder/tag-pin.txt, ou a mais recente)'
         type: string
         default: ''
       skip_regression:
