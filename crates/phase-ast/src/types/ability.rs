@@ -9441,6 +9441,7 @@ pub fn quantity_ref_grammar_any(
         | QuantityRef::DescendedThisTurn
         | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
         | QuantityRef::SpellsCastLastTurn
+        | QuantityRef::MostSpellsCastByOnePlayerLastTurn
         | QuantityRef::CardsDiscardedThisTurn { .. }
         | QuantityRef::PlayerActionsThisTurn { .. }
         | QuantityRef::DungeonsCompleted
@@ -10303,6 +10304,7 @@ fn rewrite_quantity_ref_filter_props<C>(
         | QuantityRef::DescendedThisTurn
         | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
         | QuantityRef::SpellsCastLastTurn
+        | QuantityRef::MostSpellsCastByOnePlayerLastTurn
         | QuantityRef::CardsDiscardedThisTurn { .. }
         | QuantityRef::PlayerActionsThisTurn { .. }
         | QuantityRef::DungeonsCompleted
@@ -12463,6 +12465,7 @@ fn quantity_ref_has_unsupported_selected_ref(qty: &QuantityRef) -> bool {
         | QuantityRef::ChosenNumber
         | QuantityRef::DescendedThisTurn
         | QuantityRef::SpellsCastLastTurn
+        | QuantityRef::MostSpellsCastByOnePlayerLastTurn
         | QuantityRef::DungeonsCompleted
         | QuantityRef::KickerCount
         | QuantityRef::AdditionalCostPaymentCount
@@ -14349,6 +14352,7 @@ impl QuantityRef {
             | QuantityRef::AttackedThisTurn { .. }
             | QuantityRef::DescendedThisTurn
             | QuantityRef::SpellsCastLastTurn
+            | QuantityRef::MostSpellsCastByOnePlayerLastTurn
             | QuantityRef::SpellsCastThisGame { .. }
             | QuantityRef::CounterAddedThisTurn { .. }
             | QuantityRef::DungeonsCompleted
@@ -14508,6 +14512,7 @@ impl QuantityRef {
             | QuantityRef::NotedNumber
             | QuantityRef::DescendedThisTurn
             | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
+            | QuantityRef::MostSpellsCastByOnePlayerLastTurn
             | QuantityRef::SpellsCastLastTurn
             | QuantityRef::CardsDrawnLastTurn { .. }
             | QuantityRef::OpponentSpellsCastSinceLastTurn { .. }
@@ -14621,6 +14626,7 @@ impl QuantityRef {
             | QuantityRef::AttackedThisTurn { .. }
             | QuantityRef::DescendedThisTurn
             | QuantityRef::SpellsCastLastTurn
+            | QuantityRef::MostSpellsCastByOnePlayerLastTurn
             | QuantityRef::SpellsCastThisGame { .. }
             | QuantityRef::CounterAddedThisTurn { .. }
             | QuantityRef::DungeonsCompleted
@@ -27836,6 +27842,7 @@ pub fn quantity_ref_recipient_read(qty: &QuantityRef) -> RecipientRead {
         | QuantityRef::NotedNumber
         | QuantityRef::DescendedThisTurn
         | QuantityRef::SpellsCastLastTurn
+        | QuantityRef::MostSpellsCastByOnePlayerLastTurn
         | QuantityRef::DungeonsCompleted
         | QuantityRef::CostXPaid
         | QuantityRef::KickerCount
