@@ -17965,6 +17965,7 @@ mod tests {
             source_id: None,
             enter_tapped: false,
             enters_attacking: false,
+            rest_remainder: Default::default(),
         };
 
         let contract = AiDecisionContract::issue(&state, ai);
