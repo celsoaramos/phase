@@ -1,5 +1,10 @@
 {
-  "playerLatency": {"host":"Hôte","waiting":"En attente","value":"{{ms}} ms","description":"Latence aller-retour vers l’hôte. Une réponse manquante ne déconnecte pas la partie."},
+  "playerLatency": {
+    "host": "Hôte",
+    "waiting": "En attente",
+    "value": "{{ms}} ms",
+    "description": "Latence aller-retour vers l’hôte. Une réponse manquante ne déconnecte pas la partie."
+  },
   "abilityBlock": {
     "badge": "Bloquée",
     "cantBeActivated": "Cette capacité ne peut pas être activée",
@@ -27,6 +32,7 @@
     "shorten": "Shorten it",
     "decline": "Decline the shortcut",
     "untilLethal": "Repeat until the game ends.",
+    "withoutEnd": "Repeat without end. If every player accepts, the game is a draw.",
     "fixedCount_one": "Repeat at most once.",
     "fixedCount_other": "Repeat at most {{count}} times.",
     "convokeInfo_one": "Auto-taps up to 1 creature for convoke each iteration.",
@@ -443,7 +449,9 @@
     "done": "Terminé"
   },
   "lifeTotal": {
-    "playerLabel": "J{{seat}}"
+    "playerLabel": "J{{seat}}",
+    "libraryLabel": "CARTES",
+    "libraryTooltip": "La Horde n'a pas de total de points de vie. Les blessures et les pertes de points de vie la font meuler à la place — elle est vaincue lorsque sa bibliothèque est épuisée, donc ce nombre est son véritable compte à rebours."
   },
   "phaseStop": {
     "untapLabel": "Étape de dégagement",
@@ -534,6 +542,7 @@
     }
   },
   "badges": {
+    "hordeRulesAriaLabel": "Règles du deck de la Horde",
     "monarch": "Monarque",
     "monarchTooltip": "Le Monarque — pioche une carte supplémentaire en fin de tour",
     "initiative": "Initiative",
@@ -642,6 +651,9 @@
   },
   "zone": {
     "commandZone": "Zone de commandement",
+    "conspiracy": "Conspiration",
+    "conspiracyTitle": "Conspiration : {{name}}",
+    "turnFaceUp": "Retourner {{name}} face visible",
     "emblem": "Emblème",
     "emblemFallback": "Emblème",
     "commander": "Commandant",
@@ -840,7 +852,7 @@
     "targetingLabel": "Cible {{label}}",
     "titleTargets": "Cibles : {{targets}}",
     "titlePaid": "Payé : {{paid}}",
-    "titleContext": "Contexte : {{context}}",
+    "titleContext": "Contexte : {{items}}",
     "revealedCards": "Révélée : {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}} mana",
@@ -1400,6 +1412,11 @@
     "noLegalAiDecks": {
       "withFormat": "Ajoutez ou importez un deck légal en {{format}} pour que l'IA l'utilise.",
       "generic": "Ajoutez ou importez un deck légal dans ce format pour que l'IA l'utilise."
+    },
+    "hordeDeck": {
+      "title": "Deck de la Horde",
+      "subtitle": "Le deck autonome affronté par votre équipe. Le moteur le fournit — vous n'avez pas besoin de deck IA.",
+      "selected": "Sélectionné"
     }
   },
   "cardChoice": {
@@ -1433,7 +1450,8 @@
       "cast": "Lancer",
       "crew": "Équipage ({{power}})",
       "saddle": "Seller ({{power}})",
-      "station": "Station (+{{power}})"
+      "station": "Station (+{{power}})",
+      "destroy": "Destroy"
     },
     "buttons": {
       "confirm": "Confirmer",
@@ -1552,6 +1570,7 @@
     "effectZone": {
       "titleSacrifice": "Sacrifier",
       "titleTopdeck": "Mettre sur la bibliothèque",
+      "titleBottomdeck": "Mettre sur la bibliothèque",
       "titleBattlefield": "Mettre sur le champ de bataille",
       "titleHand": "Renvoyer",
       "titleExile": "Exiler",
@@ -1571,6 +1590,12 @@
       "subtitleTopdeckUpTo_other": "Choisissez jusqu'à {{count}} cartes à mettre au-dessus de votre bibliothèque",
       "subtitleTopdeckRange_one": "Choisissez {{min}}-{{count}} carte à mettre au-dessus de votre bibliothèque",
       "subtitleTopdeckRange_other": "Choisissez {{min}}-{{count}} cartes à mettre au-dessus de votre bibliothèque",
+      "subtitleBottomdeckExact_one": "Choisissez {{count}} carte à mettre au-dessous de votre bibliothèque",
+      "subtitleBottomdeckExact_other": "Choisissez {{count}} cartes à mettre au-dessous de votre bibliothèque",
+      "subtitleBottomdeckUpTo_one": "Choisissez jusqu'à {{count}} carte à mettre au-dessous de votre bibliothèque",
+      "subtitleBottomdeckUpTo_other": "Choisissez jusqu'à {{count}} cartes à mettre au-dessous de votre bibliothèque",
+      "subtitleBottomdeckRange_one": "Choisissez {{min}}-{{count}} carte à mettre au-dessous de votre bibliothèque",
+      "subtitleBottomdeckRange_other": "Choisissez {{min}}-{{count}} cartes à mettre au-dessous de votre bibliothèque",
       "subtitleBattlefieldExact_one": "Choisissez {{count}} carte à mettre sur le champ de bataille",
       "subtitleBattlefieldExact_other": "Choisissez {{count}} cartes à mettre sur le champ de bataille",
       "subtitleBattlefieldUpTo_one": "Choisissez jusqu'à {{count}} carte à mettre sur le champ de bataille",
@@ -1616,14 +1641,17 @@
       "labelSkip": "Ignorer",
       "labelDecline": "Refuser",
       "labelPutOnTop": "Mettre au-dessus ({{order}})",
+      "labelPutOnBottom": "Mettre au-dessous ({{order}})",
       "labelConfirm": "Confirmer ({{selected}}/{{count}})",
       "labelTop": "Dessus ({{selected}}/{{count}})",
+      "labelBottom": "Dessous ({{selected}}/{{count}})",
       "labelPut": "Placer ({{selected}}/{{count}})",
       "labelReturn": "Renvoyer ({{selected}}/{{count}})",
       "labelExile": "Exiler ({{selected}}/{{count}})",
       "labelAttach": "Attach ({{selected}}/{{count}})",
       "labelCast": "Lancer ({{selected}}/{{count}})",
       "orderTop": "Dessus",
+      "orderBottom": "Dessous",
       "orderSecond": "2e",
       "orderThird": "3e",
       "orderFourth": "4e",
@@ -1777,7 +1805,8 @@
       "counterDiscard": "Défausser {{selected}} sur {{cap}}",
       "counterKeep": "Garder {{selected}} sur {{cap}}",
       "keepInstead": "Garder plutôt",
-      "discardInstead": "Défausser plutôt"
+      "discardInstead": "Défausser plutôt",
+      "counterChoose": "Choose {{selected}} of {{cap}}"
     },
     "discard": {
       "title": "Défausser",
@@ -1876,6 +1905,42 @@
       "hint": "Faites glisser pour réorganiser · la position 1 se retrouve au-dessus de ce tas",
       "moveLeft": "Déplacer vers la gauche",
       "moveRight": "Déplacer vers la droite"
+    },
+    "heroEvent": {
+      "chromeOverload": {
+        "title": "Chrome Dome's Overload",
+        "subtitle": "Choose a tapped creature you control to sacrifice"
+      },
+      "krangStratagem": {
+        "title": "Krang's Stratagem",
+        "subtitleUpTo_one": "Choose up to {{count}} card to discard (team owes {{remaining}} total)",
+        "subtitleUpTo_other": "Choose up to {{count}} cards to discard (team owes {{remaining}} total)",
+        "subtitleMin_one": "Choose {{min}} to {{count}} card to discard (team owes {{remaining}} total)",
+        "subtitleMin_other": "Choose {{min}} to {{count}} cards to discard (team owes {{remaining}} total)",
+        "subtitleExact_one": "Choose {{count}} card to discard",
+        "subtitleExact_other": "Choose {{count}} cards to discard"
+      },
+      "smackdown": {
+        "title": "Leatherhead's Smackdown",
+        "subtitle": "As a team, choose a creature with the greatest power to destroy it"
+      },
+      "ratKingRevolution": {
+        "title": "Rat King's Revolution",
+        "subtitle": "Choose a creature you control to tap and stun"
+      },
+      "savantiCurse": {
+        "title": "Savanti Romero's Curse",
+        "subtitle_one": "Choose {{count}} creature you control to return to its owner's hand",
+        "subtitle_other": "Choose {{count}} creatures you control to return to their owners' hands"
+      },
+      "infiltration": {
+        "title": "Villain Infiltration",
+        "subtitle": "As a team, choose a creature with the greatest power to destroy it"
+      },
+      "villainMayhem": {
+        "title": "Villain Mayhem!",
+        "subtitle": "As a team, choose {{count}} creatures to spare — every other creature is destroyed"
+      }
     }
   },
   "specializeColor": {
@@ -2116,13 +2181,18 @@
   "freeCastWindow": {
     "eyebrow": "Lancement gratuit",
     "title": "Lancez un sort gratuitement",
+    "titlePlay": "Jouez des cartes gratuitement",
     "subtitle": "Choisissez un sort à lancer sans payer son coût de mana ({{remaining}} restant(s)). Valeur de mana totale restante : {{budget}}.",
     "subtitleNoBudget": "Choisissez un sort à lancer sans payer son coût de mana ({{remaining}} restant(s)).",
+    "subtitlePlay": "Choisissez un terrain à jouer ou un sort à lancer sans payer son coût de mana ({{remaining}} restant(s)). Valeur de mana totale restante : {{budget}}.",
+    "subtitleNoBudgetPlay": "Choisissez un terrain à jouer ou un sort à lancer sans payer son coût de mana ({{remaining}} restant(s)).",
     "remainingAny": "n'importe quel nombre",
     "castNamed": "Lancer {{name}}",
+    "playNamed": "Jouer {{name}}",
     "castSuffix": "(sans payer son coût de mana)",
     "done": "Terminé",
-    "doneSuffix": "(arrêter de lancer des sorts de cette façon)"
+    "doneSuffix": "(arrêter de lancer des sorts de cette façon)",
+    "doneSuffixPlay": "(arrêter de jouer des cartes de cette façon)"
   },
   "castingVariant": {
     "eyebrow": "Lancer",
@@ -2205,7 +2275,8 @@
     "unitDamage": "blessures",
     "unitLife": "points de vie",
     "title": "Répartir {{total}} {{unit}}",
-    "subtitle": "Assignez au moins 1 {{unit}} à chaque cible. Restant : {{remaining}}"
+    "subtitle": "Assignez au moins 1 {{unit}} à chaque cible. Restant : {{remaining}}",
+    "subtitleAnyNumber": "Assignez au moins 1 {{unit}} à chacun de ceux que vous choisissez, parmi un nombre quelconque d'entre eux. Restant : {{remaining}}"
   },
   "dungeonChoice": {
     "title": "Choisir un donjon",
@@ -2291,6 +2362,8 @@
       "fallback": "Faire un choix"
     },
     "searchSubtitle": "Tapez pour rechercher dans toutes les cartes",
+    "secretAgendaTitle": "Nommez secrètement une carte ({{current}} sur {{total}})",
+    "secretAgendaSubtitle": "Caché jusqu'à ce que vous retourniez cette conspiration face visible",
     "searchPlaceholder": "Rechercher par nom...",
     "noCardsFound": "Aucune carte trouvée",
     "buttonSubtitle": "Sélectionnez une option",
@@ -2389,6 +2462,7 @@
     "cardFallback": "Card",
     "title": "Put {{name}} on top or bottom of library",
     "top": "Top of library",
+    "nthFromTop": "Position {{n}} from the top of library",
     "bottom": "Bottom of library"
   },
   "mutateMerge": {
@@ -2501,6 +2575,7 @@
     "triggerFallback": "Déclencheur {{number}}"
   },
   "costReductionOrder": {
+    "announcedHybrids": "Paiements hybrides annoncés",
     "eyebrow": "Ordre des réductions de coût",
     "title": "Ordonnez vos réductions de coût",
     "subtitle": "Ces réductions fixent un coût total différent selon l'ordre dans lequel vous les appliquez (CR 601.2f). Le haut de cette liste est appliqué en premier.",
@@ -2901,6 +2976,36 @@
       "winner": "{{name}} a gagné le concours.",
       "tie": "Égalité : il ne se passe rien.",
       "cancelled": "Le concours a été annulé : il ne se passe rien."
+    }
+  },
+  "unActions": {
+    "menu": {
+      "title": "Un-Actions",
+      "open": "Open Un-actions menu",
+      "close": "Close Un-actions menu",
+      "TouchFace": "Touch your face",
+      "TouchTable": "Slap the table",
+      "Laugh": "Laugh out loud",
+      "FlickCards": "Flick your cards",
+      "saysWord": "Say a word…",
+      "saysNumber": "Say a number…",
+      "wordPlaceholder": "A word",
+      "numberPlaceholder": "A number",
+      "say": "Say it!"
+    },
+    "gotcha": {
+      "button": "Gotcha!"
+    },
+    "sayPhrase": {
+      "title": "Say it to stop the effect",
+      "say": "Say “{{phrase}}”",
+      "stayQuiet": "Stay quiet"
+    },
+    "fx": {
+      "touchFace": "*smack*",
+      "touchTable": "SLAP!",
+      "laugh": "HA HA HA!",
+      "flickCards": "thwip thwip!"
     }
   }
 }
