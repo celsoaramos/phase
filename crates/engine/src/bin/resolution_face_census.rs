@@ -2686,6 +2686,7 @@ mod tests {
                 reject_action: engine::types::ability::ResolutionMvRejectAction::RemainExiled,
                 success_action: engine::types::ability::ResolutionCastSuccessAction::BottomMisses,
                 delayed_trigger_receipts: Vec::new(),
+                indicated_action: None,
             },
         };
         let positive = vec![
