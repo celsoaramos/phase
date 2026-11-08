@@ -37,8 +37,6 @@ mod ai_multi_target_selection;
 mod ajani_nacatl_pariah_co_departure_6427;
 mod ajani_nacatl_pariah_sacrifice_outlet_6018;
 mod ajani_nacatl_pariah_transform;
-mod akiri_attack_player_with_equipped;
-mod akiri_unattach_equipment;
 mod akroan_horse;
 mod alania_divergent_storm;
 mod alchemists_gift_pump_modal_keyword_choice;
