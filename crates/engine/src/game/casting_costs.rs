@@ -13633,6 +13633,8 @@ enum ReturnedCreatureCostMove {
 fn spell_payment_targets(ability: &ResolvedAbility) -> Vec<ObjectId> {
     let targets = super::ability_utils::flatten_targets_in_chain(ability);
     super::targeting::object_targets(&targets).collect()
+}
+
 /// CR 608.2c + CR 601.2a: whether a cast permission's "… is a [type] in
 /// addition to its other types" rider applies to the cast of `object_id`: its
 /// printed spell-quality condition ("If you cast a creature spell this way")
