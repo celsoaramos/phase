@@ -5045,15 +5045,34 @@ fn parse_event_context_refs(input: &str) -> OracleResult<'_, QuantityRef> {
         // "one or more creatures … deal combat damage to a player" trigger's own
         // amount: the matcher stamps the event with the total the filtered source
         // set dealt to that one recipient, so the subject and the recipient are
-        // both the trigger's referents, not new qualifiers.
+        // both the trigger's referents, not new qualifiers. The single-source form
+        // reads the same way: "it connives X, where X is the amount of damage it
+        // dealt to that player" (Mask of the Schemer) — in a damage trigger "it" /
+        // "~" / "this creature" / "that creature" is the event's source and "that
+        // player" / "that creature" its recipient. Only a fully consumed phrase
+        // matches, so a qualified tail ("… this turn", "… by <object>") stays a miss.
         value(
             QuantityRef::EventContextAmount,
             (
                 opt(alt((tag("the amount of "), tag("amount of "), tag("the ")))),
                 tag("damage "),
-                alt((tag("those creatures"), tag("they"))),
+                alt((
+                    tag("those creatures"),
+                    tag("they"),
+                    tag("this creature"),
+                    tag("that creature"),
+                    tag("it"),
+                    tag("~"),
+                )),
                 tag(" dealt"),
-                opt(tag(" to that player")),
+                opt(preceded(
+                    tag(" to "),
+                    alt((
+                        tag("that player"),
+                        tag("that creature"),
+                        tag("that permanent"),
+                    )),
+                )),
             ),
         ),
         // CR 701.47c: amass-specific definite phrases name the Army chosen by
