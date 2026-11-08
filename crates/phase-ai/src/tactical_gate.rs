@@ -2014,7 +2014,7 @@ fn temporary_pump_spell_without_beneficiary(ctx: &PolicyContext<'_>, effects: &[
         && !has_toughness_shrink(effects);
     let only_temporary_combat_effects = effects.iter().all(|effect| {
         matches!(effect, Effect::Pump { .. })
-            || crate::search::effect_is_temporary_combat_modifier(effect)
+            || crate::policies::effect_classify::effect_is_temporary_combat_modifier(effect)
     });
     if !has_positive_pump || !only_temporary_combat_effects {
         return false;
