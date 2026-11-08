@@ -20188,6 +20188,11 @@ pub struct PendingCombatLifelink {
     /// written before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement: Option<PendingCombatDamageReplacement>,
+    /// CR 510.2 + CR 616.1: the unfinished Phase C tail, present only when
+    /// the batch parked on a LEG's life-loss pause (rather than a lifelink
+    /// gain's). The resume completes it before draining `remaining`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_c_remnant: Option<PendingCombatPhaseCRemnant>,
 }
 
 /// CR 510.2 + CR 616.1 + CR 616.1g: the replacement pass of ONE simultaneous
@@ -20239,11 +20244,6 @@ pub struct PendingCombatDamageEntry {
     pub target: crate::game::combat::DamageTarget,
     /// CR 702.15b: the controller a lifelink source gains life for.
     pub lifelink_controller: Option<PlayerId>,
-    /// CR 510.2 + CR 616.1: the unfinished Phase C tail, present only when
-    /// the batch parked on a LEG's life-loss pause (rather than a lifelink
-    /// gain's). The resume completes it before draining `remaining`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub phase_c_remnant: Option<PendingCombatPhaseCRemnant>,
 }
 
 /// CR 510.1c: A blocker with its lethal damage threshold for UI display.
