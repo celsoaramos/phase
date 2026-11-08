@@ -17007,6 +17007,8 @@ impl CastOpponentChoicePurpose {
     fn is_gift(&self) -> bool {
         matches!(self, Self::Gift)
     }
+}
+
 /// Turtle Team-Up: which hero-choice Event a [`WaitingFor::HeroEventChoice`]
 /// prompt belongs to, plus the event-specific running parameters. No CR
 /// section — casual product; the variants mirror the Event names.
