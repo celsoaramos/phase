@@ -2301,7 +2301,7 @@ pub(crate) fn scavenge_ability_for_keyword(keyword: &Keyword) -> Option<AbilityD
 /// (seam 4: activated-ability-on-grant). The runtime activated-ability gather
 /// (`activated_ability_definitions` in `casting.rs`) calls this for each keyword
 /// in a graveyard card's *effective* keyword set so a keyword granted by a
-/// static (e.g. Encore/Scavenge granted to a graveyard card) surfaces its
+/// static (e.g. Encore/Scavenge/Unearth granted to a graveyard card) surfaces its
 /// activatable ability — the `AddKeyword` layer seam installs only the keyword
 /// and triggers, never activated abilities. Returns `None` for keywords whose
 /// behavior is not a graveyard activated ability. Extend this match as new
@@ -2311,6 +2311,9 @@ pub(crate) fn graveyard_activated_ability_for_keyword(
 ) -> Option<AbilityDefinition> {
     crate::database::encore::encore_ability_for_keyword(keyword)
         .or_else(|| scavenge_ability_for_keyword(keyword))
+        // CR 702.84a: Unearth functions while the card is in a graveyard
+        // (Dregscape Sliver, Sedris, Mishra and Solemn Doomguide grant it there).
+        .or_else(|| crate::database::unearth::unearth_ability_for_keyword(keyword))
 }
 
 /// CR 702.107a: Synthesize the Outlast activated ability from a `Keyword::Outlast(cost)`.
@@ -9347,6 +9350,7 @@ pub fn synthesize_read_ahead(face: &mut CardFace) {
         // chapter number"; the chosen value is persisted on the entering Saga
         // so the `PutCounter` sub-ability can read it via `ChosenNumber`.
         Effect::Choose {
+            chooser: crate::types::ability::ControllerRef::You,
             choice_type: ChoiceType::NumberRange {
                 min: 1,
                 // CR 702.155b: the Saga states its own upper bound (the final
@@ -10051,6 +10055,7 @@ pub fn synthesize_siege_intrinsics(face: &mut CardFace) {
         protector_replacement.execute = Some(Box::new(AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::Choose {
+                chooser: crate::types::ability::ControllerRef::You,
                 choice_type: ChoiceType::opponent(),
                 persist: true,
                 selection: crate::types::ability::TargetSelectionMode::Chosen,
@@ -10182,6 +10187,7 @@ pub fn synthesize_tribute_intrinsics(face: &mut CardFace) {
     let choose_stage = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::Choose {
+            chooser: crate::types::ability::ControllerRef::You,
             choice_type: ChoiceType::opponent(),
             persist: true,
             selection: crate::types::ability::TargetSelectionMode::Chosen,

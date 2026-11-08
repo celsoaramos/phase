@@ -913,17 +913,38 @@ pub fn resolve(
             // The residual applies to the spell that will be cast, not its
             // unchosen front.  Projecting through this same policy admits a
             // back-only member while keeping a front-only or zero-face sibling
-            // observable to the gate.
+            // observable to the gate. CR 701.18b: a Play grant also admits a
+            // member it may play as a land (Kayla's Music Box: "play cards you
+            // own exiled with ~"), so the policy carries the instruction's mode
+            // and the land leg keeps an exiled land the residual accepts. A
+            // modal card's land back is admitted only where the downstream
+            // grant keeps this frozen face policy (the resolution window, which
+            // re-judges every face at election). A lingering permission cannot
+            // confine itself to the land back, so admitting it there would
+            // authorize the card's spell front too (CR 601.3: The Omenkeel's
+            // land-only grant and Bala Ged Recovery); such routes admit only a
+            // land card as it is.
             let face_policy = crate::types::ability::ResolutionCastFacePolicy::new(
                 freeze_resolution_cast_filter(state, ability, own_filter, None),
                 ability.source_id,
                 ability.controller,
                 freeze_cast_permission_constraint(state, ability, constraint.clone()),
-            );
+            )
+            .with_play_mode(mode);
+            let land_admission = match driver {
+                crate::types::ability::CastFromZoneDriver::ResolutionWindow { .. } => {
+                    crate::game::casting::resolution_land_card_admission
+                }
+                crate::types::ability::CastFromZoneDriver::LingeringPermission
+                | crate::types::ability::CastFromZoneDriver::DuringResolution => {
+                    crate::game::casting::resolution_land_front_card_admission
+                }
+            };
             target_ids.retain(|id| {
                 crate::game::casting::resolution_spell_face_admission(state, *id, &face_policy)
                     .count()
                     != 0
+                    || land_admission(state, *id, &face_policy)
             });
         }
     }
@@ -993,6 +1014,7 @@ pub fn resolve(
                 target_filter,
                 constraint.as_ref(),
                 bounds,
+                mode,
                 target_ids,
                 events,
             );
@@ -1123,12 +1145,15 @@ pub fn resolve(
     // the ability resolves — cast if it is a spell, played as a land if it is a
     // land — never deferred to a later priority window ("You can't play it later
     // in the turn", Djinn of Wishes ruling). `resolution_play_route` picks the
-    // route per card. CR 712.12: a land//land modal card keeps the lingering
-    // grant (`ResolutionPlayRoute::LingeringFaceElection`) until a
-    // resolution-owned land-face election exists (follow-up); with this gate
-    // suppressed it falls past the paid branch (`!without_paying`) and the
-    // per-opponent fanout (`is_per_opponent_target_fanout`) to
-    // `grant_lingering_permissions`, exactly as the lingering driver does.
+    // route per card. CR 712.11b + CR 712.12: a spell//land modal card takes the
+    // resolution-owned face election (`ResolutionPlayRoute::ElectFace`): the
+    // player casts its spell face or plays its land face, each by its own
+    // legality. A land//land modal card keeps the lingering grant
+    // (`ResolutionPlayRoute::LingeringFaceElection`) until a resolution-owned
+    // land//land election exists (follow-up); with this gate suppressed it
+    // falls past the paid branch (`!without_paying`) and the per-opponent
+    // fanout (`is_per_opponent_target_fanout`) to `grant_lingering_permissions`,
+    // exactly as the lingering driver does.
     let single_card = single_resolution_card(&target_ids);
     let play_route = single_card
         .filter(|_| mode.is_play())
@@ -1261,6 +1286,9 @@ pub fn resolve(
                     success_action:
                         crate::types::ability::ResolutionCastSuccessAction::BottomMisses,
                     delayed_trigger_receipts: Vec::new(),
+                    // CR 603.2h + CR 601.2i: carried to the commit; spent only if the spell becomes cast.
+                    indicated_action: crate::game::triggers::indicated_action_for(ability)
+                        .map(Box::new),
                 },
             },
         };
@@ -1339,19 +1367,41 @@ pub fn resolve(
         if is_stack_spell_copy(state, target_ids[0]) {
             return cast_stack_spell_copy_during_resolution(state, ability, target_ids[0], events);
         }
-        // CR 701.18b + CR 305.9: a Play instruction plays a land card as a land.
-        if play_route == Some(ResolutionPlayRoute::PlayLand) {
-            return play_land_during_resolution_instruction(state, ability, target_ids[0], events);
-        }
-        return cast_single_target_during_resolution(
-            state,
-            ability,
-            target_ids[0],
-            constraint.clone(),
-            cast_transformed,
-            None,
-            events,
-        );
+        return match play_route {
+            // CR 701.18b + CR 305.9: a Play instruction plays a land card as a land.
+            Some(ResolutionPlayRoute::PlayLand) => {
+                play_land_during_resolution_instruction(state, ability, target_ids[0], events)
+            }
+            // CR 701.18b + CR 712.11b + CR 712.12: a spell//land modal card
+            // elects its spell face or its land face under a Play policy.
+            Some(ResolutionPlayRoute::ElectFace) => {
+                let request =
+                    resolution_play_request_for_single_target(state, ability, target_ids[0]);
+                cast_resolution_request_during_resolution(
+                    state,
+                    ability,
+                    target_ids[0],
+                    request,
+                    events,
+                )
+            }
+            // CR 608.2g: everything else is cast under a Cast policy, which
+            // never admits a land face. `LingeringFaceElection` never reaches
+            // here: `driver_free_cast` excludes it, and
+            // `immediate_graveyard_free_cast` requires the Graveyard, where
+            // `resolution_play_route` never returns it.
+            Some(ResolutionPlayRoute::CastSpell)
+            | Some(ResolutionPlayRoute::LingeringFaceElection)
+            | None => cast_single_target_during_resolution(
+                state,
+                ability,
+                target_ids[0],
+                constraint.clone(),
+                cast_transformed,
+                None,
+                events,
+            ),
+        };
     }
 
     match grant_lingering_permissions(state, ability, &target_ids, events)? {
@@ -1389,7 +1439,8 @@ pub(crate) enum ExiledBySourceBinding {
 /// form): the cards an unbound `ExiledBySource` cast/play instruction binds as
 /// it resolves. The single binding authority read by [`resolve`] (no-target,
 /// non-`ResolutionWindow` arm) and by the optional-effect feasibility probe, so
-/// the probe asks about exactly the cards resolution would act on.
+/// the probe asks about exactly the cards resolution would act on. Its empty
+/// `LinkedExile` verdict is read through [`exiled_card_link_is_empty`].
 pub(crate) fn exiled_by_source_fallback_binding(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -1442,6 +1493,44 @@ pub(crate) fn exiled_by_source_fallback_binding(
     ExiledBySourceBinding::LinkedExile(linked_ids)
 }
 
+/// CR 406.6 + CR 607.2a + CR 400.7 + CR 608.2d + CR 609.3: an unbound singular
+/// "the exiled card" instruction that resolves now (Hideaway: Mosswort Bridge,
+/// Shelldock Isle, Fight Rigging; Smuggler's Buggy's cast) refers only to the
+/// card its linked ability exiled that is still in exile. When the source's
+/// linked exile binds no such card (Hideaway exiled nothing, or the hidden card
+/// was already played and left exile), the instruction names nothing, so
+/// `resolve` reaches its "nothing to cast" tail; choosing it is choosing an
+/// impossible option. Mirrors exactly the guards under which `resolve` takes
+/// the `ExiledBySource` fallback and reaches that tail: no object target, no
+/// multi-slot group, a `DuringResolution` driver (never `ResolutionWindow`,
+/// whose batch authority differs), and an exile-scoped filter (a hand/graveyard
+/// scoped tail would open a pick instead). A looked-at-library binding (Kiora,
+/// CR 701.20e) is a real private selection and is never empty-linked here.
+/// `None` when this ability is not that shape.
+pub(crate) fn exiled_card_link_is_empty(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Option<bool> {
+    let Effect::CastFromZone { target, driver, .. } = &ability.effect else {
+        return None;
+    };
+    if !driver.is_during_resolution()
+        || !target.references_exiled_by_source()
+        || target.extract_in_zone() != Some(Zone::Exile)
+        || ability
+            .targets
+            .iter()
+            .any(|t| matches!(t, TargetRef::Object(_)))
+        || !cast_slot_group(ability).is_empty()
+    {
+        return None;
+    }
+    Some(matches!(
+        exiled_by_source_fallback_binding(state, ability, target),
+        ExiledBySourceBinding::LinkedExile(ids) if ids.is_empty()
+    ))
+}
+
 /// CR 608.2g + CR 701.18b: the cardinality authority for a free
 /// `DuringResolution` instruction. It executes as the ability resolves only for
 /// exactly one bound card; any other binding of a free instruction (e.g. a
@@ -1464,17 +1553,24 @@ pub(crate) enum ResolutionPlayRoute {
     CastSpell,
     /// CR 305.2a + CR 305.9: played as a land during resolution.
     PlayLand,
+    /// CR 701.18b + CR 712.11b + CR 712.12: a spell//land modal DFC (nonland
+    /// front face, modal land back face), in any zone. The player elects the
+    /// spell face (cast during resolution, CR 608.2g) or the land face (played
+    /// during resolution, CR 305.2a), each by its own legality
+    /// ([`resolution_play_face_legality`]).
+    ElectFace,
     /// CR 712.12: a land//land modal DFC (front face and back face both lands),
     /// whose land face the player may choose, bound in any zone the lingering
     /// grant serves (exiled Hideaway card in place; library-revealed Djinn-class
-    /// card delivered to exile by `grant_lingering_permissions`). No
-    /// resolution-owned prompt can elect a land face yet, so it keeps the
-    /// pre-existing lingering grant, whose PlayLand authority admits it (its front
-    /// face is a Land) and opens `ModalFaceChoice` (follow-up: resolution-owned
-    /// land-face election). A spell//land MDFC is not this route: it is cast by its
-    /// front face (CR 712.8a). Never returned for the Graveyard: base takes the
-    /// immediate graveyard route there (`immediate_graveyard_free_cast`) and
-    /// never lingers.
+    /// card delivered to exile by `grant_lingering_permissions`). The single-card
+    /// route keeps the pre-existing lingering grant, whose PlayLand authority
+    /// admits it (its front face is a Land) and opens `ModalFaceChoice`. The
+    /// resolution-owned election (`casting::initiate_resolution_election`) can
+    /// now elect either land face — the free-cast window uses it — so moving
+    /// this route onto it is a follow-up. A spell//land MDFC is not this route: it takes
+    /// [`ResolutionPlayRoute::ElectFace`]. Never returned for the Graveyard: base
+    /// takes the immediate graveyard route there (`immediate_graveyard_free_cast`)
+    /// and never lingers.
     LingeringFaceElection,
 }
 
@@ -1497,6 +1593,9 @@ pub(crate) fn resolution_play_route(
         ResolutionPlayRoute::LingeringFaceElection
     } else if front_is_land {
         ResolutionPlayRoute::PlayLand
+    } else if crate::game::engine::modal_land_face_election_available(obj) {
+        // CR 712.12: a nonland front with a modal land back face, in any zone.
+        ResolutionPlayRoute::ElectFace
     } else {
         ResolutionPlayRoute::CastSpell
     }
@@ -1517,8 +1616,21 @@ fn play_land_during_resolution_instruction(
         source_id: ability.source_id,
         subject: None,
     });
-    match crate::game::engine::play_land_during_resolution(state, ability.controller, card, events)
-    {
+    let commit =
+        crate::game::engine::play_land_during_resolution(state, ability.controller, card, events);
+    adopt_resolution_land_play_commit(state, commit);
+    Ok(())
+}
+
+/// CR 614.12a: a land play committed while an instruction resolves leaves the
+/// resolution's prompt as the pending entry choice, if any. A refused play
+/// (`None`, CR 305.2b / CR 305.3), an entered land and a prevented entry
+/// (CR 614.1) let the resolving chain continue.
+fn adopt_resolution_land_play_commit(
+    state: &mut GameState,
+    commit: Option<crate::game::engine::LandPlayCommit>,
+) {
+    match commit {
         None
         | Some(crate::game::engine::LandPlayCommit::Entered)
         | Some(crate::game::engine::LandPlayCommit::Prevented) => {}
@@ -1526,7 +1638,6 @@ fn play_land_during_resolution_instruction(
             state.waiting_for = *waiting_for;
         }
     }
-    Ok(())
 }
 
 /// CR 601.2c + CR 608.2g: the further target slots of one "you may cast up to
@@ -1688,12 +1799,22 @@ const RESOLUTION_WINDOW_ORIGIN_ZONES: [Zone; 4] =
 /// context is gone and a dynamic `X` would re-resolve to 0. Evaluation goes
 /// through `cast_permission_constraint_allows_cast`, the same authority the
 /// lingering-permission path uses, so the two never diverge.
+///
+/// CR 701.18b: a `Play` instruction ("play lands and cast spells from among …"
+/// — Gix, Yawgmoth Praetor) stamps a Play policy, so the window also offers the
+/// batch's lands, played as the ability resolves (CR 305.2a, under CR 305.2b /
+/// CR 305.3). A window carrying a per-cast rider (graveyard redirect,
+/// gains-modifications) keeps a Cast policy: a land play re-offers the window
+/// through a parked `CastFromZone` (`resume_free_cast_window_after_land_play`)
+/// that cannot carry those riders, and no printed Play window has one.
+#[allow(clippy::too_many_arguments)]
 fn open_resolution_cast_window(
     state: &mut GameState,
     ability: &ResolvedAbility,
     target_filter: &TargetFilter,
     constraint: Option<&CastPermissionConstraint>,
     bounds: crate::types::ability::ResolutionCastWindow,
+    mode: crate::types::ability::CardPlayMode,
     pool: Vec<ObjectId>,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
@@ -1717,12 +1838,24 @@ fn open_resolution_cast_window(
         target_filter.clone()
     };
     let window_filter = freeze_resolution_cast_filter(state, ability, window_filter, None);
+    let graveyard_replacement = cast_from_zone_graveyard_destination(ability);
+    // CR 608.2c + CR 611.2a: snapshot the gains-modifications rider from the
+    // ability before the clone's effect is replaced; every cast of the batch
+    // window receives it through the per-cast request and the re-offer
+    // carrier.
+    let enters_with_modifications = cast_from_zone_enters_with_modifications(ability);
+    let play_mode = if graveyard_replacement.is_none() && enters_with_modifications.is_empty() {
+        mode
+    } else {
+        crate::types::ability::CardPlayMode::Cast
+    };
     let face_policy = crate::types::ability::ResolutionCastFacePolicy::new(
         window_filter.clone(),
         ability.source_id,
         ability.controller,
         frozen,
-    );
+    )
+    .with_play_mode(play_mode);
     let mut pool: Vec<ObjectId> = pool
         .into_iter()
         .filter(|id| {
@@ -1730,9 +1863,21 @@ fn open_resolution_cast_window(
                 .objects
                 .get(id)
                 .is_some_and(|obj| RESOLUTION_WINDOW_ORIGIN_ZONES.contains(&obj.zone))
-                && crate::game::casting::resolution_spell_face_admission(state, *id, &face_policy)
+                && (crate::game::casting::resolution_spell_face_admission(state, *id, &face_policy)
                     .count()
                     != 0
+                    || crate::game::casting::resolution_land_front_admission(
+                        state,
+                        ability.controller,
+                        *id,
+                        &face_policy,
+                    )
+                    || crate::game::casting::resolution_land_face_admission(
+                        state,
+                        ability.controller,
+                        *id,
+                        &face_policy,
+                    ))
         })
         .collect();
     // CR 607.2a: `publish`-style forwarding can repeat an id; a duplicated pool
@@ -1897,6 +2042,8 @@ fn private_resolution_cast_request(
         _ => crate::types::ability::ResolutionCastCost::Free,
     };
     let constraint = constraint.or_else(|| effective_cast_from_zone_constraint(ability));
+    // A private pick stays a spell-only election (CR 601.2): the land face of a
+    // picked spell//land card is out of this route's scope.
     Some(resolution_cast_request_for_single_target(
         state,
         ability,
@@ -1904,6 +2051,7 @@ fn private_resolution_cast_request(
         constraint,
         cast_transformed,
         cost,
+        crate::types::ability::CardPlayMode::Cast,
     ))
 }
 
@@ -1958,6 +2106,7 @@ pub(crate) fn freeze_resolution_cast_filter(
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::TriggeringSource
+        | TargetFilter::CastingSpell
         | TargetFilter::EventTarget
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }) => selected_card
@@ -2054,6 +2203,9 @@ pub(crate) fn freeze_resolution_cast_filter(
         | TargetFilter::ParentTargetController
         | TargetFilter::DeclaredPlayer { .. }
         | TargetFilter::ParentTargetOwner
+        // CR 108.3 + CR 508.1d: per-member owner anchor — nothing to rewrite,
+        // identity like the neighboring anchors.
+        | TargetFilter::AffectedObjectOwner
         | TargetFilter::SourceChosenPlayer
         | TargetFilter::OriginalController
         | TargetFilter::OriginalSource
@@ -2219,6 +2371,9 @@ fn cast_stack_spell_copy_during_resolution(
     copy_id: ObjectId,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
+    // CR 603.2h: the lowering guard admits no cast indicated action that takes this
+    // route, which has no CR 601.2i commit carrier.
+    debug_assert!(crate::game::triggers::indicated_action_for(ability).is_none());
     let Some(obj) = state.objects.get(&copy_id).cloned() else {
         return Err(EffectError::InvalidParam(format!(
             "stack spell copy {copy_id:?} not found"
@@ -2228,6 +2383,25 @@ fn cast_stack_spell_copy_during_resolution(
         return Err(EffectError::InvalidParam(format!(
             "ParentTarget {copy_id:?} is not a stack spell copy"
         )));
+    }
+    // CR 707.12 + CR 601.3 + CR 113.6f: casting a copy of an object casts it
+    // from the zone the copied object was in (`copied_from_zone`, stamped when
+    // the copy was made), and the copy keeps the original's own restriction on
+    // where it may be cast from. A copy that can't be cast from there is refused
+    // before it is announced or recorded as cast, and, never having been cast,
+    // ceases to exist (CR 704.5e).
+    if !crate::game::restrictions::restrictions_permit_cast_origin(
+        &obj.casting_restrictions,
+        ability.controller,
+        obj.copied_from_zone,
+    ) {
+        crate::game::effects::prepare::cleanup_failed_prepared_copy_cast(state, copy_id);
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::CastFromZone,
+            source_id: ability.source_id,
+            subject: None,
+        });
+        return Ok(());
     }
     crate::game::ledger::validate_spell_cast_recording(state, ability.controller)
         .map_err(stack_spell_copy_cast_ledger_error)?;
@@ -2293,6 +2467,7 @@ fn cast_single_target_during_resolution(
         Some(cost) => crate::types::ability::ResolutionCastCost::AlternativeMana { cost },
         None => crate::types::ability::ResolutionCastCost::Free,
     };
+    // CR 601.2: a Cast policy never admits a land face.
     let request = resolution_cast_request_for_single_target(
         state,
         ability,
@@ -2300,13 +2475,61 @@ fn cast_single_target_during_resolution(
         constraint,
         cast_transformed,
         cost,
+        crate::types::ability::CardPlayMode::Cast,
     );
     cast_resolution_request_during_resolution(state, ability, card, request, events)
 }
 
+/// CR 701.18b + CR 712.11b + CR 712.12: the free resolution-time election for
+/// a spell//land modal card under a no-duration Play instruction. The policy
+/// carries `CardPlayMode::Play`, so the election admits the land face as well
+/// as the spell face. `resolve`'s `ElectFace` dispatch and the feasibility
+/// probe ([`resolution_play_face_legality`]) build this exact request.
+fn resolution_play_request_for_single_target(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    card: ObjectId,
+) -> crate::game::casting::ResolutionCastRequest {
+    let (constraint, cast_transformed) = match &ability.effect {
+        Effect::CastFromZone {
+            constraint,
+            cast_transformed,
+            ..
+        } => (constraint.clone(), *cast_transformed),
+        _ => (None, false),
+    };
+    resolution_cast_request_for_single_target(
+        state,
+        ability,
+        card,
+        constraint,
+        cast_transformed,
+        crate::types::ability::ResolutionCastCost::Free,
+        crate::types::ability::CardPlayMode::Play,
+    )
+}
+
+/// CR 701.18b + CR 712.11c + CR 712.12: every legal face of `card` under the
+/// free Play election `resolve` would open for it. The one per-card authority
+/// shared by `resolve` (through the same request builder) and the
+/// optional-effect feasibility probe, so they cannot disagree about which
+/// faces are offered.
+pub(crate) fn resolution_play_face_legality(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    card: ObjectId,
+) -> crate::game::casting::ResolutionFaceLegality {
+    crate::game::casting::ResolutionCastProjection::new(state).face_legality(
+        ability.controller,
+        card,
+        &resolution_play_request_for_single_target(state, ability, card),
+    )
+}
+
 /// Build the concrete resolution-cast transaction for one selected
 /// `CastFromZone` card. Both direct and private-zone routes call this before
-/// asking the shared casting builder to install it.
+/// asking the shared casting builder to install it. `play_mode` is the
+/// instruction's authority: only `Play` (CR 701.18b) admits a land face.
 fn resolution_cast_request_for_single_target(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -2314,6 +2537,7 @@ fn resolution_cast_request_for_single_target(
     constraint: Option<crate::types::ability::CastPermissionConstraint>,
     cast_transformed: bool,
     cost: crate::types::ability::ResolutionCastCost,
+    play_mode: crate::types::ability::CardPlayMode,
 ) -> crate::game::casting::ResolutionCastRequest {
     // CR 702.62a's "if you don't, it remains exiled" disposition is `RemainExiled`
     // for targeted single-card free casts. A library-peek pick instead bottoms
@@ -2348,7 +2572,8 @@ fn resolution_cast_request_for_single_target(
         ability.source_id,
         ability.controller,
         freeze_cast_permission_constraint(state, ability, constraint),
-    );
+    )
+    .with_play_mode(play_mode);
     let cleanup = crate::types::ability::ResolutionCastCleanup {
         source_id: ability.source_id,
         offer_id: None,
@@ -2357,6 +2582,8 @@ fn resolution_cast_request_for_single_target(
         reject_action,
         success_action: crate::types::ability::ResolutionCastSuccessAction::BottomMisses,
         delayed_trigger_receipts: Vec::new(),
+        // CR 603.2h + CR 601.2i: carried to the commit; spent only if the spell becomes cast.
+        indicated_action: crate::game::triggers::indicated_action_for(ability).map(Box::new),
     };
     let graveyard_replacement = cast_from_zone_graveyard_destination(ability);
     // CR 608.2c + CR 611.2a: the gains-modifications rider (Strago and Relm's
@@ -2389,7 +2616,7 @@ fn cast_resolution_request_during_resolution(
         source_id: ability.source_id,
         subject: None,
     });
-    let initiation = crate::game::casting::initiate_cast_during_resolution(
+    let initiation = crate::game::casting::initiate_resolution_election(
         state,
         ability.controller,
         card,
@@ -2397,19 +2624,37 @@ fn cast_resolution_request_during_resolution(
         events,
     )
     .map_err(|e| EffectError::InvalidParam(e.to_string()))?;
-    state.waiting_for = match initiation {
-        crate::game::casting::ResolutionCastInitiation::WaitingFor(waiting_for) => *waiting_for,
-        crate::game::casting::ResolutionCastInitiation::Rejected(cleanup) => {
-            crate::game::engine_resolution_choices::abort_resolution_cast(
+    match initiation {
+        crate::game::casting::ResolutionElectionInitiation::Cast(
+            crate::game::casting::ResolutionCastInitiation::WaitingFor(waiting_for),
+        ) => state.waiting_for = *waiting_for,
+        crate::game::casting::ResolutionElectionInitiation::Cast(
+            crate::game::casting::ResolutionCastInitiation::Rejected(cleanup),
+        ) => {
+            state.waiting_for = crate::game::engine_resolution_choices::abort_resolution_cast(
                 state,
                 ability.controller,
                 card,
                 *cleanup,
                 events,
             )
-            .map_err(|e| EffectError::InvalidParam(e.to_string()))?
+            .map_err(|e| EffectError::InvalidParam(e.to_string()))?;
         }
-    };
+        // CR 712.12 + CR 305.2a: the land face is the only legal face of a
+        // Play election, so it is played as the instruction resolves.
+        crate::game::casting::ResolutionElectionInitiation::PlayLandFace { cleanup, face } => {
+            let commit = crate::game::engine_resolution_choices::play_resolution_land_face(
+                state,
+                ability.controller,
+                card,
+                *cleanup,
+                face,
+                events,
+            )
+            .map_err(|e| EffectError::InvalidParam(e.to_string()))?;
+            adopt_resolution_land_play_commit(state, commit);
+        }
+    }
     Ok(())
 }
 
@@ -2534,7 +2779,7 @@ fn cast_from_zone_graveyard_destination(
         .and_then(|s| graveyard_destination_rider(&s.effect, s.condition.as_ref()))
 }
 
-/// CR 614.1c + CR 122.1: Osteomancer Adept / The Tomb of Aclazotz class — the
+/// CR 614.1c + CR 122.1: Osteomancer Adept class — the
 /// parser represents "the creature cast this way enters with a [counter] counter
 /// on it" as a sequential `AddPendingETBCounters` rider on `CastFromZone`. The
 /// rider's target is the *future* spell cast via the granted permission, not the
@@ -2615,11 +2860,11 @@ fn cast_from_zone_enters_with_counter(
     }
 }
 
-/// CR 205.1b + CR 613.1d: The Tomb of Aclazotz class — extract the enters-with
+/// CR 205.1b + CR 613.1d: extract the enters-with
 /// continuous modifications ("… is a Vampire in addition to its other types")
 /// the cast-this-way creature gains. The `AddPendingEntersModifications` rider
 /// sits at depth 0 (a type-only grant, `CastFromZone.sub_ability`) or depth 1
-/// (nested under the enters-with-counter rider, as Tomb produces: the counter
+/// (nested under the enters-with-counter rider: the counter
 /// clause's own `sub_ability`). Walks the sub-ability chain and returns the
 /// first rider's modifications, or an empty `Vec` if none is present. Consumed
 /// as permission metadata (never resolved in place), mirroring
@@ -2671,6 +2916,9 @@ pub(crate) fn grant_lingering_permissions(
     target_ids: &[ObjectId],
     events: &mut Vec<GameEvent>,
 ) -> Result<LingeringPermissionGrantResult, EffectError> {
+    // CR 603.2h: the lowering guard admits no cast indicated action that takes this
+    // route, which has no CR 601.2i commit carrier.
+    debug_assert!(crate::game::triggers::indicated_action_for(ability).is_none());
     let mut in_place_ids = Vec::new();
     let mut exile_delivery_ids = Vec::new();
     for &obj_id in target_ids {
@@ -2757,12 +3005,12 @@ fn record_lingering_permissions(
     // CR 614.1c + CR 122.1: "the creature cast this way enters with a [counter]
     // counter on it" — recorded on the granted permission so the cast
     // finalization (`casting_costs::finalize`) registers a pending ETB counter
-    // on the cast object (Osteomancer Adept, The Tomb of Aclazotz).
+    // on the cast object (Osteomancer Adept's rider shape).
     let enters_with_counter = cast_from_zone_enters_with_counter(ability);
     // CR 205.1b + CR 613.1d: "… is a [type] in addition to its other types" —
     // the additive type grant recorded on the granted permission so the cast
     // finalization applies it as a Permanent continuous effect on the cast
-    // object (The Tomb of Aclazotz).
+    // object.
     let enters_with_modifications = cast_from_zone_enters_with_modifications(ability);
 
     // CR 611.2b: set when a host-bound lifetime was attached below.
@@ -6683,14 +6931,18 @@ mod tests {
         assert_eq!(state.objects[&instant].zone, Zone::Stack);
     }
 
-    /// B3m — CR 712.8a + CR 608.2g: a spell//land MDFC is cast by its front face
-    /// during resolution; no lingering grant remains.
+    /// B3m — CR 712.11b + CR 305.2b + CR 608.2g: at the land allowance the land
+    /// face of a spell//land MDFC is unavailable, so the election's single
+    /// legal face — the spell face — is cast during resolution (through the
+    /// `ElectFace` route); no lingering grant remains.
     #[test]
     fn play_now_casts_a_spell_land_modal_card_by_its_front_face() {
         let mut state = play_now_state();
         let card = add_card_to_exile(&mut state, PlayerId(0), CardId(9_104));
         set_front_types(&mut state, card, CoreType::Instant);
         set_back_face(&mut state, card, CoreType::Land, LayoutKind::Modal);
+        state.lands_played_this_turn = 1;
+        state.players[0].lands_played_this_turn = 1;
         let mut events = vec![];
         resolve(&mut state, &play_now_ability(card), &mut events).unwrap();
         assert_eq!(state.objects[&card].zone, Zone::Stack);
@@ -6820,8 +7072,147 @@ mod tests {
         ));
     }
 
+    /// Issue #10325 — CR 406.6 + CR 607.2a + CR 400.7 + CR 608.2d: the
+    /// empty-link predicate reads the same binding authority `resolve` uses, and
+    /// answers only for the unbound resolve-now exile shape.
+    #[test]
+    fn exiled_card_link_is_empty_mirrors_the_fallback_binding() {
+        fn instruction(
+            source: ObjectId,
+            target: TargetFilter,
+            driver: CastFromZoneDriver,
+            targets: Vec<TargetRef>,
+        ) -> ResolvedAbility {
+            ResolvedAbility::new(
+                Effect::CastFromZone {
+                    target,
+                    without_paying_mana_cost: true,
+                    mode: CardPlayMode::Play,
+                    cast_transformed: false,
+                    alt_ability_cost: None,
+                    constraint: None,
+                    duration: None,
+                    driver,
+                    mana_spend_permission: None,
+                    additional_cost: None,
+                    cast_cost_modifier: None,
+                },
+                targets,
+                source,
+                PlayerId(0),
+            )
+        }
+
+        let mut state = make_test_state();
+        let source = create_object(
+            &mut state,
+            CardId(9_190),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let land = add_exiled_land(&mut state, CardId(9_191));
+        let unbound = instruction(
+            source,
+            TargetFilter::ExiledBySource,
+            CastFromZoneDriver::DuringResolution,
+            vec![],
+        );
+
+        assert_eq!(
+            exiled_card_link_is_empty(&state, &unbound),
+            Some(true),
+            "no link: the instruction names no card"
+        );
+
+        state.exile_links.push(ExileLink {
+            exiled_id: land,
+            source_id: source,
+            kind: ExileLinkKind::TrackedBySource,
+        });
+        assert_eq!(
+            exiled_card_link_is_empty(&state, &unbound),
+            Some(false),
+            "reach-guard: a live link to a card in exile binds it"
+        );
+
+        // CR 400.7: the linked card left exile, so it is a new object the
+        // instruction no longer refers to.
+        state.objects.get_mut(&land).unwrap().zone = Zone::Graveyard;
+        assert_eq!(
+            exiled_card_link_is_empty(&state, &unbound),
+            Some(true),
+            "a linked card that left exile binds nothing"
+        );
+
+        // CR 701.20e: a looked-at library card is a real private selection.
+        state.exile_links.clear();
+        let looked = create_object(
+            &mut state,
+            CardId(9_192),
+            PlayerId(0),
+            "Looked Card".to_string(),
+            Zone::Library,
+        );
+        state.last_revealed_ids = vec![looked];
+        assert_eq!(
+            exiled_card_link_is_empty(&state, &unbound),
+            Some(false),
+            "a looked-at library binding is never empty-linked"
+        );
+        state.last_revealed_ids.clear();
+
+        for (shape, ability) in [
+            (
+                "a lingering grant",
+                instruction(
+                    source,
+                    TargetFilter::ExiledBySource,
+                    CastFromZoneDriver::LingeringPermission,
+                    vec![],
+                ),
+            ),
+            (
+                "a resolution window",
+                instruction(
+                    source,
+                    TargetFilter::ExiledBySource,
+                    CastFromZoneDriver::ResolutionWindow {
+                        bounds: ResolutionCastWindow::default(),
+                    },
+                    vec![],
+                ),
+            ),
+            (
+                "a pre-bound object target",
+                instruction(
+                    source,
+                    TargetFilter::ExiledBySource,
+                    CastFromZoneDriver::DuringResolution,
+                    vec![TargetRef::Object(land)],
+                ),
+            ),
+            (
+                "a parent-target hand-off",
+                instruction(
+                    source,
+                    TargetFilter::ParentTarget,
+                    CastFromZoneDriver::DuringResolution,
+                    vec![],
+                ),
+            ),
+        ] {
+            assert_eq!(
+                exiled_card_link_is_empty(&state, &ability),
+                None,
+                "{shape} is outside the predicate"
+            );
+        }
+    }
+
     /// B6 — CR 701.18b + CR 712.8a + CR 712.12: the per-card Play route. Only a
-    /// land//land MODAL card outside the graveyard keeps the lingering grant.
+    /// land//land MODAL card outside the graveyard keeps the lingering grant; a
+    /// spell//land MODAL card elects its face in any zone.
     #[test]
     fn resolution_play_route_classifies_each_card_by_front_face_layout_and_zone() {
         let mut state = make_test_state();
@@ -6837,7 +7228,35 @@ mod tests {
         let spell_land = add_card_to_exile(&mut state, PlayerId(0), CardId(9_112));
         set_front_types(&mut state, spell_land, CoreType::Instant);
         set_back_face(&mut state, spell_land, CoreType::Land, LayoutKind::Modal);
-        assert_eq!(route(&state, spell_land), ResolutionPlayRoute::CastSpell);
+        assert_eq!(route(&state, spell_land), ResolutionPlayRoute::ElectFace);
+
+        let graveyard_spell_land = add_card_to_graveyard(&mut state, PlayerId(0), CardId(9_117));
+        set_front_types(&mut state, graveyard_spell_land, CoreType::Sorcery);
+        set_back_face(
+            &mut state,
+            graveyard_spell_land,
+            CoreType::Land,
+            LayoutKind::Modal,
+        );
+        assert_eq!(
+            route(&state, graveyard_spell_land),
+            ResolutionPlayRoute::ElectFace
+        );
+
+        // A Transform nonland-front / land-back card is not modal (CR 712.8a):
+        // it is cast by its front face.
+        let transform_spell_land = add_card_to_exile(&mut state, PlayerId(0), CardId(9_118));
+        set_front_types(&mut state, transform_spell_land, CoreType::Creature);
+        set_back_face(
+            &mut state,
+            transform_spell_land,
+            CoreType::Land,
+            LayoutKind::Transform,
+        );
+        assert_eq!(
+            route(&state, transform_spell_land),
+            ResolutionPlayRoute::CastSpell
+        );
 
         let land_land = add_exiled_land(&mut state, CardId(9_113));
         set_back_face(&mut state, land_land, CoreType::Land, LayoutKind::Modal);
