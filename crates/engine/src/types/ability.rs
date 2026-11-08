@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::card::PrintedCardRef;
 use super::card_type::CoreType;
-use super::counter::CounterType;
+use super::counter::{CounterKind, CounterType};
 use super::game_state::{CastOccurrence, LKISnapshot, MayTriggerOrigin, TriggerSourceContext};
 use super::game_state_kinds::{DistributionUnit, TargetSelectionConstraint};
 use super::identifiers::{

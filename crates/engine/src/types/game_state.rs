@@ -39,7 +39,10 @@ use super::attribution::ObjectAttribution;
 use super::card::{CardFace, PrintedCardRef, TokenImageRef};
 use super::card_printing::{DeckPrintingRecord, SharedPrinting};
 use super::card_type::{CoreType, Supertype};
-use super::counter::{CounterKind, CounterMatch, CounterType}; use super::display_only::{ reported_rules_projection, DisplayOnly, OmittedDisplayData, ReportedRulesProjection, counter_map_serde};
+use super::counter::{counter_map_serde, CounterKind, CounterMatch, CounterType};
+use super::display_only::{
+    reported_rules_projection, DisplayOnly, OmittedDisplayData, ReportedRulesProjection,
+};
 use super::events::{
     EventAttachmentSnapshot, EventCombatSnapshot, EventObjectHistorySnapshot,
     EventObjectRelationSnapshot, EventObjectSnapshot, GameEvent, PlayerActionKind, Targeter,
