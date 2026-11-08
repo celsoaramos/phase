@@ -780,6 +780,7 @@ pub(crate) fn battlefield_departure_slot(effect: &Effect) -> Option<&TargetFilte
         | Effect::CastCopyOfCard { .. }
         | Effect::CopyTokenOf { .. }
         | Effect::CreateTokenCopyFromPool { .. }
+        | Effect::CreateCardCopyByName { .. }
         | Effect::Myriad
         | Effect::Encore
         | Effect::CombineHost { .. }
@@ -4106,6 +4107,7 @@ impl ResolvedAbility {
             | Effect::ExileTopCardContest { .. }
             | Effect::SwitchPT { .. }
             | Effect::CopySpell { .. }
+            | Effect::CreateCardCopyByName { .. }
             | Effect::EpicCopy { .. }
             | Effect::CastCopyOfCard { .. }
             | Effect::CopyTokenOf { .. }
