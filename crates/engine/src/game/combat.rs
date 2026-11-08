@@ -7,6 +7,7 @@ use super::game_object::GameObject;
 use super::players;
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::functioning_abilities::static_kind_present;
+use crate::game::game_object::ObjectIncarnationRefExt;
 use crate::types::ability::{
     AttackerBlockStatus, ContinuousModification, StaticCondition, StaticDefinition, TargetFilter,
     TargetRef,
@@ -28,6 +29,8 @@ use crate::types::statics::{
     RequiredDefender, StaticMode, StaticModeKind,
 };
 use crate::types::zones::Zone;
+
+pub use crate::types::attack_target::AttackTarget;
 
 /// CR 604.1: loop-invariant presence facts for the combat-restriction statics.
 ///
@@ -155,15 +158,6 @@ pub enum TrampleKind {
     Standard,
     /// CR 702.19c: Trample over planeswalkers — excess can spill to PW controller.
     OverPlaneswalkers,
-}
-
-/// Represents who a creature is attacking: a player, planeswalker, or battle (CR 506.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data")]
-pub enum AttackTarget {
-    Player(PlayerId),
-    Planeswalker(ObjectId),
-    Battle(ObjectId),
 }
 
 /// Serde default for `AttackerInfo.attack_target` — backward-compatible with states
@@ -395,6 +389,14 @@ pub struct CombatState {
         serialize_with = "crate::types::deterministic_serde::hash_set"
     )]
     pub creature_blocked_attackers_this_combat: HashSet<BlockHistoryPair>,
+    /// CR 506.4 + CR 508.8: attackers removed from combat this combat, so a
+    /// combat whose attackers all left still had creatures attack or enter
+    /// attacking.
+    #[serde(
+        default,
+        serialize_with = "crate::types::deterministic_serde::hash_set"
+    )]
+    pub removed_attackers_this_combat: HashSet<ObjectId>,
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub damage_assignments: HashMap<ObjectId, Vec<DamageAssignment>>,
     pub first_strike_done: bool,
@@ -429,6 +431,7 @@ impl PartialEq for CombatState {
             && self.attacking_incarnations_this_combat == other.attacking_incarnations_this_combat
             && self.creature_blocked_attackers_this_combat
                 == other.creature_blocked_attackers_this_combat
+            && self.removed_attackers_this_combat == other.removed_attackers_this_combat
             && self.first_strike_done == other.first_strike_done
             && self.first_strike_participants == other.first_strike_participants
     }
@@ -802,6 +805,9 @@ pub(crate) fn prune_object_from_combat(state: &mut GameState, oid: ObjectId) -> 
     let attackers_before = combat.attackers.len();
     combat.attackers.retain(|a| a.object_id != oid);
     let mut changed = combat.attackers.len() != attackers_before;
+    if changed {
+        combat.removed_attackers_this_combat.insert(oid);
+    }
     changed |= combat.attacked_permanents.remove(&oid).is_some();
     let edges_before = combat.attacked_permanents.len();
     combat
@@ -1067,11 +1073,66 @@ fn record_block_history(
     state.creature_blocked_attackers_this_turn.insert(pair);
 }
 
+/// CR 509.1g + CR 400.7: every current block pairing `object_id` is in, in both
+/// orientations (as the blocker, and as an attacker some blocker is blocking),
+/// each side pinned to its live incarnation; sorted and deduplicated. Empty
+/// without combat. Reads `blocker_to_attacker` alone: `prune_object_from_combat`
+/// maintains it together with `blocker_assignments`, so the two agree on every
+/// pairing. Single authority for "who is `object_id` paired with right now" —
+/// the zone-change snapshot (`ZoneChangeRecord::block_pairs`) and the connive
+/// subject's related objects both project it.
+pub(crate) fn live_block_pairs_of(state: &GameState, object_id: ObjectId) -> Vec<BlockHistoryPair> {
+    let Some(combat) = state.combat.as_ref() else {
+        return Vec::new();
+    };
+    let live = |id: ObjectId| {
+        state
+            .objects
+            .get(&id)
+            .map(ObjectIncarnationRef::from_object)
+    };
+    let mut pairs: Vec<BlockHistoryPair> = combat
+        .blocker_to_attacker
+        .iter()
+        .flat_map(|(blocker, attackers)| {
+            attackers
+                .iter()
+                .filter(move |attacker| *blocker == object_id || **attacker == object_id)
+                .map(move |attacker| (*blocker, *attacker))
+        })
+        .filter_map(|(blocker, attacker)| {
+            Some(BlockHistoryPair {
+                blocker: live(blocker)?,
+                attacker: live(attacker)?,
+            })
+        })
+        .collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    pairs
+}
+
+/// CR 509.1g + CR 400.7: is `pair` a current block pairing — both creatures the
+/// exact live incarnations the pair names, and the blocker blocking the
+/// attacker right now? A creature that left combat (CR 506.4) or the
+/// battlefield (a new object, CR 400.7) is in no current pairing.
+pub(crate) fn is_live_block_pair(state: &GameState, pair: BlockHistoryPair) -> bool {
+    pair.blocker.is_current(state)
+        && pair.attacker.is_current(state)
+        && state.combat.as_ref().is_some_and(|combat| {
+            combat
+                .blocker_to_attacker
+                .get(&pair.blocker.object_id)
+                .is_some_and(|attackers| attackers.contains(&pair.attacker.object_id))
+        })
+}
+
 /// CR 508.4: Place a permanent onto the battlefield attacking.
 /// The creature is not "declared as an attacker" — attack triggers do not fire.
-/// Determines the defending player from: (1) source creature's combat info,
-/// (2) explicit "that player" event context, (3) this controller's declared
-/// attackers in the current combat, (4) fallback to opponent.
+/// Determines the defending player from: (1) the source's own combat entry,
+/// (2) the current trigger event, (3) an attacker this controller controls in
+/// the current combat, (4) this controller's first opponent (itself when it has
+/// none).
 pub fn enter_attacking(
     state: &mut GameState,
     object_id: ObjectId,
@@ -1097,12 +1158,44 @@ pub fn enter_attacking_at_target(
     push_attacker_and_journal(state, object_id, defending_player, attack_target);
 }
 
+/// CR 508.4: seat a token created attacking at the destination its
+/// instruction resolved to.
+pub fn enter_attacking_at_destination(
+    state: &mut GameState,
+    object_id: ObjectId,
+    source_id: ObjectId,
+    controller: PlayerId,
+    destination: &crate::types::ability::EntryAttackDestination,
+) {
+    use crate::types::ability::EntryAttackDestination;
+
+    match destination {
+        EntryAttackDestination::AnyDefender | EntryAttackDestination::PlayerOrPlaneswalker => {
+            // CR 508.4: no single destination named; `enter_attacking` derives one.
+            enter_attacking(state, object_id, source_id, controller);
+        }
+        EntryAttackDestination::Exact { target } => {
+            let Some(entrant_controller) = state
+                .objects
+                .get(&object_id)
+                .map(|object| object.controller)
+            else {
+                return;
+            };
+            // CR 508.4a + CR 506.3b + CR 506.3c: a named destination that is not a
+            // legal one for the token's controller leaves the token on the
+            // battlefield, never attacking.
+            if let Some(defending_player) =
+                entry_attack_target_defender(state, entrant_controller, *target)
+            {
+                enter_attacking_at_target(state, object_id, defending_player, *target);
+            }
+        }
+    }
+}
+
 /// CR 508.4 + CR 733: seat `object_id` as an attacking creature against an
 /// already-decided defender and journal the settled pair.
-///
-/// Shared by `enter_attacking` (which derives the pair from ambient state) and
-/// `place_attacking_alongside` (which is handed the pair by its caller), so both
-/// entry points record through one authority.
 fn push_attacker_and_journal(
     state: &mut GameState,
     object_id: ObjectId,
@@ -2046,10 +2139,7 @@ pub(crate) fn defending_player_for_target_or(
 /// PROTECTOR of the battle attacked. `None` when the target permanent is gone
 /// or a battle has no protector: there is then no defending player, which is a
 /// distinct answer from "player 0".
-pub(crate) fn defending_player_for_target(
-    state: &GameState,
-    target: AttackTarget,
-) -> Option<PlayerId> {
+pub fn defending_player_for_target(state: &GameState, target: AttackTarget) -> Option<PlayerId> {
     match target {
         AttackTarget::Player(pid) => Some(pid),
         AttackTarget::Planeswalker(pw_id) => state.objects.get(&pw_id).map(|pw| pw.controller),
@@ -3997,6 +4087,7 @@ pub fn compute_combat_tax(
                 if let Some(filter) = defended {
                     if !super::restrictions::attack_target_matches_defended_scope(
                         state,
+                        source_id,
                         attack_target.as_ref(),
                         filter,
                         source_obj.controller,
@@ -5451,6 +5542,7 @@ fn attack_passes_neighbor_restriction(
         };
         if !crate::game::restrictions::attack_target_matches_defended_scope(
             state,
+            source.id,
             Some(&target),
             &crate::types::triggers::AttackTargetFilter::PlayerOrPlaneswalker,
             nearest,
@@ -5523,6 +5615,7 @@ fn attack_passes_temporary_prohibition(
         }
         if crate::game::restrictions::attack_target_matches_defended_scope(
             state,
+            *source,
             Some(&target),
             defended,
             protected,
@@ -5550,7 +5643,7 @@ pub fn is_on_attacking_team(state: &GameState, player: PlayerId) -> bool {
 
 /// CR 500.1 + CR 506.1 + CR 508.1: whether the declare-attackers step of the
 /// combat phase this turn is IN — or has not yet reached — is still ahead with
-/// the attacking team yet to declare. Reads `state.phase` and `state.combat`
+/// the attacking team yet to declare. Reads `state.phase` and `state.waiting_for`
 /// only; a combat phase that is merely scheduled is the other arm of
 /// `attacker_declaration_pending_for`.
 ///
@@ -5565,15 +5658,16 @@ fn declaration_pending_at_current_phase(state: &GameState) -> bool {
         Phase::Untap | Phase::Upkeep | Phase::Draw | Phase::PreCombatMain | Phase::BeginCombat => {
             true
         }
-        // CR 508.1k: the chosen creatures become attacking creatures, so an
-        // attacking creature is the mark that the turn-based action has run.
-        // CR 508.8 keeps the empty declaration out of this arm: the engine
-        // leaves the step immediately when nothing is declared (pinned by
-        // `declaration_pending_at_current_phase_survives_an_empty_declaration`).
-        Phase::DeclareAttackers => state
-            .combat
-            .as_ref()
-            .is_none_or(|combat| combat.attackers.is_empty()),
+        // CR 508.1 + CR 508.2: the declaration is the step's first act and priority follows it, so the step is pending only while the engine waits for that declaration.
+        // CR 508.1h: an unpaid attack tax leaves the declaration in progress.
+        Phase::DeclareAttackers => matches!(
+            state.waiting_for,
+            crate::types::game_state::WaitingFor::DeclareAttackers { .. }
+                | crate::types::game_state::WaitingFor::CombatTaxPayment {
+                    context: crate::types::game_state::CombatTaxContext::Attacking,
+                    ..
+                }
+        ),
         Phase::DeclareBlockers
         | Phase::CombatDamage
         | Phase::EndCombat
@@ -6155,9 +6249,11 @@ pub enum CombatTaxPosture {
 ///
 /// An untaxed proposal is trivially affordable. A taxed one is probed with the
 /// same auto-tap payment authority `handle_pay_combat_tax` spends through
-/// (`pay_unless_cost` -> `pay_effect_mana_cost`). That spend has no resumable
-/// root, so a mana source whose own cost would pause for a replacement choice
-/// counts as unaffordable here, keeping the probe and the spend in agreement.
+/// (`pay_effect_mana_cost_with_resume` under the declaration's own
+/// `ManaAbilityResume::CombatTaxPayment` root). That spend suspends for a
+/// pre-spend mana choice exactly as the probe models it, so a replacement
+/// choice on an auto-tapped source and a choice-owing echo bonus are both
+/// payable here and the declaration commits only after they resolve.
 pub fn attack_tax_is_affordable(state: &GameState, attacks: &[(ObjectId, AttackTarget)]) -> bool {
     let Some((total_cost, _)) = compute_attack_tax(state, attacks) else {
         return true;
@@ -6167,7 +6263,7 @@ pub fn attack_tax_is_affordable(state: &GameState, attacks: &[(ObjectId, AttackT
         state.active_player,
         ObjectId(0),
         &total_cost,
-        super::casting::PausedManaPayment::Unresumable,
+        super::casting::PausedManaPayment::Resumable,
     )
 }
 
@@ -6187,7 +6283,7 @@ pub fn block_tax_is_affordable(
         player,
         ObjectId(0),
         &total_cost,
-        super::casting::PausedManaPayment::Unresumable,
+        super::casting::PausedManaPayment::Resumable,
     )
 }
 
@@ -6211,7 +6307,7 @@ pub fn pending_combat_tax_is_affordable(state: &GameState) -> bool {
         *player,
         ObjectId(0),
         total_cost,
-        super::casting::PausedManaPayment::Unresumable,
+        super::casting::PausedManaPayment::Resumable,
     )
 }
 
@@ -7006,21 +7102,29 @@ pub(super) fn commit_attack_declaration(
     state
         .creature_attacked_defenders_recent_combat
         .remove(&combat_player);
-    for (attacker_id, defending_player) in creature_attacked_defenders {
+    // CR 508.6: a creature has "attacked [a player]" only when declared attacking
+    // that player; attacking a planeswalker or battle that player controls or
+    // protects is not attacking the player (CR 506.3), so those declarations are
+    // not recorded in the per-creature player ledger.
+    for attacker in combat
+        .attackers
+        .iter()
+        .filter(|attacker| matches!(attacker.attack_target, AttackTarget::Player(_)))
+    {
         state
             .creature_attacked_defenders_this_turn
-            .entry(attacker_id)
+            .entry(attacker.object_id)
             .or_default()
-            .insert(defending_player);
+            .insert(attacker.defending_player);
         // CR 506.1 + CR 508.6: the same fact, kept per combat for "your last
         // combat" (rotated at the next beginning of combat of this player).
         state
             .creature_attacked_defenders_recent_combat
             .entry(combat_player)
             .or_default()
-            .entry(attacker_id)
+            .entry(attacker.object_id)
             .or_default()
-            .insert(defending_player);
+            .insert(attacker.defending_player);
     }
 
     // Use the first attacker's defending player for the event
@@ -8607,18 +8711,19 @@ fn entry_defender(
         .map(|(_, target)| defending_player_for_target_or(state, *target, global))
 }
 
-/// CR 508.5 second clause: when the bound event names exactly ONE attacking
-/// creature, that creature is the "attacking creature" the ability refers to,
-/// so its defender answers even when the asker is attacking someone else.
-fn sole_attacker_defender(
+/// CR 508.5 second clause + CR 508.5a: when every attacking creature the bound
+/// event names has the same defending player, that player answers, even when
+/// the asker is attacking someone else.
+fn single_event_defender(
     state: &GameState,
     entries: &[(ObjectId, AttackTarget)],
     global: PlayerId,
 ) -> Option<PlayerId> {
-    match entries {
-        [(_, target)] => Some(defending_player_for_target_or(state, *target, global)),
-        _ => None,
-    }
+    let mut defenders = entries
+        .iter()
+        .map(|(_, target)| defending_player_for_target_or(state, *target, global));
+    let first = defenders.next()?;
+    defenders.all(|defender| defender == first).then_some(first)
 }
 
 /// CR 508.5 (+ CR 508.5a / CR 802.2a in multiplayer): THE authority that decides
@@ -8676,30 +8781,28 @@ fn sole_attacker_defender(
 ///    player". Resolved through [`defending_player_for_target_or`], so a
 ///    planeswalker target answers with its controller and a battle target with
 ///    its protector (CR 310.9d) instead of being skipped.
-/// 2. The bound event's SOLE attacker, when the event names exactly one.
+/// 2. The defending player of the bound event's attackers, when they all have
+///    the same one.
 ///
 ///    **THIS STEP EXISTS TO OUTRANK THE LATCH (step 3), NOT TO RESOLVE THE
 ///    ATTACK TARGET. DO NOT COLLAPSE IT INTO STEP 4.**
 ///
 ///    CR 508.5 second clause — "a spell or ability refers to both an attacking
 ///    creature and a defending player": on an observer trigger, the attacking
-///    creature the ability refers to is the one the event names, EVEN IF the
+///    creatures the ability refers to are the ones the event names, EVEN IF the
 ///    asker is itself attacking someone else. The latch (step 3) is the CR
 ///    508.5 LAST-clause LKI snapshot of the ASKER's own attack; the second
-///    clause beats it whenever the event names the referred-to attacker.
+///    clause beats it whenever the event's attackers have one defending player.
 ///
 ///    Note that `trigger_matchers::matching_attack_events` already writes the
 ///    per-target-RESOLVED defender into each synthesized singleton's global
 ///    `defending_player` field, so step 2 and step 4 return the SAME `PlayerId`
 ///    on the production path. The only thing step 2 adds is its POSITION —
 ///    ahead of the latch. Merging it into step 4 restores latch-before-event
-///    and re-breaks the observer-trigger anaphor; the M'Baku integration test
-///    `mbaku_buffs_only_the_creature_attacking_the_monarch` and the unit test
-///    `event_sole_attacker_outranks_source_latch_cr_508_5` are what fail.
-/// 3. The latch. Reached when the bound event names neither the asker nor a
-///    sole attacker (a raw multi-attacker batch), or when there is no bound
-///    event at all. Not dead code — `raw_batch_without_asker_falls_back_to_latch`
-///    pins it.
+///    and re-breaks the observer-trigger anaphor.
+/// 3. The latch. Reached when the bound event names neither the asker nor
+///    attackers with one defending player, or when there is no bound event at
+///    all. Not dead code — `raw_batch_without_asker_falls_back_to_latch` pins it.
 /// 4. The bound event's declared global `defending_player` (CR 508.1b). The
 ///    coarsest answer; reachable only for a raw batch, and only inside a
 ///    triggered ability's scope (an unbound reference never reaches here).
@@ -8729,7 +8832,7 @@ pub(crate) fn defending_player_cr508_5(
     with_bound_attack_event(state, trigger_source, |event| {
         match event.and_then(attack_entries) {
             Some((entries, global)) => entry_defender(state, entries, global, entry_id)
-                .or_else(|| sole_attacker_defender(state, entries, global))
+                .or_else(|| single_event_defender(state, entries, global))
                 .or(latch)
                 .or(Some(global)),
             None => latch,
@@ -8788,14 +8891,9 @@ fn departed_attack_row<'a>(
         declared_incarnation.map(|incarnation| ObjectIncarnationRef::of(referent, incarnation))
     };
     match exact_identity {
-        Some(identity) => state.zone_changes_this_turn.iter().rev().find(|row| {
-            row.object_id == referent
-                && row.from_zone == Some(Zone::Battlefield)
-                && row.trigger_source_context.as_ref().is_some_and(|context| {
-                    context.identity.reference == identity
-                        && context.identity.expected_zone == Zone::Battlefield
-                })
-        }),
+        Some(identity) => {
+            crate::types::game_state::exact_battlefield_departure_row(state, identity)
+        }
         None => crate::types::game_state::terminal_battlefield_departure_row(state, referent),
     }
 }
@@ -9024,21 +9122,15 @@ pub fn get_valid_attack_targets(state: &GameState) -> Vec<AttackTarget> {
     };
     let mut targets = Vec::new();
 
-    // CR 508.1b + CR 702.16j: A player with protection from everything can't
-    // be declared as the player each attacking creature is attacking — the
-    // attack declaration would fail because the protected player is not a
-    // legal attack target.
-    let protected = |pid: PlayerId| -> bool {
-        super::static_abilities::player_has_protection_from_everything(state, pid)
-    };
-
-    // All non-eliminated, phased-in opponents (excluding teammates)
+    // All non-eliminated, phased-in opponents (excluding teammates).
+    // CR 702.16j: Protection from everything does not make a player an illegal
+    // attack target — it stops targeting, Auras, and damage, not attacks. Combat
+    // damage to that player is prevented in `pre_replacement_damage_gate`.
     for player in &state.players {
         if player.id != active
             && !state.eliminated_players.contains(&player.id)
             && !allies.contains(&player.id)
             && player.is_phased_in()
-            && !protected(player.id)
         {
             targets.push(AttackTarget::Player(player.id));
         }
@@ -9512,11 +9604,51 @@ mod tests {
         );
     }
 
-    /// The latch is NOT dead code: a raw multi-attacker batch that names neither
-    /// the asker nor a sole attacker falls through steps 1 and 2 to step 3.
+    /// CR 508.5a: an observer firing for one attacked player names several
+    /// creatures that all attack that player. Each has the same defending
+    /// player, so the firing has one answer even though the asker is itself
+    /// attacking someone else.
+    ///
+    /// Revert-failing against the one-entry-only second step: the asker's latch
+    /// (P1) then answers ahead of the event's P2.
+    #[test]
+    fn grouped_event_defender_outranks_source_latch_cr_508_5a() {
+        let (mut state, source) = anchor_state();
+        let b = spawn(&mut state, 2, "B");
+        let c = spawn(&mut state, 3, "C");
+        declare_combat(
+            &mut state,
+            &[(source, PlayerId(1)), (b, PlayerId(2)), (c, PlayerId(2))],
+        );
+        let ctx = latch_context(&state, source);
+        assert_eq!(
+            ctx.combat_status.defending_player,
+            Some(PlayerId(1)),
+            "precondition: the source's own latch must be populated"
+        );
+
+        state.current_trigger_event = Some(GameEvent::AttackersDeclared {
+            attacker_ids: vec![b, c],
+            defending_player: PlayerId(2),
+            attacks: vec![
+                (b, AttackTarget::Player(PlayerId(2))),
+                (c, AttackTarget::Player(PlayerId(2))),
+            ],
+            declaration_records: Vec::new(),
+        });
+
+        assert_eq!(
+            defending_player_cr508_5(&state, source, Some(&ctx)),
+            Some(PlayerId(2)),
+            "every attacker the event names is attacking P2, so P2 answers ahead of the asker's own latch"
+        );
+    }
+
+    /// The latch is NOT dead code: a raw batch that names neither the asker nor
+    /// attackers with one defending player falls through steps 1 and 2 to step 3.
     ///
     /// Revert-failing against a design that promotes the event's global field
-    /// wholesale, which would answer P3.
+    /// wholesale.
     #[test]
     fn raw_batch_without_asker_falls_back_to_latch_cr_608_2h() {
         let (mut state, source) = anchor_state();
@@ -11060,6 +11192,235 @@ mod tests {
             ));
             assert!(!combat_tax_relevant_kinds(&context).contains(&StaticModeKind::CantBeBlocked));
         }
+    }
+
+    /// CR 508.1c + CR 508.6: Bloodthirster — "This creature can't attack a player it
+    /// has already attacked this turn." The restriction is PER PAIRING: it must not
+    /// stop the creature attacking at all (the shipped misparse lowered the line to
+    /// a blanket `CantAttack` — issue #8064), and once it has attacked an opponent it
+    /// must stop a repeat attack on THAT opponent while leaving every other opponent
+    /// attackable.
+    #[test]
+    fn previously_attacked_player_restriction_narrows_only_the_attacked_opponent() {
+        const BLOODTHIRSTER: &str =
+            "This creature can't attack a player it has already attacked this turn.";
+
+        let mut state = GameState::new(FormatConfig::free_for_all(), 3, 42);
+        state.active_player = PlayerId(0);
+        state.turn_number = 2;
+
+        let bloodthirster = create_creature(&mut state, PlayerId(0), "Bloodthirster", 6, 6);
+        let def = parse_static_line(BLOODTHIRSTER).expect(BLOODTHIRSTER);
+        assert_eq!(def.mode, StaticMode::CantAttack);
+        assert_eq!(
+            def.attack_defended,
+            Some(crate::types::triggers::AttackTargetFilter::PlayerAttackedBySourceThisTurn)
+        );
+        state
+            .objects
+            .get_mut(&bloodthirster)
+            .unwrap()
+            .static_definitions
+            .push(def);
+
+        let legal_targets = |state: &GameState| {
+            let gates = CombatStaticGates::compute(state);
+            let attackable = attackable_defender_targets(state);
+            legal_attack_targets_for_attacker(
+                state,
+                bloodthirster,
+                &attackable,
+                &gates,
+                &[PlayerId(0)],
+            )
+        };
+
+        // Before any attack this turn, every opponent is attackable. The reported
+        // bug was that NONE was.
+        let legal = legal_targets(&state);
+        assert!(
+            legal.contains(&AttackTarget::Player(PlayerId(1)))
+                && legal.contains(&AttackTarget::Player(PlayerId(2))),
+            "the restriction must not remove any opponent before an attack: {legal:?}"
+        );
+
+        // First combat: attack P1.
+        let mut events = Vec::new();
+        declare_attackers(
+            &mut state,
+            &[(bloodthirster, AttackTarget::Player(PlayerId(1)))],
+            &mut events,
+        )
+        .expect("the first attack on an opponent is legal");
+
+        // CR 511.3 end of combat ends the phase while the per-turn attack ledger
+        // (CR 508.6) survives to cleanup, and Bloodthirster's own trigger untaps it
+        // for the additional combat phase.
+        state.combat = None;
+        state.objects.get_mut(&bloodthirster).unwrap().tapped = false;
+
+        let legal = legal_targets(&state);
+        assert!(
+            !legal.contains(&AttackTarget::Player(PlayerId(1))),
+            "a player it has already attacked this turn must not be attackable again: {legal:?}"
+        );
+        assert!(
+            legal.contains(&AttackTarget::Player(PlayerId(2))),
+            "every other opponent stays attackable: {legal:?}"
+        );
+
+        assert!(
+            declare_attackers(
+                &mut state,
+                &[(bloodthirster, AttackTarget::Player(PlayerId(1)))],
+                &mut events,
+            )
+            .is_err(),
+            "the declaration engine must refuse the repeat attack on P1"
+        );
+        events.clear();
+        declare_attackers(
+            &mut state,
+            &[(bloodthirster, AttackTarget::Player(PlayerId(2)))],
+            &mut events,
+        )
+        .expect("attacking a different opponent stays legal");
+    }
+
+    /// CR 506.3 + CR 508.6: "can't attack a player it has already attacked this
+    /// turn" restricts attacks on a PLAYER only. Attacking a planeswalker or battle
+    /// is not attacking a player, so the restriction never stops one (official Port
+    /// Razer ruling, 2024-04-12: "Port Razer's last ability doesn't stop it from
+    /// attacking a planeswalker or battle during any combat").
+    #[test]
+    fn previously_attacked_player_restriction_leaves_planeswalker_attacks_legal() {
+        const PORT_RAZER: &str =
+            "This creature can't attack a player it has already attacked this turn.";
+
+        let mut state = GameState::new(FormatConfig::free_for_all(), 3, 42);
+        state.active_player = PlayerId(0);
+        state.turn_number = 2;
+
+        let razer = create_creature(&mut state, PlayerId(0), "Port Razer", 4, 4);
+        let def = parse_static_line(PORT_RAZER).expect(PORT_RAZER);
+        state
+            .objects
+            .get_mut(&razer)
+            .unwrap()
+            .static_definitions
+            .push(def);
+
+        let walker_card = crate::types::identifiers::CardId(state.next_object_id);
+        let walker = create_object(
+            &mut state,
+            walker_card,
+            PlayerId(1),
+            "Jace".to_string(),
+            crate::types::zones::Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&walker)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(crate::types::card_type::CoreType::Planeswalker);
+
+        let mut events = Vec::new();
+        declare_attackers(
+            &mut state,
+            &[(razer, AttackTarget::Player(PlayerId(1)))],
+            &mut events,
+        )
+        .expect("the first attack on P1 is legal");
+
+        state.combat = None;
+        state.objects.get_mut(&razer).unwrap().tapped = false;
+
+        let gates = CombatStaticGates::compute(&state);
+        let attackable = attackable_defender_targets(&state);
+        let legal =
+            legal_attack_targets_for_attacker(&state, razer, &attackable, &gates, &[PlayerId(0)]);
+        assert!(
+            !legal.contains(&AttackTarget::Player(PlayerId(1))),
+            "guard: the already attacked player is still prohibited per pairing, so the \
+             planeswalker result below is not vacuous: {legal:?}"
+        );
+        assert!(
+            legal.contains(&AttackTarget::Planeswalker(walker)),
+            "attacking a planeswalker is not attacking a player, so it stays a legal \
+             target: {legal:?}"
+        );
+        assert!(
+            attacker_can_attack_target(
+                &state,
+                razer,
+                AttackTarget::Planeswalker(walker),
+                &gates,
+                &[PlayerId(0)],
+            ),
+            "attacking a planeswalker is not attacking a player (CR 506.3)"
+        );
+        assert!(
+            !attacker_can_attack_target(
+                &state,
+                razer,
+                AttackTarget::Player(PlayerId(1)),
+                &gates,
+                &[PlayerId(0)],
+            ),
+            "the already-attacked PLAYER stays prohibited"
+        );
+    }
+
+    /// CR 508.6 + CR 506.3: attacking a planeswalker a player controls is not
+    /// attacking that player, so it does not record a player attack — the same
+    /// player stays attackable in the additional combat.
+    #[test]
+    fn attacking_a_planeswalker_does_not_count_as_attacking_its_controller() {
+        let mut state = GameState::new(FormatConfig::free_for_all(), 3, 42);
+        state.active_player = PlayerId(0);
+        state.turn_number = 2;
+
+        let razer = create_creature(&mut state, PlayerId(0), "Port Razer", 4, 4);
+        let def = parse_static_line(
+            "This creature can't attack a player it has already attacked this turn.",
+        )
+        .unwrap();
+        state
+            .objects
+            .get_mut(&razer)
+            .unwrap()
+            .static_definitions
+            .push(def);
+        let walker = create_planeswalker(&mut state, PlayerId(1), "Jace");
+
+        let mut events = Vec::new();
+        declare_attackers(
+            &mut state,
+            &[(razer, AttackTarget::Planeswalker(walker))],
+            &mut events,
+        )
+        .expect("attacking a planeswalker is legal");
+        assert!(
+            state.creatures_attacked_this_turn.contains(&razer),
+            "guard: the attack was declared"
+        );
+
+        state.combat = None;
+        state.objects.get_mut(&razer).unwrap().tapped = false;
+
+        let gates = CombatStaticGates::compute(&state);
+        assert!(
+            attacker_can_attack_target(
+                &state,
+                razer,
+                AttackTarget::Player(PlayerId(1)),
+                &gates,
+                &[PlayerId(0)],
+            ),
+            "P1 was never attacked directly, so it stays attackable"
+        );
     }
 
     fn setup() -> GameState {
@@ -16831,7 +17192,164 @@ mod tests {
 
         state.phase = Phase::DeclareAttackers;
         state.combat = Some(CombatState::default());
+        state.waiting_for = build_declare_attackers_waiting_for(&state);
         assert!(declaration_pending_at_current_phase(&state));
+    }
+
+    /// CR 508.2 + CR 508.8: after an empty declaration whose triggers keep the
+    /// step open, the declaration has happened even though no creature attacks.
+    #[test]
+    fn declaration_pending_at_current_phase_is_false_in_the_priority_window_after_an_empty_declaration(
+    ) {
+        let mut state = setup();
+        create_creature(&mut state, PlayerId(0), "Ready", 2, 2);
+        state.phase = Phase::DeclareAttackers;
+        state.combat = Some(CombatState::default());
+        state.waiting_for = build_declare_attackers_waiting_for(&state);
+        assert!(declaration_pending_at_current_phase(&state));
+        state.waiting_for = crate::types::game_state::WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        assert!(!declaration_pending_at_current_phase(&state));
+    }
+
+    /// P0 declares a 2/2 against P1, who controls Ghostly Prison; returns the
+    /// runner paused at the attack-tax prompt.
+    fn ghostly_prison_taxed_declaration() -> crate::game::scenario::GameRunner {
+        use crate::game::scenario::GameScenario;
+        use crate::types::game_state::{CombatTaxContext, WaitingFor};
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let attacker = scenario.add_creature(PlayerId(0), "Taxed", 2, 2).id();
+        scenario.add_enchantment_from_oracle(
+            PlayerId(1),
+            "Ghostly Prison",
+            "Creatures can't attack you unless their controller pays {2} for each creature they control that's attacking you.",
+        );
+        let mut runner = scenario.build();
+        runner.advance_to_phase(Phase::DeclareAttackers);
+        runner
+            .declare_attackers(&[(attacker, AttackTarget::Player(PlayerId(1)))])
+            .expect("declaring a taxed attacker is legal");
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::CombatTaxPayment {
+                context: CombatTaxContext::Attacking,
+                ..
+            }
+        ));
+        runner
+    }
+
+    /// CR 508.1h + CR 508.1j: the declaration is still pending while its attack
+    /// tax awaits payment, and complete once the tax is paid.
+    #[test]
+    fn declaration_pending_at_current_phase_holds_through_an_unpaid_attack_tax() {
+        use crate::types::mana::{ManaType, ManaUnit};
+
+        let mut runner = ghostly_prison_taxed_declaration();
+        assert!(declaration_pending_at_current_phase(runner.state()));
+
+        for _ in 0..2 {
+            runner.state_mut().players[0].mana_pool.add(ManaUnit::new(
+                ManaType::Colorless,
+                ObjectId(0),
+                false,
+                Vec::new(),
+            ));
+        }
+        runner
+            .act(crate::types::actions::GameAction::PayCombatTax { accept: true })
+            .expect("paying the attack tax completes the declaration");
+        assert_eq!(runner.state().phase, Phase::DeclareAttackers);
+        assert!(runner
+            .state()
+            .combat
+            .as_ref()
+            .is_some_and(|c| c.attackers.len() == 1));
+        assert!(!declaration_pending_at_current_phase(runner.state()));
+    }
+
+    /// CR 508.1d + CR 733.1: declining the attack tax reverses the declaration,
+    /// which stays pending until the player declares again.
+    #[test]
+    fn declaration_pending_at_current_phase_holds_through_a_declined_attack_tax() {
+        use crate::types::game_state::WaitingFor;
+
+        let mut runner = ghostly_prison_taxed_declaration();
+        runner
+            .act(crate::types::actions::GameAction::PayCombatTax { accept: false })
+            .expect("declining the attack tax is legal");
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::DeclareAttackers { .. }
+        ));
+        assert!(declaration_pending_at_current_phase(runner.state()));
+
+        runner
+            .declare_attackers(&[])
+            .expect("an empty declaration is legal");
+        assert!(runner
+            .state()
+            .combat
+            .as_ref()
+            .is_none_or(|c| c.attackers.is_empty()));
+        assert!(!declaration_pending_at_current_phase(runner.state()));
+    }
+
+    /// CR 509.1d: a block tax prompt is the blockers' declaration, not the
+    /// attackers'.
+    #[test]
+    fn declaration_pending_at_current_phase_ignores_a_block_tax() {
+        use crate::game::scenario::GameScenario;
+        use crate::types::game_state::{CombatTaxContext, WaitingFor};
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let archangel = scenario
+            .add_creature(PlayerId(0), "Archangel of Tithes", 3, 5)
+            .from_oracle_text_with_keywords(
+                &["Flying"],
+                "Flying\nAs long as this creature is untapped, creatures can't attack you or planeswalkers you control unless their controller pays {1} for each of those creatures.\nAs long as this creature is attacking, creatures can't block unless their controller pays {1} for each of those creatures.",
+            )
+            .id();
+        let blocker = scenario
+            .add_creature(PlayerId(1), "Wind Drake", 2, 2)
+            .flying()
+            .id();
+        let mut runner = scenario.build();
+        runner.advance_to_phase(Phase::DeclareAttackers);
+        runner
+            .declare_attackers(&[(archangel, AttackTarget::Player(PlayerId(1)))])
+            .expect("Archangel of Tithes can attack");
+        while !matches!(
+            runner.state().waiting_for,
+            WaitingFor::DeclareBlockers { .. }
+        ) {
+            runner
+                .act(crate::types::actions::GameAction::PassPriority)
+                .expect("passing priority is legal");
+        }
+        float_mana(runner.state_mut(), PlayerId(1), 1);
+        runner
+            .declare_blockers(&[(blocker, archangel)])
+            .expect("declaring a taxed blocker is legal");
+        let waiting_for = runner.state().waiting_for.clone();
+        assert!(matches!(
+            waiting_for,
+            WaitingFor::CombatTaxPayment {
+                context: CombatTaxContext::Blocking,
+                ..
+            }
+        ));
+        assert!(!declaration_pending_at_current_phase(runner.state()));
+
+        let mut attack_step = runner.state().clone();
+        attack_step.phase = Phase::DeclareAttackers;
+        assert!(!declaration_pending_at_current_phase(&attack_step));
+        attack_step.waiting_for = build_declare_attackers_waiting_for(&attack_step);
+        assert!(declaration_pending_at_current_phase(&attack_step));
     }
 
     /// CR 508.1k: once attackers are declared, the whole `=> false` arm group
@@ -23717,12 +24235,12 @@ mod tests {
         );
     }
 
-    /// CR 508.1b + CR 702.16j: A player with protection from everything is
-    /// not a legal attack target. `get_valid_attack_targets` must exclude
-    /// them from the list opposing creatures can declare as their attack
-    /// target.
+    /// CR 702.16j: Protection from everything stops targeting, Auras, and
+    /// damage — not attacks. A protected player stays a legal attack target
+    /// (issue #10315: The One Ring / Teferi's Protection left a 1v1 opponent
+    /// unable to attack at all).
     #[test]
-    fn get_valid_attack_targets_excludes_protected_player() {
+    fn get_valid_attack_targets_includes_protected_player() {
         use crate::types::ability::{ContinuousModification, Duration, TargetFilter};
         use crate::types::keywords::{Keyword, ProtectionTarget};
 
@@ -23747,12 +24265,19 @@ mod tests {
         );
 
         // Active player is PlayerId(0) (default for new_two_player).
+        assert!(
+            crate::game::static_abilities::player_has_protection_from_everything(
+                &state,
+                PlayerId(1)
+            ),
+            "fixture must actually grant PlayerId(1) protection from everything"
+        );
         let targets = get_valid_attack_targets(&state);
         assert!(
-            !targets
+            targets
                 .iter()
                 .any(|t| matches!(t, AttackTarget::Player(id) if *id == PlayerId(1))),
-            "protected PlayerId(1) must not be a valid attack target, got {:?}",
+            "protected PlayerId(1) must remain a valid attack target, got {:?}",
             targets
         );
     }

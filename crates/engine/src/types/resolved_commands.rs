@@ -29,6 +29,7 @@ use super::mana::{ManaPipId, ManaUnit};
 use super::player::{PlayerCounterKind, PlayerId};
 use super::proposed_event::{CopyTokenSpec, TokenSpec};
 use super::resolution::{FrameKind, ResolutionFrame, ResolutionStackError};
+use super::stickers::StickerLocator;
 use super::zones::Zone;
 
 /// Globally ordered identity of a resolved command.
@@ -343,8 +344,9 @@ pub struct ResolvedContinuousEffectCommand {
     pub cause: RulesExecutionNodeRef,
 }
 
-/// Exact records selected at one settled CR 611.2b state-duration boundary.
-/// Replay consumes these operands without rechecking their expired conditions.
+/// Exact records selected at one settled CR 611.2b state-duration boundary, or
+/// a single-cast grant its cast used up. Replay consumes these
+/// operands without rechecking their expired conditions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedContinuousEffectRetirementCommand {
@@ -424,8 +426,12 @@ pub enum ResolvedContinuousEffectRetirementInvariantError {
     EmptyBatch,
     #[error("continuous-effect retirement repeats operand id {0}")]
     DuplicateOperandId(u64),
-    #[error("continuous-effect retirement operand {0} is not a state duration")]
-    NotStateDuration(u64),
+    /// CR 611.2b: only a state duration, or a used single-cast grant,
+    /// ends outside its stated duration.
+    #[error(
+        "continuous-effect retirement operand {0} is neither a state duration nor a single-cast grant"
+    )]
+    NotRetirable(u64),
     #[error("continuous-effect retirement operand {0} is not installed")]
     MissingEffect(u64),
     #[error("continuous-effect retirement id {0} has multiple installed records")]
@@ -449,14 +455,33 @@ impl ResolvedContinuousEffectRetirementCommand {
                     ResolvedContinuousEffectRetirementInvariantError::DuplicateOperandId(effect.id),
                 );
             }
-            if !effect.duration.is_for_as_long_as() {
+            if !effect.duration.is_for_as_long_as() && !grants_single_cast(effect) {
                 return Err(
-                    ResolvedContinuousEffectRetirementInvariantError::NotStateDuration(effect.id),
+                    ResolvedContinuousEffectRetirementInvariantError::NotRetirable(effect.id),
                 );
             }
         }
         Ok(())
     }
+}
+
+/// An effect whose Oracle wording grants ONE cast ("you may cast a creature
+/// spell from your graveyard this turn") ends with the cast it authorized,
+/// before its stated duration runs out.
+fn grants_single_cast(effect: &TransientContinuousEffect) -> bool {
+    effect.modifications.iter().any(|modification| {
+        matches!(
+            modification,
+            ContinuousModification::GrantStaticAbility { definition }
+                if matches!(
+                    definition.mode,
+                    super::statics::StaticMode::GraveyardCastPermission {
+                        cast_limit: super::statics::PermissionCastLimit::Single,
+                        ..
+                    }
+                )
+        )
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -951,7 +976,7 @@ pub struct ResolvedInformationCommand {
 /// One exact constrained-trigger ledger fact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolvedTriggerLedgerEdit {
-    /// CR 603.2c: This trigger occurrence has used its one-per-turn fact.
+    /// CR 603.2: This trigger occurrence has used its once-each-turn trigger limit.
     OncePerTurn,
     /// CR 603.2c: This trigger occurrence has used its one-per-game fact.
     OncePerGame,
@@ -959,6 +984,8 @@ pub enum ResolvedTriggerLedgerEdit {
     OncePerOpponentPerTurn { opponent: PlayerId },
     /// Increment from the captured prior count for MaxTimesPerTurn.
     MaxTimesPerTurn { expected_old: u32 },
+    /// CR 603.2h: this player took this ability's indicated action this turn.
+    IndicatedActionTaken { player: PlayerId },
 }
 
 /// A named once-per-turn permission slot consumed by a completed play or cast.
@@ -1066,12 +1093,20 @@ pub struct ResolvedLibraryShuffleCommand {
     pub cause: RulesExecutionNodeRef,
 }
 
+/// CR 613.7k: one retained sticker's renewal, in prior relative timestamp order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainedStickerTimestamp {
+    pub locator: StickerLocator,
+    pub prior_timestamp: u64,
+    pub timestamp: u64,
+}
+
 /// One exact transition of an object occurrence between zone containers.
 ///
 /// CR 400.7: the command binds the source occurrence and its resulting
 /// incarnation, so replay neither selects a new object nor creates a new
-/// incarnation. CR 613.7d: battlefield-entry timestamps are captured by the
-/// ordinary path and installed exactly on replay.
+/// incarnation. CR 613.7d + CR 613.7k: object-entry and retained-sticker
+/// timestamps are captured by the ordinary path and installed exactly on replay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedZoneChangeCommand {
     pub object: ObjectIncarnationRef,
@@ -1087,9 +1122,64 @@ pub struct ResolvedZoneChangeCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebound_from: Option<PlayerId>,
     pub entry_timestamp: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_sticker_timestamps: Option<Vec<RetainedStickerTimestamp>>,
     pub turn_zone_change_index: usize,
     pub zone_change_record: ZoneChangeRecord,
     pub cause: RulesExecutionNodeRef,
+}
+
+impl ResolvedZoneChangeCommand {
+    /// CR 613.7d + CR 613.7k: the structural authority for the timestamp
+    /// operands. A battlefield entry carries its entry timestamp; retained
+    /// sticker rows follow a recorded entry timestamp on a real move into a
+    /// zone that retains stickers, with unique locators, non-decreasing prior
+    /// stamps and strictly increasing installed stamps after the object's. A
+    /// real public nonbattlefield move with a scalar and no rows stays
+    /// loadable; the live prestate decides whether rows were required.
+    pub fn validate_timestamp_operands(
+        &self,
+    ) -> Result<(), ResolvedZoneChangeReplayInvariantError> {
+        if self.to == Zone::Battlefield && self.entry_timestamp.is_none() {
+            return Err(ResolvedZoneChangeReplayInvariantError::MissingBattlefieldEntryTimestamp);
+        }
+        let retains = crate::game::stickers::zone_retains_stickers(self.to);
+        match &self.retained_sticker_timestamps {
+            Some(rows) => {
+                let mismatch =
+                    || ResolvedZoneChangeReplayInvariantError::RetainedStickerMetadataMismatch {
+                        recorded: self.retained_sticker_timestamps.clone(),
+                    };
+                let Some(entry_timestamp) = self.entry_timestamp else {
+                    return Err(mismatch());
+                };
+                if rows.is_empty() || self.from == self.to || !retains {
+                    return Err(mismatch());
+                }
+                let mut locators = HashSet::new();
+                let mut prior_floor = 0;
+                let mut installed_floor = entry_timestamp;
+                for row in rows {
+                    if !locators.insert(&row.locator)
+                        || row.prior_timestamp < prior_floor
+                        || row.timestamp <= installed_floor
+                    {
+                        return Err(mismatch());
+                    }
+                    prior_floor = row.prior_timestamp;
+                    installed_floor = row.timestamp;
+                }
+                Ok(())
+            }
+            None if self.to != Zone::Battlefield
+                && self.entry_timestamp.is_some()
+                && (self.from == self.to || !retains) =>
+            {
+                Err(ResolvedZoneChangeReplayInvariantError::UnexpectedNonbattlefieldTimestamp)
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 /// Typed failure while applying one already-resolved zone transition.
@@ -1114,8 +1204,18 @@ pub enum ResolvedZoneChangeReplayInvariantError {
     RecordedTurnMismatch { expected: u32, found: u32 },
     #[error("zone-change battlefield entry is missing its timestamp")]
     MissingBattlefieldEntryTimestamp,
-    #[error("zone-change nonbattlefield entry unexpectedly has a timestamp")]
+    /// CR 613.7d + CR 613.7k: a nonbattlefield move carries an entry timestamp
+    /// only when it renews retained stickers.
+    #[error(
+        "zone-change entry timestamp is unexpected for a hidden, same-zone or unstickered nonbattlefield move"
+    )]
     UnexpectedNonbattlefieldTimestamp,
+    /// CR 613.7k: recorded retained timestamps disagree with the operand or the
+    /// source's stickers.
+    #[error("zone-change retained sticker timestamp metadata mismatch: {recorded:?}")]
+    RetainedStickerMetadataMismatch {
+        recorded: Option<Vec<RetainedStickerTimestamp>>,
+    },
     #[error("zone-change installed incarnation mismatch: expected {expected}, found {found}")]
     ResultingIncarnationMismatch { expected: u64, found: u64 },
 }
@@ -2172,9 +2272,34 @@ struct JournalIndex {
     latest_producer: im::HashMap<ObjectId, usize>,
     delayed_by_token: im::HashMap<DelayedTriggerToken, im::Vector<usize>>,
     delayed_by_instance: im::HashMap<DelayedTriggerInstanceId, im::Vector<usize>>,
+    player_leave_moves: im::HashSet<PlayerLeaveMove>,
+}
+
+/// CR 800.4a: a zone change caused by a player leaving the game. A log event carries no
+/// incarnation, so the turn zone-change index tells repeated identical moves apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PlayerLeaveMove {
+    pub object_id: ObjectId,
+    pub from: Zone,
+    pub to: Zone,
+    pub turn_zone_change_index: usize,
 }
 
 impl JournalIndex {
+    fn record_entry(&mut self, position: usize, entry: &ResolvedCommandJournalEntry) {
+        self.record_delayed_install(position, entry);
+        if let Some(ResolvedRulesCommand::ZoneChange(command)) = &entry.command {
+            if matches!(command.cause, RulesExecutionNodeRef::PlayerLeave(_)) {
+                self.player_leave_moves.insert(PlayerLeaveMove {
+                    object_id: command.object.object_id,
+                    from: command.from,
+                    to: command.to,
+                    turn_zone_change_index: command.turn_zone_change_index,
+                });
+            }
+        }
+    }
+
     fn record_delayed_install(&mut self, position: usize, entry: &ResolvedCommandJournalEntry) {
         if let Some(origin) = delayed_install_origin(entry) {
             self.delayed_by_token
@@ -2283,6 +2408,11 @@ impl ResolvedRulesJournal {
     /// boundary has truncated the journal under a caller's earlier length.
     pub fn entries_since(&self, start: usize) -> im::Vector<ResolvedCommandJournalEntry> {
         self.entries.skip(start.min(self.entries.len()))
+    }
+
+    /// CR 800.4a: whether this turn's journal records `key` as caused by a player leaving.
+    pub fn records_player_leave_move(&self, key: &PlayerLeaveMove) -> bool {
+        self.index.player_leave_moves.contains(key)
     }
 
     pub fn has_produced_pip(&self, pip: ManaPipId) -> bool {
@@ -2869,8 +2999,7 @@ impl ResolvedRulesJournal {
             node,
             command: Some(command),
         };
-        self.index
-            .record_delayed_install(self.entries.len(), &entry);
+        self.index.record_entry(self.entries.len(), &entry);
         self.entries.push_back(entry);
         self.nodes[node_index].journal_ordinals.push(ordinal);
         Ok(ordinal)
@@ -2955,7 +3084,7 @@ impl ResolvedRulesJournal {
             index.spent.entry(record.unit.pip_id).or_insert(position);
         }
         for (position, entry) in self.entries.iter().enumerate() {
-            index.record_delayed_install(position, entry);
+            index.record_entry(position, entry);
         }
         self.index = index;
     }
@@ -3722,7 +3851,7 @@ fn zone_change_command_is_invalid(command: &ResolvedZoneChangeCommand) -> bool {
         || record.turn_zone_change_index != command.turn_zone_change_index
         || (changes_incarnation && command.resulting_incarnation <= command.object.incarnation)
         || (!changes_incarnation && command.resulting_incarnation != command.object.incarnation)
-        || (command.to == Zone::Battlefield) != command.entry_timestamp.is_some()
+        || command.validate_timestamp_operands().is_err()
         || (command.to == Zone::Battlefield
             && record.entered_incarnation != Some(command.resulting_incarnation))
         || (command.to != Zone::Battlefield && record.entered_incarnation.is_some())
@@ -4626,5 +4755,67 @@ mod tests {
         let reloaded: GameState =
             serde_json::from_str(&serde_json::to_string(live).unwrap()).expect("the state reloads");
         assert_index_answers_as_the_scan("reloaded", &reloaded.resolved_rules_journal);
+    }
+
+    /// A hidden-origin Library → Exile move of one object under `cause`.
+    fn sweep_move(
+        cause: RulesExecutionNodeRef,
+        incarnation: u64,
+        turn_zone_change_index: usize,
+    ) -> ResolvedZoneChangeCommand {
+        let owner = PlayerId(1);
+        let mut record =
+            ZoneChangeRecord::test_minimal(ObjectId(5), Some(Zone::Library), Zone::Exile);
+        record.owner = owner;
+        record.arrival.owner = owner;
+        record.turn_zone_change_index = turn_zone_change_index;
+        ResolvedZoneChangeCommand {
+            object: ObjectIncarnationRef::of(ObjectId(5), incarnation),
+            resulting_incarnation: incarnation + 1,
+            from: Zone::Library,
+            to: Zone::Exile,
+            destination_position: 0,
+            owner,
+            rebound_from: None,
+            entry_timestamp: None,
+            retained_sticker_timestamps: None,
+            turn_zone_change_index,
+            zone_change_record: record,
+            cause,
+        }
+    }
+
+    /// CR 800.4a: the index holds exactly the zone changes a player leaving caused, survives a
+    /// reload, and starts empty.
+    #[test]
+    fn player_leave_move_index_tracks_leave_caused_zone_changes() {
+        let key = |turn_zone_change_index| PlayerLeaveMove {
+            object_id: ObjectId(5),
+            from: Zone::Library,
+            to: Zone::Exile,
+            turn_zone_change_index,
+        };
+        let mut journal = ResolvedRulesJournal::default();
+        let leave = journal.begin_player_leave().unwrap();
+        journal.record_zone_change(sweep_move(leave, 1, 0)).unwrap();
+        let proposal = journal.begin_proposal().unwrap();
+        journal
+            .record_zone_change(sweep_move(proposal, 2, 1))
+            .unwrap();
+        let assert_leave_only = |label: &str, journal: &ResolvedRulesJournal| {
+            assert!(
+                journal.records_player_leave_move(&key(0)),
+                "{label}: the leave-caused move is indexed"
+            );
+            assert!(
+                !journal.records_player_leave_move(&key(1)),
+                "{label}: the proposal-caused move is not"
+            );
+        };
+        assert_leave_only("live", &journal);
+        let reloaded: ResolvedRulesJournal =
+            serde_json::from_value(serde_json::to_value(&journal).unwrap()).unwrap();
+        assert_leave_only("reloaded", &reloaded);
+        assert!(!ResolvedRulesJournal::default().records_player_leave_move(&key(0)));
     }
 }
