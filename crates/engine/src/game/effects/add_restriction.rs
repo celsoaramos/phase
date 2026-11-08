@@ -13,7 +13,7 @@ pub fn resolve(
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
     if let Effect::AddRestriction { restriction } = &ability.effect {
-        for mut restriction in expand_per_opponent_next_turn(state, restriction.clone(), ability) {
+        for mut restriction in expand_per_opponent(state, restriction.clone(), ability) {
             fill_runtime_fields(state, &mut restriction, ability);
             state.restrictions.push(restriction);
         }
@@ -30,59 +30,58 @@ pub fn resolve(
     }
 }
 
-/// CR 500.7 + CR 514.2 + CR 109.5: Fan out an "each opponent can't … during that
-/// player's next turn" prohibition (Sphinx's Decree, Azor) into one
-/// `SpecificPlayer` restriction per opponent, each anchored on that opponent's
-/// OWN next turn.
+/// CR 109.5 + CR 611.2a + CR 707.10a: Lower "your opponents can't …" to one
+/// `SpecificPlayer` restriction per opponent of the resolving ability's
+/// controller, fixed as the restriction is created.
 ///
-/// A single `OpponentsOfSourceController` restriction carrying the pre-armed
-/// `UntilEndOfNextTurnOf` marker cannot express this: `fill_runtime_fields` has
-/// no single restricted player to anchor on, so it falls back to the controller,
-/// and a controller-anchored marker stays dormant through every opponent's turn
-/// (`casting.rs` skips a still-pre-armed `UntilEndOfNextTurnOf`) and only arms on
-/// the controller's own next turn — when no opponent has a turn — so the ban
-/// never takes force. Splitting per opponent lets each marker arm on its own
-/// player's untap step (`turns.rs`).
+/// The "your" is the ability's controller at resolution (CR 109.5), and the
+/// resulting rules-modifying effect lasts for its duration independent of its
+/// source (CR 611.2a). Reading the source's controller LIVE would drop the ban
+/// whenever the source no longer exists: a copied spell ceases to exist as it
+/// leaves the stack (CR 707.10a), so Silence cast as an Isochron Scepter copy
+/// restricted no one — the `source` id pointed at nothing and
+/// `restriction_scope_matches_player` got no controller.
 ///
-/// Only the `OpponentsOfSourceController` + next-turn combination is fanned out;
-/// every other shape (including Kang's `AllPlayers` self-anchored power-up ban,
+/// It also fixes "each opponent can't … during that player's next turn"
+/// (Sphinx's Decree, Azor, CR 500.7 + CR 514.2): a single
+/// `OpponentsOfSourceController` restriction carrying the pre-armed
+/// `UntilEndOfNextTurnOf` marker has no single restricted player to anchor on,
+/// so `fill_runtime_fields` would fall back to the controller and the marker
+/// would only arm on the controller's own next turn — when no opponent has a
+/// turn. Splitting per opponent lets each marker arm on its own player's untap
+/// step (`turns.rs`).
+///
+/// Every other scope (including Kang's `AllPlayers` self-anchored power-up ban,
 /// which correctly anchors on the controller's own extra turn) passes through as
-/// a single-element vec.
-fn expand_per_opponent_next_turn(
+/// a single-element vec. With no opponent left the restriction passes through
+/// unchanged (it restricts no one either way).
+fn expand_per_opponent(
     state: &GameState,
     restriction: GameRestriction,
     ability: &ResolvedAbility,
 ) -> Vec<GameRestriction> {
-    use crate::types::ability::{Duration, PlayerScope, RestrictionPlayerScope};
+    use crate::types::ability::RestrictionPlayerScope;
 
-    let is_next_turn = matches!(
-        ability.duration,
-        Some(Duration::UntilEndOfNextTurnOf {
-            player: PlayerScope::Controller,
-        })
-    );
-    if is_next_turn {
-        if let GameRestriction::ProhibitActivity {
-            affected_players: RestrictionPlayerScope::OpponentsOfSourceController,
-            ..
-        } = &restriction
-        {
-            let opponents = crate::game::players::opponents(state, ability.controller);
-            if !opponents.is_empty() {
-                return opponents
-                    .into_iter()
-                    .map(|opponent| {
-                        let mut per_opponent = restriction.clone();
-                        if let GameRestriction::ProhibitActivity {
-                            affected_players, ..
-                        } = &mut per_opponent
-                        {
-                            *affected_players = RestrictionPlayerScope::SpecificPlayer(opponent);
-                        }
-                        per_opponent
-                    })
-                    .collect();
-            }
+    if let GameRestriction::ProhibitActivity {
+        affected_players: RestrictionPlayerScope::OpponentsOfSourceController,
+        ..
+    } = &restriction
+    {
+        let opponents = crate::game::players::opponents(state, ability.controller);
+        if !opponents.is_empty() {
+            return opponents
+                .into_iter()
+                .map(|opponent| {
+                    let mut per_opponent = restriction.clone();
+                    if let GameRestriction::ProhibitActivity {
+                        affected_players, ..
+                    } = &mut per_opponent
+                    {
+                        *affected_players = RestrictionPlayerScope::SpecificPlayer(opponent);
+                    }
+                    per_opponent
+                })
+                .collect();
         }
     }
     vec![restriction]
@@ -342,7 +341,7 @@ mod tests {
             &state.restrictions[0],
             GameRestriction::ProhibitActivity {
                 source: ObjectId(9),
-                affected_players: RestrictionPlayerScope::OpponentsOfSourceController,
+                affected_players: RestrictionPlayerScope::SpecificPlayer(PlayerId(0)),
                 expiry: RestrictionExpiry::UntilPlayerNextTurn { player: PlayerId(1) },
                 activity: ProhibitedActivity::CastOnlyFromZones { allowed_zones },
             } if allowed_zones == &vec![Zone::Hand]

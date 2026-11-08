@@ -128,6 +128,7 @@ mod shuri_wakandan_inventor_copy_recipient;
 mod siege_behemoth_unblocked_grant;
 mod sift_through_sands;
 mod sigarda_tajuru_tamiyo_forced_action_protection;
+mod silence_copy_restricts_opponents;
 mod silumgar_scavenger_exploit_haste;
 mod sin_spiras_punishment_repeat;
 mod single_graveyard_cast_grant_9334;
