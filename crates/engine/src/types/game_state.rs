@@ -467,16 +467,6 @@ where
     })
 }
 
-impl DayNight {
-    /// The wire/log label carried by `GameEvent::DayNightChanged::new_state`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DayNight::Day => "Day",
-            DayNight::Night => "Night",
-        }
-    }
-}
-
 /// CR 702.51a / Waterbend: Determines tap-to-pay behavior during mana payment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConvokeMode {

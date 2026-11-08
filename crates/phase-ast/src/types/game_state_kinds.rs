@@ -14,6 +14,16 @@ pub enum DayNight {
     Night,
 }
 
+impl DayNight {
+    /// The wire/log label carried by `GameEvent::DayNightChanged::new_state`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DayNight::Day => "Day",
+            DayNight::Night => "Night",
+        }
+    }
+}
+
 /// CR 601.2f: The kind of modification to apply to the next qualifying spell.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
