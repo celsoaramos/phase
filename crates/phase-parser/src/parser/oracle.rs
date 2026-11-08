@@ -2806,6 +2806,7 @@ fn coordinated_exile_play_effect(effect: &Effect) -> Option<Effect> {
     match effect {
         Effect::CastFromZone {
             target: TargetFilter::ExiledBySource,
+            caster: TargetFilter::Controller,
             without_paying_mana_cost,
             mode: CardPlayMode::Cast,
             cast_transformed: false,
