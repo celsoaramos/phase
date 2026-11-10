@@ -166,6 +166,16 @@ fn reject_reason(ctx: &PolicyContext<'_>) -> Option<PolicyReason> {
             Some(PolicyReason::new("anti_self_harm_extra_turn_self_loss"))
         }
         GameAction::ActivateAbility { .. } => harmful_activation_reaches_only_own_board(ctx),
+        // An instant or sorcery whose harmful legs can only reach the AI's own board
+        // (Abrade with the AI's artifacts as the only artifacts and no creature in
+        // play — relato de 09/11/2026: "destruiu o próprio artefato"). Casting it is
+        // the last window to decline, exactly as for an activation: once cast, the
+        // target step must pick one of the AI's own permanents. Permanent spells stay
+        // out — their ETB/static value is not this cast's harmful leg.
+        GameAction::CastSpell { .. } if source_is_instant_or_sorcery(ctx) => {
+            harmful_activation_reaches_only_own_board(ctx)
+                .map(|_| PolicyReason::new("anti_self_harm_harmful_spell_own_board_only"))
+        }
         GameAction::DecideOptionalEffect { accept: true }
             if optional_effect_life_cost_is_lethal(ctx) =>
         {
@@ -179,6 +189,14 @@ fn reject_reason(ctx: &PolicyContext<'_>) -> Option<PolicyReason> {
             .find_map(|target| target_reject_reason(ctx, target)),
         _ => None,
     }
+}
+
+fn source_is_instant_or_sorcery(ctx: &PolicyContext<'_>) -> bool {
+    ctx.source_object().is_some_and(|source| {
+        let types = &source.card_types.core_types;
+        (types.contains(&CoreType::Instant) || types.contains(&CoreType::Sorcery))
+            && !types.iter().any(|t| matches!(t, CoreType::Creature | CoreType::Artifact | CoreType::Enchantment | CoreType::Planeswalker | CoreType::Battle | CoreType::Land))
+    })
 }
 
 /// Reject a pure creature-benefit spell when the AI has no creature that can

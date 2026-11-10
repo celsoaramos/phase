@@ -18,6 +18,7 @@ pub mod lifegain_payoff;
 pub mod mill_payoff;
 pub mod mulligan_input_lint;
 pub mod own_board_only_activation_repro;
+pub mod own_board_only_spell_repro;
 pub mod poison;
 pub mod reanimator_payoff;
 pub mod removal_lethality;

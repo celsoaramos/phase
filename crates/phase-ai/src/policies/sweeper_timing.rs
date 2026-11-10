@@ -5,13 +5,17 @@
 //! at the time of resolution. CR 701.8: destroy moves permanents to the
 //! graveyard. CR 701.13: exile removes them from the game entirely.
 
+use engine::game::filter::{matches_target_filter, FilterContext};
 use engine::game::players;
+use engine::types::ability::{AbilityDefinition, Effect};
+use engine::types::identifiers::ObjectId;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::GameState;
 use engine::types::player::PlayerId;
 
 use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
+use crate::ability_chain::collect_chain_effects;
 use crate::cast_facts::is_cast_family_action;
 use crate::features::control::{is_sweeper_parts, COMMITMENT_FLOOR};
 use crate::features::DeckFeatures;
@@ -62,6 +66,18 @@ impl TacticalPolicy for SweeperTimingPolicy {
             };
         }
 
+        // CR 608.2h: a sweeper that would hit no opposing permanent only destroys the
+        // caster's own board — a hard veto, not a −2 the search outweighs. Relato de
+        // 09/11/2026: o azorius-control conjurou Supreme Verdict com UMA ficha na mesa,
+        // e ela era do próprio robô.
+        if let Some(facts) = ctx.cast_facts() {
+            if sweeper_spares_every_opponent(ctx.state, ctx.ai_player, facts.object.id, &facts.object.abilities) {
+                return PolicyVerdict::Reject {
+                    reason: PolicyReason::new("sweeper_hits_only_own_board"),
+                };
+            }
+        }
+
         let opposing_creatures = count_opposing_creatures(ctx.state, ctx.ai_player);
 
         if opposing_creatures >= SWEEPER_TIMELY_THRESHOLD {
@@ -96,6 +112,44 @@ fn candidate_is_sweeper(ctx: &PolicyContext<'_>) -> bool {
         return false;
     };
     is_sweeper_parts(&facts.object.abilities)
+}
+
+/// True when every effect of the sweeper is a `DestroyAll`/`DamageAll` over the
+/// battlefield and none of the permanents it would hit is controlled by an
+/// opponent. Fails open: any other effect in the chain (draw, exile from a
+/// graveyard, damage to players) keeps the spell castable.
+fn sweeper_spares_every_opponent(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    abilities: &[AbilityDefinition],
+) -> bool {
+    let opponents = players::opponents(state, player);
+    let filter_ctx = FilterContext::from_source(state, source_id);
+    let mut saw_sweep = false;
+    for ability in abilities
+        .iter()
+        .filter(|a| a.kind == engine::types::ability::AbilityKind::Spell)
+    {
+        for effect in collect_chain_effects(ability) {
+            let target = match effect {
+                Effect::DestroyAll { target, .. } | Effect::DamageAll { target, .. } => target,
+                _ => return false,
+            };
+            saw_sweep = true;
+            let hits_opponent = state.battlefield.iter().any(|&id| {
+                state
+                    .objects
+                    .get(&id)
+                    .is_some_and(|obj| opponents.contains(&obj.controller))
+                    && matches_target_filter(state, id, target, &filter_ctx)
+            });
+            if hits_opponent {
+                return false;
+            }
+        }
+    }
+    saw_sweep
 }
 
 /// Count the number of creature permanents controlled by opponents of `player`.
@@ -268,6 +322,44 @@ mod tests {
         assert!(SweeperTimingPolicy
             .activation(&features, &state, AI)
             .is_some());
+    }
+
+    fn verdict_for(state: &GameState, sweeper_id: ObjectId) -> PolicyVerdict {
+        let candidate = cast_candidate(sweeper_id, CardId(6000));
+        let decision = priority_decision();
+        let (context, config) = context_with_features(control_features_with_sweepers(3, 0.8));
+        let ctx = PolicyContext {
+            state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: AI,
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        SweeperTimingPolicy.verdict(&ctx)
+    }
+
+    #[test]
+    fn sweeper_rejected_when_only_own_permanent_would_die() {
+        // Relato de 09/11/2026: Supreme Verdict com uma ficha só na mesa, e ela era do robô.
+        let mut state = GameState::new_two_player(42);
+        let own = make_opponent_creature(&mut state, 0);
+        state.objects.get_mut(&own).unwrap().controller = AI;
+        let sweeper_id = make_sweeper_spell(&mut state, 0);
+        match verdict_for(&state, sweeper_id) {
+            PolicyVerdict::Reject { reason } => assert_eq!(reason.kind, "sweeper_hits_only_own_board"),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sweeper_with_one_opposing_creature_is_not_vetoed() {
+        let mut state = GameState::new_two_player(42);
+        make_opponent_creature(&mut state, 0);
+        let sweeper_id = make_sweeper_spell(&mut state, 0);
+        assert!(matches!(verdict_for(&state, sweeper_id), PolicyVerdict::Score { .. }));
     }
 
     #[test]
