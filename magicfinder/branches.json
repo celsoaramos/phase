@@ -424,5 +424,8 @@
   },
   {
     "branch": "card/silence-copy-opponents"
+  },
+  {
+    "branch": "ai/mf-flags-1110"
   }
 ]
