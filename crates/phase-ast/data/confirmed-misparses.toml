@@ -2382,7 +2382,6 @@ face = [
   { key = "spock, always your friend", class = "wrong_zone", clauses = ["Put the rest on the bottom of your library in any order."] },
   { key = "spore cloud", class = "wrong_object", clauses = ["Prevent all combat damage that would be dealt this turn.", "Each attacking creature and each blocking creature doesn't untap during its controller's next untap step."] },
   { key = "sporogenesis", class = "wrong_object", clauses = ["Whenever a creature with a fungus counter on it dies, create a 1/1 green Saproling creature token for each fungus counter on that creature."] },
-  { key = "springheart nantuko", class = "condition_wrong", clauses = ["Landfall — Whenever a land you control enters, you may pay {1}{G} if this permanent is attached to a creature you control.", "If you didn't create a token this way, create a 1/1 green Insect creature token."] },
   { key = "sproutback trudge", class = "wrong_zone", clauses = ["At the beginning of your end step, if you gained life this turn, you may cast this creature from your graveyard."] },
   { key = "spy kit", class = "missing_effect", clauses = ["and has all names of nonlegendary creature cards in addition to its name."] },
   { key = "spy network", class = "missing_effect", clauses = ["Look at target player's hand, the top card of that player's library, and any face-down creatures they control."] },
