@@ -8734,8 +8734,17 @@ fn parse_prevent_effect_with_context(
         || nom_primitives::scan_contains(rest, "to its controller")
     {
         TargetFilter::Controller
-    } else if let Some(filter) = TextPair::new(text, &lower)
-        .strip_after("dealt to ")
+    } else if let Some(filter) = recipient
+        // CR 615.1a: the recipient follows "dealt [this turn] to" — the same
+        // phrase `prevent_recipient_phrase` located above, so a "this turn"
+        // window between "dealt" and "to" (Pack Leader's "dealt this turn to
+        // Dogs you control") still binds its descriptor instead of falling
+        // through to the broadcast `Any` (which shielded every recipient).
+        .map(|recipient| {
+            TextPair::new(text, &lower)
+                .split_at(lower.len() - recipient.len())
+                .1
+        })
         .and_then(|tp| {
             resolve_prevent_recipient_with_context(
                 tp,
