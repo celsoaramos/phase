@@ -27019,9 +27019,19 @@ fn has_they_pronoun(lower: &str) -> bool {
     .is_some()
 }
 
+/// CR 115.1 + CR 601.2d: the clause declares its own fresh "any target"
+/// recipient — singular ("to any target") or the plural recipient of a
+/// counted/divided declaration ("divided as you choose among one or two
+/// targets", "to each of up to two targets"). A subject anaphor in the same
+/// clause ("When you do, it deals 7 damage …" — Death to Our Enemies) names
+/// the damage SOURCE, never the recipient, so the parent-target rewrite must
+/// not collapse these new targets to `ParentTarget`.
 fn explicit_any_target_clause(effect: &Effect, lower: &str) -> bool {
     matches!(effect.target_filter(), Some(TargetFilter::Any))
-        && nom_primitives::scan_contains(lower, "any target")
+        && nom_primitives::scan_at_word_boundaries(lower, |i| {
+            alt((tag::<_, _, OracleError<'_>>("any target"), tag("targets"))).parse(i)
+        })
+        .is_some()
 }
 
 fn rewrite_triggering_spell_controller_to_parent_target_controller(effect: &mut Effect) {

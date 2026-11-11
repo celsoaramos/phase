@@ -98417,3 +98417,48 @@ fn fused_subject_look_exile_preserves_or_rejects_the_complete_instruction() {
         "the public chain must retain the honest gap, not fall back to Dig: {unsupported:?}"
     );
 }
+
+/// Relato da mesa (11/11/2026), Death to Our Enemies: "When you do, it deals 7
+/// damage divided as you choose among one or two targets." The subject "it" is
+/// the damage source; the plural "targets" declares FRESH any-target
+/// recipients. The anaphor rewrite collapsed them to `ParentTarget` (the
+/// sacrificed enchantment's empty target list) and the 7 damage went nowhere.
+#[test]
+fn reflexive_it_deals_divided_damage_keeps_fresh_any_targets() {
+    for (text, multi) in [
+        (
+            "When the fourth plan counter is put on this enchantment, sacrifice it. When you do, it deals 7 damage divided as you choose among one or two targets.",
+            true,
+        ),
+        (
+            "When this enchantment enters, sacrifice it. When you do, it deals 2 damage to each of up to two targets.",
+            true,
+        ),
+        (
+            "When this enchantment enters, sacrifice it. When you do, it deals 3 damage to any target.",
+            false,
+        ),
+    ] {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            text,
+            "Death to Our Enemies",
+            &[],
+            &["Enchantment".to_string()],
+            &[],
+        );
+        let execute = parsed.triggers[0].execute.as_ref().expect("trigger body");
+        let damage = execute.sub_ability.as_ref().expect("reflexive damage");
+        assert!(
+            matches!(
+                *damage.effect,
+                Effect::DealDamage {
+                    target: TargetFilter::Any,
+                    ..
+                }
+            ),
+            "{text}: {:?}",
+            damage.effect
+        );
+        assert_eq!(damage.multi_target.is_some(), multi, "{text}");
+    }
+}

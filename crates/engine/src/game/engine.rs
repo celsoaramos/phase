@@ -11646,7 +11646,7 @@ fn finalize_copy_walk(
     if walk.mode == crate::types::game_state::CopyChoiceMode::Announce {
         let cast_start = events.len();
         super::casting_costs::commit_copy_cast(state, walk.copy_id, walk.player, events)?;
-        collect_copy_cast_observers(state, events, cast_start);
+        collect_observers_before_resume(state, events, cast_start);
     }
     // CR 603.3 + CR 603.3b: the latched observers wait in `deferred_triggers`.
     // Once the offering resolution has finished, the post-action pipeline
@@ -11656,14 +11656,22 @@ fn finalize_copy_walk(
     complete_copy_walk_effect(state, walk, events)
 }
 
-/// CR 603.2 + CR 702.40a: a cast trigger triggers when the spell becomes
-/// cast, so the observers of a copy's `SpellCast` (`events[cast_start..]`)
-/// are collected now, before the effect that offered the copy resumes and can
-/// cast more spells: Storm counts the spells cast before this one. They stay
-/// parked in `deferred_triggers` (put on the stack at the next priority, as
-/// before), and their occurrences are claimed so the post-action scan does
-/// not collect them a second time (CR 603.2c).
-fn collect_copy_cast_observers(state: &mut GameState, events: &[GameEvent], cast_start: usize) {
+/// CR 603.2: collect the triggers of `events[cast_start..]` NOW and park them in
+/// `deferred_triggers` (put on the stack at the next priority), claiming their
+/// occurrences so the post-action scan does not collect them a second time
+/// (CR 603.2c).
+///
+/// Used where those events could otherwise miss the scan or be scanned too
+/// late:
+/// - CR 702.40a: a cast trigger triggers when the spell becomes cast, so the
+///   observers of a copy's `SpellCast` are collected before the effect that
+///   offered the copy resumes and can cast more spells (Storm counts the
+///   spells cast before this one).
+/// - CR 603.6a: an entering Aura's resumed battlefield entry (CR 303.4f host
+///   choice) whose action then stops on another prompt of the same resolution
+///   (Yenna's scry) — the action never reaches the priority pipeline, and its
+///   entry events would be dropped with it.
+fn collect_observers_before_resume(state: &mut GameState, events: &[GameEvent], cast_start: usize) {
     let cast_events = &events[cast_start..];
     if cast_events.is_empty() {
         return;
@@ -16210,7 +16218,7 @@ fn apply_non_priority_pass_action(
                 pending_effect,
             },
             GameAction::ChooseTarget { target },
-        ) => {
+        ) => 'return_as_aura_target: {
             if turn_control::authorized_submitter(state) != Some(*player) {
                 return Err(EngineError::WrongPlayer);
             }
@@ -16231,6 +16239,7 @@ fn apply_non_priority_pass_action(
                     grants,
                 } => (enchant_filter.clone(), grants.clone()),
                 _ => {
+                    let entry_events_start = events.len();
                     // CR 303.4f + CR 701.3b: attach through the entering-Aura
                     // authority, so the CR 701.3a gate judges the same entrant
                     // the host list was offered for. Seams that park none get
@@ -16268,7 +16277,18 @@ fn apply_non_priority_pass_action(
                         super::zone_pipeline::drain_pending_batch_deliveries(state, &mut events);
                     }
                     resume_pending_continuation_if_priority(state, &mut events)?;
-                    return Ok(ActionResult::applied(events, state.waiting_for.clone()));
+                    if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                        collect_observers_before_resume(state, &events, entry_events_start);
+                    }
+                    // CR 603.6a + CR 603.3b: the resumed entry (a copy token's
+                    // entry tail — Yenna copying Sheltered by Ghosts) appends the
+                    // permanent's battlefield-entry events to this action. They
+                    // must reach the post-action pipeline's trigger scan like
+                    // every other settled action (or, when the resolution stops on
+                    // another prompt, be parked above); returning the result
+                    // directly dropped them, so the entering Aura's "When this
+                    // Aura enters" never triggered when a host had to be chosen.
+                    break 'return_as_aura_target state.waiting_for.clone();
                 }
             };
             let chosen = match chosen {
