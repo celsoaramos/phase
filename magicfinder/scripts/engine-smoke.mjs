@@ -16,6 +16,7 @@
  */
 
 import { createNodeEngine, seat, LEGACY, snapshot } from './lib/phaseEngineNode.mjs'
+import { withoutCensusGaps } from './lib/engineCoverage.mjs'
 
 const argv = process.argv.slice(2)
 const arg = (n, d) => { const i = argv.indexOf(`--${n}`); return i >= 0 && argv[i + 1] ? argv[i + 1] : d }
@@ -121,7 +122,7 @@ async function main() {
     })
     const unknown = c?.unknown_cards ?? []
     assert(unknown.length === 0, `desconhecidas: ${unknown.join(', ')}`)
-    const cov = c?.coverage
+    const cov = withoutCensusGaps(c?.coverage)
     if (cov?.total_unique) {
       const ratio = cov.supported_unique / cov.total_unique
       assert(ratio >= MIN_COVERAGE, `cobertura ${(ratio * 100).toFixed(0)}% < ${MIN_COVERAGE * 100}% (${(cov.unsupported_cards ?? []).map(u => u.name).join(', ')})`)
