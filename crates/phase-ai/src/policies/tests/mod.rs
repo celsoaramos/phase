@@ -15,6 +15,7 @@ pub mod energy_payoff;
 pub mod equipment_payoff;
 pub mod graveyard_types;
 pub mod lifegain_payoff;
+pub mod mass_spell_spares_opponents_repro;
 pub mod mill_payoff;
 pub mod mulligan_input_lint;
 pub mod own_board_only_activation_repro;

@@ -143,6 +143,18 @@ impl TacticalPolicy for AntiSelfHarmPolicy {
 }
 
 fn reject_reason(ctx: &PolicyContext<'_>) -> Option<PolicyReason> {
+    // CR 608.2h: a mass battlefield move (destroy / return / exile all …) that
+    // reaches no opposing permanent is a dead card or a self-sweep — never a
+    // line worth casting (Aetherize with no attacking creature, relato de
+    // 12/11/2026).
+    if matches!(ctx.candidate.action, GameAction::CastSpell { .. })
+        && mass_spell_source_is_instant_or_sorcery(ctx)
+        && super::removal_lethality::mass_battlefield_spell_spares_every_opponent(ctx)
+    {
+        return Some(PolicyReason::new(
+            "anti_self_harm_mass_spell_spares_opponents",
+        ));
+    }
     match &ctx.candidate.action {
         GameAction::CastSpell { .. }
             if is_pact_payment_cast(ctx.state, &ctx.candidate.action)
@@ -1854,6 +1866,28 @@ pub(crate) fn extract_damage_amount(effects: &[&Effect]) -> Option<i32> {
             ..
         } => Some(*value),
         _ => None,
+    })
+}
+
+/// An instant or sorcery card (no permanent type): only these resolve and leave,
+/// so their mass leg is the whole value of the cast.
+fn mass_spell_source_is_instant_or_sorcery(ctx: &PolicyContext<'_>) -> bool {
+    ctx.source_object().is_some_and(|source| {
+        let types = &source.card_types.core_types;
+        types
+            .iter()
+            .any(|t| matches!(t, CoreType::Instant | CoreType::Sorcery))
+            && !types.iter().any(|t| {
+                matches!(
+                    t,
+                    CoreType::Creature
+                        | CoreType::Artifact
+                        | CoreType::Enchantment
+                        | CoreType::Planeswalker
+                        | CoreType::Battle
+                        | CoreType::Land
+                )
+            })
     })
 }
 
