@@ -872,6 +872,28 @@ fn own_permanent_with_opponent_alternative(
         .then(|| PolicyReason::new("anti_self_harm_own_permanent_with_opponent_target"))
 }
 
+/// True when `effect` only improves the creature it addresses: a
+/// non-negative pump, a beneficial granted static (keywords — "gains
+/// lifelink"), or a choice ("your choice of lifelink or indestructible" —
+/// Orcish Medicine) whose every branch is such a boon. A choice that offers any
+/// other outcome stands down.
+fn boons_its_target(effect: &Effect) -> bool {
+    match effect {
+        Effect::Pump { .. } | Effect::DoublePT { .. } | Effect::GenericEffect { .. } => {
+            matches!(effect_polarity(effect), EffectPolarity::Beneficial)
+        }
+        Effect::ChooseOneOf { branches, .. } => {
+            !branches.is_empty()
+                && branches.iter().all(|branch| {
+                    collect_definition_effects(branch)
+                        .into_iter()
+                        .all(boons_its_target)
+                })
+        }
+        _ => false,
+    }
+}
+
 /// Mirror of [`own_permanent_with_opponent_alternative`]: refuse aiming a
 /// PURE creature-benefit spell (a non-negative pump, optionally with a Role
 /// attached to the same creature) at an opponent's permanent while the same
@@ -883,8 +905,12 @@ fn own_permanent_with_opponent_alternative(
 /// on the human's creature about 1 in 20 casts with the AI's own attacker
 /// available.
 ///
-/// "Pure" is strict on purpose: every effect must be `Beneficial`, and at
-/// least one must be a `Pump`/`DoublePT` that targets creatures. Threaten
+/// "Pure" is strict on purpose: every effect must boon the target, be
+/// `Beneficial`, or leave the target alone, and at least one must boon a
+/// creature slot ([`boons_its_target`]). Relato 11/11/2026: the AI cast
+/// Orcish Medicine ("target creature gains your choice of lifelink or
+/// indestructible", then Amass) on the human's Imperious Perfect with its own
+/// Orc Army available — the pump-only check never saw the keyword choice. Threaten
 /// effects (`GainControl` + pump + haste), where the opponent's creature IS
 /// the intended target, carry a non-`Beneficial` effect and stand down here.
 fn opponent_permanent_with_own_alternative(
@@ -906,15 +932,21 @@ fn opponent_permanent_with_own_alternative(
     }
 
     let effects = ctx.effects();
-    let has_creature_pump = effects.iter().any(|effect| {
-        matches!(effect, Effect::Pump { .. } | Effect::DoublePT { .. })
-            && matches!(effect_polarity(effect), EffectPolarity::Beneficial)
-            && targets_creatures(effect)
+    // The boon lands on a creature: the pump's own filter names one, or the
+    // chosen object is one (a `TargetOnly` declaring the target of a chain
+    // whose later nodes read it carries no filter `targets_creatures` reads).
+    let creature_slot = target.card_types.core_types.contains(&CoreType::Creature)
+        || effects.iter().any(|effect| targets_creatures(effect));
+    let has_creature_benefit = effects.iter().any(|effect| boons_its_target(effect));
+    // Every node either boons the target, is plainly beneficial, or does not
+    // touch the target at all (the declaring `TargetOnly`; "Amass" grows the
+    // caster's own Army — Orcish Medicine).
+    let pure = effects.iter().all(|effect| {
+        boons_its_target(effect)
+            || matches!(effect_polarity(effect), EffectPolarity::Beneficial)
+            || matches!(effect, Effect::TargetOnly { .. } | Effect::Amass { .. })
     });
-    let all_beneficial = effects
-        .iter()
-        .all(|effect| matches!(effect_polarity(effect), EffectPolarity::Beneficial));
-    if !has_creature_pump || !all_beneficial {
+    if !creature_slot || !has_creature_benefit || !pure {
         return None;
     }
 
@@ -3029,9 +3061,13 @@ mod tests {
             "Undying grant should prefer own creature: own={score_own}, opp={score_opp}"
         );
         assert!(score_own > 0.0, "Own creature score should be positive");
+        // A beneficial grant on the opponent's creature with the AI's own
+        // creature available is now a hard veto at the verdict level
+        // (`keyword_choice_boon_rejects_opponent_target_with_own_alternative`);
+        // a rejected target scores 0 here instead of a soft negative.
         assert!(
-            score_opp < 0.0,
-            "Opponent creature score should be negative"
+            score_opp <= 0.0,
+            "Opponent creature score should not be positive"
         );
     }
 
@@ -3620,6 +3656,68 @@ mod tests {
             PolicyVerdict::Reject { reason }
                 if reason.kind == "anti_self_harm_beneficial_opponent_target_with_own_alternative"
         ));
+    }
+
+    /// Relato 11/11/2026: the AI cast Orcish Medicine on the human's Imperious
+    /// Perfect with its own Orc Army on the battlefield. "Your choice of
+    /// lifelink or indestructible" is a keyword choice, not a pump, so the
+    /// pure-benefit veto never applied.
+    #[test]
+    fn keyword_choice_boon_rejects_opponent_target_with_own_alternative() {
+        let mut state = make_state();
+        let own_id = add_creature(&mut state, PlayerId(0), "Orc Army", 3, 3);
+        let opp_id = add_creature(&mut state, PlayerId(1), "Imperious Perfect", 2, 2);
+        let abilities = parsed_abilities(
+            "Orcish Medicine",
+            "Target creature gains your choice of lifelink or indestructible until end of turn.\nAmass Orcs 1.",
+            &[],
+            &["Instant"],
+        );
+        let definition = &abilities[0];
+        let legal = vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)];
+
+        let opp = target_verdict_for_definition(
+            &mut state,
+            "Orcish Medicine",
+            definition,
+            legal.clone(),
+            TargetRef::Object(opp_id),
+        );
+        assert_eq!(
+            reject_kind(&opp),
+            Some("anti_self_harm_beneficial_opponent_target_with_own_alternative")
+        );
+        let own = target_verdict_for_definition(
+            &mut state,
+            "Orcish Medicine",
+            definition,
+            legal,
+            TargetRef::Object(own_id),
+        );
+        assert_ne!(
+            reject_kind(&own),
+            Some("anti_self_harm_beneficial_opponent_target_with_own_alternative")
+        );
+
+        // A choice that can hurt the target ("gains lifelink or can't block")
+        // is not a pure boon: no veto from this rule.
+        let mixed = parsed_abilities(
+            "Mixed Choice",
+            "Target creature gains your choice of lifelink or menace until end of turn. Target creature can't block this turn.",
+            &[],
+            &["Instant"],
+        );
+        let verdict = target_verdict_for_definition(
+            &mut state,
+            "Mixed Choice",
+            &mixed[0],
+            vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
+            TargetRef::Object(opp_id),
+        );
+        assert_ne!(
+            reject_kind(&verdict),
+            Some("anti_self_harm_beneficial_opponent_target_with_own_alternative")
+        );
     }
 
     #[test]
@@ -7212,9 +7310,13 @@ mod tests {
             "GenericEffect CantBeBlocked should prefer own creature: own={score_own}, opp={score_opp}"
         );
         assert!(score_own > 0.0, "Own creature score should be positive");
+        // A beneficial grant on the opponent's creature with the AI's own
+        // creature available is now a hard veto at the verdict level
+        // (`keyword_choice_boon_rejects_opponent_target_with_own_alternative`);
+        // a rejected target scores 0 here instead of a soft negative.
         assert!(
-            score_opp < 0.0,
-            "Opponent creature score should be negative"
+            score_opp <= 0.0,
+            "Opponent creature score should not be positive"
         );
     }
 
