@@ -106,6 +106,39 @@ fn parse_creature_subtype_card_tail(lower: &str) -> Option<(TargetFilter, &str)>
     Some((subtype_filter, rest))
 }
 
+/// CR 205.3m + CR 608.2c: a bare subtype gate on a revealed/looked-at card —
+/// "a Zombie card" (Archghoul of Thraben), "an Elf or Warrior card" — names a
+/// subtype with no core-type word, so the gate matches any card with that
+/// subtype (a Kindred Zombie included).
+fn parse_subtype_card_tail(lower: &str) -> Option<(TargetFilter, &str)> {
+    let (subtype_filter, rest) = parse_creature_subtype_or_list_prefix(lower)?;
+    // The list reader takes any word; only real subtypes belong here, so "a land
+    // card" / "a nonland card" stay with the core-type gate below.
+    if !subtype_leaves_are_known(&subtype_filter) {
+        return None;
+    }
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" card").parse(rest).ok()?;
+    Some((subtype_filter, rest))
+}
+
+fn subtype_leaves_are_known(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(typed) => {
+            !typed.type_filters.is_empty()
+                && typed.type_filters.iter().all(|tf| match tf {
+                    TypeFilter::Subtype(name) => {
+                        parse_subtype(name).is_some_and(|(canonical, consumed)| {
+                            consumed == name.len() && canonical.eq_ignore_ascii_case(name)
+                        })
+                    }
+                    _ => false,
+                })
+        }
+        TargetFilter::Or { filters } => filters.iter().all(subtype_leaves_are_known),
+        _ => false,
+    }
+}
+
 fn parse_creature_subtype_type_tail(lower: &str) -> Option<TargetFilter> {
     let (subtype_filter, rest) = parse_creature_subtype_or_list_prefix(lower)?;
     let (rest, _) = tag::<_, _, OracleError<'_>>(" creature").parse(rest).ok()?;
@@ -2001,6 +2034,19 @@ fn parse_its_a_card_type_gate_body<'a>(
             maybe_negate(
                 AbilityCondition::RevealedHasCardType {
                     card_types: vec![CoreType::Creature],
+                    additional_filter: None,
+                    subtype_filter: Some(Box::new(subtype_filter)),
+                },
+                negated,
+            ),
+            after_type,
+        ));
+    }
+    if let Some((subtype_filter, after_type)) = parse_subtype_card_tail(rest) {
+        return Some((
+            maybe_negate(
+                AbilityCondition::RevealedHasCardType {
+                    card_types: vec![],
                     additional_filter: None,
                     subtype_filter: Some(Box::new(subtype_filter)),
                 },
@@ -7970,7 +8016,12 @@ fn try_unrouted_nom_condition_tail(text: &str, ctx: &mut ParseContext) -> Option
     };
 
     if let Some(rest) = rest_after_prefix {
+        let rest_with_noun = rest.trim();
         let rest = rest.trim_end_matches(" card").trim();
+        // CR 109.2: a description that includes the word "card" names an object
+        // outside the battlefield — here the card just looked at or revealed —
+        // never a permanent.
+        let names_a_card = rest.len() != rest_with_noun.len();
         // CR 608.2c: "permanent" is not a CoreType — gate on it via the existing
         // parse_type_phrase_folding building block + TargetMatchesFilter, keeping this handler
         // in lockstep with strip_card_type_conditional's "permanent" arm.
@@ -8075,6 +8126,20 @@ fn try_unrouted_nom_condition_tail(text: &str, ctx: &mut ParseContext) -> Option
                     .iter()
                     .any(type_filter_references_subtype)
             {
+                // CR 205.3m + CR 608.2c: "If it's a Zombie card, you may reveal it
+                // and put it into your hand" (Archghoul of Thraben) gates the card
+                // the effect just looked at, exactly like the core-type arms above
+                // — not the ability's target or the creature that triggered it.
+                if names_a_card {
+                    return Some(maybe_negate(
+                        AbilityCondition::RevealedHasCardType {
+                            card_types: vec![],
+                            additional_filter: None,
+                            subtype_filter: Some(Box::new(filter.clone())),
+                        },
+                        negated,
+                    ));
+                }
                 return Some(maybe_negate(
                     AbilityCondition::TargetMatchesFilter {
                         filter: filter.clone(),

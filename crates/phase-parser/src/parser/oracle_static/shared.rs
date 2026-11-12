@@ -1950,7 +1950,22 @@ fn segment_subject_is_pronoun_it(segment: &str) -> bool {
     // `nom_tag_tp` bridge so the pronoun match stays on the combinator path.
     let trimmed = segment.trim_start();
     let lower = trimmed.to_lowercase();
-    nom_tag_tp(&TextPair::new(trimmed, &lower), "it ").is_some()
+    if nom_tag_tp(&TextPair::new(trimmed, &lower), "it ").is_some() {
+        return true;
+    }
+    // CR 611.3a: a leading "As long as <condition>," clause does not change the
+    // subject of the sentence — "As long as it's legendary, it gets an
+    // additional +2/+2" (Tenza, Godo's Maul) is still a pronoun-"it"
+    // continuation of the equipped creature. The condition itself is lowered as
+    // a recipient check, so rebinding the affected scope makes it read the
+    // equipped creature too.
+    let leading_condition_then_it = preceded(
+        tag::<_, _, OracleError<'_>>("as long as "),
+        preceded(take_until(", "), preceded(tag(", "), tag("it "))),
+    )
+    .parse(lower.as_str())
+    .is_ok();
+    leading_condition_then_it
 }
 
 /// True iff a filter is scoped to an attached object — the enchanted (Aura,
