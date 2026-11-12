@@ -926,6 +926,55 @@ fn filter_has_unbound_player_controller(filter: &TargetFilter) -> bool {
     }
 }
 
+/// CR 608.2h + CR 115.10a: an instant or sorcery whose EVERY effect is a
+/// non-targeted mass move off the battlefield (`DestroyAll`, `BounceAll`,
+/// `ChangeZoneAll` from the battlefield) and whose populations hold no
+/// permanent an opponent controls. Casting it does nothing for the AI — or
+/// worse, sweeps its own board. Relato de 12/11/2026: Aetherize ("Return all
+/// attacking creatures to their owner's hand") cast in the AI's own end step,
+/// with no creature attacking.
+///
+/// Fails open: any other effect in the chain, an unresolvable player-relative
+/// population (`filter_has_unbound_player_controller`), a counted `BounceAll`
+/// ("return N …") or a default (`None`) population keeps the spell castable.
+pub(crate) fn mass_battlefield_spell_spares_every_opponent(ctx: &PolicyContext<'_>) -> bool {
+    let Some(source) = ctx.source_object() else {
+        return false;
+    };
+    let effects = ctx.effects();
+    if effects.is_empty() {
+        return false;
+    }
+    effects.iter().all(|effect| {
+        let (target, destroys) = match effect {
+            Effect::DestroyAll { target, .. } => (target, true),
+            Effect::BounceAll {
+                target,
+                count: None,
+                ..
+            } => (target, false),
+            Effect::ChangeZoneAll {
+                origin: Some(engine::types::zones::Zone::Battlefield),
+                target,
+                ..
+            } => (target, false),
+            _ => return false,
+        };
+        if matches!(target, TargetFilter::None) || filter_has_unbound_player_controller(target) {
+            return false;
+        }
+        let filter_ctx = FilterContext::from_source_with_controller(source.id, source.controller);
+        !ctx.state.battlefield.iter().any(|&id| {
+            ctx.state.objects.get(&id).is_some_and(|obj| {
+                is_opponent(ctx.state, ctx.ai_player, obj.controller)
+                    // CR 702.12b: indestructible permanents aren't destroyed.
+                    && !(destroys && obj.has_keyword(&Keyword::Indestructible))
+                    && matches_target_filter(ctx.state, id, target, &filter_ctx)
+            })
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2525,53 +2574,4 @@ mod tests {
             },
         );
     }
-}
-
-/// CR 608.2h + CR 115.10a: an instant or sorcery whose EVERY effect is a
-/// non-targeted mass move off the battlefield (`DestroyAll`, `BounceAll`,
-/// `ChangeZoneAll` from the battlefield) and whose populations hold no
-/// permanent an opponent controls. Casting it does nothing for the AI — or
-/// worse, sweeps its own board. Relato de 12/11/2026: Aetherize ("Return all
-/// attacking creatures to their owner's hand") cast in the AI's own end step,
-/// with no creature attacking.
-///
-/// Fails open: any other effect in the chain, an unresolvable player-relative
-/// population (`filter_has_unbound_player_controller`), a counted `BounceAll`
-/// ("return N …") or a default (`None`) population keeps the spell castable.
-pub(crate) fn mass_battlefield_spell_spares_every_opponent(ctx: &PolicyContext<'_>) -> bool {
-    let Some(source) = ctx.source_object() else {
-        return false;
-    };
-    let effects = ctx.effects();
-    if effects.is_empty() {
-        return false;
-    }
-    effects.iter().all(|effect| {
-        let (target, destroys) = match effect {
-            Effect::DestroyAll { target, .. } => (target, true),
-            Effect::BounceAll {
-                target,
-                count: None,
-                ..
-            } => (target, false),
-            Effect::ChangeZoneAll {
-                origin: Some(engine::types::zones::Zone::Battlefield),
-                target,
-                ..
-            } => (target, false),
-            _ => return false,
-        };
-        if matches!(target, TargetFilter::None) || filter_has_unbound_player_controller(target) {
-            return false;
-        }
-        let filter_ctx = FilterContext::from_source_with_controller(source.id, source.controller);
-        !ctx.state.battlefield.iter().any(|&id| {
-            ctx.state.objects.get(&id).is_some_and(|obj| {
-                is_opponent(ctx.state, ctx.ai_player, obj.controller)
-                    // CR 702.12b: indestructible permanents aren't destroyed.
-                    && !(destroys && obj.has_keyword(&Keyword::Indestructible))
-                    && matches_target_filter(ctx.state, id, target, &filter_ctx)
-            })
-        })
-    })
 }
