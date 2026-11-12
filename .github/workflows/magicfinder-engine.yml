@@ -14,9 +14,12 @@ name: MagicFinder — motor do fork
 # Voltar uma versão: no repo magic, `node scripts/publish-phase-manifest.mjs --rollback`.
 on:
   schedule:
-    - cron: '30 17 * * *'   # depois da janela de release deles (~14-15 UTC)
-  # Mesclar um PR que muda a lista de branches publica na hora (rotina de relatos de
-  # 4 h, 2026-10-25): sem isto o build esperava o agendado — o disparo manual pela
+    # Nas três rodadas da rotina de relatos (11h, 16h e 21h de Brasília, 2026-11-12): pega
+    # a tag nova do upstream mesmo quando a rodada não mescla nada. Sem nada novo, o `plan`
+    # para em ~1 min. O GitHub costuma atrasar o agendado em horas.
+    - cron: '0 0,14,19 * * *'
+  # Mesclar um PR que muda a lista de branches publica na hora (rotina de relatos,
+  # 2026-10-25): sem isto o build esperava o agendado — o disparo manual pela
   # integração do GitHub dá 403. A `concurrency` abaixo enfileira, não cancela.
   push:
     branches: [magicfinder-ci]
