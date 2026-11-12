@@ -129,6 +129,13 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     // Routes that consult `enters_with_fails_closed` record the line as the
     // `enters_with_clause` gap. An arm that reads every sentence of such a line
     // must dispatch above this gate.
+    //
+    // CR 614.1c + CR 706.1 + CR 706.4: the as-enters dice roll whose total sets
+    // the enters-with count (Neverwinter Hydra, Hydradoodle) reads BOTH
+    // sentences, so it dispatches above the gate.
+    if let Some(def) = parse_as_enters_roll_dice_counters(&norm_lower, &text) {
+        return Some(def);
+    }
     if is_line_owned_enters_with_clause(&norm_lower) {
         return None;
     }
@@ -2544,6 +2551,90 @@ fn parse_as_enters_pay(norm_lower: &str, original_text: &str) -> Option<Replacem
         def.entry_payment_max = Some(parse_entry_payment_cap(trailing)?);
     }
     Some(def)
+}
+
+/// CR 614.1c + CR 706.1 + CR 706.4: "As ~ enters, roll X d6. It enters with a
+/// number of +1/+1 counters on it equal to the total of those results."
+/// (Neverwinter Hydra; Hydradoodle prints "roll X six-sided dice" and "This
+/// creature enters …").
+///
+/// One replacement reads both sentences: the roll is part of the entry event
+/// (CR 614.1c), and the enters-with count is the total of the dice rolled by
+/// that instruction (CR 706.4), which `Effect::RollDie` publishes on the
+/// `EventContextAmount` channel the "equal to the result" counter readers
+/// already use. The roll count's X is the X paid on the entering object's cost
+/// (CR 614.12, `CostXPaid`), like every other enters-with X.
+///
+/// Strict on both sentences: the roll must be a bare multi-die instruction (no
+/// results table, no modifier), and the second sentence must be exactly the
+/// self enters-with "equal to the total/sum of those results" clause.
+/// Anything else declines and falls through to the enters-with gate below,
+/// which keeps the line an honest gap.
+fn parse_as_enters_roll_dice_counters(
+    norm_lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    let (residue, ()) = parse_as_self_enters_frame(norm_lower).ok()?;
+    let roll_text = first_sentence(residue).trim();
+    let tail = residue[roll_text.len()..].trim_start_matches('.').trim();
+    tag::<_, _, OracleError<'_>>("roll ")
+        .parse(roll_text)
+        .ok()?;
+
+    let mut roll = parse_effect_chain(roll_text, AbilityKind::Spell);
+    if roll.sub_ability.is_some() || !is_mandatory_unconditional_node(&roll) {
+        return None;
+    }
+    let Effect::RollDie {
+        count,
+        sides: _,
+        results,
+        modifier: None,
+    } = &mut *roll.effect
+    else {
+        return None;
+    };
+    if !results.is_empty() {
+        return None;
+    }
+    // CR 614.12: X is the X paid for the entering permanent.
+    rewrite_variable_x_to_cost_x_paid(count);
+
+    let (_, counter_type) = all_consuming((
+        alt((
+            tag::<_, _, OracleError<'_>>("~"),
+            tag("it"),
+            tag("this creature"),
+        )),
+        tag(" enters with a number of "),
+        nom_primitives::parse_strict_counter_type,
+        tag(" counters on it equal to the "),
+        alt((tag("total"), tag("sum"))),
+        tag(" of "),
+        alt((tag("those"), tag("the"))),
+        tag(" results"),
+        opt(tag(".")),
+    ))
+    .parse(tail)
+    .ok()
+    .map(|(rest, (_, _, counter_type, ..))| (rest, counter_type))?;
+
+    // CR 706.4: the counters read the total of the dice the roll above rolled.
+    let put_counter = build_enters_counter_ability(vec![(
+        counter_type,
+        QuantityExpr::Ref {
+            qty: QuantityRef::EventContextAmount,
+        },
+    )]);
+    roll.sub_ability = Some(Box::new(put_counter));
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::Moved)
+            .execute(roll)
+            .valid_card(TargetFilter::SelfRef)
+            .destination_zone(Zone::Battlefield)
+            .description(original_text.to_string()),
+    )
 }
 
 /// CR 614.12a (Nameless Race): "The amount you pay can't be more than \<A\>
@@ -33161,6 +33252,85 @@ mod tests {
             assert_eq!(
                 enters_with_counters_outcome(line, line).err(),
                 Some(expected),
+                "{line:?}"
+            );
+        }
+    }
+
+    /// CR 614.1c + CR 706.1 + CR 706.4: "As ~ enters, roll X d6. It enters with
+    /// a number of +1/+1 counters on it equal to the total of those results."
+    /// is ONE replacement: roll the X paid (`CostXPaid`, CR 614.12) d6, then
+    /// put that many +1/+1 counters on itself, reading the dice total from the
+    /// `EventContextAmount` channel `Effect::RollDie` publishes. Verbatim lines
+    /// (MTGJSON): Neverwinter Hydra ("d6", "It enters"), Hydradoodle
+    /// ("six-sided dice", "This creature enters").
+    #[test]
+    fn as_enters_roll_x_dice_counters_equal_to_total_of_results() {
+        for (name, line) in [
+            (
+                "Neverwinter Hydra",
+                "As this creature enters, roll X d6. It enters with a number of +1/+1 counters on it equal to the total of those results.",
+            ),
+            (
+                "Hydradoodle",
+                "As this creature enters, roll X six-sided dice. This creature enters with a number of +1/+1 counters on it equal to the total of those results.",
+            ),
+        ] {
+            let def = parse_replacement_line(line, name).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(def.event, ReplacementEvent::Moved, "{name}");
+            assert_eq!(def.valid_card, Some(TargetFilter::SelfRef), "{name}");
+            assert_eq!(def.destination_zone, Some(Zone::Battlefield), "{name}");
+            let execute = def.execute.as_ref().expect("execute");
+            assert_eq!(
+                *execute.effect,
+                Effect::RollDie {
+                    count: QuantityExpr::Ref {
+                        qty: QuantityRef::CostXPaid,
+                    },
+                    sides: 6,
+                    results: vec![],
+                    modifier: None,
+                },
+                "{name}"
+            );
+            let counters = execute.sub_ability.as_ref().expect("counters follow the roll");
+            assert_eq!(
+                *counters.effect,
+                Effect::PutCounter {
+                    counter_type: CounterType::Plus1Plus1,
+                    count: QuantityExpr::Ref {
+                        qty: QuantityRef::EventContextAmount,
+                    },
+                    target: TargetFilter::SelfRef,
+                },
+                "{name}"
+            );
+            assert!(counters.sub_ability.is_none(), "{name}");
+        }
+
+        // Negative rows: the arm reads both sentences or neither. A results
+        // table, a different count reading, or a foreign subject stays out.
+        for (name, line) in [
+            // Count reads one die, not "the total of those results".
+            (
+                "Test Hydra",
+                "As this creature enters, roll X d6. It enters with a number of +1/+1 counters on it equal to the highest result.",
+            ),
+            // Not a roll.
+            (
+                "Test Hydra",
+                "As this creature enters, choose a color. It enters with a number of +1/+1 counters on it equal to the total of those results.",
+            ),
+            // A rider after the counters is unread text of this replacement.
+            (
+                "Test Hydra",
+                "As this creature enters, roll X d6. It enters with a number of +1/+1 counters on it equal to the total of those results. Then draw a card.",
+            ),
+        ] {
+            let norm_lower =
+                replace_self_refs(&strip_reminder_text(line), name).to_lowercase();
+            assert!(
+                parse_as_enters_roll_dice_counters(&norm_lower, line).is_none(),
                 "{line:?}"
             );
         }
