@@ -5777,6 +5777,10 @@ fn exile_permission_pool(state: &GameState, source: &ExilePermissionSource<'_>) 
                 .map(|entry| entry.exiled_id)
                 .collect()
         }
+        // CR 406.6 + CR 122.1: every card in exile; the static's `affected`
+        // filter (Tinybones: "cards you don't own with stash counters on them")
+        // is the whole scope.
+        ExileCardPool::AnyExile => state.exile.iter().copied().collect(),
     };
     // CR 406.6 + CR 607.2b: An "each player … cards they exiled with ~" grant
     // admits only the source-linked cards this player exiled — the recorded
@@ -5790,6 +5794,15 @@ fn exile_permission_pool(state: &GameState, source: &ExilePermissionSource<'_>) 
         });
     }
     pool
+}
+
+/// CR 406.6: Superset gate for the `ExileCardPool::AnyExile` pool, which reads
+/// the whole exile instead of a tracked set. Keeps the empty-pool fast exits
+/// cheap: with nothing in exile, or no functioning `ExileCastPermission` static
+/// at all (O(1) presence cache), no any-exile source can offer a card.
+fn any_exile_pool_may_offer(state: &GameState) -> bool {
+    !state.exile.is_empty()
+        && static_kind_present(state, StaticModeKind::ExileCastPermission)
 }
 
 /// CR 117.1c: Whether a source's timing gate is currently satisfied.
@@ -5912,7 +5925,10 @@ fn exile_objects_castable_by_permission(
     // `Persistent` (The Matrix of Time) shape reads `exile_links`. With both
     // empty there is nothing to offer, matching the ~100% of board states with
     // no exile-cast permanent in play.
-    if state.cards_exiled_with_source_this_turn.is_empty() && state.exile_links.is_empty() {
+    if state.cards_exiled_with_source_this_turn.is_empty()
+        && state.exile_links.is_empty()
+        && !any_exile_pool_may_offer(state)
+    {
         return Vec::new();
     }
     let mut results = Vec::new();
@@ -6025,7 +6041,10 @@ fn exile_cast_permission_source_matching(
     // Same empty-pool fast exit as `exile_objects_castable_by_permission`: with
     // both exile pools empty no static can authorize the cast, so skip the
     // battlefield scan in `exile_permission_sources`.
-    if state.cards_exiled_with_source_this_turn.is_empty() && state.exile_links.is_empty() {
+    if state.cards_exiled_with_source_this_turn.is_empty()
+        && state.exile_links.is_empty()
+        && !any_exile_pool_may_offer(state)
+    {
         return None;
     }
     let sources = exile_permission_sources(state, player);
@@ -6082,7 +6101,10 @@ fn exile_cast_permission_source_full(
     if !exile_object_can_enter_cast_path(obj) {
         return None;
     }
-    if state.cards_exiled_with_source_this_turn.is_empty() && state.exile_links.is_empty() {
+    if state.cards_exiled_with_source_this_turn.is_empty()
+        && state.exile_links.is_empty()
+        && !any_exile_pool_may_offer(state)
+    {
         return None;
     }
     let sources = exile_permission_sources(state, player);
@@ -7621,7 +7643,10 @@ fn exile_land_playable_by_static_permission(
     player: PlayerId,
     land_id: ObjectId,
 ) -> Option<(ObjectId, CastFrequency)> {
-    if state.cards_exiled_with_source_this_turn.is_empty() && state.exile_links.is_empty() {
+    if state.cards_exiled_with_source_this_turn.is_empty()
+        && state.exile_links.is_empty()
+        && !any_exile_pool_may_offer(state)
+    {
         return None;
     }
     let sources = exile_permission_sources(state, player);

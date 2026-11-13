@@ -16703,8 +16703,19 @@ fn neighbouring_cast_permissions_keep_their_parse() {
         "Tinybones, Bauble Burglar",
         &[],
     );
-    assert!(tinybones.statics.is_empty());
-    assert_eq!(unimplemented_names(&tinybones), ["unknown"]);
+    // CR 406.6 + CR 122.1: the stash counter is the only link, so the pool is
+    // the whole exile and the filter carries "you don't own" + the counter.
+    match &tinybones.statics.iter().map(|d| &d.mode).collect::<Vec<_>>()[..] {
+        [StaticMode::ExileCastPermission {
+            play_mode: CardPlayMode::Play,
+            pool: ExileCardPool::AnyExile,
+            timing: ExileCastTiming::YourTurnOnly,
+            mana_spend_permission: Some(_),
+            ..
+        }] => {}
+        other => panic!("expected Tinybones' counter-marked exile play permission, got {other:?}"),
+    }
+    assert!(unimplemented_names(&tinybones).is_empty());
 
     let serra = parse_creature_card(
         "Flying\nOnce during each of your turns, you may play a land from your graveyard or cast a permanent spell with mana value 3 or less from your graveyard. If you do, it gains \"When this permanent is put into a graveyard from the battlefield, exile it and you gain 2 life.\"",

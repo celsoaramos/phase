@@ -1286,6 +1286,14 @@ pub(crate) fn parse_static_line_inner(
         return Some(result);
     }
 
+    // CR 406.6 + CR 122.1: counter-marked exile-play permission — "During your
+    // turn, you may play cards you don't own with stash counters on them from
+    // exile, …" (Tinybones, Bauble Burglar). The counter is the only link to
+    // the cards, so the pool is the whole exile and the filter carries it.
+    if let Some(result) = try_parse_counter_marked_exile_play_permission(&text, &lower) {
+        return Some(result);
+    }
+
     // CR 118.9 + CR 601.2b: "[Once during each of your turns, ]you may cast
     // [filter] by paying life equal to its mana value rather than paying its
     // mana cost." Demon of Fate's Design class. Must precede the free-cast

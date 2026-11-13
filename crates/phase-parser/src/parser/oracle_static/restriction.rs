@@ -3617,6 +3617,91 @@ pub(crate) fn try_parse_persistent_exile_play_permission(
     Some(definition)
 }
 
+/// CR 406.6 + CR 122.1 + CR 305.1: Parse the counter-marked exile-play
+/// permission — "[During your turn, ]you may play cards [you don't own ]with
+/// <kind> counters on them from exile[, and mana of any type can be spent to
+/// cast those spells]." (Tinybones, Bauble Burglar).
+///
+/// Unlike The Matrix of Time the eligible cards are not "exiled with ~": the
+/// counter marker is the only link, so the pool is the whole exile
+/// (`ExileCardPool::AnyExile`) and the `affected` filter carries the counter
+/// (and the "you don't own" ownership) constraint.
+pub(crate) fn try_parse_counter_marked_exile_play_permission(
+    text: &str,
+    lower: &str,
+) -> Option<StaticDefinition> {
+    let (rest, timing) = match nom_tag_lower(lower, lower, "during your turn, ") {
+        Some(r) => (r, ExileCastTiming::YourTurnOnly),
+        None => (lower, ExileCastTiming::AnyTime),
+    };
+    let (rest, play_mode) = alt((
+        value(CardPlayMode::Play, tag::<_, _, OracleError<'_>>("you may play cards ")),
+        value(CardPlayMode::Cast, tag("you may cast spells ")),
+    ))
+    .parse(rest)
+    .ok()?;
+    // CR 108.3: "you don't own" — the card's owner is not the permission's
+    // controller.
+    let (rest, not_owned) = match alt((
+        tag::<_, _, OracleError<'_>>("you don't own "),
+        tag("you do not own "),
+    ))
+    .parse(rest)
+    {
+        Ok((rest, _)) => (rest, true),
+        Err(_) => (rest, false),
+    };
+    // CR 122.1: "with <kind> counters on them" — any positive number of that
+    // counter.
+    let (rest, counter_name) = (
+        tag::<_, _, OracleError<'_>>("with "),
+        nom::bytes::complete::take_till1(|c: char| c.is_whitespace()),
+        tag(" counters on them from exile"),
+    )
+        .map(|(_, name, _): (&str, &str, &str)| name)
+        .parse(rest)
+        .ok()?;
+    let (after_riders, grants_flash, mana_spend_permission) =
+        strip_exile_cast_concession_riders(rest)?;
+    let tail = after_riders.trim_start();
+    // allow-noncombinator: punctuation cleanup (drop the sentence terminator) on a pre-tokenized chunk, not parsing dispatch.
+    let tail = tail.strip_prefix('.').unwrap_or(tail).trim(); // allow-noncombinator: punctuation cleanup on a pre-tokenized chunk, not parsing dispatch.
+    if !tail.is_empty() {
+        return None;
+    }
+
+    let mut properties = vec![
+        FilterProp::InZone { zone: Zone::Exile },
+        FilterProp::Counters {
+            counters: CounterMatch::OfType(crate::types::CounterType::Generic(counter_name.to_string())),
+            comparator: Comparator::GE,
+            count: QuantityExpr::Fixed { value: 1 },
+        },
+    ];
+    if not_owned {
+        properties.push(FilterProp::Owned {
+            controller: ControllerRef::Opponent,
+        });
+    }
+
+    Some(
+        StaticDefinition::new(StaticMode::ExileCastPermission {
+            frequency: CastFrequency::Unlimited,
+            play_mode,
+            cost: ExileCastCost::PayNormalCost,
+            pool: ExileCardPool::AnyExile,
+            timing,
+            mana_spend_permission,
+            grants_flash,
+            extra_cost: None,
+            enters_with_counter: None,
+            grantee: ExileCastGrantee::SourceController,
+        })
+        .affected(TargetFilter::Typed(TypedFilter::card().properties(properties)))
+        .description(text.to_string()),
+    )
+}
+
 /// CR 601.3b + CR 609.4b: Strip the optional flash-grant and mana-spend
 /// concession riders that follow the core exile-cast clause (Azula, Cunning
 /// Usurper: "… and you may cast them as though they had flash. Mana of any type
