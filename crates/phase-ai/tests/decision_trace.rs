@@ -194,8 +194,23 @@ fn run_with_trace<F: FnOnce()>(f: F) -> Vec<String> {
     out
 }
 
+/// Serialises the tests in this file. The callsite interest of
+/// `event_enabled!` is cached process-wide, and while a single dispatcher is
+/// registered tracing-core computes it from the *registering thread's*
+/// default subscriber. If the no-subscriber test reaches the callsite after
+/// the capture test installed its subscriber but before it emitted, the
+/// callsite is cached as `never` and the capture sees no entry.
+static TRACE_LOCK: Mutex<()> = Mutex::new(());
+
+fn trace_lock() -> std::sync::MutexGuard<'static, ()> {
+    TRACE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn decision_trace_emits_landfall_no_payoff_kind() {
+    let _guard = trace_lock();
     let (state, fetch) = build_state_with_fetchland();
     let (context, config) = build_context(landfall_features(None));
     let candidate = fetchland_candidate(fetch);
@@ -230,6 +245,7 @@ fn decision_trace_emits_landfall_no_payoff_kind() {
 
 #[test]
 fn decision_trace_gate_short_circuits_with_no_subscriber() {
+    let _guard = trace_lock();
     // No subscriber installed — `event_enabled!` must short-circuit cleanly
     // with no observable effect. Regression guard for the gated hot path.
     let (state, fetch) = build_state_with_fetchland();
