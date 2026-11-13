@@ -26304,7 +26304,7 @@ pub fn is_graveyard_exile_rider_subability(
 /// (via `state.current_trigger_event`), so they do not require player selection.
 /// CR 115.1 + CR 702.26a: True when a `PhaseOut`/`PhaseIn` filter denotes a
 /// population to expand at resolution rather than a single declared target.
-fn phase_out_or_in_filter_is_mass(filter: &TargetFilter) -> bool {
+pub fn phase_out_or_in_filter_is_mass(filter: &TargetFilter) -> bool {
     match filter {
         TargetFilter::Controller | TargetFilter::Player | TargetFilter::ScopedPlayer => true,
         TargetFilter::Typed(tf) => {

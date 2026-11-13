@@ -25819,6 +25819,9 @@ struct CompoundSubjectPrefix {
     first: TargetFilter,
     second: TargetFilter,
     declares_target: Option<TargetFilter>,
+    /// CR 115.1d + CR 601.2c: the second conjunct's own target count when it is
+    /// a declared object target ("up to one target creature you control").
+    second_multi_target: Option<MultiTargetSpec>,
 }
 
 /// CR 109.5 + CR 115.1: Second-subject axis of a static compound-subject prefix —
@@ -25882,6 +25885,7 @@ fn parse_static_compound_subject_prefix(lower: &str) -> Option<CompoundSubjectPr
         first,
         second,
         declares_target: None,
+        second_multi_target: None,
     })
 }
 
@@ -25899,6 +25903,7 @@ fn parse_dynamic_compound_subject_prefix(lower: &str) -> Option<CompoundSubjectP
         first,
         second,
         declares_target: None,
+        second_multi_target: None,
     })
 }
 
@@ -25911,6 +25916,55 @@ fn parse_possessive_actor_compound_subject_prefix(lower: &str) -> Option<Compoun
         first,
         second,
         declares_target: Some(declared_target),
+        second_multi_target: None,
+    })
+}
+
+/// CR 115.1 + CR 601.2c + CR 608.2c: "<~|it> and [up to one] target <filter>
+/// <plural verb>" — the source and a separately-declared object target share
+/// one predicate with no "each" (U.S.S. Defiant, Mirror Migrant: "it and up to
+/// one target creature you control phase out"). The second conjunct keeps its
+/// own typed target (and "up to one" count), so the targeted half is chosen
+/// independently of the source half. The "each" form stays with the axes above.
+fn parse_declared_target_compound_subject_prefix(lower: &str) -> Option<CompoundSubjectPrefix> {
+    let (remaining, first) = alt((
+        parse_compound_first_subject,
+        value(TargetFilter::SelfRef, tag("it and ")),
+    ))
+    .parse(lower)
+    .ok()?;
+    let (after_count, up_to_one) = opt(tag::<_, _, OracleError<'_>>("up to one "))
+        .parse(remaining)
+        .ok()?;
+    peek(nom_target::parse_declared_target_prefix)
+        .parse(after_count)
+        .ok()?;
+    let (second, after_target) = parse_target(after_count);
+    if !matches!(second, TargetFilter::Typed(_)) {
+        return None;
+    }
+    let body = after_target.trim_start();
+    // "each" bodies belong to the axes above; "can't"/"cannot" bodies are the
+    // conjoined restriction class (`try_parse_source_and_other_restriction_clause`).
+    if body.is_empty()
+        || alt((
+            tag::<_, _, OracleError<'_>>("each "),
+            tag("and "),
+            tag("can't "),
+            tag("cannot "),
+        ))
+        .parse(body)
+        .is_ok()
+    {
+        return None;
+    }
+    Some(CompoundSubjectPrefix {
+        consumed: lower.len() - body.len(),
+        first,
+        second,
+        declares_target: None,
+        second_multi_target: up_to_one
+            .map(|_| MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 1 })),
     })
 }
 
@@ -25918,6 +25972,7 @@ fn parse_compound_subject_prefix(lower: &str) -> Option<CompoundSubjectPrefix> {
     parse_static_compound_subject_prefix(lower)
         .or_else(|| parse_dynamic_compound_subject_prefix(lower))
         .or_else(|| parse_possessive_actor_compound_subject_prefix(lower))
+        .or_else(|| parse_declared_target_compound_subject_prefix(lower))
 }
 
 /// CR 109.5 + CR 608.2c: True when `text` opens with a compound-subject
@@ -26116,6 +26171,7 @@ fn try_parse_compound_subject_each(
         first: first_filter,
         second: second_filter,
         declares_target,
+        second_multi_target,
     } = parse_compound_subject_prefix(lower.as_str())?;
 
     // CR 109.5 + CR 608.2c: "you and <player> each <body>" names a coordinated
@@ -26226,6 +26282,10 @@ fn try_parse_compound_subject_each(
     let mut half_b = parsed_body;
     if !rewrite_recipient_chain(&mut half_b, &second_filter) {
         return None;
+    }
+    // CR 115.1d: the declared second target keeps its own count ("up to one").
+    if second_multi_target.is_some() {
+        half_b.multi_target = second_multi_target;
     }
 
     // Compose: Half A is the top-level effect; Half B is its sub_ability.
@@ -26389,6 +26449,11 @@ fn rewrite_recipient_on_link(def: &mut AbilityDefinition, filter: &TargetFilter)
         Effect::Draw { target, .. }
         | Effect::Discard { target, .. }
         | Effect::Mill { target, .. } => {
+            *target = filter.clone();
+            true
+        }
+        // CR 702.26a + CR 702.26c: the phasing permanent is the recipient.
+        Effect::PhaseOut { target } | Effect::PhaseIn { target } => {
             *target = filter.clone();
             true
         }

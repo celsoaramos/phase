@@ -1839,6 +1839,21 @@ fn occurrence_trigger_events(
             source_context,
             state,
         )),
+        // CR 508.3a + CR 603.2c: the attack half of a compound "enters or
+        // attacks" / "attacks or blocks" trigger fires once per matching
+        // attacker, each firing narrowed to that attacker — otherwise a
+        // multi-attacker declaration leaves "it" (Janice Rand, Essential Aide:
+        // "put a +1/+1 counter on it") without a referent.
+        TriggerMode::EntersOrAttacks | TriggerMode::AttacksOrBlocks
+            if matches!(event, GameEvent::AttackersDeclared { .. }) =>
+        {
+            Some(m::matching_attack_events(
+                event,
+                trig_def,
+                source_context,
+                state,
+            ))
+        }
         TriggerMode::YouAttack if ability.has_event_source_force_block_recursive() => {
             let matching = m::matching_you_attack_pairs(event, trig_def, source_context, state);
             Some(match event {

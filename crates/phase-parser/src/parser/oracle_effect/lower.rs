@@ -219,7 +219,20 @@ pub(super) fn patch_self_ref_head_tap_anaphor(def: &mut AbilityDefinition) {
     fn walk(def: &mut AbilityDefinition, carried_self_ref: bool) {
         // Update the active permanent antecedent for THIS node, then apply it to
         // the immediate chained sub before recursing further down the chain.
-        let active_self_ref = match def.effect.target_filter() {
+        // CR 608.2c: a targetless grant ("~ gains indestructible until end of
+        // turn. Tap it." — Iron-Shield Elf, Homarid Warrior) names its subject
+        // only through the granted static's `affected` filter; that filter is the
+        // antecedent of the chained "it".
+        let head_filter = match def.effect.as_ref() {
+            Effect::GenericEffect {
+                target,
+                static_abilities,
+                ..
+            } => generic_effect_population_filter(target.as_ref(), static_abilities)
+                .or(def.effect.target_filter()),
+            effect => effect.target_filter(),
+        };
+        let active_self_ref = match head_filter {
             Some(TargetFilter::SelfRef) => true,
             // A new object antecedent (target creature/permanent/...) takes over.
             Some(filter) if !target_filter_is_player_scoped(filter) => false,
