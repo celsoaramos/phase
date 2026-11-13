@@ -454,5 +454,8 @@
   },
   {
     "branch": "ai/decision-trace-test-race"
+  },
+  {
+    "branch": "card/mf-relatos-20261113-14"
   }
 ]
