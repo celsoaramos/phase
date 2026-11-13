@@ -21,11 +21,16 @@ on:
   # Mesclar um PR que muda a lista de branches publica na hora (rotina de relatos,
   # 2026-10-25): sem isto o build esperava o agendado — o disparo manual pela
   # integração do GitHub dá 403. A `concurrency` abaixo enfileira, não cancela.
+  # O relatos.md também dispara (2026-11-13): a correção de um build reprovado vai por
+  # push na branch `card/*` que já está na lista, e o PR do CI só anota o relatos.md —
+  # sem ele o conserto esperava o agendado (run 221 ficou 4 h parado). Sem nada novo, o
+  # `plan` para em ~1 min.
   push:
     branches: [magicfinder-ci]
     paths:
       - 'magicfinder/branches.json'
       - 'magicfinder/tag-pin.txt'
+      - 'magicfinder/relatos.md'
   workflow_dispatch:
     inputs:
       force:
