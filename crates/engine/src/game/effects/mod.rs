@@ -9604,7 +9604,8 @@ fn choice_type_reads_filter_population(
         | ChoiceType::TwoColors
         | ChoiceType::Word
         | ChoiceType::Artist
-        | ChoiceType::CounterKind { .. } => false,
+        | ChoiceType::CounterKind { .. }
+        | ChoiceType::DieResult => false,
     }
 }
 

@@ -67,13 +67,21 @@ pub fn resolve(
         return Ok(());
     };
 
-    let options = compute_options(
-        state,
-        &choice_type,
-        choosing_player,
-        ability.source_id,
-        &ability.chosen_players,
-    );
+    // CR 706.2 + CR 608.2d: "choose one result" offers the results of the dice
+    // this resolution just rolled — read from the survivors' `DieRolled` events of
+    // the immediately preceding roll instruction (an ignored roll emits only the
+    // display mirror and is never offered, CR 706.6).
+    let options = if matches!(choice_type, ChoiceType::DieResult) {
+        die_result_options(events)
+    } else {
+        compute_options(
+            state,
+            &choice_type,
+            choosing_player,
+            ability.source_id,
+            &ability.chosen_players,
+        )
+    };
 
     // CR 609.3: If an effect attempts to do something impossible, it does only
     // as much as possible. When the engine enumerates the legal options for a
@@ -128,6 +136,44 @@ pub fn resolve(
     });
 
     Ok(())
+}
+
+/// CR 706.2: the distinct results of the most recent die-roll instruction in
+/// this resolution, in roll order. Walks the event log backwards from the end
+/// to the `EffectResolved { kind: RollDie }` that closed the instruction, and
+/// collects the `DieRolled` events emitted before it until the previous
+/// instruction boundary.
+pub(crate) fn die_result_options(events: &[GameEvent]) -> Vec<String> {
+    let Some(end) = events.iter().rposition(|e| {
+        matches!(
+            e,
+            GameEvent::EffectResolved {
+                kind: EffectKind::RollDie,
+                ..
+            }
+        )
+    }) else {
+        return Vec::new();
+    };
+    let mut results: Vec<u8> = Vec::new();
+    for event in events[..end].iter().rev() {
+        match event {
+            GameEvent::DieRolled {
+                result: Some(r), ..
+            } => results.push(*r),
+            GameEvent::DieRolled { result: None, .. } | GameEvent::DieRollIgnored { .. } => {}
+            _ => break,
+        }
+    }
+    results.reverse();
+    let mut options: Vec<String> = Vec::new();
+    for r in results {
+        let label = r.to_string();
+        if !options.contains(&label) {
+            options.push(label);
+        }
+    }
+    options
 }
 
 /// CR 608.2d (override) + CR 701.9b (analogous) + CR 109.4: Resolve a random
@@ -941,6 +987,8 @@ fn compute_options(
             .collect(),
         ChoiceType::TwoColors => two_color_options(),
         ChoiceType::Word | ChoiceType::Artist => Vec::new(),
+        // Enumerated from the roll events in `resolve` (see `die_result_options`).
+        ChoiceType::DieResult => Vec::new(),
         // CR 608.2d: "Choose an ability the target has, then remove it" —
         // option labels come from the typed `Keyword` list emitted by the
         // converter. Empty option lists are legal (the choice resolves with

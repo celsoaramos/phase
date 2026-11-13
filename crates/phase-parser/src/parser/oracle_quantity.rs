@@ -823,6 +823,13 @@ pub(crate) fn parse_cda_quantity_with_context(
 ) -> Option<QuantityExpr> {
     let text = text.trim().trim_end_matches('.');
 
+    // CR 706.2 + CR 608.2d: "that result" / "the other result" (Endeavor cycle).
+    // The bare "the result" stays with the event-context fallback (see
+    // `cda_quantity_returns_none_for_the_result`).
+    if let Ok(("", expr)) = nom_quantity::parse_die_result_choice_expr(text) {
+        return Some(expr);
+    }
+
     // CR 608.2k: owner-bound possessive pronouns ("its power", "2 plus its
     // power", "half its toughness"). When the context carries a
     // `characteristic_pronoun_owner` (set only by
@@ -1969,6 +1976,16 @@ fn parse_anaphoric_power_toughness_sum(
 
 /// Parse event-context quantity references from Oracle text fragments.
 /// Returns None for unrecognized patterns (caller falls back to Variable).
+/// CR 706.2 + CR 608.2d: the die result the player chose with
+/// `ChoiceType::DieResult` — read back from `last_named_choice`.
+pub(crate) fn chosen_die_result() -> QuantityExpr {
+    QuantityExpr::Ref {
+        qty: QuantityRef::Variable {
+            name: "chosen result".to_string(),
+        },
+    }
+}
+
 pub(crate) fn parse_event_context_quantity(text: &str) -> Option<QuantityExpr> {
     parse_event_context_quantity_with_context(text, &ParseContext::default())
 }
@@ -2061,7 +2078,13 @@ pub(crate) fn parse_event_context_quantity_with_context(
     // Knight of Dawn's Light, Cleric Class siblings; and the existing draw /
     // mill / scry "that many [cards] plus N" patterns.
     if let Ok((_, (_quantifier, _noun, sign, n))) = nom::combinator::all_consuming((
-        alt((tag::<_, _, OracleError<'_>>("that much"), tag("that many"))),
+        // CR 706.2: "the result minus 1" (Velukan Dragon) offsets the die
+        // result through the same event-context channel.
+        alt((
+            tag::<_, _, OracleError<'_>>("that much"),
+            tag("that many"),
+            tag("the result"),
+        )),
         alt((
             tag::<_, _, OracleError<'_>>(" cards"),
             tag(" life"),
@@ -2107,6 +2130,23 @@ pub(crate) fn parse_event_context_quantity_with_context(
         "the result" => {
             return Some(QuantityExpr::Ref {
                 qty: QuantityRef::EventContextAmount,
+            });
+        }
+        // CR 706.2 + CR 608.2d: "Roll two dN and choose one result" (Endeavor
+        // cycle). "that result" is the result the player chose
+        // (`ChoiceType::DieResult` → `last_named_choice`); "the other result" is
+        // the roll total minus the chosen one.
+        // allow-noncombinator: dispatching on already-classified pre-trimmed phrase
+        "that result" => {
+            return Some(chosen_die_result());
+        }
+        // allow-noncombinator: dispatching on already-classified pre-trimmed phrase
+        "the other result" => {
+            return Some(QuantityExpr::Difference {
+                left: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                }),
+                right: Box::new(chosen_die_result()),
             });
         }
         // CR 608.2k: bare anaphoric "its" — referent bound at parse time by the

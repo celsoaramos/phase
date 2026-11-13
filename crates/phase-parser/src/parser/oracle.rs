@@ -10201,6 +10201,30 @@ fn resolve_guards_in_continuous_mod(modification: &mut ContinuousModification) {
     }
 }
 
+/// MagicFinder + CR 706.1a: see the call site in `parse_oracle_pipeline`.
+fn mf_die_named_oracle_text(oracle_text: &str, card_name: &str) -> Option<String> {
+    let sides = match card_name.to_ascii_lowercase().as_str() {
+        "four-sided die" => "d4",
+        "six-sided die" => "d6",
+        "eight-sided die" => "d8",
+        "ten-sided die" => "d10",
+        "twelve-sided die" => "d12",
+        "twenty-sided die" => "d20",
+        _ => return None,
+    };
+    // Case-insensitive: the card prints "Roll a six-sided die" (lowercase die).
+    let needle = format!("roll a {}", card_name.to_ascii_lowercase());
+    let lower = oracle_text.to_ascii_lowercase();
+    let at = lower.find(&needle)?;
+    let mut out = String::with_capacity(oracle_text.len());
+    out.push_str(&oracle_text[..at]);
+    out.push_str(&oracle_text[at..at + 1]);
+    out.push_str("oll a ");
+    out.push_str(sides);
+    out.push_str(&oracle_text[at + needle.len()..]);
+    Some(out)
+}
+
 fn parse_oracle_pipeline(
     oracle_text: &str,
     card_name: &str,
@@ -10215,6 +10239,11 @@ fn parse_oracle_pipeline(
 ) {
     let _card_span =
         tracing::debug_span!(target: "engine::parser::binding", "card", card_name).entered();
+    // MagicFinder + CR 706.1a: a card NAMED after a die ("Six-Sided Die") prints
+    // "Roll a six-sided die." — the name normalizer would turn the die into "~"
+    // and the results table would lose its header. "a d6" is the same die.
+    let die_named = mf_die_named_oracle_text(oracle_text, card_name);
+    let oracle_text = die_named.as_deref().unwrap_or(oracle_text);
     let (normalized, refusals) = normalize_card_name_refs_reporting(oracle_text, card_name);
     let mut ir = {
         let _stage = tracing::debug_span!(target: "engine::parser::binding", "stage", stage = "ir_production").entered();
@@ -10242,6 +10271,11 @@ fn parse_oracle_pipeline(
     demote_unenforceable_replacement_lifetimes(&mut parsed);
     demote_unsupported_composite_counter_choice_costs(&mut parsed);
     demote_crew_history_population_counts(&mut parsed);
+    // MagicFinder: die-roll result-table rows ("two of those tokens", "roll again").
+    crate::parser::oracle_effect::mf_dice::fix_die_tables(
+        &mut parsed.abilities,
+        &mut parsed.triggers,
+    );
     #[cfg(debug_assertions)]
     crate::parser::oracle_effect::debug_assert_exile_top_opponent_sentinel_lifted(
         &parsed, card_name,

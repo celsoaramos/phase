@@ -2605,6 +2605,7 @@ fn fmt_choice_type(ct: &ChoiceType) -> String {
         }
         ChoiceType::Labeled { options } => return format!("one of: {}", options.join(", ")),
         ChoiceType::LandType => "land type",
+        ChoiceType::DieResult => "result",
         ChoiceType::CardPredicate { .. } => "card predicate",
         ChoiceType::CardPredicateGuess { .. } => "card predicate guess",
         ChoiceType::Opponent { .. } => "opponent",

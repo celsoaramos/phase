@@ -8,6 +8,7 @@ pub mod imperative;
 pub(super) mod lower;
 pub mod mana;
 pub(crate) mod meld;
+pub(crate) mod mf_dice;
 mod multi_target_list;
 mod per_opponent_choice;
 mod search;
@@ -38119,6 +38120,14 @@ pub(crate) fn parse_named_choice_object_with_provenance(
     has_number_choice: bool,
 ) -> Option<ChoiceType> {
     type E<'a> = OracleError<'a>;
+    // CR 706.2 + CR 608.2d: "roll two dN and choose one result" (Endeavor cycle)
+    // — choose among the results the preceding roll produced.
+    if (tag::<_, _, E>("one result"), opt(tag(".")), eof)
+        .parse(rest)
+        .is_ok()
+    {
+        return Some(ChoiceType::DieResult);
+    }
     if tag::<_, _, E>("a creature type").parse(rest).is_ok() {
         Some(ChoiceType::creature_type())
     } else if let Some(options) = parse_creature_type_enumeration(rest) {

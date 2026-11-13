@@ -3615,6 +3615,15 @@ fn starts_bare_and_clause_lower(s: &str) -> bool {
         (),
         terminated(tag("repeat this process"), (opt(tag(".")), eof)),
     ))
+    // CR 706.2 + CR 608.2d: "roll two dN and choose one result" (Endeavor cycle)
+    // is two instructions — the roll, then the choice among its results.
+    .or(value(
+        (),
+        terminated(
+            tag("choose one result"),
+            alt((value((), tag(".")), value((), eof))),
+        ),
+    ))
     .or(value((), tag("cloak ")))
     .or(value((), tag("convert ")))
     // CR 701.34a + CR 608.2c: "draw a card and proliferate" is two

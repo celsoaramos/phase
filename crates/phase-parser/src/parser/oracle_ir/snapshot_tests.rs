@@ -3785,15 +3785,12 @@ fn word_form_header_does_not_swallow_its_trailing_instruction() {
     );
 }
 
-/// Row D-2 — CR 706.1: the roll-and-choose header (Reckless Endeavor, Phase 6's
-/// shape) still refuses honestly through the consolidated authority. Verbatim
-/// card text, taken from `card-data.json` at the base. The first production
-/// branch reached is the honest refusal marker on ability[0] (rebase taxonomy:
-/// `unparsed_verb_arguments`); the paired reach-guard is the rest of the
-/// chain (`deal`, `create`), proving the fixture reaches dispatch rather
-/// than going inert.
+/// Row D-2 — CR 706.1 + CR 706.2 + CR 608.2d: the roll-and-choose header
+/// (Reckless Endeavor). MagicFinder fork: the header now lowers to a two-die
+/// roll followed by a `ChoiceType::DieResult` named choice, and both result
+/// quantities ("that result" / "the other result") parse — no gap is left.
 #[test]
-fn roll_and_choose_header_refuses_honestly() {
+fn roll_and_choose_header_rolls_two_and_chooses_a_result() {
     let (_, lowered) = parse_two_layer(
         "Roll two d12 and choose one result. Reckless Endeavor deals damage equal to that result to each creature. Then create a number of Treasure tokens equal to the other result.",
         "Reckless Endeavor",
@@ -3801,34 +3798,37 @@ fn roll_and_choose_header_refuses_honestly() {
         &[],
     );
     assert!(
-        !lowered_has_roll_die(&lowered),
-        "the multi-die roll-and-choose header must stay refused (Phase 6 owns it); got {:?}",
+        lowered_has_roll_die(&lowered),
+        "got {:?}",
         lowered.abilities
     );
-    let Effect::Unimplemented { name, description } = lowered.abilities[0].effect.as_ref() else {
-        panic!(
-            "ability[0] must be the honest refusal marker, got {:?}",
-            lowered.abilities[0].effect
-        );
+    let root = &lowered.abilities[0];
+    let Effect::RollDie { count, sides, .. } = root.effect.as_ref() else {
+        panic!("ability[0] must be the roll, got {:?}", root.effect);
     };
-    // Rebase taxonomy note: main's evolved header vocabulary names this
-    // `unparsed_verb_arguments` where our tree said `roll` — equally red; the
-    // no-RollDie assert above and the trailing-clause description below are unchanged.
-    assert_eq!(name, "unparsed_verb_arguments");
-    assert!(
-        description
-            .as_deref()
-            .is_some_and(|d| d.contains("choose one result")),
-        "the marker must carry the trailing choice clause (the shape Phase 6 will lower), got {description:?}"
-    );
-    // Rebase taxonomy note: both clauses refuse on their unbound result
-    // quantities ("equal to that/other result" — the roll result Phase 6 will
-    // park) rather than on the `deal`/`create` verbs our tree named. Still
-    // honestly red per clause; the chain still reaches dispatch per clause.
-    let names = collect_unimplemented_names(&lowered);
+    assert_eq!(*sides, 12);
     assert_eq!(
-        names.iter().filter(|n| *n == "unparsed_quantity").count(),
-        2,
-        "both the damage and the Treasure clause must refuse on their result quantity, got {names:?}"
+        *count,
+        crate::types::ability::QuantityExpr::Fixed { value: 2 }
+    );
+    let choose = root
+        .sub_ability
+        .as_deref()
+        .expect("the choice follows the roll");
+    assert!(
+        matches!(
+            choose.effect.as_ref(),
+            Effect::Choose {
+                choice_type: crate::types::ability::ChoiceType::DieResult,
+                ..
+            }
+        ),
+        "got {:?}",
+        choose.effect
+    );
+    assert!(
+        collect_unimplemented_names(&lowered).is_empty(),
+        "no clause may stay refused, got {:?}",
+        collect_unimplemented_names(&lowered)
     );
 }

@@ -1208,6 +1208,12 @@ pub enum ChoiceType {
     CounterKind {
         options: Vec<CounterType>,
     },
+    /// CR 706.2 + CR 608.2d: "Roll two dN and choose one result" (the Endeavor
+    /// cycle). The options are the results of the dice the same resolution just
+    /// rolled, enumerated at resolution from the surviving `DieRolled` events of
+    /// the preceding roll instruction. The answer is a `ChoiceValue::Number`,
+    /// read back as "that result"; "the other result" is the roll total minus it.
+    DieResult,
 }
 
 /// A predicate option that can be chosen or guessed for a card revealed during
@@ -1589,6 +1595,7 @@ impl Serialize for ChoiceType {
             Self::TwoColors => serializer.serialize_unit_variant("ChoiceType", 11, "TwoColors"),
             Self::Word => serializer.serialize_unit_variant("ChoiceType", 12, "Word"),
             Self::Artist => serializer.serialize_unit_variant("ChoiceType", 13, "Artist"),
+            Self::DieResult => serializer.serialize_unit_variant("ChoiceType", 16, "DieResult"),
             Self::Keyword { options, count } => {
                 // Skip `count` when it is the default (1) so existing
                 // single-keyword card-data JSON stays byte-stable; only emit
@@ -1708,6 +1715,7 @@ impl<'de> Deserialize<'de> for ChoiceType {
                 "TwoColors" => Ok(Self::TwoColors),
                 "Word" => Ok(Self::Word),
                 "Artist" => Ok(Self::Artist),
+                "DieResult" => Ok(Self::DieResult),
                 other => Err(de::Error::unknown_variant(
                     other,
                     &[
@@ -1723,6 +1731,7 @@ impl<'de> Deserialize<'de> for ChoiceType {
                         "TwoColors",
                         "Word",
                         "Artist",
+                        "DieResult",
                     ],
                 )),
             },
@@ -3011,6 +3020,8 @@ impl ChoiceValue {
                 Some(Self::TwoColors([c1, c2]))
             }
             ChoiceType::Word | ChoiceType::Artist => Some(Self::Label(value.to_string())),
+            // CR 706.2: a die result is a number the dice showed.
+            ChoiceType::DieResult => value.parse::<u32>().ok().map(Self::Number),
             // CR 608.2d: match the player's response against the typed option
             // list by display string. Comparison is case-insensitive so the
             // frontend can render canonical capitalization while the engine

@@ -380,6 +380,7 @@ fn parse_pt_infix_tail(input: &str) -> OracleResult<'_, (Comparator, QuantityExp
     // `parse_quantity_expr_number`; the infix form must too, so try the dynamic
     // ref first (unchanged behavior) and fall back to the literal/X parser.
     let (rest, value) = alt((
+        crate::parser::oracle_nom::quantity::parse_die_result_choice_expr,
         map(parse_quantity_ref, |qty| QuantityExpr::Ref { qty }),
         parse_quantity_expr_number,
     ))

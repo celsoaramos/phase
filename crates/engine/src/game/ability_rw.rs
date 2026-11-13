@@ -4003,7 +4003,8 @@ fn legacy_choice_type(choice_type: &crate::types::ability::ChoiceType) -> bool {
         | crate::types::ability::ChoiceType::Word
         | crate::types::ability::ChoiceType::Artist
         | crate::types::ability::ChoiceType::Keyword { .. }
-        | crate::types::ability::ChoiceType::CounterKind { .. } => false,
+        | crate::types::ability::ChoiceType::CounterKind { .. }
+        | crate::types::ability::ChoiceType::DieResult => false,
     }
 }
 
@@ -6816,7 +6817,8 @@ fn rw_choice_type(choice_type: &crate::types::ability::ChoiceType) -> RwProfile 
         | crate::types::ability::ChoiceType::Word
         | crate::types::ability::ChoiceType::Artist
         | crate::types::ability::ChoiceType::Keyword { .. }
-        | crate::types::ability::ChoiceType::CounterKind { .. } => RwProfile::empty(),
+        | crate::types::ability::ChoiceType::CounterKind { .. }
+        | crate::types::ability::ChoiceType::DieResult => RwProfile::empty(),
     }
 }
 

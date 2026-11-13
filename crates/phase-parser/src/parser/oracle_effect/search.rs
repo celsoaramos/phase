@@ -84,6 +84,20 @@ pub(super) fn parse_search_library_details(
     // emits a sentinel count that is capped to the matching-set size at resolution.
     let any_number_tail = scan_after_tag(lower, "any number of ");
 
+    // CR 701.23d + CR 107.1: "for a number of [FILTER] cards equal to <qty>"
+    // (Wild Endeavor: "a number of basic land cards equal to the other result")
+    // — an exact count given by a quantity phrase, with the filter between
+    // "a number of " and " equal to ".
+    let number_of_equal = scan_after_tag(lower, "for a number of ").and_then(|start| {
+        let tail = &lower[start..];
+        let idx = tail.find(" equal to ")?;
+        let filter_text = &tail[..idx];
+        let qty_tail = &tail[idx + " equal to ".len()..];
+        let qty_end = qty_tail.find([',', '.']).unwrap_or(qty_tail.len());
+        let qty = oracle_quantity::parse_cda_quantity(qty_tail[..qty_end].trim())?;
+        Some((filter_text, qty))
+    });
+
     // Extract count from "up to N" / "up to X" / "up to that many" (must be done
     // before filter extraction since "for up to five creature cards" needs to skip
     // the count to find the type).
@@ -154,8 +168,9 @@ pub(super) fn parse_search_library_details(
     // CR 107.1c + CR 701.23d: up_to=true ⇒ searcher picks 0..=count (vs. exactly count).
     // "any number of" uses i32::MAX as an unbounded ceiling — the resolver floors it
     // against matching.len(), so the effective ceiling is always the legal-option set.
-    let (count, count_end_in_for, up_to) =
-        match (any_number_tail, up_to_match, for_match, for_that_many_match) {
+    let (count, count_end_in_for, up_to) = match &number_of_equal {
+        Some((_, qty)) => (qty.clone(), None, false),
+        None => match (any_number_tail, up_to_match, for_match, for_that_many_match) {
             (Some(off), _, _, _) => (QuantityExpr::Fixed { value: i32::MAX }, Some(off), true),
             (None, Some((expr, off)), _, _) => (expr, Some(off), true),
             // CR 701.23d: a count without "up to" is the number to find, not a ceiling;
@@ -167,7 +182,8 @@ pub(super) fn parse_search_library_details(
             (None, None, Some((None, _)), _) | (None, None, None, None) => {
                 (QuantityExpr::Fixed { value: 1 }, None, false)
             }
-        };
+        },
+    };
 
     // Extract the type filter from after "for a/an" or from the tail after "up to N"
     // or "any number of".
@@ -176,7 +192,9 @@ pub(super) fn parse_search_library_details(
     // the filter tail on this conjunction BEFORE parsing so each side becomes a
     // distinct `TargetFilter` and the suffix parser for the primary filter does
     // not consume the extras as a dangling "and a ..." fragment.
-    let (mut filter, extra_filters) = if let Some(type_start) = count_end_in_for {
+    let (mut filter, extra_filters) = if let Some((filter_text, _)) = number_of_equal {
+        (parse_search_filter(filter_text, ctx), Vec::new())
+    } else if let Some(type_start) = count_end_in_for {
         // "for up to five creature cards" or "for any number of dragon creature cards"
         // — type text starts after the number / quantity phrase. Multi-filter is
         // not supported for explicit-count searches (grammar always uses "a X and a Y").

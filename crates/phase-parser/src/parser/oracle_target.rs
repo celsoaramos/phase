@@ -7840,6 +7840,30 @@ pub(crate) fn parse_mana_value_suffix(
         } else {
             (false, a)
         };
+        // CR 706.2 + CR 608.2d: "less than or equal to the other result"
+        // (Arcane Endeavor) — the threshold is a composite die-result expression.
+        if let Ok((after, value)) = nom_quantity::parse_die_result_choice_expr(a) {
+            let value = match (is_le, is_equal) {
+                (_, true) => value,
+                (true, false) => QuantityExpr::Offset {
+                    inner: Box::new(value),
+                    offset: -1,
+                },
+                (false, false) => QuantityExpr::Offset {
+                    inner: Box::new(value),
+                    offset: 1,
+                },
+            };
+            let comparator = if is_le {
+                Comparator::LE
+            } else {
+                Comparator::GE
+            };
+            return Some((
+                FilterProp::Cmc { comparator, value },
+                text.len() - after.len(),
+            ));
+        }
         // CR 120.3: Anaphoric "that <noun>" forms — bind to the trigger context.
         // CR 119.3: Non-anaphoric quantity-ref forms — bind to a static or
         // game-state quantity ("the number of lands you control",
