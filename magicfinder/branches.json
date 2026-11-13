@@ -451,5 +451,8 @@
   },
   {
     "branch": "card/dice-rolls-mf"
+  },
+  {
+    "branch": "ai/decision-trace-test-race"
   }
 ]
