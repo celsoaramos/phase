@@ -14220,6 +14220,23 @@ fn parse_assimilate_target(lower: &str, ctx: &mut ParseContext) -> Option<Target
     let (rest, _) = tag::<_, _, OracleError<'_>>("assimilate ")
         .parse(lower.trim())
         .ok()?;
+    // CR 608.2c: "Assimilate that card." (The Borg Queen) names the card a
+    // preceding exile-until loop found — the chain's parent target, exactly as
+    // "Put that card onto the battlefield under your control" binds it.
+    if ctx.chain_prior_exile_until_match.is_some()
+        && all_consuming(terminated(
+            alt((
+                tag::<_, _, OracleError<'_>>("that card"),
+                tag("it"),
+                tag("that creature card"),
+            )),
+            opt(tag(".")),
+        ))
+        .parse(rest.trim())
+        .is_ok()
+    {
+        return Some(TargetFilter::ParentTarget);
+    }
     let (target, remainder) = parse_target_with_ctx(rest, ctx);
     if !remainder.trim().is_empty() {
         return None;

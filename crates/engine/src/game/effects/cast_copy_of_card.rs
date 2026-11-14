@@ -23,12 +23,13 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let (target_filter, cost, count) = match &ability.effect {
+    let (target_filter, cost, count, constraint) = match &ability.effect {
         Effect::CastCopyOfCard {
             target,
             cost,
             count,
-        } => (target, cost, count),
+            constraint,
+        } => (target, cost, count, constraint),
         _ => return Err(EffectError::MissingParam("CastCopyOfCard".to_string())),
     };
 
@@ -88,6 +89,7 @@ pub fn resolve(
                 // The cap is consumed by this choice; the resumed cast of the
                 // chosen copies (explicit targets) must not re-apply it.
                 count: None,
+                constraint: None,
             };
             resume.sub_ability = None;
             // CR 707.12a: under a "copy that card N times" loop the
@@ -100,7 +102,9 @@ pub fn resolve(
                 cards: source_ids,
                 count: choose,
                 up_to: true,
-                constraint: None,
+                // CR 707.12a + CR 202.3: "with total mana value N or less" bounds
+                // the chosen SET of copies (Uldaros Theorix).
+                constraint: constraint.clone(),
                 source_id: ability.source_id,
                 reciprocal_role: None,
             };
@@ -140,6 +144,7 @@ pub fn resolve(
                 target: TargetFilter::None,
                 cost: cost.clone(),
                 count: None,
+                constraint: None,
             };
             resume.sub_ability = None;
             // The rest of this iteration only (see the choice resume above).
@@ -381,6 +386,7 @@ mod tests {
                 target: TargetFilter::None,
                 cost: ManaCost::zero(),
                 count: None,
+                constraint: None,
             },
             vec![TargetRef::Object(source_id)],
             ObjectId(99),
@@ -433,6 +439,7 @@ mod tests {
                 target: TargetFilter::None,
                 cost: ManaCost::zero(),
                 count: None,
+                constraint: None,
             },
             vec![TargetRef::Object(source_id)],
             ObjectId(99),
@@ -492,6 +499,7 @@ mod tests {
                 target: TargetFilter::None,
                 cost: ManaCost::zero(),
                 count: None,
+                constraint: None,
             },
             vec![TargetRef::Object(source_id)],
             ObjectId(99),
@@ -548,6 +556,7 @@ mod tests {
                 target: TargetFilter::None,
                 cost: ManaCost::zero(),
                 count: None,
+                constraint: None,
             },
             vec![TargetRef::Object(source_id)],
             ObjectId(99),
@@ -603,6 +612,7 @@ mod tests {
                 },
                 cost: ManaCost::zero(),
                 count: None,
+                constraint: None,
             },
             Vec::new(),
             ObjectId(99),
@@ -649,6 +659,7 @@ mod tests {
                 },
                 cost: ManaCost::zero(),
                 count: None,
+                constraint: None,
             },
             Vec::new(),
             ObjectId(99),
@@ -696,6 +707,7 @@ mod tests {
                 target: TargetFilter::None,
                 cost: ManaCost::zero(),
                 count: None,
+                constraint: None,
             },
             vec![TargetRef::Object(source_id)],
             ObjectId(99),
@@ -742,6 +754,7 @@ mod tests {
                 target: TargetFilter::None,
                 cost: ManaCost::zero(),
                 count: None,
+                constraint: None,
             },
             vec![TargetRef::Object(source_id)],
             ObjectId(99),

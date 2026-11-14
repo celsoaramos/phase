@@ -9838,6 +9838,23 @@ fn parse_effect_clause_with_damage_context(
     ctx: &mut ParseContext,
     damage_context: DamageTargetContext,
 ) -> ParsedEffectClause {
+    // CR 115.1 + CR 205.2a + CR 601.2c: "exile up to one target nonland card OF EACH
+    // CARD TYPE from your graveyard" (Uldaros Theorix) announces up to one target
+    // per card type. The qualifier sits inside the target phrase, between the noun
+    // and its zone, so it is lifted out here: the clause parses as the plain
+    // "up to one target <filter> from <zone>", its announced count widens to one
+    // per possible card type, and assembly attaches the
+    // `TargetSelectionConstraint::DistinctCardTypes` the qualifier names
+    // (`parse_distinct_card_types_target_constraint`).
+    if let Some(stripped) = lower::strip_each_card_type_target_qualifier(text) {
+        let mut clause = parse_effect_clause_with_damage_context(&stripped, ctx, damage_context);
+        if clause.multi_target.is_some() {
+            clause.multi_target = Some(MultiTargetSpec::up_to(QuantityExpr::Fixed {
+                value: lower::EACH_CARD_TYPE_TARGET_CEILING,
+            }));
+        }
+        return clause;
+    }
     // CR 611.2a: the recognizers below that own their duration return before the
     // clause shell runs, so a window heading the unpeeled clause is recorded here;
     // any other clause leaves the probe armed for the post-peel reading.
@@ -22361,6 +22378,10 @@ fn lower_imperative_clause(
         return clause;
     }
 
+    if let Some(clause) = try_parse_exile_until_rest_to_bottom(text, ctx) {
+        return clause;
+    }
+
     // CR 106.1 + CR 109.1: "For each color among [X], add one mana of that color"
     // (Faeburrow Elder). Must run before the generic for-each-prefix strip path,
     // because "that color" anaphors a per-iteration color rather than the
@@ -22683,6 +22704,60 @@ fn lower_imperative_clause(
         clause.multi_target = extract_double_counter_multi_target(text);
     }
     clause
+}
+
+/// CR 608.2c + CR 401.4: "They put the rest on the bottom in a random order." after
+/// a same-chain exile-until loop (The Borg Queen: "target opponent exiles cards from
+/// the top of their library until they exile a creature card. Assimilate that card.
+/// They put the rest on the bottom in a random order."). "The rest" is every card the
+/// loop exiled that is still in exile — the found card has already left (assimilated,
+/// cast or put into a hand) — which is the same `ExiledBySource` set Chaos Wand /
+/// Gríma's "the exiled cards that weren't cast this way" names. The library is the
+/// one the cards came from (CR 400.3: the owner's), so "of their library" may be
+/// omitted.
+fn try_parse_exile_until_rest_to_bottom(
+    text: &str,
+    ctx: &ParseContext,
+) -> Option<ParsedEffectClause> {
+    let found = ctx.chain_prior_exile_until_match.clone()?;
+    let lower = text.to_lowercase();
+    (
+        multispace0::<_, OracleError<'_>>,
+        opt(alt((tag("they "), tag("that player "), tag("then they ")))),
+        alt((tag("puts "), tag("put "))),
+        tag("the rest on the bottom"),
+        opt(preceded(
+            tag(" of "),
+            alt((
+                tag("their library"),
+                tag("that library"),
+                tag("that player's library"),
+                tag("its owner's library"),
+            )),
+        )),
+        opt(tag(" in a random order")),
+        opt(tag(".")),
+        multispace0,
+        eof,
+    )
+        .parse(lower.as_str())
+        .ok()?;
+    // The loop stops on its match, so "the rest" are the exiled cards NOT matching
+    // its filter (the same shape as "the other cards exiled this way" in
+    // `refine_put_at_library_position`); a found card still in exile stays there.
+    Some(parsed_clause(Effect::PutAtLibraryPosition {
+        target: TargetFilter::And {
+            filters: vec![
+                TargetFilter::ExiledBySource,
+                TargetFilter::Not {
+                    filter: Box::new(found),
+                },
+            ],
+        },
+        count: QuantityExpr::Fixed { value: 0 },
+        position: crate::types::ability::LibraryPosition::Bottom,
+        arranger: None,
+    }))
 }
 
 /// CR 608.2c + CR 608.2d: "Put one of them into your hand." after an earlier
@@ -36904,8 +36979,31 @@ fn is_free_cast_exile_instead_rider(input: &str) -> bool {
 /// fold path (the 13 existing cast-a-copy cards) is left untouched.
 fn try_parse_cast_copies_with_count(lower: &str) -> Option<Effect> {
     let (rest, _) = tag::<_, _, OracleError<'_>>("cast ").parse(lower).ok()?;
+    // CR 707.12a + CR 202.3: "any number of spells with total mana value N or
+    // less from among the copies" (Uldaros Theorix) — no count cap, but the SET of
+    // copies cast together is bounded by its combined mana value.
+    let (rest, constraint) = match (
+        tag::<_, _, OracleError<'_>>("any number of spells with total mana value "),
+        nom_primitives::parse_number,
+        tag(" or less from among "),
+    )
+        .parse(rest)
+    {
+        Ok((rest, (_, n, _))) => (
+            rest,
+            Some(ChooseFromZoneConstraint::TotalManaValue {
+                comparator: Comparator::LE,
+                value: n as i32,
+            }),
+        ),
+        Err(_) => (rest, None),
+    };
     // CR 707.12a: optional "up to N of " / "N of " cap on how many copies to cast.
-    let (rest, count) = parse_cast_copies_count_prefix(rest);
+    let (rest, count) = if constraint.is_some() {
+        (rest, None)
+    } else {
+        parse_cast_copies_count_prefix(rest)
+    };
     // CR 707.12: the copies created by the preceding "Copy …" clause.
     let (rest, _) = alt((
         tag::<_, _, OracleError<'_>>("the copies"),
@@ -36922,6 +37020,7 @@ fn try_parse_cast_copies_with_count(lower: &str) -> Option<Effect> {
         target: tracked_set_filter(),
         cost: ManaCost::zero(),
         count,
+        constraint,
     })
 }
 
@@ -42267,6 +42366,7 @@ fn fold_cast_copy_of_card_defs(defs: &mut Vec<AbilityDefinition>) {
                 target: tracked_set_filter(),
                 cost: ManaCost::zero(),
                 count: None,
+                constraint: None,
             };
             defs[index].optional = false;
             defs[index].repeat_for = None;

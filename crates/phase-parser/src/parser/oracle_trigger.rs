@@ -859,7 +859,8 @@ fn cost_x_sibling_slot_still_unbound(def: &crate::types::ability::AbilityDefinit
             // one must be handled here or the build breaks — it cannot silently fabricate.
             TargetSelectionConstraint::DifferentTargetPlayers
             | TargetSelectionConstraint::DifferentObjectControllers
-            | TargetSelectionConstraint::SameZoneOwner { .. } => {}
+            | TargetSelectionConstraint::SameZoneOwner { .. }
+            | TargetSelectionConstraint::DistinctCardTypes => {}
         }
     }
     def.sub_ability
@@ -8397,19 +8398,24 @@ fn extract_if_condition_with_card_name(
         return IfExtraction::hoisted(strip_condition_clause(text, pos, clause_len), condition);
     }
 
-    // CR 701.57a: "if you cast it" — zoneless cast check (Discover ETBs).
+    // CR 701.57a: "if you cast it" — zoneless cast check (Discover ETBs). The
+    // personal pronouns are the same check for a character card ("if you cast
+    // him" — Uldaros Theorix).
     // Guard: must not be followed by " from" (zone-specific variant).
-    if let Some(pos) = tp.find("if you cast it") {
-        let after = &lower[pos + "if you cast it".len()..];
-        if !after.starts_with(" from") {
-            return IfExtraction::hoisted(
-                strip_condition_clause(text, pos, "if you cast it".len()),
-                TriggerCondition::WasCast {
-                    zone: None,
-                    controller: None,
-                    owner: None,
-                },
-            );
+    for phrase in ["if you cast it", "if you cast him", "if you cast her"] {
+        if let Some(pos) = tp.find(phrase) {
+            let after = &lower[pos + phrase.len()..];
+            // Word boundary: "if you cast it" must not match "if you cast items…".
+            if !after.starts_with(" from") && !after.starts_with(|c: char| c.is_alphanumeric()) {
+                return IfExtraction::hoisted(
+                    strip_condition_clause(text, pos, phrase.len()),
+                    TriggerCondition::WasCast {
+                        zone: None,
+                        controller: None,
+                        owner: None,
+                    },
+                );
+            }
         }
     }
 

@@ -8932,6 +8932,49 @@ pub(super) fn parse_controlled_by_different_players_target_constraint(text: &str
     parser.parse(lower.as_str()).is_ok()
 }
 
+const EACH_CARD_TYPE_QUALIFIER: &str = " of each card type";
+
+/// CR 205.2a: the card types a card can have (artifact, battle, creature,
+/// enchantment, instant, kindred, land, planeswalker, sorcery). "Up to one target
+/// … of each card type" can announce at most one target per type; the
+/// `DistinctCardTypes` constraint keeps a non-matching set from being chosen.
+pub(super) const EACH_CARD_TYPE_TARGET_CEILING: i32 = 9;
+
+/// CR 115.1 + CR 205.2a: "up to one target <filter> card of each card type from
+/// <zone>" with the per-type qualifier removed, or `None` when the clause has no
+/// such targeted qualifier.
+pub(super) fn strip_each_card_type_target_qualifier(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let (after, before) = take_until::<_, _, OracleError<'_>>(EACH_CARD_TYPE_QUALIFIER)
+        .parse(lower.as_str())
+        .ok()?;
+    // Only a TARGET phrase ("[up to one] target … of each card type"); the chunk
+    // loop may already have peeled the "up to one" quantity off the clause text.
+    if !nom_primitives::scan_contains(before, "target") {
+        return None;
+    }
+    let cut = before.len();
+    Some(format!(
+        "{}{}",
+        &text[..cut],
+        &text[cut + EACH_CARD_TYPE_QUALIFIER.len()..]
+    ))
+    .filter(|_| after.len() >= EACH_CARD_TYPE_QUALIFIER.len())
+}
+
+/// CR 115.1 + CR 205.2a + CR 601.2c: "up to one target … of each card type" —
+/// the chosen targets must admit one distinct card type each.
+pub(super) fn parse_distinct_card_types_target_constraint(
+    text: &str,
+) -> Option<TargetSelectionConstraint> {
+    let lower = text.to_lowercase();
+    let (_, before) = take_until::<_, _, OracleError<'_>>(EACH_CARD_TYPE_QUALIFIER)
+        .parse(lower.as_str())
+        .ok()?;
+    nom_primitives::scan_contains(before, "up to one target")
+        .then_some(TargetSelectionConstraint::DistinctCardTypes)
+}
+
 /// CR 115.1 + CR 601.2c + CR 400.1: Detect target-set constraints that require
 /// all chosen objects to come from one player's zone pile, currently the printed
 /// "from a single graveyard" class.

@@ -381,6 +381,7 @@ mod mf_temporada_picard_luminary;
 mod mf_temporada_scion_of_draco;
 mod mf_temporada_seasoned_cryomancer;
 mod mf_temporada_tron_lands;
+mod mf_temporada_uldaros_borg_queen;
 mod militant_angel_attacked_opponents;
 mod mf_relatos_20261113_14;
 mod mill_double_redirect_choice_continuation;

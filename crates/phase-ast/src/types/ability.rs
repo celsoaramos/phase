@@ -23897,6 +23897,13 @@ pub enum Effect {
         /// upper bound, never a forced count.
         #[serde(default)]
         count: Option<QuantityExpr>,
+        /// CR 707.12a + CR 202.3: a set-level bound on WHICH copies may be cast
+        /// together — "you may cast any number of spells with total mana value 6
+        /// or less from among the copies" (Uldaros Theorix) is
+        /// `ChooseFromZoneConstraint::TotalManaValue { LE, 6 }`. Carried onto the
+        /// `WaitingFor::ChooseFromZoneChoice` that offers the copies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        constraint: Option<ChooseFromZoneConstraint>,
     },
     /// CR 707.2 / CR 707.5: Create a token that's a copy of a permanent.
     /// Copies copiable characteristics (name, mana cost, color, types, P/T, abilities, keywords)
