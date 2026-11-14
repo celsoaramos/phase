@@ -26107,12 +26107,18 @@ fn parse_declared_target_compound_subject_prefix(lower: &str) -> Option<Compound
     let body = after_target.trim_start();
     // "each" bodies belong to the axes above; "can't"/"cannot" bodies are the
     // conjoined restriction class (`try_parse_source_and_other_restriction_clause`).
+    // CR 702.26a: phasing bodies ("it and up to one target creature you control
+    // phase out" — U.S.S. Defiant) belong to
+    // `subject::try_parse_source_and_target_phase_out` (v0.125.0), which lowers
+    // them to one target declaration plus a single phasing union.
     if body.is_empty()
         || alt((
             tag::<_, _, OracleError<'_>>("each "),
             tag("and "),
             tag("can't "),
             tag("cannot "),
+            tag("phase out"),
+            tag("phase in"),
         ))
         .parse(body)
         .is_ok()
