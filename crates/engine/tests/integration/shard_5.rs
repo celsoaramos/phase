@@ -25,6 +25,7 @@ mod replacement_mill_double_application;
 mod repro_pilot_crew;
 mod resolution_optional_payments;
 mod resolution_tap_x_binding;
+mod restless_dreams_discard_x_additional_cost;
 mod restricted_mana_face_down_and_face_up;
 mod restricted_mana_mv_or_x;
 mod restricted_mana_not_from_zone;

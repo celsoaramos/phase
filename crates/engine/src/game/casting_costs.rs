@@ -8532,6 +8532,21 @@ fn concretize_chosen_x_cost(cost: &AbilityCost, chosen_x: u32) -> AbilityCost {
                 value: chosen_x as i32,
             },
         },
+        // CR 107.3a + CR 601.2h: once X is announced, "discard X cards"
+        // (Restless Dreams) discards exactly that many cards.
+        AbilityCost::Discard {
+            count,
+            filter,
+            selection,
+            self_scope,
+        } if count.contains_x() => AbilityCost::Discard {
+            count: QuantityExpr::Fixed {
+                value: chosen_x as i32,
+            },
+            filter: filter.clone(),
+            selection: *selection,
+            self_scope: *self_scope,
+        },
         // CR 107.3a + CR 107.3k: bare X belongs to this activation's announcement.
         // CR 602.2b + CR 601.2h + CR 119.4: bind it before the authoritative
         // residual cost payer deducts life, without replacing derived quantities.
@@ -8763,8 +8778,14 @@ pub(super) fn finish_pending_cast_cost_or_pay(
         // `begin_deferred_target_selection` clears the deferral, and the
         // authority's own pendings never defer targets, so each cast meets the
         // tail once, here or in the authority.
-        let residual =
-            cast_variant_cost_residual(state, player, pending.object_id, pending.casting_variant);
+        // CR 702.34a: a flashback residual with X (Conflagrate's "Discard X
+        // cards") is the required cost declared and paid before targets
+        // (`required_additional_cost_can_declare_x`); it is not owed twice.
+        let residual = if flashback_residual_paid_before_targets(state, player, &pending) {
+            None
+        } else {
+            cast_variant_cost_residual(state, player, pending.object_id, pending.casting_variant)
+        };
         return continue_cost_declarations(
             state,
             player,
@@ -9037,11 +9058,25 @@ pub(super) fn begin_optional_cost_before_targets(
 }
 
 /// CR 601.2b: X in a variable additional cost is announced before later target choices.
+/// CR 702.34a: a flashback cast pays the flashback cost instead of the mana
+/// cost, so an X that only its non-mana part defines ("Flashback—{R}{R},
+/// Discard X cards" — Conflagrate) is announced from that part.
 pub(super) fn required_additional_cost_can_declare_x(
     state: &GameState,
     player: PlayerId,
     object_id: ObjectId,
+    casting_variant: CastingVariant,
 ) -> Option<AbilityCost> {
+    if casting_variant == CastingVariant::Flashback {
+        let flashback_cost = super::keywords::effective_flashback_cost(state, object_id);
+        if let (_, Some(residual)) =
+            super::casting::split_flashback_cost_components(flashback_cost.as_ref())
+        {
+            if additional_cost_x_max(state, player, object_id, None, &residual).is_some() {
+                return Some(residual);
+            }
+        }
+    }
     let Some(AdditionalCost::Required(cost)) = state
         .objects
         .get(&object_id)
@@ -10541,6 +10576,30 @@ fn encode_declaration_exit(
 /// - CR 702.81a: Retrace's land discard.
 /// - CR 702.133a: Jump-start's discard.
 /// - A card's own compound alternative cost (`alternative_cost_residual`).
+/// CR 702.34a + CR 601.2b: the flashback cast whose required cost before
+/// targets came from the flashback residual (the object prints no required
+/// additional cost of its own) already declared that residual.
+fn flashback_residual_paid_before_targets(
+    state: &GameState,
+    player: PlayerId,
+    pending: &PendingCast,
+) -> bool {
+    if pending.casting_variant != CastingVariant::Flashback
+        || !matches!(pending.additional_cost_flow, Some(AdditionalCost::Required(_)))
+        || state
+            .objects
+            .get(&pending.object_id)
+            .is_some_and(|obj| matches!(obj.additional_cost, Some(AdditionalCost::Required(_))))
+    {
+        return false;
+    }
+    let flashback_cost = super::keywords::effective_flashback_cost(state, pending.object_id);
+    let (_, residual) = super::casting::split_flashback_cost_components(flashback_cost.as_ref());
+    residual.is_some_and(|residual| {
+        additional_cost_x_max(state, player, pending.object_id, None, &residual).is_some()
+    })
+}
+
 fn cast_variant_cost_residual(
     state: &GameState,
     player: PlayerId,
