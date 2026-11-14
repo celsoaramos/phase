@@ -2222,6 +2222,61 @@ pub(crate) fn auto_tap_mana_options_gated(
     )
 }
 
+/// CR 605.3b + CR 608.2c: Gross mana ONE resolution of `ability` adds — the base
+/// `Effect::Mana` plus every targetless `Effect::Mana` in its sub-ability chain
+/// whose condition holds right now.
+///
+/// Urza's Tower parses as `Add {C}` with a sub-ability `Add {C}{C}` gated on
+/// controlling an Urza's Mine and an Urza's Power-Plant (CR 614.1a "instead"
+/// delta). Resolution runs that chain inline (`resolve_mana_ability_sub_chain`)
+/// and adds both, but the yield/capacity previews read only the base `produced`
+/// — so `max_x_value` treated a full Tron as one mana per land and capped
+/// Walking Ballista's X far below what the caster could pay. The "instead"
+/// swap and the condition evaluation are the same authorities resolution uses.
+pub(crate) fn gross_mana_output(
+    state: &GameState,
+    ability: &crate::types::ability::AbilityDefinition,
+    object_id: ObjectId,
+    controller: PlayerId,
+) -> u32 {
+    // CR 608.2h + CR 118.3: sized by the cost-paid object that adds the most.
+    sizing_resolutions(state, ability, object_id, controller)
+        .iter()
+        .map(|resolved| gross_mana_output_of(state, resolved))
+        .max()
+        .unwrap_or(0)
+}
+
+fn gross_mana_output_of(state: &GameState, resolved: &ResolvedAbility) -> u32 {
+    let resolved = mana_abilities::apply_condition_instead_mana_swap(state, resolved);
+    // The base output is planned like every other source (a "choose a color"
+    // count follows the chosen color — Nyx Lotus, #8443).
+    let mut total = match &resolved.effect {
+        Effect::Mana { produced, .. } => planned_gross_mana(produced, state, &resolved),
+        _ => 0,
+    };
+    let mut node = resolved.sub_ability.as_deref();
+    while let Some(sub) = node {
+        if let Effect::Mana {
+            produced,
+            target: None,
+            ..
+        } = &sub.effect
+        {
+            if sub
+                .condition
+                .as_ref()
+                .is_none_or(|condition| super::effects::evaluate_condition(condition, state, sub))
+            {
+                total += super::effects::mana::resolve_mana_types_for_ability(produced, state, sub)
+                    .len() as u32;
+            }
+        }
+        node = sub.sub_ability.as_deref();
+    }
+    total
+}
+
 /// CR 107.1b + CR 601.2f: Maximum *net* mana a single battlefield object can
 /// contribute to a cast — the largest net output of any one of its activatable
 /// `{T}` mana abilities (only one can be activated per tap), where net output
@@ -2261,10 +2316,10 @@ pub fn max_mana_yield(state: &GameState, object_id: ObjectId, controller: Player
             )
         })
         .filter_map(|(_, ability)| match &*ability.effect {
-            Effect::Mana { produced, .. } => {
-                let gross =
-                    largest_sizing_resolution(state, produced, ability, object_id, controller)
-                        .map_or(0, |(_, gross)| gross);
+            Effect::Mana { .. } => {
+                // CR 605.3b: base output plus satisfied conditional mana clauses
+                // (Urza's Tower with Mine + Power-Plant adds three, not one).
+                let gross = gross_mana_output(state, ability, object_id, controller);
                 // CR 605.3b: Net the mana paid to activate this ability —
                 // gross output overstates what a filter land actually adds.
                 let activation_cost = mana_abilities::mana_sub_cost_of(&ability.cost)
@@ -2526,7 +2581,9 @@ fn usable_mana_ability_net(
     {
         return None;
     }
-    let gross = sizing.map_or(0, |(_, gross)| gross);
+    // CR 605.3b: base output plus satisfied conditional mana clauses (Urza's
+    // Tower with Mine + Power-Plant adds three, not one).
+    let gross = gross_mana_output(state, ability, object_id, controller);
     // CR 605.3b: Net the mana paid to activate. Non-mana cost
     // components (Sacrifice / Discard / PayLife / Exile) have no
     // mana sub-cost, so `mana_sub_cost_of` returns `None` and the
@@ -4330,6 +4387,90 @@ mod tests {
             },
         )
         .cost(AbilityCost::Tap)
+    }
+
+    /// Urza's Tower as the parser emits it: base `Add {C}` plus a conditional
+    /// `Add {C}{C}` sub-ability gated on controlling a Mine and a Power-Plant.
+    fn tron_state(with_power_plant: bool) -> (GameState, ObjectId) {
+        use crate::types::ability::{AbilityCondition, ControllerRef, TargetFilter, TypedFilter};
+        let mut state = GameState::new_two_player(42);
+        let tower = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Urza's Tower".to_string(),
+            Zone::Battlefield,
+        );
+        let mine = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Urza's Mine".to_string(),
+            Zone::Battlefield,
+        );
+        let mut lands = vec![(tower, "Tower"), (mine, "Mine")];
+        if with_power_plant {
+            let plant = create_object(
+                &mut state,
+                CardId(4),
+                PlayerId(0),
+                "Urza's Power Plant".to_string(),
+                Zone::Battlefield,
+            );
+            lands.push((plant, "Power-Plant"));
+        }
+        for (id, subtype) in lands {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Land);
+            obj.card_types.subtypes.push("Urza's".to_string());
+            obj.card_types.subtypes.push(subtype.to_string());
+        }
+        let colorless = |n: i32| Effect::Mana {
+            produced: ManaProduction::Colorless {
+                count: QuantityExpr::Fixed { value: n },
+            },
+            restrictions: vec![],
+            grants: vec![],
+            expiry: None,
+            target: None,
+        };
+        let controls = |subtype: &str| AbilityCondition::ControllerControlsMatching {
+            filter: TargetFilter::Typed(
+                TypedFilter::land()
+                    .subtype(subtype.to_string())
+                    .controller(ControllerRef::You),
+            ),
+        };
+        let ability = AbilityDefinition::new(AbilityKind::Activated, colorless(1))
+            .cost(AbilityCost::Tap)
+            .sub_ability(
+                AbilityDefinition::new(AbilityKind::Spell, colorless(2)).condition(
+                    AbilityCondition::And {
+                        conditions: vec![controls("Mine"), controls("Power-Plant")],
+                    },
+                ),
+            );
+        Arc::make_mut(&mut state.objects.get_mut(&tower).unwrap().abilities).push(ability);
+        (state, tower)
+    }
+
+    /// CR 605.3b + CR 107.1b: the yield/capacity previews count a satisfied
+    /// conditional mana clause, matching what resolution adds — a full Tron's
+    /// Tower yields 3, so `max_x_value` stops capping X at one mana per land.
+    #[test]
+    fn mana_yield_counts_satisfied_conditional_mana_sub_ability() {
+        let (state, tower) = tron_state(true);
+        assert_eq!(max_mana_yield(&state, tower, PlayerId(0)), 3);
+        assert_eq!(feasible_mana_capacity(&state, tower, PlayerId(0), None), 3);
+    }
+
+    /// CR 614.1a: without the companion land the "instead" delta does not apply
+    /// — the preview stays at the base one mana, same as resolution.
+    #[test]
+    fn mana_yield_skips_conditional_mana_when_condition_fails() {
+        let (state, tower) = tron_state(false);
+        assert_eq!(max_mana_yield(&state, tower, PlayerId(0)), 1);
+        assert_eq!(feasible_mana_capacity(&state, tower, PlayerId(0), None), 1);
     }
 
     #[test]
