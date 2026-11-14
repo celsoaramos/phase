@@ -253,6 +253,7 @@ mod targeted_offer_witness;
 mod targeted_player_mass_library_shuffle;
 mod targeted_player_up_to_library_shuffle;
 mod tataru_taru;
+mod tataru_taru_target_opponent_may_draw;
 mod tchaka_venerable_king;
 mod teamwork_aggregate_legal_actions;
 mod teamwork_keyword;
