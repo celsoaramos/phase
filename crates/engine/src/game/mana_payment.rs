@@ -4450,7 +4450,7 @@ mod tests {
             ast,
             vec![ManaSpendRestriction::SpellTypeOrAbilityActivation {
                 spell_type: "Artifact".to_string(),
-                ability: AbilityActivationScope::Any,
+                ability: AbilityActivationScope::NonSpellUnrestricted,
             }],
             "negative nonartifact restriction must keep ability activation unrestricted"
         );
@@ -4586,7 +4586,7 @@ mod tests {
                 source_could_produce_two_or_more_colors: false,
                 restrictions: vec![ManaRestriction::OnlyForTypeSpellsOrAbilities {
                     spell_type: "Artifact".to_string(),
-                    ability: AbilityActivationScope::Any,
+                    ability: AbilityActivationScope::NonSpellUnrestricted,
                 }],
                 grants: vec![],
                 expiry: None,

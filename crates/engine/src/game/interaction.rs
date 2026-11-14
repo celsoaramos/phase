@@ -5461,6 +5461,9 @@ fn interaction_mana_ability_activation_scope(
     match scope {
         AbilityActivationScope::OfSpellType => InteractionManaAbilityActivationScope::OfSpellType,
         AbilityActivationScope::Any => InteractionManaAbilityActivationScope::Any,
+        AbilityActivationScope::NonSpellUnrestricted => {
+            InteractionManaAbilityActivationScope::NonSpellUnrestricted
+        }
     }
 }
 
