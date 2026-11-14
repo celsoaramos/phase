@@ -412,6 +412,7 @@ mod well_of_lost_dreams_may_pay_x;
 mod wernog_riders_chaplain_investigate_count;
 mod wheel_and_deal;
 mod wheel_of_misfortune_secret_numbers;
+mod when_next_cast_copy_it_two_triggers;
 mod where_x_coverage_runtime;
 mod where_x_quantity_channel_binds;
 mod where_x_totality_guard;
