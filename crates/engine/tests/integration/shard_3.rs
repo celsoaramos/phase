@@ -147,6 +147,7 @@ mod exchange_life_totals_cards;
 mod exert_cost_bookkeeping;
 mod exhaust_keyword_once_per_permanent;
 mod exhibition_tidecaller_target_player_mill;
+mod exile_any_number_target_players_graveyards;
 mod exile_dynamic_from_top;
 mod exile_one_card_from_each_graveyard_9213;
 mod exile_origin_target_acquisition;

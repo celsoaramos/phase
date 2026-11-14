@@ -12808,6 +12808,22 @@ fn extract_shares_quality_props(
 /// solely by `ControllerRef::Opponent`; `target players` uses
 /// `TargetFilter::Player`. All three select players at announcement and need
 /// the same per-target resolution fan-out.
+/// CR 115.1 + CR 400.12: a MASS effect can still be parameterized by a chosen
+/// PLAYER — "exile any number of target players' graveyards" (Thraben Charm) is
+/// one graveyard scan per chosen player, and `ChangeZoneAll`'s player filter is
+/// exactly that scan parameter (`change_zone_all_player_scope`).
+///
+/// `Effect::target_filter()` reports no target for mass effects — correctly, as
+/// "all" does not target (CR 115.1) — so the multi-target player fan-out would
+/// never see this axis and `change_zone_all_player_scope` would keep the FIRST
+/// chosen player, silently ignoring the rest.
+fn mass_player_scope_filter(effect: &Effect) -> Option<&TargetFilter> {
+    match effect {
+        Effect::ChangeZoneAll { target, .. } => Some(target),
+        _ => None,
+    }
+}
+
 fn is_multi_target_player_filter(filter: &TargetFilter) -> bool {
     match filter {
         TargetFilter::Player | TargetFilter::Opponent => true,
@@ -27045,7 +27061,9 @@ pub(crate) fn record_player_action_this_turn(
 /// was chosen.
 fn resolves_for_each_target_player(ability: &ResolvedAbility) -> bool {
     ability.multi_target.is_some()
-        && effect_target_filter(&ability.effect).is_some_and(is_multi_target_player_filter)
+        && effect_target_filter(&ability.effect)
+            .or_else(|| mass_player_scope_filter(&ability.effect))
+            .is_some_and(is_multi_target_player_filter)
         && !matches!(
             ability.effect,
             Effect::ChooseFromZone {
