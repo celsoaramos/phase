@@ -83,6 +83,7 @@ use crate::policies::strategy_helpers::{can_pay_ward_cost, ward_cost_against_ai}
 
 mod mf_flags_1107;
 mod mf_flags_1115;
+mod mf_flags_1116;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateDecision {
@@ -316,6 +317,13 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     // change, loyalty with nothing to put, lethal life loss on resolution, flash in
     // the opponent's upkeep, mana grant outside its window). Proof-backed only.
     if let Some(decision) = mf_flags_1107::assess_pre_cast(ctx) {
+        return decision;
+    }
+
+    // 16/11/2026 ("jogada ruim do robô" f4f895c5): "Sacrifice an artifact: put a
+    // +1/+1 counter on ~" (Arcbound Ravager) with no stack, no combat and no death
+    // payoff throws a card away. Proof-backed; fails open.
+    if let Some(decision) = mf_flags_1116::assess_sacrifice_for_counter(ctx) {
         return decision;
     }
 
