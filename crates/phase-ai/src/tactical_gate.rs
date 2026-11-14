@@ -11456,7 +11456,11 @@ mod tests {
     fn keeps_own_warded_target_it_cannot_pay_for() {
         let (gev_kept, bears_kept, gev_picks) = ward_pump_target_verdict(None, 2, P0, P1);
         assert!(gev_kept);
-        assert!(bears_kept);
+        // MagicFinder (`mf_flags_1107::beneficial_target_on_opponent_with_own_alternative`):
+        // the Bears here are the OPPONENT's, and a beneficial-only spell is not
+        // aimed at an opponent's creature while a legal target of the AI's own
+        // (Gev) exists. Upstream keeps the candidate and leaves it to scoring.
+        assert!(!bears_kept);
         assert_eq!(gev_picks, [true; 4]);
     }
 
