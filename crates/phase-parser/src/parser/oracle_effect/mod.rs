@@ -45769,10 +45769,72 @@ pub(crate) enum ChainLoweringMode {
 /// `RollDie` with an empty results vector and then mutate the result behind them.
 /// The step is a no-op on an empty `die_results`, which is what keeps every
 /// non-die producer byte-identical.
+/// CR 601.2a + CR 113.6b + CR 611.2c: "Creature cards in your graveyard gain 'You may
+/// cast this card from your graveyard' until end of turn" (Case of the Uneaten Feast;
+/// Kethis, the Hidden Hand's "play") is lowered by the quoted-static grant as an
+/// `AddStaticMode(GraveyardCastPermission)` on the graveyard cards themselves — a shape
+/// the layer system never installs on a card in a graveyard, so the cast was refused.
+/// The runtime authority for a resolution-created graveyard permission is the
+/// controller-anchored `GrantStaticAbility` whose inner static names the cards
+/// (Chainer, Nightmare Adept; Gaea's Will; Whispersteel Dagger). Rewrite to it.
+fn normalize_graveyard_card_cast_permission_grant(def: &mut AbilityDefinition) {
+    if let Effect::GenericEffect {
+        static_abilities,
+        target,
+        ..
+    } = def.effect.as_mut()
+    {
+        let mut rewrote = false;
+        for static_def in static_abilities.iter_mut() {
+            let [ContinuousModification::AddStaticMode {
+                mode: mode @ StaticMode::GraveyardCastPermission { .. },
+            }] = static_def.modifications.as_slice()
+            else {
+                continue;
+            };
+            let Some(TargetFilter::Typed(typed)) = static_def.affected.as_ref() else {
+                continue;
+            };
+            if !typed.properties.iter().any(|p| {
+                matches!(
+                    p,
+                    FilterProp::InZone {
+                        zone: crate::types::zones::Zone::Graveyard
+                    }
+                )
+            }) {
+                continue;
+            }
+            let granted =
+                StaticDefinition::new(mode.clone()).affected(TargetFilter::Typed(typed.clone()));
+            let mut installer = StaticDefinition::continuous()
+                .affected(TargetFilter::Controller)
+                .modifications(vec![ContinuousModification::GrantStaticAbility {
+                    definition: Box::new(granted),
+                }]);
+            installer.description = static_def.description.take();
+            *static_def = installer;
+            rewrote = true;
+        }
+        if rewrote && target.is_none() {
+            *target = Some(TargetFilter::Controller);
+        }
+    }
+    if let Some(sub) = def.sub_ability.as_deref_mut() {
+        normalize_graveyard_card_cast_permission_grant(sub);
+    }
+    if let Some(other) = def.else_ability.as_deref_mut() {
+        normalize_graveyard_card_cast_permission_grant(other);
+    }
+}
+
 pub(crate) fn lower_ability_ir(ir: &AbilityIr) -> AbilityDefinition {
     let mut def = lower_effect_chain_ir(&ir.body);
     attach_die_result_branches_before_finalization(&mut def, &ir.die_results);
     finalize_effect_chain(&mut def);
+    // CR 601.2a + CR 113.6b: "<cards> in your graveyard gain 'You may cast this
+    // card from your graveyard'" grants a GRAVEYARD permission; see the helper.
+    normalize_graveyard_card_cast_permission_grant(&mut def);
     // CR 608.2c + CR 121.1: finalization can assemble the Great Aurora class's
     // owner-shuffle continuation after the assembly-time player-scope rewrite.
     // Reapply the same narrow structural normalizer here, where the whole
