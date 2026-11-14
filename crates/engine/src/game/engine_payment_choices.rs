@@ -2069,7 +2069,16 @@ pub(super) fn finish_unless_tap_payment(
     if matches!(state.waiting_for, WaitingFor::PayCost { .. }) {
         set_active_priority(state);
     }
-    finish_successful_unless_payment(state, &unless.pending_effect, &unless.trigger_event, events)
+    // Resumed from the payer's selection, like the unless-discard resumes below:
+    // the answering action's own pipeline scans the tap events, so no payment
+    // event range is handed over.
+    finish_successful_unless_payment(
+        state,
+        &unless.pending_effect,
+        &unless.trigger_event,
+        events,
+        None,
+    )
 }
 
 /// CR 118.12 + CR 118.12a: The DECLINED-or-FAILED epilogue for every
