@@ -766,6 +766,71 @@ fn countered_spell_zone_redirect_is_only_instead_marker(
     parse_countered_spell_redirect_shape(sentence).is_ok() && instead_sentences.next().is_none()
 }
 
+/// CR 106.1 + CR 614.1a: the delta shape `normalize_activated_mana_instead_delta`
+/// leaves behind — a fixed colorless `Mana` root whose `sub_ability` is a GATED,
+/// costless fixed colorless `Mana` (the "instead" amount minus the base). Producing
+/// base + delta when the gate holds is exactly "add N instead" for a same-type pool.
+fn def_has_colorless_mana_instead_delta(def: &AbilityDefinition) -> bool {
+    let is_fixed_colorless = |effect: &Effect| {
+        matches!(
+            effect,
+            Effect::Mana {
+                produced: ManaProduction::Colorless {
+                    count: QuantityExpr::Fixed { .. }
+                },
+                target: None,
+                ..
+            }
+        )
+    };
+    if !is_fixed_colorless(&def.effect) {
+        return false;
+    }
+    def.sub_ability.as_deref().is_some_and(|sub| {
+        is_fixed_colorless(&sub.effect)
+            && sub.cost.is_none()
+            && sub.sub_ability.is_none()
+            && sub
+                .condition
+                .as_ref()
+                .is_some_and(|c| !matches!(c, AbilityCondition::ConditionInstead { .. }))
+    })
+}
+
+/// The sentence "if <condition>, add {c}[{c}…] instead." anchored at both ends, so an
+/// unmodelled head or tail never rides along with the delta encoding.
+fn parse_colorless_mana_instead_sentence(input: &str) -> nom::IResult<&str, (), OracleError<'_>> {
+    let (rest, _) = tag("if ").parse(input)?;
+    let (rest, _) = take_until(", add {c}").parse(rest)?;
+    let (rest, _) = tag(", add ").parse(rest)?;
+    let (rest, _) = nom::multi::many1(tag("{c}")).parse(rest)?;
+    let (rest, _) = tag(" instead").parse(rest)?;
+    let (rest, _) = opt(tag(".")).parse(rest)?;
+    let (rest, _) = multispace0.parse(rest)?;
+    value((), eof).parse(rest)
+}
+
+fn colorless_mana_instead_delta_is_only_instead_marker(
+    cleaned: &str,
+    parsed: &ParsedAbilities,
+) -> bool {
+    if !parsed
+        .abilities
+        .iter()
+        .any(def_has_colorless_mana_instead_delta)
+    {
+        return false;
+    }
+    let mut instead_sentences = split_sentence_units(cleaned)
+        .into_iter()
+        .filter(|sentence| scan_contains(sentence, "instead"));
+    let Some(sentence) = instead_sentences.next() else {
+        return false;
+    };
+    parse_colorless_mana_instead_sentence(sentence.trim_start()).is_ok()
+        && instead_sentences.next().is_none()
+}
+
 // ── Detector A: Replacement_Instead ─────────────────────────────────────
 
 /// CR 614: "if X would Y, [do Z] instead" — every "instead" phrase outside of
@@ -818,6 +883,13 @@ fn detect_replacement_instead(
     // <zone> instead of into that player's graveyard" is the typed
     // `Counter.countered_spell_zone` redirect, provided it is the ONLY "instead" clause.
     if countered_spell_zone_redirect_is_only_instead_marker(cleaned, parsed) {
+        return;
+    }
+    // CR 106.1 + CR 614.1a: "{T}: Add {C}. If <cond>, add {C}{C} instead." is folded by
+    // `normalize_activated_mana_instead_delta` into a conditional colorless DELTA
+    // sub-ability (Urza's Mine / Power-Plant / Tower, Ugin's Labyrinth), provided that
+    // sentence is the unit's ONLY "instead" clause.
+    if colorless_mana_instead_delta_is_only_instead_marker(cleaned, parsed) {
         return;
     }
     diagnostics.push(OracleDiagnostic::swallowed_clause(
@@ -6806,6 +6878,21 @@ mod tests {
     use crate::types::triggers::TriggerMode;
     use crate::types::zones::Zone;
     use std::collections::BTreeSet; // the non-phrase set-equality guard
+
+    /// CR 614.1a: the delta exemption is anchored on the whole sentence — a tail or a
+    /// second "instead" clause must not ride along with the typed delta.
+    #[test]
+    fn colorless_mana_instead_sentence_is_anchored_both_ends() {
+        use super::parse_colorless_mana_instead_sentence as sentence;
+        assert!(sentence(
+            "if you control an urza's power-plant and an urza's tower, add {c}{c} instead."
+        )
+        .is_ok());
+        assert!(sentence("if a card is exiled with this land, add {c}{c} instead.").is_ok());
+        assert!(sentence("if you control a swamp, add {b}{b} instead.").is_err());
+        assert!(sentence("if x, add {c}{c} instead and you gain 2 life.").is_err());
+        assert!(sentence("you gain 2 life. if x, add {c}{c} instead.").is_err());
+    }
 
     fn parse(text: &str, types: &[&str]) -> crate::parser::oracle::ParsedAbilities {
         parse_named(text, "Test Card", types)

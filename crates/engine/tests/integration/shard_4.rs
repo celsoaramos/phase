@@ -374,6 +374,7 @@ mod mf_relatos_20261115_00;
 mod mf_relatos_20261115_14;
 mod mf_relatos_20261115_19;
 mod mf_relatos_20261116_00;
+mod mf_temporada_tron_lands;
 mod militant_angel_attacked_opponents;
 mod mf_relatos_20261113_14;
 mod mill_double_redirect_choice_continuation;
