@@ -221,6 +221,7 @@ mod kav_landseeker_delayed_sacrifice;
 mod kaya_geist_hunter;
 mod kaya_spirits_justice_per_opponent_exile;
 mod kaysa_green_anthem;
+mod kazuul_defending_player_attack_trigger;
 mod kellan_daring_traveler_mana_value_gate;
 mod ketramose_exile_trigger_gate_4952;
 mod keyword_activation_cancel;
