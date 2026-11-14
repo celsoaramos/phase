@@ -5869,6 +5869,7 @@ fn detect_duration_this_turn(
                 | TriggerCondition::DealtDamageThisTurnBySource { .. }
                 | TriggerCondition::FirstTimeObjectTappedThisTurn
                 | TriggerCondition::FirstTimeObjectCountersAddedThisTurn
+                | TriggerCondition::FirstTimeObjectCountersOfTypeAddedThisTurn { .. }
                 | TriggerCondition::AddedManaWithThisAbilityThisTurn
                 | TriggerCondition::AttackedThisTurn
                 | TriggerCondition::CastSpellThisTurn { .. }
