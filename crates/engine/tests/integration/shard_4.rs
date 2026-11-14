@@ -301,6 +301,7 @@ mod loyalty_ability_activated_trigger;
 mod loyalty_replacement_order_resume;
 mod lurking_predators_1604_repro;
 mod luxior_ignited_zero_target_attach;
+mod lyzolda_roadkill_rodney;
 mod m_odo_the_gnarled_oracle_activation;
 mod machine_gods_effigy_copy_exception;
 mod mad_mage_lost_level_scry_runtime;

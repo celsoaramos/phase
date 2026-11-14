@@ -131,7 +131,7 @@ fn muscle_token_count(runner: &GameRunner) -> usize {
 #[test]
 fn hatchery_granted_replicate_charges_the_recipient_slivers_mana_cost_once() {
     let (mut runner, muscle) = hatchery_grants_replicate_scenario(1);
-    add_green_mana(&mut runner, 4); // Muscle's {1}{G}, then one granted Replicate {1}{G}.
+    add_green_mana(&mut runner, 6); // Muscle's {1}{G}, one granted Replicate {1}{G}, plus a payable second offer to decline (CR 601.2f).
 
     cast_creature(&mut runner, muscle);
     assert_replicate_prompt(&runner, 0, 0);
@@ -148,8 +148,8 @@ fn hatchery_granted_replicate_charges_the_recipient_slivers_mana_cost_once() {
     assert_replicate_payment_records(&runner, muscle, &[(0, 1)]);
     assert_eq!(
         runner.state().players[P0.0 as usize].mana_pool.total(),
-        0,
-        "the recipient's base and granted Replicate costs must consume all four green mana"
+        2,
+        "the recipient's base and granted Replicate costs must consume exactly four green mana"
     );
 
     runner.advance_until_stack_empty();
@@ -169,7 +169,7 @@ fn hatchery_granted_replicate_charges_the_recipient_slivers_mana_cost_once() {
 fn one_hatchery_grant_paid_four_times_creates_exactly_four_tokens() {
     let (mut runner, muscle) = hatchery_grants_replicate_scenario(1);
     // Muscle's {1}{G}, then four granted Replicate {1}{G} payments.
-    add_green_mana(&mut runner, 10);
+    add_green_mana(&mut runner, 12); // Four payments plus a payable fifth offer to decline (CR 601.2f).
 
     cast_creature(&mut runner, muscle);
     for payment in 0..4 {
@@ -186,8 +186,8 @@ fn one_hatchery_grant_paid_four_times_creates_exactly_four_tokens() {
     assert_replicate_payment_records(&runner, muscle, &[(0, 1), (0, 1), (0, 1), (0, 1)]);
     assert_eq!(
         runner.state().players[P0.0 as usize].mana_pool.total(),
-        0,
-        "the base cost and four granted Replicate payments must consume all ten green mana"
+        2,
+        "the base cost and four granted Replicate payments must consume exactly ten green mana"
     );
 
     runner.advance_until_stack_empty();
@@ -227,7 +227,7 @@ fn printed_and_granted_replicate_instances_each_copy_only_their_own_payments() {
         .id();
     let mut runner = scenario.build();
     // Hatchery's {1}{G}, two printed Replicate payments, three granted payments.
-    add_green_mana(&mut runner, 12);
+    add_green_mana(&mut runner, 14); // Five payments plus a payable last offer to decline (CR 601.2f).
 
     cast_creature(&mut runner, cast_hatchery);
     for payment in 0..2 {
@@ -260,8 +260,8 @@ fn printed_and_granted_replicate_instances_each_copy_only_their_own_payments() {
     );
     assert_eq!(
         runner.state().players[P0.0 as usize].mana_pool.total(),
-        0,
-        "the base cost and five Replicate payments must consume all twelve green mana"
+        2,
+        "the base cost and five Replicate payments must consume exactly twelve green mana"
     );
 
     runner.advance_until_stack_empty();
@@ -281,7 +281,7 @@ fn printed_and_granted_replicate_instances_each_copy_only_their_own_payments() {
 #[test]
 fn two_hatchery_grants_keep_replicate_payments_on_distinct_ordinals() {
     let (mut runner, muscle) = hatchery_grants_replicate_scenario(2);
-    add_green_mana(&mut runner, 6); // Muscle's {1}{G}, then one {1}{G} payment for each grant.
+    add_green_mana(&mut runner, 8); // Muscle's {1}{G}, one {1}{G} payment per grant, plus a payable offer to decline (CR 601.2f).
 
     cast_creature(&mut runner, muscle);
     assert_replicate_prompt(&runner, 0, 0);
@@ -308,8 +308,8 @@ fn two_hatchery_grants_keep_replicate_payments_on_distinct_ordinals() {
     assert_replicate_payment_records(&runner, muscle, &[(0, 1), (1, 1)]);
     assert_eq!(
         runner.state().players[P0.0 as usize].mana_pool.total(),
-        0,
-        "the recipient's base and two granted Replicate costs must consume all six green mana"
+        2,
+        "the recipient's base and two granted Replicate costs must consume exactly six green mana"
     );
 
     runner.advance_until_stack_empty();
@@ -330,7 +330,7 @@ fn printed_hatchery_replicate_keeps_its_fixed_cost() {
         .with_subtypes(vec!["Sliver"])
         .id();
     let mut runner = scenario.build();
-    add_green_mana(&mut runner, 4); // Hatchery's {1}{G}, then printed Replicate {1}{G}.
+    add_green_mana(&mut runner, 6); // Hatchery's {1}{G}, printed Replicate {1}{G}, plus a payable second offer to decline (CR 601.2f).
 
     cast_creature(&mut runner, hatchery);
     assert_replicate_prompt(&runner, 0, 0);
@@ -345,7 +345,8 @@ fn printed_hatchery_replicate_keeps_its_fixed_cost() {
         .expect("declining another printed Replicate payment must finish casting");
 
     assert_replicate_payment_records(&runner, hatchery, &[(0, 1)]);
-    assert_eq!(runner.state().players[P0.0 as usize].mana_pool.total(), 0);
+    // Two green stay floating: the extra that made the declined offer payable.
+    assert_eq!(runner.state().players[P0.0 as usize].mana_pool.total(), 2);
 
     runner.advance_until_stack_empty();
     let hatchery_tokens = runner

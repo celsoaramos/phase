@@ -749,7 +749,9 @@ fn aura_replicate_is_declared_with_the_defiler() {
         .with_color(vec![ManaColor::Black])
         .from_oracle_text_with_keywords(&["Flash", "Replicate", "Enchant"], CHANGING_LOYALTY)
         .id();
-    scenario.with_mana_pool(P0, mana(&[(ManaType::Black, 1), (ManaType::Colorless, 3)]));
+    // CR 601.2f: a repeatable additional cost is offered only while one more
+    // payment is payable, so fund the second replicate offer that is declined.
+    scenario.with_mana_pool(P0, mana(&[(ManaType::Black, 1), (ManaType::Colorless, 4)]));
     let mut runner = scenario.build();
 
     let trail = cast(
@@ -775,7 +777,11 @@ fn aura_replicate_is_declared_with_the_defiler() {
         "the Aura's target, then the Defiler, then replicate (paid once, then declined)"
     );
     assert_eq!(life(&runner), 18);
-    assert_eq!(pool(&runner), 1, "{{1}}{{B}} + replicate {{2}} less {{B}}");
+    assert_eq!(
+        pool(&runner),
+        2,
+        "{{1}}{{B}} + replicate {{2}} less {{B}}, plus the {{1}} that funded the declined offer"
+    );
 }
 
 /// CR 702.138a + CR 702.33a: an escaped kicker spell still exiles its three
