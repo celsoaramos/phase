@@ -183,7 +183,7 @@ impl ChosenAttribute {
             Self::BasicLandType(_) => ChoiceType::BasicLandType,
             Self::CardType(_) => ChoiceType::card_type(),
             Self::OddOrEven(_) => ChoiceType::OddOrEven,
-            Self::CardName(_) => ChoiceType::CardName,
+            Self::CardName(_) => ChoiceType::card_name(),
             // CR 101.4: the secret and the published number came from the same
             // `NumberRange` prompt; revealing changes visibility, not category.
             // CR 107.1a/b: recovering the CATEGORY from a stored value cannot
@@ -783,6 +783,7 @@ pub(crate) fn battlefield_departure_slot(effect: &Effect) -> Option<&TargetFilte
         | Effect::CastCopyOfCard { .. }
         | Effect::CopyTokenOf { .. }
         | Effect::CreateTokenCopyFromPool { .. }
+        | Effect::CreateCardCopyByName { .. }
         | Effect::Myriad
         | Effect::Encore
         | Effect::CombineHost { .. }
@@ -4126,6 +4127,7 @@ impl ResolvedAbility {
             | Effect::ExileTopCardContest { .. }
             | Effect::SwitchPT { .. }
             | Effect::CopySpell { .. }
+            | Effect::CreateCardCopyByName { .. }
             | Effect::EpicCopy { .. }
             | Effect::CastCopyOfCard { .. }
             | Effect::CopyTokenOf { .. }

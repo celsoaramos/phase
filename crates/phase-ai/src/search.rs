@@ -6875,7 +6875,11 @@ mod tests {
         }
         let mut runner = scenario.build();
         rehydrate_game_from_card_db(runner.state_mut(), &db);
-        let config = create_config(AiDifficulty::Medium, Platform::Native);
+        let mut config = create_config(AiDifficulty::Medium, Platform::Native);
+        // Node-bounded, like the other decision-quality tests here: this asserts
+        // WHICH action is chosen, and under the 1.5 s wall clock a debug build
+        // on a loaded runner can time out and fall back to PassPriority.
+        config.search.time_budget_ms = None;
         let session = AiSession::arc_from_game(runner.state());
         let mut rng = SmallRng::seed_from_u64(17);
 
@@ -14659,7 +14663,7 @@ mod tests {
         state.waiting_for = WaitingFor::NamedChoice {
             free_entry: None,
             player: PlayerId(0),
-            choice_type: ChoiceType::CardName,
+            choice_type: ChoiceType::card_name(),
             options: Vec::new(),
             source: None,
             persist_player: None,
@@ -14679,7 +14683,7 @@ mod tests {
         state.waiting_for = WaitingFor::NamedChoice {
             free_entry: None,
             player: P0,
-            choice_type: ChoiceType::CardName,
+            choice_type: ChoiceType::card_name(),
             options: Vec::new(),
             source: None,
             persist_player: None,
@@ -14712,7 +14716,7 @@ mod tests {
         state.waiting_for = WaitingFor::NamedChoice {
             free_entry: None,
             player: PlayerId(0),
-            choice_type: ChoiceType::CardName,
+            choice_type: ChoiceType::card_name(),
             options: Vec::new(),
             source: None,
             persist_player: None,
