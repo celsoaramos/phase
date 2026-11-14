@@ -345,6 +345,7 @@ mod twinned_vision_cast_origin;
 mod type_phrase_union_rows;
 mod typhoon_per_opponent_island_count;
 mod tyvar_activate_as_though_haste;
+mod tyvar_bellicose_mana_ability_resolves;
 mod uba_mask_draw_to_exile_play;
 mod ultimate_magic_meteor_per_opponent_destroy;
 mod ultimate_nullification;
