@@ -4475,6 +4475,11 @@ fn redact_waiting_for_payment(waiting_for: &mut WaitingFor, hidden_ids: &HashSet
             CostResume::ManaAbility { mana_ability } => {
                 redact_pending_mana_ability_payment(mana_ability, hidden_ids);
             }
+            // CR 118.12: the paused unless-payment holds the guarded effect, the same
+            // payload `pending_player_scope_unless_payment` carries.
+            CostResume::UnlessPayment { unless } => {
+                redact_ability_payment(&mut unless.pending_effect, hidden_ids);
+            }
             // The spell resumes are the `pending_cast_mut()` call above.
             // `TeamTapPayment`'s creature ids are public board state (already
             // surfaced as prompt `choices`) and its cost filter is card text

@@ -2786,6 +2786,7 @@ pub fn fallback_action(
         WaitingFor::PayCost {
             resume:
                 CostResume::Resolution
+                | CostResume::UnlessPayment { .. }
                 | CostResume::TeamTapPayment { .. }
                 | CostResume::TurnFaceUp { .. },
             ..

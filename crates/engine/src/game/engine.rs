@@ -14587,6 +14587,7 @@ fn apply_non_priority_pass_action(
                 ));
             }
             CostResume::Resolution
+            | CostResume::UnlessPayment { .. }
             | CostResume::TeamTapPayment { .. }
             | CostResume::TurnFaceUp { .. } => {
                 return Err(EngineError::InvalidAction(
@@ -14938,6 +14939,29 @@ fn apply_non_priority_pass_action(
                 | PayCostKind::ExileFromManaZone { .. } => {
                     return Err(EngineError::InvalidAction(
                         "Cost kind cannot resume a resolution PayCost".into(),
+                    ));
+                }
+            },
+            // CR 118.12: the payer chose which permanents pay an
+            // "unless [player] taps …" cost; tapping them IS the payment.
+            CostResume::UnlessPayment { unless } => match kind {
+                PayCostKind::TapCreatures { mode } => {
+                    engine_payment_choices::finish_unless_tap_payment(
+                        state,
+                        engine_payment_choices::UnlessTapSelection {
+                            min_count: *min_count,
+                            count: *count,
+                            mode: *mode,
+                            legal: choices,
+                            chosen: &chosen,
+                        },
+                        unless,
+                        &mut events,
+                    )?
+                }
+                _ => {
+                    return Err(EngineError::InvalidAction(
+                        "Cost kind cannot resume an unless payment".into(),
                     ));
                 }
             },

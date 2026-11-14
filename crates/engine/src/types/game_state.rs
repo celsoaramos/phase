@@ -12932,6 +12932,27 @@ pub enum CostResume {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remaining_cost: Option<Box<AbilityCost>>,
     },
+    /// CR 118.12: Resume an "[effect] unless [player] taps …" cost after the
+    /// payer selects which permanents to tap (Command Bridge, "sacrifice it
+    /// unless you tap an untapped permanent you control"). The payer already
+    /// answered `PayUnlessCost { pay: true }`; completing the selection is the
+    /// payment, so the guarded effect is suppressed via
+    /// `finish_successful_unless_payment` instead of draining the generic
+    /// resolution continuation (which would let the guarded effect happen).
+    UnlessPayment {
+        #[serde(rename = "UnlessPayment")]
+        unless: Box<UnlessCostResume>,
+    },
+}
+
+/// CR 118.12: The unless-payment continuation carried by
+/// [`CostResume::UnlessPayment`] while the payer picks the objects that pay
+/// an interactive unless-cost. Boxed so `WaitingFor::PayCost` stays small.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnlessCostResume {
+    pub pending_effect: ResolvedAbility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_event: Option<GameEvent>,
 }
 
 /// CR 601.2h + CR 702.48c: Identifies which spell-cost component a
@@ -21703,6 +21724,7 @@ impl WaitingFor {
                 } => Some(pending_cast),
                 CostResume::ManaAbility { .. }
                 | CostResume::Resolution
+                | CostResume::UnlessPayment { .. }
                 | CostResume::TeamTapPayment { .. }
                 | CostResume::TurnFaceUp { .. } => None,
             },
@@ -21742,6 +21764,7 @@ impl WaitingFor {
                 } => Some(pending_cast),
                 CostResume::ManaAbility { .. }
                 | CostResume::Resolution
+                | CostResume::UnlessPayment { .. }
                 | CostResume::TeamTapPayment { .. }
                 | CostResume::TurnFaceUp { .. } => None,
             },
@@ -22002,6 +22025,7 @@ impl WaitingFor {
                 CostResume::Spell { .. }
                 | CostResume::SpellCost { .. }
                 | CostResume::Resolution
+                | CostResume::UnlessPayment { .. }
                 | CostResume::TeamTapPayment { .. }
                 | CostResume::TurnFaceUp { .. } => None,
             },
@@ -28386,6 +28410,12 @@ fn visit_cost_resume_chains<'a>(
         CostResume::Resolution
         | CostResume::TeamTapPayment { .. }
         | CostResume::TurnFaceUp { .. } => Ok(()),
+        // CR 118.12: the guarded effect waits on the payer's interactive
+        // unless-cost choice.
+        CostResume::UnlessPayment { unless } => f(
+            &unless.pending_effect,
+            SuspendedChainEvent::Bound(unless.trigger_event.as_ref()),
+        ),
     }
 }
 

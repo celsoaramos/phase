@@ -476,6 +476,9 @@ function payCostSourceId(data: Extract<WaitingFor, { type: "PayCost" }>["data"])
   if (data.resume.type === "Resolution" || data.resume.type === "TeamTapPayment") {
     return undefined;
   }
+  if (data.resume.type === "UnlessPayment") {
+    return data.resume.UnlessPayment.pending_effect.source_id;
+  }
   if (data.resume.type === "TurnFaceUp") {
     return (data.resume.source?.object_id ?? data.resume.object_id) as ObjectId;
   }

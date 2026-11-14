@@ -1072,6 +1072,7 @@ export type CostResume =
   | { type: "Spell"; Spell: PendingCast }
   | { type: "SpellCost"; Spell: PendingCast; cost: unknown; source: "Other" | "Offering" | "Emerge" }
   | { type: "Resolution" }
+  | { type: "UnlessPayment"; UnlessPayment: { pending_effect: { source_id?: ObjectId } } }
   | { type: "ManaAbility"; ManaAbility: unknown }
   | {
       type: "TurnFaceUp";
