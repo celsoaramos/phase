@@ -293,6 +293,7 @@ mod thickest_in_the_thicket_target_anaphor_8460;
 mod thor_god_of_thunder;
 mod thorna_and_twigtooth_shared_x_relay_6956;
 mod thought_distortion;
+mod thought_erasure_surveil_trigger;
 mod thousand_moons_smithy;
 mod thranduil_graveyard_granted_abilities;
 mod three_blind_mice;
