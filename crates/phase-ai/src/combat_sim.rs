@@ -20,8 +20,14 @@
 //! the combat left behind (attackers stay tapped through the opponent's turn —
 //! CR 502.3 untaps them only in their controller's untap step).
 //!
-//! Anything the replay cannot drive without making a choice for a player
-//! (targets, damage assignment, modal triggers) drops that candidate. When the
+//! A prompt that belongs to the simulating player mid-replay ("you may put an
+//! Angel, Demon, or Dragon onto the battlefield attacking" — Kaalia of the
+//! Vast; a trigger's target) is answered by the AI's own quick choice
+//! (`CombatSimInput::answer`). Before that answer existed, every such prompt
+//! dropped the declaration, and Kaalia never attacked at the "Difícil" table
+//! (six flags in one game, 2026-10-29). The OTHER player's prompts are answered
+//! only when the engine issues a single legal action: picking for them would
+//! read their hidden hand. Anything else drops that candidate. When the
 //! incumbent itself cannot be replayed, the heuristic answer stands unchanged:
 //! this layer only ever swaps a declaration it has measured for a better one.
 
@@ -76,6 +82,9 @@ pub(crate) struct CombatSimInput<'a> {
     /// Wall-clock guard for interactive play; `None` in measurement mode, where
     /// only `MAX_REPLAYS` bounds the work.
     pub deadline: Option<Deadline>,
+    /// The AI's own answer (a small search, no nested combat replay) to a
+    /// prompt of `player`'s that opens mid-replay. `None` drops the candidate.
+    pub answer: &'a dyn Fn(&GameState) -> Option<GameAction>,
 }
 
 struct Budget {
@@ -132,7 +141,12 @@ fn combat_is_over(state: &GameState, turn: u32) -> bool {
 /// Pass priority (and answer a combat-tax quote) until the defender must
 /// block or combat damage is done. `stop_at_blocks` = false makes a pending
 /// block declaration `Unsupported` (the caller already declared).
-fn advance(state: &mut GameState, turn: u32, stop_at_blocks: bool) -> Reached {
+fn advance(
+    input: &CombatSimInput<'_>,
+    state: &mut GameState,
+    turn: u32,
+    stop_at_blocks: bool,
+) -> Reached {
     for _ in 0..MAX_REPLAY_STEPS {
         if combat_is_over(state, turn) {
             return Reached::Finished;
@@ -179,13 +193,29 @@ fn advance(state: &mut GameState, turn: u32, stop_at_blocks: bool) -> Reached {
                     None => return Reached::Unsupported,
                 }
             }
-            _ => return Reached::Unsupported,
+            _ => match answer_prompt(input, state) {
+                Some(action) => action,
+                None => return Reached::Unsupported,
+            },
         };
         if apply_as_current_for_simulation(state, action).is_err() {
             return Reached::Unsupported;
         }
     }
     Reached::Unsupported
+}
+
+/// A mid-replay prompt the loop above has no rule for. The simulating player's
+/// own prompt gets the AI's quick choice; the other player's only a forced one.
+fn answer_prompt(input: &CombatSimInput<'_>, state: &GameState) -> Option<GameAction> {
+    if state.waiting_for.acting_player() == Some(input.player) {
+        return (input.answer)(state);
+    }
+    let mut actions = legal_actions(state).into_iter();
+    match (actions.next(), actions.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
 }
 
 /// Damage the opponent's whole creature board can push through `player`'s
@@ -300,7 +330,7 @@ fn attack_value(
     }
     let mut declared = input.state.clone();
     apply_as_current_for_simulation(&mut declared, action.clone()).ok()?;
-    let (defender, targets) = match advance(&mut declared, turn, true) {
+    let (defender, targets) = match advance(input, &mut declared, turn, true) {
         Reached::Finished => {
             return Some(position_value(
                 &declared,
@@ -346,7 +376,7 @@ fn attack_value(
         if apply_as_current_for_simulation(&mut branch, blocks).is_err() {
             continue;
         }
-        match advance(&mut branch, turn, false) {
+        match advance(input, &mut branch, turn, false) {
             Reached::Finished => {}
             // The defender's answer led to a prompt the replay will not answer
             // (a trigger target, a damage-assignment order): this attack can't
@@ -480,7 +510,7 @@ fn block_value(
     let turn = input.state.turn_number;
     let mut branch = input.state.clone();
     apply_as_current_for_simulation(&mut branch, action.clone()).ok()?;
-    match advance(&mut branch, turn, false) {
+    match advance(input, &mut branch, turn, false) {
         Reached::Finished => Some(position_value(
             &branch,
             input.player,
