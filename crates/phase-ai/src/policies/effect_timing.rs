@@ -5,7 +5,8 @@ use engine::game::combat::{
 };
 use engine::game::{players, turn_control};
 use engine::types::ability::{
-    ContinuousModification, Duration, Effect, StaticDefinition, TargetRef,
+    ContinuousModification, ControllerRef, Duration, Effect, PtValue, StaticDefinition,
+    TargetFilter, TargetRef, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
@@ -55,9 +56,23 @@ impl EffectTimingPolicy {
         // resolves it, so a permanent spell is not timed by what its abilities do later, and it is
         // priced once per candidate. A payload beside value that lands elsewhere keeps the combat
         // window and takes no penalty out of it: waiting would cost the rest.
-        score += match CombatBinding::of_candidate(ctx, &own_resolution_effects(ctx)) {
+        let own_effects = own_resolution_effects(ctx);
+        score += match CombatBinding::of_candidate(ctx, &own_effects) {
             CombatBinding::Whole => combat_trick_score(ctx),
             CombatBinding::Partial => combat_trick_score(ctx).max(0.0),
+            // CR 613.4c + CR 514.2: a team-wide pump of the caster's own creatures
+            // ("creatures you control get +2/+0 until end of turn") is the same combat
+            // trick a single-target `Pump` is, and pays only in the combat window.
+            CombatBinding::Unbound if own_effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    Effect::PumpAll { power, toughness, target }
+                        if is_own_team_buff(power, toughness, target)
+                )
+            }) =>
+            {
+                combat_trick_score(ctx)
+            }
             CombatBinding::Unbound => 0.0,
         };
 
@@ -583,6 +598,25 @@ fn threatened_own_spell_value(state: &GameState, ai_player: PlayerId) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
+/// A mass pump that only grows the AI's own creatures ("{B}{R}: Creatures you
+/// control with menace get +1/+0 until end of turn" — Labyrinth Raptor) is a
+/// combat trick like a single-target `Pump`: `PumpAll` always lasts until end
+/// of turn (CR 611.2a), so outside combat it buys nothing. Reported from play:
+/// the AI tapped out for Labyrinth Raptor's pump every upkeep and stranded its
+/// hand. A mass shrink of the opponent's creatures is removal, not a trick, and
+/// keeps its neutral score.
+fn is_own_team_buff(power: &PtValue, toughness: &PtValue, target: &TargetFilter) -> bool {
+    let non_negative = |v: &PtValue| !matches!(v, PtValue::Fixed(n) if *n < 0);
+    let own_team = matches!(
+        target,
+        TargetFilter::Typed(TypedFilter {
+            controller: Some(ControllerRef::You),
+            ..
+        })
+    );
+    own_team && non_negative(power) && non_negative(toughness)
+}
+
 fn combat_trick_score(ctx: &PolicyContext<'_>) -> f64 {
     // CR 514.2: until-end-of-turn effects end in the cleanup step.
     // Pump effects expire at cleanup — casting outside combat has no lasting impact.
@@ -674,6 +708,7 @@ mod tests {
     use engine::types::zones::Zone;
     use rand::rngs::SmallRng;
     use rand::SeedableRng;
+    use std::sync::Arc;
 
     /// The AI's seat in the counterspell fixtures; every other seat is foreign.
     const AI: PlayerId = PlayerId(1);
@@ -2635,6 +2670,79 @@ mod tests {
         assert!(
             removal >= 0.3,
             "the removal mode must earn removal_score at the mode prompt, got {removal}"
+        );
+    }
+
+    /// Labyrinth Raptor: "{B}{R}: Creatures you control with menace get +1/+0
+    /// until end of turn." Reported from play: the AI paid it every upkeep.
+    fn team_pump_score(phase: Phase, power: i32, controller: ControllerRef) -> f64 {
+        let mut state = GameState::new_two_player(42);
+        let source = creature(&mut state, P0, "Labyrinth Raptor");
+        let ability = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::PumpAll {
+                power: PtValue::Fixed(power),
+                toughness: PtValue::Fixed(if power < 0 { power } else { 0 }),
+                target: TargetFilter::Typed(
+                    TypedFilter::new(TypeFilter::Creature).controller(controller),
+                ),
+            },
+        );
+        Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(ability);
+        state.active_player = P0;
+        state.phase = phase;
+        let candidate = CandidateAction {
+            action: GameAction::ActivateAbility {
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+                source_id: source,
+                ability_index: 0,
+            },
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Ability),
+        };
+        let decision = build_decision_context(&state);
+        let config = AiConfig::default();
+        let context = crate::context::AiContext::empty(&config.weights);
+        let ctx = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: P0,
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        assert!(
+            ctx.effects()
+                .iter()
+                .any(|e| matches!(e, Effect::PumpAll { .. })),
+            "reach guard: the activation's PumpAll must be visible to the policy"
+        );
+        EffectTimingPolicy.score(&ctx)
+    }
+
+    #[test]
+    fn own_team_mass_pump_is_a_combat_trick_not_an_upkeep_sink() {
+        for phase in [Phase::Upkeep, Phase::Draw, Phase::End] {
+            let score = team_pump_score(phase, 1, ControllerRef::You);
+            // -2.0 from the trick gate; the creature source keeps the +0.1 that
+            // `score_action_shape` gives every creature outside a main phase —
+            // the single-target `Pump` path carries the same.
+            assert!(score < -1.5, "{phase:?}: got {score}");
+        }
+        let combat = team_pump_score(Phase::DeclareBlockers, 1, ControllerRef::You);
+        assert!(
+            combat > 0.0,
+            "a declared-blockers team pump must stay attractive: {combat}"
+        );
+    }
+
+    #[test]
+    fn opponent_mass_shrink_is_not_treated_as_a_trick() {
+        let score = team_pump_score(Phase::Upkeep, -1, ControllerRef::Opponent);
+        assert!(
+            score > -1.0,
+            "a -1/-1 to the opponent's creatures is removal: {score}"
         );
     }
 
