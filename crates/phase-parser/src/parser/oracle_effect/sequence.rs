@@ -6706,6 +6706,17 @@ pub(super) fn apply_clause_continuation(
                             def = def
                                 .multi_target(MultiTargetSpec::unlimited(0))
                                 .target_choice_timing(TargetChoiceTiming::Resolution);
+                        } else if let PutCount::Up(max) = &quantity {
+                            // CR 608.2c: "put up to two artifact cards from among
+                            // them into your hand" (Transwarp Hub, Smuggler's
+                            // Surprise) selects zero to N milled cards. Without the
+                            // bound the selection fell back to one card. A bound
+                            // of one keeps the single-selection shape.
+                            if !matches!(max, QuantityExpr::Fixed { value: 1 }) {
+                                def = def
+                                    .multi_target(MultiTargetSpec::up_to(max.clone()))
+                                    .target_choice_timing(TargetChoiceTiming::Resolution);
+                            }
                         }
                         defs.push(def);
                     }

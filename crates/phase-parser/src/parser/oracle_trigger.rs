@@ -3293,6 +3293,28 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
         }
     }
 
+    // CR 603.10a + CR 608.2k: a departure trigger whose subject is described by
+    // its own counters ("Whenever a creature you control with a +1/+1 counter on
+    // it leaves the battlefield, create a token for each +1/+1 counter on it" —
+    // The Ooze; "Whenever a legendary creature with counters on it dies, draw a
+    // card for each counter on it" — Cleopatra, Exiled Pharaoh) uses "it" in the
+    // body for that same departing object. The quantity parser reads a bare
+    // "counter(s) on it" as the ability source, which counts the counters on the
+    // trigger's carrier (none) instead of the departed object's last-known
+    // counters. Rebind those source-scoped counter counts to the event object.
+    if matches!(
+        def.mode,
+        TriggerMode::ChangesZone | TriggerMode::LeavesBattlefield
+    ) && def
+        .valid_card
+        .as_ref()
+        .is_some_and(subject_filter_reads_counters)
+    {
+        if let Some(execute) = def.execute.as_deref_mut() {
+            rebind_source_counter_counts_to_event_source_in_ability(execute);
+        }
+    }
+
     // CR 303.4 + CR 301.5a + CR 611.2c: On an Aura/Equipment self-trigger whose
     // subject is the attached host (`valid_card == AttachedTo` — "Whenever
     // enchanted/equipped creature attacks/...", Martial Impetus), the anaphoric
@@ -4361,6 +4383,51 @@ fn remap_self_scope_to_event_source_in_ref(qty: &mut QuantityRef) {
     };
     if *scope == ObjectScope::Source {
         *scope = ObjectScope::EventSource;
+    }
+}
+
+/// Whether a trigger subject filter is qualified by the subject's own counters
+/// ("a creature you control with a +1/+1 counter on it", "a legendary creature
+/// with counters on it"). Descends through `And`/`Or` composites; `Not` never
+/// qualifies (a subject described by the ABSENCE of counters gives "counters on
+/// it" no departing-object antecedent to count).
+fn subject_filter_reads_counters(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(typed) => typed
+            .properties
+            .iter()
+            .any(|prop| matches!(prop, FilterProp::Counters { .. })),
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            filters.iter().any(subject_filter_reads_counters)
+        }
+        _ => false,
+    }
+}
+
+/// CR 603.10a: retarget `CountersOn { Source }` counts to `EventSource` (the
+/// departing object, read through last-known information) across an ability
+/// chain. Only counter counts move — other source reads (power, mana value) keep
+/// their scope, because the subject's counter qualifier is the only evidence
+/// that the body's "it" names the departing object.
+fn rebind_source_counter_counts_to_event_source_in_ability(ability: &mut AbilityDefinition) {
+    let mut rebind = |expr: &mut QuantityExpr| {
+        expr.each_ref_mut(&mut |qty: &mut QuantityRef| {
+            if let QuantityRef::CountersOn { scope, .. } = qty {
+                if *scope == ObjectScope::Source {
+                    *scope = ObjectScope::EventSource;
+                }
+            }
+        });
+    };
+    match ability.effect.as_mut() {
+        Effect::Token { count, .. } => rebind(count),
+        effect => super::oracle_effect::each_quantity_expr_mut(effect, &mut rebind),
+    }
+    if let Some(sub) = ability.sub_ability.as_deref_mut() {
+        rebind_source_counter_counts_to_event_source_in_ability(sub);
+    }
+    if let Some(else_ability) = ability.else_ability.as_deref_mut() {
+        rebind_source_counter_counts_to_event_source_in_ability(else_ability);
     }
 }
 
