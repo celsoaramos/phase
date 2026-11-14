@@ -5564,7 +5564,9 @@ impl ResolvedAbility {
         if source.identity.reference.object_id != self.source_id {
             return false;
         }
-        if !self.effect_returns_self_ref_from_graveyard() {
+        if !self.effect_returns_self_ref_from_graveyard()
+            && !self.aura_bounces_self_ref_to_hand(state)
+        {
             return false;
         }
         if !state
@@ -5669,6 +5671,38 @@ impl ResolvedAbility {
 
     /// True when this ability (or a nested sub) is a `ChangeZone` of `SelfRef`
     /// whose origin is the graveyard.
+    /// CR 400.7 + CR 704.5m: "When enchanted creature dies, return ~ to its
+    /// owner's hand" (Angelic Destiny) parses to `Bounce { SelfRef }` with no
+    /// origin. The Aura is put into the graveyard by state-based actions after
+    /// its host leaves, and its trigger still finds that card there — so a
+    /// self-bounce to hand from an Aura source counts as a graveyard return.
+    /// Limited to Aura sources: a non-Aura permanent whose "return ~" trigger
+    /// resolves after it died is a new object (CR 400.7) and finds nothing.
+    fn aura_bounces_self_ref_to_hand(&self, state: &crate::types::game_state::GameState) -> bool {
+        fn bounce_self_to_hand(effect: &Effect) -> bool {
+            matches!(
+                effect,
+                Effect::Bounce {
+                    target: TargetFilter::SelfRef,
+                    destination: None | Some(crate::types::zones::Zone::Hand),
+                    ..
+                }
+            )
+        }
+        fn walk(ability: &ResolvedAbility) -> bool {
+            bounce_self_to_hand(&ability.effect)
+                || ability.child_links().any(|(_, child)| walk(child))
+        }
+        let is_aura = state.objects.get(&self.source_id).is_some_and(|object| {
+            object
+                .card_types
+                .subtypes
+                .iter()
+                .any(|subtype| subtype == "Aura")
+        });
+        is_aura && walk(self)
+    }
+
     fn effect_returns_self_ref_from_graveyard(&self) -> bool {
         fn change_zone_self_from_gy(effect: &Effect) -> bool {
             matches!(
