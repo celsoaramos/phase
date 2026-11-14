@@ -1368,12 +1368,9 @@ fn snapshot_transient_modifications(
                         crate::types::keywords::ProtectionTarget::Color(color),
                     ),
                 },
-                // CR 609.3 + follow-up F1: no colour was chosen, because a
-                // PRINTED `Choose a color.` still lowers `persist: false` in the
-                // in-chain imperative route. Measured: a minority of the seam-reaching
-                // pool cards take this arm (census `<SP>/census-base.out`). Leave the
-                // payload untouched so `game/layers.rs`'s existing unresolved handling
-                // stays byte-identical. This is what keeps F1 out of scope.
+                // CR 609.3: this resolution announced no colour and the source
+                // holds no linked answer. Leave the payload untouched so
+                // `game/layers.rs`'s existing unresolved handling applies.
                 None => modification.clone(),
             },
             ContinuousModification::AddKeyword {
@@ -1390,7 +1387,7 @@ fn snapshot_transient_modifications(
                         crate::types::keywords::HexproofFilter::Color(color),
                     ),
                 },
-                // Symmetric with the Protection arm above: CR 609.3 + F1.
+                // Symmetric with the Protection arm above: CR 609.3.
                 None => modification.clone(),
             },
             // CR 608.2d + CR 608.2h: "becomes the creature type / basic land type of
