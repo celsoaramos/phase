@@ -4354,6 +4354,18 @@ pub(crate) fn aggregate_property_over(
     function: AggregateFunction,
     property: ObjectProperty,
 ) -> i32 {
+    // CR 205.2a: "<N> or more card types among them" is a SET reduction over each
+    // object's card types — not a fold of one number per object — so `property`
+    // is not read.
+    if function == AggregateFunction::DistinctCardTypes {
+        let mut seen = HashSet::new();
+        for &id in ids {
+            if let Some(view) = characteristic_view_for_object(state, id) {
+                seen.extend(view.core_types().iter().copied());
+            }
+        }
+        return usize_to_i32_saturating(seen.len());
+    }
     let values = ids
         .iter()
         .filter_map(|&id| object_property_value(state, id, property));
@@ -4384,7 +4396,9 @@ fn object_property_value(state: &GameState, id: ObjectId, property: ObjectProper
 
 fn reduce_property_values(values: impl Iterator<Item = i32>, function: AggregateFunction) -> i32 {
     match function {
-        AggregateFunction::Max => values.max().unwrap_or(0),
+        // `DistinctCardTypes` is answered by `aggregate_property_over` before any
+        // per-object value is read; a bare value stream degrades to `Max`.
+        AggregateFunction::Max | AggregateFunction::DistinctCardTypes => values.max().unwrap_or(0),
         AggregateFunction::Min => values.min().unwrap_or(0),
         AggregateFunction::Sum => values.sum(),
     }
@@ -5226,7 +5240,7 @@ fn resolve_ref(
             }
 
             match aggregate {
-                AggregateFunction::Max => buckets
+                AggregateFunction::Max | AggregateFunction::DistinctCardTypes => buckets
                     .values()
                     .map(HashSet::len)
                     .max()
@@ -5957,7 +5971,9 @@ fn resolve_ref(
                         // consumer in the IMMEDIATELY following link, so no B can
                         // interpose; and `Sum` is unaffected either way because it
                         // reads `last_effect_amount`, exactly as before this change.
-                        AggregateFunction::Max => per_player.max().unwrap_or(total),
+                        AggregateFunction::Max | AggregateFunction::DistinctCardTypes => {
+                            per_player.max().unwrap_or(total)
+                        }
                         AggregateFunction::Min => per_player.min().unwrap_or(total),
                     }
                 }
@@ -6529,7 +6545,9 @@ fn resolve_ref(
                     ObjectProperty::ManaSymbolCount(_) => None,
                 });
             match function {
-                AggregateFunction::Max => vals.max().unwrap_or(0),
+                AggregateFunction::Max | AggregateFunction::DistinctCardTypes => {
+                    vals.max().unwrap_or(0)
+                }
                 AggregateFunction::Min => vals.min().unwrap_or(0),
                 AggregateFunction::Sum => vals.sum(),
             }
@@ -7289,7 +7307,9 @@ fn aggregate_per_group<'a, K: Eq + std::hash::Hash>(
             .or_insert(record.amount);
     }
     let aggregated: Option<u32> = match aggregate {
-        AggregateFunction::Max => totals.values().copied().max(),
+        AggregateFunction::Max | AggregateFunction::DistinctCardTypes => {
+            totals.values().copied().max()
+        }
         AggregateFunction::Min => totals.values().copied().min(),
         AggregateFunction::Sum => Some(totals.values().copied().sum()),
     };
@@ -9639,7 +9659,7 @@ where
 {
     let values = players.into_iter().filter_map(&mut extract);
     match aggregate {
-        AggregateFunction::Max => values.max().unwrap_or(0),
+        AggregateFunction::Max | AggregateFunction::DistinctCardTypes => values.max().unwrap_or(0),
         AggregateFunction::Min => values.min().unwrap_or(0),
         AggregateFunction::Sum => values.sum(),
     }
@@ -9738,7 +9758,7 @@ where
 {
     let values = players.into_iter().map(&mut extract);
     match aggregate {
-        AggregateFunction::Max => values.max().unwrap_or(0),
+        AggregateFunction::Max | AggregateFunction::DistinctCardTypes => values.max().unwrap_or(0),
         AggregateFunction::Min => values.min().unwrap_or(0),
         AggregateFunction::Sum => values.sum(),
     }

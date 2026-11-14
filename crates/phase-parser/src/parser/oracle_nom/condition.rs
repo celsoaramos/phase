@@ -4018,7 +4018,7 @@ fn parse_optional_tied_for_tail(
         AggregateFunction::Min => Comparator::LT,
         // Sum aggregate is not produced by this combinator; default to GT
         // for completeness (this arm is dead).
-        AggregateFunction::Sum => Comparator::GT,
+        AggregateFunction::Sum | AggregateFunction::DistinctCardTypes => Comparator::GT,
     };
     // The leading clause may end here (no "or is tied for" tail) — return GT/LT.
     let Ok((rest, _)) = alt((
@@ -4232,7 +4232,9 @@ pub(crate) fn parse_spell_target_has_superlative(
     let comparator = match aggregate {
         AggregateFunction::Min => Comparator::LE,
         AggregateFunction::Max => Comparator::GE,
-        AggregateFunction::Sum => return Err(oracle_err(rest)),
+        AggregateFunction::Sum | AggregateFunction::DistinctCardTypes => {
+            return Err(oracle_err(rest))
+        }
     };
     Ok((
         remainder,

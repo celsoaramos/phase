@@ -1689,6 +1689,9 @@ fn parse_single_cost_in(text: &str, channel: CostChannel) -> AbilityCost {
     // symbols among their mana costs" — Baron Helmut Zemo's Boast cost. Must run
     // before the EffectCost fallback, which would otherwise wrap the exile as a
     // non-functional `ChangeZone` effect-cost.
+    if let Some(cost) = try_parse_exile_with_distinct_card_types_cost(&lower) {
+        return cost;
+    }
     if let Some(cost) = try_parse_exile_with_aggregate_cost(&lower) {
         return cost;
     }
@@ -2362,6 +2365,47 @@ fn fold_attached_to_source_rider(filter: TargetFilter, tail: &str) -> (TargetFil
         ),
         rest,
     )
+}
+
+/// CR 117.1 + CR 601.2b + CR 205.2a + CR 702.138a: Nethergoyf's escape cost —
+/// "Exile any number of other cards from your graveyard with four or more card
+/// types among them" — as `AbilityCost::ExileWithAggregate` with the set-level
+/// `AggregateFunction::DistinctCardTypes` reduction. "Other" excludes the card
+/// being cast; the eligible-object scan already drops the source and the spell
+/// on the stack (CR 601.2a), so the filter itself names cards in your graveyard.
+fn try_parse_exile_with_distinct_card_types_cost(lower: &str) -> Option<AbilityCost> {
+    type E<'a> = super::oracle_nom::error::OracleError<'a>;
+    let (i, _) = tag::<_, _, E<'_>>("exile any number of ")
+        .parse(lower)
+        .ok()?;
+    let (i, _) = opt(tag::<_, _, E<'_>>("other ")).parse(i).ok()?;
+    let (i, _) = tag::<_, _, E<'_>>("cards from your graveyard with ")
+        .parse(i)
+        .ok()?;
+    let (i, n) = nom_primitives::parse_number(i).ok()?;
+    let (i, _) = alt((tag::<_, _, E<'_>>(" or more "), tag(" or greater ")))
+        .parse(i)
+        .ok()?;
+    let (i, _) = tag::<_, _, E<'_>>("card types among them").parse(i).ok()?;
+    if !i.trim().trim_end_matches('.').trim().is_empty() {
+        return None;
+    }
+    let filter = TargetFilter::Typed(
+        TypedFilter::card()
+            .controller(ControllerRef::You)
+            .properties(vec![FilterProp::InZone {
+                zone: Zone::Graveyard,
+            }]),
+    );
+    Some(AbilityCost::ExileWithAggregate {
+        filter,
+        function: AggregateFunction::DistinctCardTypes,
+        // Not read by the DistinctCardTypes reduction.
+        property: ObjectProperty::ManaValue,
+        comparator: Comparator::GE,
+        value: n as i32,
+        zone: Zone::Graveyard,
+    })
 }
 
 /// CR 117.1 + CR 601.2b + CR 107.4a/107.4e/202.1: Parse Baron Helmut Zemo's

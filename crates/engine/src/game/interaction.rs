@@ -5601,7 +5601,9 @@ fn interaction_mana_restriction(restriction: &ManaRestriction) -> InteractionMan
 
 fn aggregate_function_code(function: AggregateFunction) -> InteractionAggregateFunction {
     match function {
-        AggregateFunction::Max => InteractionAggregateFunction::Max,
+        AggregateFunction::Max | AggregateFunction::DistinctCardTypes => {
+            InteractionAggregateFunction::Max
+        }
         AggregateFunction::Min => InteractionAggregateFunction::Min,
         AggregateFunction::Sum => InteractionAggregateFunction::Sum,
     }

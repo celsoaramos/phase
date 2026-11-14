@@ -2525,6 +2525,74 @@ pub fn candidate_actions_broad_with_probe(
                 |cards| GameAction::SelectCards { cards },
             )
         }
+        // CR 205.2a + CR 702.138a: "exile any number of other cards with <N> or more
+        // card types among them" (Nethergoyf's escape). Offer a greedy minimal cover
+        // — each step takes the card adding the most new card types, ties to the
+        // later (cheaper-to-lose, deeper) graveyard position — and the whole pool
+        // as a fallback; both satisfy the validator whenever the pool does.
+        WaitingFor::PayCost {
+            player,
+            kind:
+                PayCostKind::ExileAggregate {
+                    function: crate::types::ability::AggregateFunction::DistinctCardTypes,
+                    property,
+                    comparator,
+                    value,
+                    ..
+                },
+            choices,
+            ..
+        } => {
+            let distinct = |state: &GameState, ids: &[ObjectId]| {
+                crate::game::quantity::aggregate_property_over(
+                    state,
+                    ids,
+                    crate::types::ability::AggregateFunction::DistinctCardTypes,
+                    *property,
+                )
+            };
+            let mut picked: Vec<ObjectId> = Vec::new();
+            let mut remaining: Vec<ObjectId> = choices.clone();
+            while !comparator.evaluate(distinct(state, &picked), *value) && !remaining.is_empty() {
+                let current = distinct(state, &picked);
+                let (best_index, best_gain) = remaining
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &id)| {
+                        let mut with = picked.clone();
+                        with.push(id);
+                        (index, distinct(state, &with) - current)
+                    })
+                    .max_by_key(|&(index, gain)| (gain, index))
+                    .expect("remaining is non-empty");
+                if best_gain <= 0 {
+                    break;
+                }
+                picked.push(remaining.remove(best_index));
+            }
+            let mut out = Vec::new();
+            if comparator.evaluate(distinct(state, &picked), *value) {
+                out.push(candidate(
+                    GameAction::SelectCards {
+                        cards: picked.clone(),
+                    },
+                    TacticalClass::Utility,
+                    Some(*player),
+                ));
+            }
+            if picked.len() != choices.len()
+                && comparator.evaluate(distinct(state, choices), *value)
+            {
+                out.push(candidate(
+                    GameAction::SelectCards {
+                        cards: choices.clone(),
+                    },
+                    TacticalClass::Utility,
+                    Some(*player),
+                ));
+            }
+            out
+        }
         // CR 701.20a: A shared-quality reveal ("two cards that share a color")
         // offers only selections the payment validator accepts.
         // CR 701.20a: The AI must consider the full eligible pool, not just the

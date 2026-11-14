@@ -502,7 +502,9 @@ where
         seen.insert(key).then(|| team_life_total(state, pid))
     });
     match aggregate {
-        AggregateFunction::Max => team_totals.max().unwrap_or(0),
+        AggregateFunction::Max | AggregateFunction::DistinctCardTypes => {
+            team_totals.max().unwrap_or(0)
+        }
         AggregateFunction::Min => team_totals.min().unwrap_or(0),
         AggregateFunction::Sum => team_totals.sum(),
     }

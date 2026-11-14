@@ -15301,6 +15301,13 @@ pub enum AggregateFunction {
     Max,
     Min,
     Sum,
+    /// CR 205.2a: the number of DISTINCT card types among the objects ("cards
+    /// with four or more card types among them" — Nethergoyf's escape cost). A
+    /// set-level reduction over each object's card types, so the paired
+    /// `ObjectProperty` is not read. Built only by the object-set cost
+    /// aggregate (`AbilityCost::ExileWithAggregate`); the per-player reductions
+    /// treat it like `Max` (they never receive it).
+    DistinctCardTypes,
 }
 
 /// CR 608.2c: selects which object-id set a [`QuantityRef::TrackedSetAggregate`]

@@ -12018,6 +12018,53 @@ fn pay_additional_cost_with_source(
                 },
             });
         }
+        // CR 117.1 + CR 601.2b + CR 601.2h + CR 702.138a: an "exile any number of
+        // cards with <aggregate> among them" sub-cost of a SPELL's cost — Nethergoyf's
+        // escape ("Exile any number of other cards from your graveyard with four or
+        // more card types among them"). Same prompt and handler as the activation
+        // path (Baron Helmut Zemo); the handler validates the threshold and resumes
+        // the cast through `finish_pending_cost_or_cast`.
+        AbilityCost::ExileWithAggregate {
+            ref filter,
+            function,
+            property,
+            comparator,
+            value,
+            zone,
+        } => {
+            let eligible = super::cost_payability::eligible_exile_with_aggregate_objects(
+                state,
+                player,
+                pending.object_id,
+                filter,
+                zone,
+            );
+            let total =
+                super::quantity::aggregate_property_over(state, &eligible, function, property);
+            if !comparator.evaluate(total, value) {
+                return Err(EngineError::ActionNotAllowed(
+                    "Not enough eligible cards to reach the exile threshold".into(),
+                ));
+            }
+            return Ok(WaitingFor::PayCost {
+                player,
+                kind: PayCostKind::ExileAggregate {
+                    zone,
+                    function,
+                    property,
+                    comparator,
+                    value,
+                    filter: filter.clone(),
+                },
+                count: eligible.len(),
+                // The threshold needs at least one card (CR 118.3).
+                min_count: 1,
+                choices: eligible,
+                resume: CostResume::Spell {
+                    spell: Box::new(pending),
+                },
+            });
+        }
         AbilityCost::CollectEvidence { amount } => {
             return super::effects::collect_evidence::begin_cost_payment(
                 state,
