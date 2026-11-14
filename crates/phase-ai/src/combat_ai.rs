@@ -363,6 +363,15 @@ pub(crate) fn choose_attackers_with_targets_with_profile_and_deadline_and_threat
         })
         .collect();
 
+    // A free attacker with no power and nothing that rewards attacking only
+    // risks the creature (field reports: Market Gnome 0/3 and a 0/1 Wizard
+    // that pinged on every noncreature spell, swung into open blockers).
+    candidates.retain(|&id| {
+        mandatory.contains(&id) || !zero_power_attack_is_pointless(state, player, id)
+    });
+    if candidates.is_empty() {
+        return Vec::new();
+    }
     // CR 702.16e + CR 702.16j: a voluntary attacker whose every legal target is a
     // player preventing all of its damage (The One Ring, Teferi's Protection)
     // gains nothing by attacking, so it is not a candidate.
@@ -1270,6 +1279,70 @@ fn planeswalker_threat(state: &GameState, pw_id: ObjectId) -> f64 {
             loyalty_ability_weight(cost, loyalty)
         })
         .sum()
+}
+
+/// CR 510.1a: a creature with 0 or less power assigns no combat damage, so
+/// attacking with it only gains something through an attack-related trigger
+/// or keyword (its own or another permanent's — exalted, battle cry, "whenever
+/// a creature you control attacks") or by enabling ninjutsu from hand. With
+/// none of those it is a free attacker exposed to blocks and kept off defense.
+pub(crate) fn zero_power_attack_is_pointless(
+    state: &GameState,
+    player: PlayerId,
+    id: ObjectId,
+) -> bool {
+    use engine::types::keywords::KeywordKind;
+
+    let Some(attacker) = state.objects.get(&id) else {
+        return false;
+    };
+    if attacker.power.unwrap_or(0) > 0 {
+        return false;
+    }
+    let attack_keyword = |keyword: &engine::types::keywords::Keyword| {
+        matches!(
+            keyword.kind(),
+            KeywordKind::Afflict
+                | KeywordKind::Annihilator
+                | KeywordKind::Battlecry
+                | KeywordKind::Bushido
+                | KeywordKind::Exalted
+                | KeywordKind::Flanking
+                | KeywordKind::Rampage
+                | KeywordKind::Training
+        )
+    };
+    let attack_trigger = |object: &engine::game::game_object::GameObject| {
+        object
+            .trigger_definitions
+            .iter_unchecked()
+            .any(|entry| format!("{:?}", entry.definition.mode).contains("Attack"))
+    };
+    if attacker.keywords.iter().any(attack_keyword) || attack_trigger(attacker) {
+        return false;
+    }
+    let other_rewards_attacking = state.battlefield.iter().any(|&other| {
+        other != id
+            && state.objects.get(&other).is_some_and(|object| {
+                object.controller == player
+                    && (attack_trigger(object)
+                        || object
+                            .keywords
+                            .iter()
+                            .any(|keyword| keyword.kind() == KeywordKind::Exalted))
+            })
+    });
+    let ninjutsu_in_hand = state.players[player.0 as usize].hand.iter().any(|card| {
+        state.objects.get(card).is_some_and(|object| {
+            object.keywords.iter().any(|keyword| {
+                matches!(
+                    keyword.kind(),
+                    KeywordKind::Ninjutsu | KeywordKind::CommanderNinjutsu | KeywordKind::Sneak
+                )
+            })
+        })
+    });
+    !other_rewards_attacking && !ninjutsu_in_hand
 }
 
 /// Single-opponent planeswalker redirect (CR 508.1: legality of attacking a
