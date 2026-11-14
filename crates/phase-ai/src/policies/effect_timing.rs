@@ -486,6 +486,7 @@ fn burn_score(ctx: &PolicyContext<'_>) -> f64 {
 fn counterspell_score(ctx: &PolicyContext<'_>) -> f64 {
     let is_own_turn = turn_control::turn_decision_maker(ctx.state) == ctx.ai_player;
     let patience = ctx.config.profile.interaction_patience;
+
     let intent_bonus = match ctx.strategic_intent() {
         StrategicIntent::PreserveAdvantage => 0.15,
         StrategicIntent::Stabilize => 0.2,
@@ -651,6 +652,21 @@ fn combat_trick_score(ctx: &PolicyContext<'_>) -> f64 {
     }
 
     let patience = ctx.config.profile.interaction_patience;
+
+    // Before blockers, with nothing on the stack to answer, the pump only
+    // gives information away: on our turn the opponent blocks around it, on
+    // theirs they may simply not attack (and with no attack there is no
+    // blocking step, CR 508.8). The trick belongs after blocks.
+    if ctx.state.stack.is_empty()
+        && matches!(
+            ctx.state.phase,
+            Phase::BeginCombat | Phase::DeclareAttackers
+        )
+    {
+        let own_turn = engine::game::turn_control::turn_decision_maker(ctx.state) == ctx.ai_player;
+        return if own_turn { -0.5 * patience } else { -2.0 };
+    }
+
     let intent_bonus = match ctx.strategic_intent() {
         StrategicIntent::PushLethal => 0.2,
         StrategicIntent::PreserveAdvantage => 0.1,
@@ -2478,6 +2494,64 @@ mod tests {
         );
     }
 
+    /// `combat_trick_score` for the AI (seat 0) at `phase` of `active`'s turn,
+    /// with an empty stack.
+    fn combat_trick_score_at(phase: Phase, active: PlayerId) -> f64 {
+        let mut state = GameState::new_two_player(42);
+        state.phase = phase;
+        state.active_player = active;
+        let config = AiConfig::default();
+        let decision = AiDecisionContext {
+            waiting_for: WaitingFor::Priority {
+                player: PlayerId(0),
+            },
+            candidates: Vec::new(),
+        };
+        let candidate = CandidateAction {
+            action: GameAction::CastSpell {
+                object_id: ObjectId(0),
+                card_id: CardId(1),
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
+        };
+        let ctx = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &crate::context::AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        combat_trick_score(&ctx)
+    }
+
+    /// Field report 2026-10-12 (MagicFinder): Giant Growth at the beginning of
+    /// the OPPONENT'S combat, with no attacker coming.
+    #[test]
+    fn combat_trick_strongly_penalized_before_attacks_on_opponents_turn() {
+        for phase in [Phase::BeginCombat, Phase::DeclareAttackers] {
+            let score = combat_trick_score_at(phase, PlayerId(1));
+            assert!(
+                score < -1.5,
+                "{phase:?} on the opponent's turn, got {score}"
+            );
+        }
+    }
+
+    #[test]
+    fn combat_trick_waits_for_blocks_on_own_turn() {
+        let before = combat_trick_score_at(Phase::DeclareAttackers, PlayerId(0));
+        let after = combat_trick_score_at(Phase::DeclareBlockers, PlayerId(0));
+        assert!(before < 0.0, "before blocks, got {before}");
+        assert!(after > 0.0, "after blocks, got {after}");
+        // On the opponent's turn the blocking step is where our trick lives.
+        assert!(combat_trick_score_at(Phase::DeclareBlockers, PlayerId(1)) > 0.0);
+    }
+
     #[test]
     fn combat_trick_strongly_penalized_main_phase_no_combat() {
         let mut state = GameState::new_two_player(42);
@@ -2872,7 +2946,8 @@ mod tests {
     /// CR 611.2a + CR 514.2: Coordinated Assault's "+1/+0 and gain first strike until end of
     /// turn" (an until-end-of-turn `GenericEffect`, not a `Pump`) and Giant Growth's "+3/+3
     /// until end of turn" both end at cleanup, so EffectTiming prices them the same: the trick
-    /// penalty in the own Draw step, the combat bonus in DeclareAttackers. Unleash Fury's
+    /// penalty in the own Draw step, the combat bonus in DeclareBlockers (the fork holds a
+    /// pump until blocks are declared). Unleash Fury's
     /// doubled power (CR 701.10b: +X/+0) reads as Giant Growth does. Dwarven Song's colour
     /// change is not a trick in either row.
     #[test]
@@ -2902,7 +2977,7 @@ mod tests {
             "premise: Giant Growth parses as Pump"
         );
 
-        for (phase, combat) in [(Phase::Draw, false), (Phase::DeclareAttackers, true)] {
+        for (phase, combat) in [(Phase::Draw, false), (Phase::DeclareBlockers, true)] {
             let mut state = d1_board(phase, P0);
             if combat {
                 state.combat = Some(CombatState::default());
@@ -3285,7 +3360,7 @@ mod tests {
     /// CR 611.2a + CR 514.2: one spell is one combat trick, however many until-end-of-turn
     /// payloads its resolution carries. Barge In's `Pump` plus trample grant, and Arm the
     /// Cathars' three `Pump`s plus vigilance grant, price as Giant Growth's single `Pump` does:
-    /// the trick penalty out of combat, the combat bonus in DeclareAttackers. Arm the Cathars is a
+    /// the trick penalty out of combat, the combat bonus in DeclareBlockers. Arm the Cathars is a
     /// sorcery, so it is priced in its controller's postcombat main phase, a window it can be cast in (CR 307.1) with the turn's combat behind it (CR 505.1a).
     #[test]
     fn effect_timing_prices_a_multi_payload_trick_once() {
@@ -3307,7 +3382,7 @@ mod tests {
             "premise: Arm the Cathars carries several Pump trick payloads: {arm:?}"
         );
 
-        for (phase, combat) in [(Phase::End, false), (Phase::DeclareAttackers, true)] {
+        for (phase, combat) in [(Phase::End, false), (Phase::DeclareBlockers, true)] {
             let mut state = d1_board(phase, P0);
             if combat {
                 state.combat = Some(CombatState::default());
@@ -4069,7 +4144,7 @@ mod tests {
         }
 
         // The payload still earns the window, and the rest does not cost it.
-        let mut state = d1_board(Phase::DeclareAttackers, P0);
+        let mut state = d1_board(Phase::DeclareBlockers, P0);
         state.combat = Some(engine::game::combat::CombatState::default());
         let growth = oracle_instant(&mut state, P0, "Giant Growth", GIANT_GROWTH);
         let rage = oracle_instant(&mut state, P0, "Monstrous Rage", MONSTROUS_RAGE);
