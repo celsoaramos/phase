@@ -38,6 +38,18 @@ pub fn resolve(
         }
         EffectScope::Single => target.clone(),
     };
+    // CR 107.1c + CR 608.2d: "transform any number of Human Werewolves you
+    // control" (Tovolar, Dire Overlord) — an untargeted variable-count choice
+    // made while this effect resolves.
+    if super::tap_untap::prompt_resolution_battlefield_choice(
+        state,
+        ability,
+        &single_target,
+        EffectKind::Transform,
+        events,
+    ) {
+        return Ok(());
+    }
 
     // CR 201.5: "Text that refers to the object it's on by name means just that
     // particular object and not any other objects with that name." A printed
@@ -191,6 +203,10 @@ pub fn resolve(
         // which is what keeps "no target declared" and "the referent went stale"
         // from collapsing into the same OUTCOME even though they share this arm.
         [] => ability.source_id,
+        // CR 115.1: two object targets are not a single-scope transform subject.
+        // The variable-count "transform any number of …" set is an untargeted
+        // resolution-time choice, applied by `transform_each` from the
+        // `EffectZoneChoice` handler, never an announced target list.
         _ => {
             return Err(EffectError::InvalidParam(
                 "transform expects exactly one object target".to_string(),
@@ -210,6 +226,26 @@ pub fn resolve(
     });
 
     Ok(())
+}
+
+/// CR 701.27a + CR 701.27c: transform each permanent of a chosen set. Only
+/// double-faced permanents can transform; any other (or one a "can't transform"
+/// effect stops) is a per-object no-op, so one failure never aborts the set.
+/// Applied by the resolution-time `EffectZoneChoice` (`EffectKind::Transform`).
+pub(crate) fn transform_each(
+    state: &mut GameState,
+    chosen: &[crate::types::identifiers::ObjectId],
+    events: &mut Vec<GameEvent>,
+) {
+    for &object_id in chosen {
+        if state
+            .objects
+            .get(&object_id)
+            .is_some_and(is_double_faced_permanent)
+        {
+            let _ = transform_permanent(state, object_id, events);
+        }
+    }
 }
 
 /// CR 701.27f + CR 701.28e: A self-transform (or convert) instruction does
