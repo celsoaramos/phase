@@ -399,6 +399,7 @@ fn handle_opponent_may_choice_inner(
                 state, &ability,
             ) == Some(true)
             {
+                push_declined(events, promptee, source_id);
                 if let Some((&next, rest)) = remaining.split_first() {
                     state.waiting_for = WaitingFor::OpponentMayChoice {
                         player: next,
@@ -561,6 +562,9 @@ fn handle_opponent_may_choice_inner(
                     return Ok(state.waiting_for.clone());
                 }
 
+                // CR 608.2d: nothing the promptee controls can be chosen, so the
+                // acceptance cannot be carried out — it reads as a decline.
+                push_declined(events, promptee, source_id);
                 if !remaining.is_empty() {
                     let next = remaining[0];
                     let rest = remaining[1..].to_vec();
@@ -598,6 +602,7 @@ fn handle_opponent_may_choice_inner(
             }
         }
     } else if !remaining.is_empty() {
+        push_declined(events, promptee, source_id);
         let next = remaining[0];
         let rest = remaining[1..].to_vec();
         state.waiting_for = WaitingFor::OpponentMayChoice {
@@ -609,6 +614,7 @@ fn handle_opponent_may_choice_inner(
         };
         return Ok(state.waiting_for.clone());
     } else {
+        push_declined(events, promptee, source_id);
         set_active_priority(state);
         if let Some(frame) = state
             .take_active_optional_effect_frame()
@@ -621,6 +627,12 @@ fn handle_opponent_may_choice_inner(
     resume_pending_continuation_if_priority(state, events)?;
     super::triggers::collect_and_drain_observer_triggers_if_settled(state, events, events_before);
     Ok(state.waiting_for.clone())
+}
+
+/// Log-only narration of a promptee who did not perform an "any opponent/player
+/// may" choice (see `GameEvent::OptionalEffectDeclined`).
+fn push_declined(events: &mut Vec<GameEvent>, player: PlayerId, source_id: ObjectId) {
+    events.push(GameEvent::OptionalEffectDeclined { player, source_id });
 }
 
 /// For `AnyOpponent` prompts, drops a top-level `controller: Opponent` stamp from the

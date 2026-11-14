@@ -462,6 +462,7 @@ fn importance(event: &GameEvent) -> LogImportance {
         | GameEvent::AttackerBecameBlockedByFilteredBlocker { .. }
         | GameEvent::CombatTaxPaid { .. }
         | GameEvent::CombatTaxDeclined { .. }
+        | GameEvent::OptionalEffectDeclined { .. }
         | GameEvent::VehicleCrewed { .. }
         | GameEvent::Stationed { .. }
         | GameEvent::Saddled { .. }
@@ -559,6 +560,7 @@ fn tone(event: &GameEvent) -> LogTone {
         | GameEvent::AttackerBecameBlockedByFilteredBlocker { .. }
         | GameEvent::CombatTaxPaid { .. }
         | GameEvent::CombatTaxDeclined { .. }
+        | GameEvent::OptionalEffectDeclined { .. }
         | GameEvent::CreatureExerted { .. }
         | GameEvent::CreatureEnlisted { .. }
         | GameEvent::SpeedChanged { .. }
@@ -1019,6 +1021,7 @@ fn categorize(event: &GameEvent) -> LogCategory {
         GameEvent::CardCopyCreated { .. } => LogCategory::Token,
 
         GameEvent::EffectResolved { .. }
+        | GameEvent::OptionalEffectDeclined { .. }
         | GameEvent::Unattached { .. }
         // CR 116.2c: a special action that ends a continuous effect is an
         // effect-level state change, grouped with the other effect events.
@@ -2347,6 +2350,12 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             text(" paid combat tax ("),
             num(*total_mana_value as i32),
             text(" mana)"),
+        ],
+        GameEvent::OptionalEffectDeclined { player, source_id } => vec![
+            player_seg(state, *player),
+            text(" declines "),
+            card_seg(state, *source_id),
+            text("'s optional effect"),
         ],
         GameEvent::CombatTaxDeclined { player, dropped } => vec![
             player_seg(state, *player),
