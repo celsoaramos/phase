@@ -990,6 +990,89 @@ pub(super) fn fold_grant_cap_rider(segment: &str, defs: &mut [StaticDefinition])
     false
 }
 
+/// CR 609.4b: The "you may spend mana as though it were mana of any color to
+/// activate those abilities" rider that follows an ability-grant sentence (Drana
+/// and Linvala: "~ has all activated abilities of all creatures your opponents
+/// control. You may spend mana as though it were mana of any color to activate
+/// those abilities."). Decomposed into its axes — permission (`you may spend`),
+/// the concession wording (the value), the payment scope (`to activate`), and
+/// the granted-set anaphor (`those abilities`) — so the concession is parsed,
+/// not a sentence consumed and discarded.
+fn parse_spend_any_color_to_activate_those_abilities_rider(
+    input: &str,
+) -> OracleResult<'_, crate::types::ability::ManaSpendPermission> {
+    value(
+        crate::types::ability::ManaSpendPermission::AnyColor,
+        (
+            tag("you may "),
+            tag("spend mana as though it were mana of any color"),
+            tag(" to activate "),
+            alt((tag("each of those abilities"), tag("those abilities"))),
+        ),
+    )
+    .parse(input)
+}
+
+/// CR 609.4b + CR 613.1f: Fold the any-color activation rider (a trailing
+/// sentence that yields no standalone static) that follows an activated-ability
+/// grant into a `SpendManaAsAnyColor` static, returning `true` when it lands.
+/// Returns `false` when `segment` is not the rider or no activated-ability grant
+/// precedes it (the anaphor "those abilities" would have no antecedent).
+///
+/// Shares the rider slot with [`fold_grant_cap_rider`]: it composes with the
+/// STANDARD grant parse during normal sentence splitting
+/// (`parse_multi_sentence_statics`), over any grant source, with no card-specific
+/// whole-line hook.
+///
+/// Scope: "those abilities" are the abilities the host acquired through the grant,
+/// which the host activates as its own (CR 113.8 — they are abilities of the
+/// recipient). The concession is therefore scoped to activated abilities whose
+/// source is the host (`activation_source_filter: SelfRef`, the same shape
+/// Manascape Refractor's "~'s abilities" lowers to), which
+/// `player_mana_spend_permission_for_activation_source` re-derives at spend time.
+/// This is exact when the host has no printed activated abilities of its own
+/// (every rider card to date: Drana and Linvala); a host that also printed its own
+/// activated ability would see the concession reach that ability too — a known
+/// over-approximation, kept over a per-ability concession so the grant's donated
+/// set and its payment rule stay on the existing authorities.
+pub(super) fn fold_grant_mana_concession_rider(
+    segment: &str,
+    defs: &mut Vec<StaticDefinition>,
+) -> bool {
+    let lower = segment.trim().trim_end_matches('.').trim().to_lowercase();
+    let Ok((_, concession)) =
+        all_consuming(parse_spend_any_color_to_activate_those_abilities_rider)
+            .parse(lower.as_str())
+    else {
+        return false;
+    };
+    // The anaphor needs an antecedent: the nearest preceding activated-ability
+    // grant. Kind-selected grants (loyalty) stay out, matching `fold_grant_cap_rider`.
+    let has_grant_antecedent = defs
+        .iter()
+        .rev()
+        .flat_map(|def| def.modifications.iter().rev())
+        .find_map(|modification| match modification {
+            ContinuousModification::GrantAllActivatedAbilitiesOf { kind, .. } => {
+                Some(kind.is_none())
+            }
+            _ => None,
+        });
+    if has_grant_antecedent != Some(true) {
+        return false;
+    }
+    defs.push(
+        StaticDefinition::new(crate::types::statics::StaticMode::SpendManaAsAnyColor {
+            spell_filter: None,
+            activation_source_filter: Some(crate::types::ability::TargetFilter::SelfRef),
+            concession,
+        })
+        .affected(crate::types::ability::TargetFilter::Player)
+        .description(segment.trim().to_string()),
+    );
+    true
+}
+
 /// CR 613.1f + CR 607.2a + CR 201.2: The source-set noun phrase of an
 /// ability-grant-by-reference static. Each arm is a leaf of the source-set axis;
 /// adding a new referenced set is one more `alt` arm here, never a new variant.
