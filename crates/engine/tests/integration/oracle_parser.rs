@@ -1086,13 +1086,13 @@ fn token_grant_spells_no_longer_misroute_to_static() {
     }
 }
 
-/// Negative control: Brood Birthing's "have \"…\"" grant marker is OUTSIDE the
-/// quoted span, so masking must NOT change its parse — it still lowers to its
-/// functional `GrantAbility` static (the sacrifice-for-mana grant). This is the
-/// invariant the masking fix must preserve.
+/// Brood Birthing's "They have \"…\"" sentence grants the ability to the tokens
+/// the sorcery creates; the line is the spell's instruction, never a static of
+/// the card (CR 111.1 + CR 608.2c). Both branches create Spawn that can be
+/// sacrificed for mana.
 #[test]
-fn brood_birthing_grant_static_unchanged_by_masking() {
-    use engine::types::ability::ContinuousModification;
+fn brood_birthing_is_a_token_spell_not_a_static() {
+    use engine::types::ability::Effect;
 
     let result = parse(
         "If you control an Eldrazi Spawn, create three 0/1 colorless Eldrazi Spawn \
@@ -1104,22 +1104,20 @@ fn brood_birthing_grant_static_unchanged_by_masking() {
         &[],
     );
 
-    assert_eq!(
-        result.statics.len(),
-        1,
-        "Brood Birthing keeps exactly one static (the GrantAbility grant): {:#?}",
+    assert!(
+        result.statics.is_empty(),
+        "Brood Birthing has no static: {:#?}",
         result.statics
     );
-    let grants_ability = matches!(result.statics[0].mode, StaticMode::Continuous)
-        && result.statics[0]
-            .modifications
-            .iter()
-            .any(|m| matches!(m, ContinuousModification::GrantAbility { .. }));
+    let spell = &result.abilities[0];
     assert!(
-        grants_ability,
-        "Brood Birthing's static must remain the functional GrantAbility grant, \
-         got: {:#?}",
-        result.statics[0]
+        matches!(&*spell.effect, Effect::Token { .. }),
+        "the gated branch creates the tokens: {spell:#?}"
+    );
+    let otherwise = spell.else_ability.as_deref().expect("otherwise branch");
+    assert!(
+        matches!(&*otherwise.effect, Effect::Token { .. }),
+        "\"Otherwise, create one of those tokens\" creates the same token: {otherwise:#?}"
     );
 }
 

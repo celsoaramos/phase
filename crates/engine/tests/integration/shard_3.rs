@@ -261,6 +261,7 @@ mod gideon_jura_forced_attack_planeswalker;
 mod gideon_the_oathless;
 mod gideon_trials_emblem;
 mod gift_delivery_draw_sequence_migration;
+mod gift_on_permanents;
 mod gift_recipient_phased_out_opponent;
 mod gifts_given_opponent_partition;
 mod gifts_ungiven_duplicate_candidates_8135;
