@@ -51,6 +51,7 @@ use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, Tacti
 use crate::ability_chain::collect_chain_effects;
 use crate::features::DeckFeatures;
 use crate::mana_colors::land_produced_color_types;
+use crate::zone_eval::available_mana;
 
 /// Penalty for playing a self-bouncing land while a non-bouncing land is also
 /// currently playable. The non-bounce land's `PlayLand` scores `0.0` here, so
@@ -71,6 +72,13 @@ const REASON_NA: &str = "land_sequencing_na";
 const REASON_PLAY_OTHER_FIRST: &str = "land_sequencing_play_other_first";
 const REASON_NO_ALTERNATIVE: &str = "land_sequencing_no_alternative";
 const REASON_TEMPO_RIDER: &str = "land_sequencing_tempo_rider";
+const REASON_FREE_TAPLAND_TURN: &str = "land_sequencing_free_tapland_turn";
+
+/// Share of one tempo rider credited to a tapland on a turn where no spell
+/// needs the land untapped: playing it now spends a turn that was idle anyway
+/// and keeps the untapped land for a turn that casts. Below one rider, so a
+/// tapland never out-scores an untapped land on a turn that CAN cast.
+const FREE_TAPLAND_TURN_SHARE: f64 = 0.5;
 const REASON_COLOR_DEMAND: &str = "land_sequencing_color_demand";
 
 pub struct LandSequencingPolicy;
@@ -131,13 +139,30 @@ impl TacticalPolicy for LandSequencingPolicy {
                 other_playable_land(ctx, object_id, candidate)
                     .is_some_and(|alternative| !carries_tempo_rider(&alternative))
             });
-        let charged_riders = if has_untapped_alternative { riders } else { 0 };
+        // A tempo rider only costs tempo when this turn has a spell that the
+        // land drop would make castable — with Counterspell and one land drop
+        // on turn one nothing is castable either way, and the tapland is the
+        // land to play. An untapped land saved for a turn that casts is the
+        // whole point of sequencing taplands first.
+        let turn_can_use_untapped_drop =
+            has_untapped_alternative && spell_needs_untapped_drop(ctx.state, ctx.ai_player);
+        let charged_riders = if turn_can_use_untapped_drop {
+            riders
+        } else {
+            0
+        };
+        let free_tapland_turn = has_untapped_alternative && !turn_can_use_untapped_drop;
 
         let color_fixes = unmet_colors_covered(ctx, &face);
 
         let penalties = &ctx.config.policy_penalties;
         let delta = color_fixes as f64 * penalties.land_color_demand_unit
             - charged_riders as f64 * penalties.land_tempo_rider_penalty
+            + if free_tapland_turn {
+                FREE_TAPLAND_TURN_SHARE * penalties.land_tempo_rider_penalty
+            } else {
+                0.0
+            }
             - if has_non_bounce_alternative {
                 BOUNCE_DEPRIORITIZE
             } else {
@@ -151,6 +176,8 @@ impl TacticalPolicy for LandSequencingPolicy {
             REASON_PLAY_OTHER_FIRST
         } else if charged_riders > 0 {
             REASON_TEMPO_RIDER
+        } else if free_tapland_turn {
+            REASON_FREE_TAPLAND_TURN
         } else if color_fixes > 0 {
             REASON_COLOR_DEMAND
         } else if bounce {
@@ -167,6 +194,24 @@ impl TacticalPolicy for LandSequencingPolicy {
                 .with_fact("tempo_riders", charged_riders as i64),
         )
     }
+}
+
+/// Whether some non-land card in the AI's hand becomes castable this turn only
+/// if the land drop enters untapped: its mana value is exactly one more than the
+/// mana available now (CR 202.3 against the count of untapped sources, the same
+/// count-based check the colour-demand scan uses — never an affordability
+/// sweep). Targets and timing restrictions are not checked.
+fn spell_needs_untapped_drop(state: &GameState, player: PlayerId) -> bool {
+    let available = available_mana(state, player);
+    state.players.get(player.0 as usize).is_some_and(|p| {
+        p.hand
+            .iter()
+            .filter_map(|id| state.objects.get(id))
+            .any(|obj| {
+                !obj.card_types.core_types.contains(&CoreType::Land)
+                    && obj.mana_cost.mana_value() == available + 1
+            })
+    })
 }
 
 /// The land face of another currently-legal `PlayLand` candidate, or `None`
@@ -850,12 +895,14 @@ mod tests {
     }
 
     /// The reported "Gateway Plaza as the first land" line: it enters tapped AND
-    /// costs {1} to keep, so beside an untapped basic it is charged for both.
+    /// costs {1} to keep, so beside an untapped basic it is charged for both —
+    /// on a turn whose land drop casts the one-drop in hand.
     #[test]
     fn gateway_plaza_pays_for_both_riders_when_a_basic_is_playable() {
         let mut state = GameState::new_two_player(42);
         let plaza = gateway_plaza(&mut state);
         let forest = typed_land(&mut state, "Forest", "Forest", Zone::Hand);
+        hand_spell(&mut state, "One Drop", vec![], 1);
         let candidates = vec![play_candidate(plaza), play_candidate(forest)];
         let rider = AiConfig::default()
             .policy_penalties
@@ -870,6 +917,78 @@ mod tests {
             play_verdict(&state, forest, candidates),
             "land_sequencing_na",
             0.0,
+        );
+    }
+
+    /// Turn one, Counterspell in hand, a tapland and an Island: nothing is
+    /// castable with one land either way, so the tapland goes first and keeps
+    /// the Island for a turn that casts. The rider used to be charged on every
+    /// turn with an untapped alternative, idle or not.
+    #[test]
+    fn tapland_first_on_a_turn_with_nothing_to_cast() {
+        let mut state = GameState::new_two_player(42);
+        let tapland = plain_land(&mut state, "Dismal Backwater");
+        state
+            .objects
+            .get_mut(&tapland)
+            .unwrap()
+            .replacement_definitions
+            .push(etb_tapped(None));
+        let island = typed_land(&mut state, "Island", "Island", Zone::Hand);
+        hand_spell(
+            &mut state,
+            "Counterspell",
+            vec![ManaCostShard::Blue, ManaCostShard::Blue],
+            0,
+        );
+        let candidates = vec![play_candidate(tapland), play_candidate(island)];
+        let rider = AiConfig::default()
+            .policy_penalties
+            .land_tempo_rider_penalty;
+
+        assert_score(
+            play_verdict(&state, tapland, candidates.clone()),
+            "land_sequencing_free_tapland_turn",
+            FREE_TAPLAND_TURN_SHARE * rider,
+        );
+        assert_score(
+            play_verdict(&state, island, candidates),
+            "land_sequencing_na",
+            0.0,
+        );
+    }
+
+    /// Turn one, Lightning Bolt in hand, a tapland and a Mountain: the Bolt is
+    /// castable only if the drop enters untapped, so the tapland pays its rider
+    /// and the Mountain is the play.
+    #[test]
+    fn untapped_land_first_when_the_drop_casts_a_spell() {
+        let mut state = GameState::new_two_player(42);
+        let tapland = plain_land(&mut state, "Dismal Backwater");
+        state
+            .objects
+            .get_mut(&tapland)
+            .unwrap()
+            .replacement_definitions
+            .push(etb_tapped(None));
+        let mountain = typed_land(&mut state, "Mountain", "Mountain", Zone::Hand);
+        hand_spell(&mut state, "Lightning Bolt", vec![ManaCostShard::Red], 0);
+        let candidates = vec![play_candidate(tapland), play_candidate(mountain)];
+        let rider = AiConfig::default()
+            .policy_penalties
+            .land_tempo_rider_penalty;
+
+        assert_score(
+            play_verdict(&state, tapland, candidates.clone()),
+            "land_sequencing_tempo_rider",
+            -rider,
+        );
+        let PolicyVerdict::Score { delta, .. } = play_verdict(&state, mountain, candidates) else {
+            panic!("the Mountain is scored, not rejected");
+        };
+        assert!(
+            delta > -rider,
+            "the untapped Mountain must outrank the tapland, got {delta}"
         );
     }
 
@@ -941,6 +1060,7 @@ mod tests {
         obj.card_types.core_types.push(CoreType::Sorcery);
         obj.back_face = Some(back);
         let forest = typed_land(&mut state, "Forest", "Forest", Zone::Hand);
+        hand_spell(&mut state, "One Drop", vec![], 1);
         let candidates = vec![play_candidate(mdfc), play_candidate(forest)];
 
         assert_score(
@@ -970,6 +1090,7 @@ mod tests {
             .replacement_definitions
             .push(etb_tapped(None));
         let basic = plain_land(&mut state, "Forest");
+        hand_spell(&mut state, "One Drop", vec![], 1);
 
         assert_score(
             play_verdict(
