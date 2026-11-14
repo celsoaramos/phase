@@ -4302,7 +4302,8 @@ fn scan_trigger_condition(x: &TriggerCondition, mode: ScanMode) -> Axes {
             projected: true,
             history: HistoryReads::of(HistoryMember::TurnNumber),
         },
-        TriggerCondition::SourceAttackedThisCombat => Axes {
+        TriggerCondition::SourceAttackedThisCombat
+        | TriggerCondition::SourceAndOthersAttackedThisCombat { .. } => Axes {
             event: false,
             sibling: false,
             projected: true,

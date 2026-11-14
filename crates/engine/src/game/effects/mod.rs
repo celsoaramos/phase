@@ -10216,6 +10216,7 @@ fn trigger_condition_reads_filter_population(
         | TriggerCondition::TwoOrMoreSpellsCastLastTurn
         | TriggerCondition::SourceEnteredThisTurn
         | TriggerCondition::SourceAttackedThisCombat
+        | TriggerCondition::SourceAndOthersAttackedThisCombat { .. }
         | TriggerCondition::ChoseOtherRingBearer
         | TriggerCondition::ChoseRingBearer
         | TriggerCondition::EchoDue

@@ -5088,6 +5088,9 @@ fn fmt_trigger_condition(
         TC::ControlsNone { filter } => format!("you control no {}", fmt_target(filter)),
         TC::AttackedThisTurn => "attacked this turn".into(),
         TC::SourceAttackedThisCombat => "source attacked this combat".into(),
+        TC::SourceAndOthersAttackedThisCombat { others } => {
+            format!("source and at least {others} other creatures attacked this combat")
+        }
         TC::FirstCombatPhaseOfTurn => "first combat phase of the turn".into(),
         TC::CastSpellThisTurn { filter } => match filter {
             Some(f) => format!("cast a {} spell this turn", fmt_target(f)),
@@ -10746,6 +10749,7 @@ fn extract_trigger_condition_features(
         | TriggerCondition::DuringPlayersTurn { .. }
         | TriggerCondition::SourceEnteredThisTurn
         | TriggerCondition::SourceAttackedThisCombat
+        | TriggerCondition::SourceAndOthersAttackedThisCombat { .. }
         | TriggerCondition::ChoseOtherRingBearer
         | TriggerCondition::ChoseRingBearer
         | TriggerCondition::EchoDue

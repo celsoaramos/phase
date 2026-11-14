@@ -2026,6 +2026,7 @@ fn legacy_trigger_condition(x: &TriggerCondition) -> bool {
         | TriggerCondition::SpellCastWithVariantThisTurn { .. }
         | TriggerCondition::SourceEnteredThisTurn
         | TriggerCondition::SourceAttackedThisCombat
+        | TriggerCondition::SourceAndOthersAttackedThisCombat { .. }
         | TriggerCondition::SourceIsHarnessed
         | TriggerCondition::SourceIsAttacking
         | TriggerCondition::SourceIsTransformed
@@ -7394,6 +7395,7 @@ fn rw_trigger_condition(x: &TriggerCondition) -> RwProfile {
         TriggerCondition::DuringPlayersTurn { player } => rw_player_filter(player),
         TriggerCondition::SourceEnteredThisTurn
         | TriggerCondition::SourceAttackedThisCombat
+        | TriggerCondition::SourceAndOthersAttackedThisCombat { .. }
         | TriggerCondition::SourceIsHarnessed
         | TriggerCondition::SourceIsAttacking
         | TriggerCondition::SourceIsTransformed
