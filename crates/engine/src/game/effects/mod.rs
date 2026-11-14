@@ -27818,6 +27818,34 @@ fn subject_dependent_condition_has_no_subject(
     }
 }
 
+/// CR 301.5 + CR 303.4 + CR 608.2c: the anaphoric subject of "if it's [quality]"
+/// when the gated effect's recipient is the source's attachment host, named by
+/// description rather than targeted — "put a +1/+1 counter on equipped creature
+/// if it's white" (Ring of Thune and the rest of the M13 ring cycle). Such an
+/// ability carries no object target and, in a phase trigger ("at the beginning
+/// of your upkeep"), no triggering object, so without this tier the subject was
+/// absent and the condition read false forever: the trigger resolved and did
+/// nothing. Same gate as the attachment-host arm of the counter recipient
+/// resolver (`counters::resolve_defined_or_targets`): resolution-timed, no
+/// chosen targets, and a recipient filter that names `EquippedBy`/`EnchantedBy`.
+/// Returns the host only when it is unique; an unattached source yields `None`
+/// (the condition stays false, and the effect has no recipient anyway).
+fn attachment_host_recipient(state: &GameState, ability: &ResolvedAbility) -> Option<ObjectId> {
+    if ability.target_choice_timing != TargetChoiceTiming::Resolution || !ability.targets.is_empty()
+    {
+        return None;
+    }
+    let filter = ability.effect.target_filter()?;
+    if !filter.contains_source_attachment_host() {
+        return None;
+    }
+    match crate::game::targeting::resolved_object_ids_for_filter(state, ability, filter).as_slice()
+    {
+        [host] => Some(*host),
+        _ => None,
+    }
+}
+
 /// CR 608.2c + CR 608.2k + CR 608.2h: the values of `quality` for one
 /// `ObjectsShareQuality` operand. A cost-paid referent ("the discarded card")
 /// is read from the information captured when the cost was paid — the same
@@ -28580,6 +28608,7 @@ pub(crate) fn evaluate_condition(
                         TargetRef::Object(id) => Some(*id),
                         _ => None,
                     })
+                    .or_else(|| attachment_host_recipient(state, ability))
                     .or_else(|| {
                         crate::game::targeting::resolve_event_context_target(
                             state,
