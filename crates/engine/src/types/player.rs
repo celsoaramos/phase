@@ -59,6 +59,25 @@ impl PlayerStatus {
     }
 }
 
+impl Player {
+    /// CR 122.1: How many counters of `kind` this player has.
+    pub fn counter_type_count(&self, kind: PlayerCounterType) -> u32 {
+        match kind {
+            PlayerCounterType::Kind(kind) => self.player_counter(&kind),
+            PlayerCounterType::Energy => self.energy,
+        }
+    }
+
+    /// CR 122.1: The distinct kinds of counters this player has, in
+    /// `PlayerCounterType::ALL` order.
+    pub fn counter_types(&self) -> Vec<PlayerCounterType> {
+        PlayerCounterType::ALL
+            .into_iter()
+            .filter(|kind| self.counter_type_count(*kind) > 0)
+            .collect()
+    }
+}
+
 /// CR 702.139: Tracks a declared companion outside the game.
 /// The companion is not a `GameObject` until it moves to hand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

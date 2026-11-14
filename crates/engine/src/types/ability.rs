@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::card::PrintedCardRef;
 use super::card_type::CoreType;
-use super::counter::CounterType;
+use super::counter::{CounterKind, CounterType};
 use super::game_state::{CastOccurrence, LKISnapshot, MayTriggerOrigin, TriggerSourceContext};
 use super::game_state_kinds::{DistributionUnit, TargetSelectionConstraint};
 use super::identifiers::{
@@ -116,7 +116,7 @@ pub enum ChosenAttribute {
     /// `Effect::PutChosenCounter` ("put an additional counter of that kind on
     /// that permanent") to add one counter of the chosen kind. Replace-on-rechoose
     /// (the per-iteration bind clears the prior `Counter` — see `bind_named_choice`).
-    Counter(CounterType),
+    Counter(CounterKind),
     /// CR 607.2d: The chosen seat direction (left/right) for a directional
     /// "choose left or right" ability linked to a "the [last] chosen direction"
     /// static (Pramikon, Sky Rampart; Mystic Barrier; Teyo, Geometric

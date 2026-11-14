@@ -1,4 +1,5 @@
 use crate::types::keywords::KeywordKind;
+use crate::types::player::PlayerCounterType;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -206,6 +207,71 @@ impl<'de> serde::Deserialize<'de> for CounterType {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         Ok(parse_counter_type(&s))
+    }
+}
+
+/// CR 122.1: A counter kind on any recipient that can have counters — an
+/// object's `CounterType` or a player's `PlayerCounterType`. A choice of "a
+/// counter on target permanent or player" (Animation Module) picks one of
+/// these, and "another counter of that kind" goes to whichever recipient it
+/// was chosen on.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CounterKind {
+    Object(CounterType),
+    Player(PlayerCounterType),
+}
+
+/// Serialized prefix of a player counter kind. Object kinds keep the bare
+/// `CounterType` string, so records written before player kinds existed load
+/// unchanged.
+const PLAYER_COUNTER_KIND_PREFIX: &str = "player:";
+
+impl CounterKind {
+    /// The kind's name as offered in a choice: the `CounterType` string for an
+    /// object kind, the counter's name ("poison", "energy") for a player kind.
+    pub fn as_str(&self) -> Cow<'_, str> {
+        match self {
+            CounterKind::Object(counter_type) => counter_type.as_str(),
+            CounterKind::Player(kind) => Cow::Owned(kind.to_string()),
+        }
+    }
+}
+
+impl From<CounterType> for CounterKind {
+    fn from(counter_type: CounterType) -> Self {
+        CounterKind::Object(counter_type)
+    }
+}
+
+impl From<PlayerCounterType> for CounterKind {
+    fn from(kind: PlayerCounterType) -> Self {
+        CounterKind::Player(kind)
+    }
+}
+
+impl serde::Serialize for CounterKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            CounterKind::Object(counter_type) => counter_type.serialize(serializer),
+            CounterKind::Player(kind) => {
+                serializer.serialize_str(&format!("{PLAYER_COUNTER_KIND_PREFIX}{kind}"))
+            }
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CounterKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.strip_prefix(PLAYER_COUNTER_KIND_PREFIX) {
+            Some(name) => name
+                .parse::<PlayerCounterType>()
+                .map(CounterKind::Player)
+                .map_err(|()| {
+                    serde::de::Error::custom(format!("unknown player counter kind `{name}`"))
+                }),
+            None => Ok(CounterKind::Object(parse_counter_type(&s))),
+        }
     }
 }
 

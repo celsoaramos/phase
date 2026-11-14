@@ -55,6 +55,7 @@ mod angelic_field_marshal_lieutenant_2885;
 mod angels_grace;
 mod angels_grace_2hg;
 mod anger_milled_into_graveyard;
+mod animation_module_player_counters;
 mod announce_locked_x_runtime;
 mod announced_counter_recipient_set;
 mod announced_target_set_placement;

@@ -24,6 +24,47 @@ impl fmt::Display for PlayerCounterKind {
     }
 }
 
+/// CR 122.1: The kind of a counter a player can have. Named kinds live in
+/// `PlayerCounterKind`; energy is a player counter too, but the engine stores
+/// it apart (`Player::energy`), so a player's counter kind is one of the two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PlayerCounterType {
+    Kind(PlayerCounterKind),
+    Energy,
+}
+
+impl PlayerCounterType {
+    /// Every player counter kind, in a stable order.
+    pub const ALL: [PlayerCounterType; 5] = [
+        PlayerCounterType::Kind(PlayerCounterKind::Poison),
+        PlayerCounterType::Kind(PlayerCounterKind::Experience),
+        PlayerCounterType::Kind(PlayerCounterKind::Rad),
+        PlayerCounterType::Kind(PlayerCounterKind::Ticket),
+        PlayerCounterType::Energy,
+    ];
+}
+
+impl fmt::Display for PlayerCounterType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Kind(kind) => kind.fmt(f),
+            Self::Energy => write!(f, "energy"),
+        }
+    }
+}
+
+impl std::str::FromStr for PlayerCounterType {
+    type Err = ();
+
+    /// Inverse of `Display`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.to_string() == s)
+            .ok_or(())
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]

@@ -4217,7 +4217,7 @@ mod tests {
                             if pay {
                                 None
                             } else {
-                                Some(CounterType::Plus1Plus1)
+                                Some(CounterType::Plus1Plus1.into())
                             }
                         );
                     }
