@@ -17,6 +17,7 @@ mod regenerate_all_is_not_a_target;
 mod regenerate_card_shields_creature;
 mod rejoin_the_fight_choose_pool;
 mod relic_of_progenitus_6446;
+mod remembered_may_repeat_process;
 mod remove_all_counters_transform;
 mod render_silent_cant_cast;
 mod repeat_directive_gate;
