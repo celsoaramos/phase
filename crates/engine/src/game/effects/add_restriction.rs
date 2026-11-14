@@ -1,6 +1,6 @@
 use crate::types::ability::{
-    Effect, EffectError, EffectKind, GameRestriction, ProhibitedActivity, ResolvedAbility,
-    RestrictionExpiry,
+    Effect, EffectError, EffectKind, FilterProp, GameRestriction, ProhibitedActivity,
+    ResolvedAbility, RestrictionExpiry, TargetFilter,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
@@ -161,6 +161,17 @@ fn fill_runtime_fields(
                         *affected_players = RestrictionPlayerScope::SpecificPlayer(controller);
                     }
                 }
+                // CR 108.3: "that creature's owner" — the owner is stable across
+                // zone changes, so the bounced card's owner is read directly
+                // (Reflector Mage). Unresolvable referent fails closed like the
+                // controller sibling above.
+                RestrictionPlayerScope::ParentObjectTargetOwner => {
+                    if let Some(owner) =
+                        crate::game::ability_utils::parent_target_owner(ability, state)
+                    {
+                        *affected_players = RestrictionPlayerScope::SpecificPlayer(owner);
+                    }
+                }
                 // CR 109.5 + CR 611.2a: `SourceController` (the "you" in "you
                 // can't cast additional spells this turn" — Conduit of Worlds)
                 // comes from the resolution of an ACTIVATED ability, so "you" is
@@ -183,6 +194,24 @@ fn fill_runtime_fields(
         // object zone transition, CR 614.1d), so there is nothing to lower here.
         GameRestriction::DamagePreventionDisabled { .. }
         | GameRestriction::CantEnterBattlefieldFrom { .. } => {}
+    }
+
+    // CR 201.2 + CR 611.2c: "can't cast spells with the same name as that
+    // creature" (Reflector Mage) names the parent target as the restriction is
+    // created. The restriction outlives the resolving ability, so the
+    // ability-relative `SameNameAsParentTarget` predicate is snapshotted to the
+    // literal name now; a referent that can't be resolved leaves the predicate
+    // in place, which then matches nothing (fail-closed).
+    if let GameRestriction::ProhibitActivity {
+        activity: ProhibitedActivity::CastSpells {
+            spell_filter: Some(filter),
+        },
+        ..
+    } = restriction
+    {
+        if let Some(name) = crate::game::filter::parent_target_name(state, Some(ability)) {
+            snapshot_parent_target_name(filter, &name);
+        }
     }
 
     if let GameRestriction::ProhibitActivity {
@@ -256,6 +285,29 @@ fn fill_runtime_fields(
         // DamagePreventionDisabled.
         GameRestriction::DamagePreventionDisabled { .. }
         | GameRestriction::CantEnterBattlefieldFrom { .. } => {}
+    }
+}
+
+/// CR 201.2: Replace every `SameNameAsParentTarget` leaf of a stored filter
+/// with the literal `Named` predicate for the referent's name.
+fn snapshot_parent_target_name(filter: &mut TargetFilter, name: &str) {
+    match filter {
+        TargetFilter::Typed(typed) => {
+            for prop in &mut typed.properties {
+                if matches!(prop, FilterProp::SameNameAsParentTarget) {
+                    *prop = FilterProp::Named {
+                        name: name.to_string(),
+                    };
+                }
+            }
+        }
+        TargetFilter::Not { filter } => snapshot_parent_target_name(filter, name),
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            for filter in filters {
+                snapshot_parent_target_name(filter, name);
+            }
+        }
+        _ => {}
     }
 }
 

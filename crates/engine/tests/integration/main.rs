@@ -46,6 +46,7 @@ mod choose_creature_and_opponent_flip;
 mod choose_creature_resolution;
 mod chosen_object_reader_hand_built;
 mod cobertura_mf_1031;
+mod cobertura_mf_1101;
 mod cobra_king_guarded_reflexive_modal;
 mod combat_celebrant_exert;
 mod combat_damage_order_triggers_no_hang;

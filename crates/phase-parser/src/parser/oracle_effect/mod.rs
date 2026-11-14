@@ -1600,8 +1600,9 @@ enum GuardPosition {
 /// the next independent one, and a following instruction with its own guard
 /// (leading or trailing) is evaluated on that guard even when the earlier one was
 /// false (Glimmer Seeker: "draw a card if you control a Glimmer creature. If you
-/// don't control a Glimmer creature, create a … Glimmer … token."). A leading
-/// guard is a sentence-level gate and releases nothing.
+/// don't control a Glimmer creature, create a … Glimmer … token." — and Battle
+/// Angels of Tyr: "Draw a card if X. Then you create a Treasure token if Y."). A
+/// leading guard is a sentence-level gate and releases nothing.
 /// `pushed_from` is the clause count before the guarded chunk pushed anything.
 fn settle_trailing_guard(
     clauses: &mut [ClauseIr],
@@ -6297,6 +6298,17 @@ fn try_parse_cant_cast_spells_effect(tp: TextPair<'_>) -> Option<ParsedEffectCla
                 RestrictionPlayerScope::ParentTargetedPlayer,
                 tag("that player"),
             ),
+            // CR 108.3 + CR 608.2c: "that creature's owner" — the owner of the
+            // parent object target (Reflector Mage's bounced creature), bound at
+            // resolution via add_restriction + parent_target_owner.
+            value(
+                RestrictionPlayerScope::ParentObjectTargetOwner,
+                (
+                    tag("that "),
+                    alt((tag("creature"), tag("permanent"), tag("card"))),
+                    tag("'s owner"),
+                ),
+            ),
             // CR 109.4 + CR 608.2c: "its controller" — the controller of the
             // parent object target (the countered spell). Bound at resolution via
             // add_restriction + parent_target_controller. The sub-ability inherits
@@ -6369,6 +6381,21 @@ fn try_parse_cant_cast_spells_effect(tp: TextPair<'_>) -> Option<ParsedEffectCla
         return None;
     }
 
+    // CR 201.2: "can't cast spells with the same name as that creature"
+    // (Reflector Mage) — a name-scoped ban whose referent is the parent object
+    // target. `add_restriction` snapshots the name at resolution.
+    let (same_name_prop, remaining, remaining_lower) = match (
+        spell_filter_text.is_none(),
+        crate::parser::oracle_target::parse_same_name_suffix(remaining_lower),
+    ) {
+        (true, Some((prop, consumed))) => (
+            Some(prop),
+            &remaining[consumed..],
+            &remaining_lower[consumed..],
+        ),
+        _ => (None, remaining, remaining_lower),
+    };
+
     // CR 514.2 + CR 500.7 + CR 109.5: a TRAILING "during their next turn" /
     // "during that player's next turn" clause (Sphinx's Decree, Azor) makes the
     // prohibition expire at the affected player's next turn — the cast-branch
@@ -6381,15 +6408,25 @@ fn try_parse_cant_cast_spells_effect(tp: TextPair<'_>) -> Option<ParsedEffectCla
     // `add_restriction::fill_runtime_fields`, and the `EndOfTurn` placeholder
     // below is overridden there from `ability.duration`).
     let (duration, remaining) = match nom_on_lower(remaining, remaining_lower, |input| {
-        value(
-            Duration::UntilEndOfNextTurnOf {
-                player: PlayerScope::Controller,
-            },
-            alt((
-                tag(" during their next turn"),
-                tag(" during that player's next turn"),
-            )),
-        )
+        alt((
+            value(
+                Duration::UntilEndOfNextTurnOf {
+                    player: PlayerScope::Controller,
+                },
+                alt((
+                    tag(" during their next turn"),
+                    tag(" during that player's next turn"),
+                )),
+            ),
+            // CR 514.2 + CR 611.2a: a TRAILING "until your next turn" (Reflector
+            // Mage) — the ban ends as the controller's next turn begins.
+            value(
+                Duration::UntilNextTurnOf {
+                    player: PlayerScope::Controller,
+                },
+                tag(" until your next turn"),
+            ),
+        ))
         .parse(input)
     }) {
         Some((next_turn_duration, rest)) if rest.trim_matches(['.', ' ']).is_empty() => {
@@ -6399,7 +6436,12 @@ fn try_parse_cant_cast_spells_effect(tp: TextPair<'_>) -> Option<ParsedEffectCla
     };
 
     let spell_filter = match spell_filter_text {
-        None => None,
+        None => same_name_prop.map(|prop| {
+            TargetFilter::Typed(TypedFilter {
+                properties: vec![prop],
+                ..TypedFilter::default()
+            })
+        }),
         Some(text) => {
             let (filter, rem) = parse_type_phrase_folding(text.trim());
             if !rem.trim().is_empty() || matches!(filter, TargetFilter::Any) {
