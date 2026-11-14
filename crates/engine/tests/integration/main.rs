@@ -15,6 +15,7 @@ mod adapter_contract_fixtures;
 mod additional_cost_declaration_tail;
 mod agent_frank_horrigan_attacked_this_turn_indestructible;
 mod akiri_attack_player_with_equipped;
+mod akiri_unattach_equipment;
 mod all_good_things_shared_card_type;
 mod ancient_brass_dragon_roll_d20;
 mod ancient_bronze_dragon_roll_d20;
