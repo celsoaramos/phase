@@ -200,6 +200,7 @@ mod issue_desperate_gambit_choose_damage_source;
 mod issue_haze_frog_other_creature_prevention;
 mod issue_vex_draw_card;
 mod issue_worldspine_wurm_duplicate_triggers;
+mod its_controller_manifests_dread;
 mod ivory_gargoyle_temporal_and_skip_tail;
 mod jace_vryns_prodigy_transform;
 mod jace_wielder_empty_library_win;
