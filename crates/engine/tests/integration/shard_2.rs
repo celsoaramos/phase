@@ -201,6 +201,7 @@ mod chaos_warp_owner_library;
 mod chatterstorm_storm;
 mod chicago_loop_pay_speed_x_mana;
 mod chittering_rats;
+mod choco_seeker_of_paradise_dig_remainder;
 mod choose_flip_context_coverage;
 mod choose_from_zone_exiled_this_way_anaphor;
 mod chord_of_calling;

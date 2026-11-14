@@ -4312,16 +4312,29 @@ impl ResolvedAbility {
         }
     }
 
-    /// Whether this ability chain contains a zone change bounded by `event`.
+    /// CR 610.3 + CR 611.2b: the event that, observed while this node waits on
+    /// the stack, means its duration has already ended — a zone change's "until"
+    /// event (CR 610.3a) or the source untapping under a "remains tapped"
+    /// duration (CR 611.2b).
+    pub(crate) fn latchable_duration_event(&self) -> Option<DurationEvent> {
+        self.bounded_zone_change_event().or_else(|| {
+            self.duration
+                .as_ref()
+                .and_then(Duration::source_state_event)
+        })
+    }
+
+    /// Whether this ability chain contains a node whose duration is bounded by
+    /// `event` (see [`Self::latchable_duration_event`]).
     pub(crate) fn contains_duration_event(&self, event: DurationEvent) -> bool {
-        self.bounded_zone_change_event() == Some(event)
+        self.latchable_duration_event() == Some(event)
             || self
                 .child_links()
                 .any(|(_, child)| child.contains_duration_event(event))
     }
 
     pub(crate) fn record_duration_event_recursive(&mut self, event: DurationEvent) {
-        if self.bounded_zone_change_event() == Some(event)
+        if self.latchable_duration_event() == Some(event)
             && !self.context.duration_events.contains(&event)
         {
             self.context.duration_events.push(event);

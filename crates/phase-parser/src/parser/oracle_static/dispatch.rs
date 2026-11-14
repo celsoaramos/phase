@@ -559,10 +559,17 @@ pub(crate) fn parse_may_look_at_face_down_filter(
         &filter,
         TargetFilter::Typed(t) if t.properties.iter().any(|p| matches!(p, FilterProp::FaceDown))
     );
+    let tail = remainder.trim().trim_end_matches('.').trim();
+    // CR 406.3: "You may look at cards exiled with ~." (Grimoire Thief, Bane
+    // Alley Broker) — the source's face-down exiles, with no "any time" clause.
+    // Visibility honors this subject only for exiled cards linked to the source
+    // (`visibility::viewer_may_look_at_exiled_with_source`).
+    if matches!(filter, TargetFilter::ExiledBySource) {
+        return tail.is_empty().then_some(filter);
+    }
     if !has_face_down {
         return None;
     }
-    let tail = remainder.trim().trim_end_matches('.').trim();
     if !tail.eq_ignore_ascii_case("any time") {
         return None;
     }

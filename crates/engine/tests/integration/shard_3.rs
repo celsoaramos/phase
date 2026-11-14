@@ -294,6 +294,7 @@ mod greymond_avacyns_stalwart;
 mod griffin_guide_ceased_token_co_departure;
 mod griffin_rider_conditional_self_buff;
 mod grimdancer_two_counter_entry_choice;
+mod grimoire_thief_named_counter;
 mod grist_zone_functioning;
 mod grubs_command_tracked_set_filter;
 mod guard_ownership;

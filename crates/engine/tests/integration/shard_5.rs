@@ -104,6 +104,7 @@ mod search_choice_duplicate_ids;
 mod search_delivery_observer_dedup;
 mod search_result_conditional_destination;
 mod search_result_missing_referent;
+mod seasinger_remains_tapped;
 mod season_points_budget_modal;
 mod seasoned_dungeoneer_initiative_room_trigger;
 mod secret_of_bloodbending_control_window;

@@ -4642,6 +4642,11 @@ pub enum Duration {
 pub enum DurationEvent {
     SourceLeftBattlefield,
     OpponentBecameMonarch,
+    /// CR 611.2b: the source became untapped. Ends a "for as long as ~ remains
+    /// tapped" duration (Seasinger, Old Man of the Sea, Rubinia Soulsinger):
+    /// once the source has untapped it did not remain tapped, even if it is
+    /// tapped again before the ability resolves.
+    SourceUntapped,
 }
 
 impl Duration {
@@ -4658,6 +4663,32 @@ impl Duration {
             | Self::UntilNextStepOf { .. }
             | Self::ForAsLongAs { .. }
             | Self::UntilSourceExilesAnotherCard
+            | Self::UntilEvent { .. }
+            | Self::Permanent => None,
+        }
+    }
+
+    /// CR 611.2b: the source-state event that ends this duration before it can
+    /// begin. "For as long as ~ remains tapped" (the source tapped as the
+    /// activation cost) ends the moment the source untaps — if that happens
+    /// while the ability waits on the stack, the duration ends before the
+    /// effect would begin and the effect does nothing, even when the source
+    /// is tapped again by the time the ability resolves.
+    pub fn source_state_event(&self) -> Option<DurationEvent> {
+        match self {
+            Self::ForAsLongAs { condition } => condition
+                .requires_source_tapped()
+                .then_some(DurationEvent::SourceUntapped),
+            Self::UntilEndOfTurn
+            | Self::UntilEndOfCombat
+            | Self::UntilNextTurnOf { .. }
+            | Self::UntilEndOfNextTurnOf { .. }
+            | Self::UntilHostLeavesPlay
+            | Self::WhileHostOnBattlefield
+            | Self::WhileControllingHost
+            | Self::UntilNextStepOf { .. }
+            | Self::UntilSourceExilesAnotherCard
+            | Self::UntilOpponentBecomesMonarch
             | Self::UntilEvent { .. }
             | Self::Permanent => None,
         }
@@ -17854,6 +17885,20 @@ pub enum StaticCondition {
 }
 
 impl StaticCondition {
+    /// CR 110.5b + CR 611.2b: true when this duration condition requires the
+    /// SOURCE to stay tapped — `SourceIsTapped` itself, or a conjunction that
+    /// contains it ("for as long as you control ~ and ~ remains tapped"). A
+    /// disjunction or negation does not: untapping the source need not end it.
+    pub(crate) fn requires_source_tapped(&self) -> bool {
+        match self {
+            StaticCondition::SourceIsTapped => true,
+            StaticCondition::And { conditions } => conditions
+                .iter()
+                .any(StaticCondition::requires_source_tapped),
+            _ => false,
+        }
+    }
+
     /// Engine limitation, not CR-mandated: the player whose DESIGNATION this
     /// leaf tests, when the leaf is a designation predicate at all.
     ///
@@ -22393,12 +22438,19 @@ impl DigRestRemainder {
 /// `PriorLook` reads from `GameState::private_look_ids`, which was populated
 /// by a preceding look-only Dig (e.g. the Birthing Ritual pattern: look →
 /// sacrifice → choose from among those cards).
+/// `PriorDigRemainder` reads the cards a preceding keep-Dig left behind in the
+/// library — the unkept pile that Dig published as the chain's tracked set —
+/// for a SECOND selection over the same looked-at cards (Choco, Seeker of
+/// Paradise: "You may put one of them into your hand. Then put any number of
+/// land cards from among them onto the battlefield tapped and the rest into
+/// your graveyard").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DigSource {
     #[default]
     Library,
     PriorLook,
+    PriorDigRemainder,
 }
 
 impl DigSource {
