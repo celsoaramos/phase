@@ -246,6 +246,7 @@ mod commander_draft_filler;
 mod commander_team_formats;
 mod commanders_plate_protection;
 mod companion_special_action;
+mod composite_alt_cost_base;
 mod composite_cost_shared_resources;
 mod compound_ward_cost_pays_every_part;
 mod condition_gates_fail_closed;
