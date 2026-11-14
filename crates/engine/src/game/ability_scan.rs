@@ -3127,7 +3127,7 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
             acc = acc.or(scan_player_scope(player));
             acc
         }
-        QuantityRef::SpellsCastLastTurn => Axes {
+        QuantityRef::SpellsCastLastTurn | QuantityRef::MostSpellsCastByOnePlayerLastTurn => Axes {
             event: false,
             sibling: false,
             projected: true,
