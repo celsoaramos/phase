@@ -419,6 +419,18 @@ pub(super) fn collect_object_targets(
         return from_targets;
     }
 
+    // CR 115.1d + CR 601.2c: a node that declared its own counted target slot
+    // ("up to one target creature you control phase out" — the slot carries a
+    // `multi_target` count) phases out nothing when no target was chosen; it
+    // must not widen into every permanent the filter matches. A node without a
+    // declared count keeps the filter's mass lookup below.
+    if ability.multi_target.is_some()
+        && matches!(target, TargetFilter::Typed(_))
+        && !crate::types::ability::phase_out_or_in_filter_is_mass(target)
+    {
+        return Vec::new();
+    }
+
     // CR 400.7: a self-reference cannot phase out a later same-ID incarnation.
     // Explicit targets retain precedence; other filters retain their mass lookup.
     if matches!(target, TargetFilter::SelfRef) && !ability.self_ref_is_current(state) {
