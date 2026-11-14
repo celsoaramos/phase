@@ -17028,7 +17028,51 @@ fn trigger_nth_draw_second() {
     );
     assert_eq!(
         def.constraint,
-        Some(TriggerConstraint::NthDrawThisTurn { n: 2 })
+        Some(TriggerConstraint::NthDrawThisTurn {
+            n: 2,
+            comparator: Comparator::EQ
+        })
+    );
+}
+
+#[test]
+fn trigger_nth_draw_first_or_second() {
+    // CR 121.2: "your first or second card each turn" (Lady Octopus, Inspired
+    // Inventor) fires on each of the turn's first two draws — `LE 2`.
+    let def = parse_trigger_line(
+        "Whenever you draw your first or second card each turn, put an ingenuity counter on ~.",
+        "Some Card",
+    );
+    assert_eq!(def.mode, TriggerMode::Drawn);
+    assert_eq!(
+        def.valid_target,
+        Some(TargetFilter::Typed(
+            TypedFilter::default().controller(ControllerRef::You),
+        ))
+    );
+    assert_eq!(
+        def.constraint,
+        Some(TriggerConstraint::NthDrawThisTurn {
+            n: 2,
+            comparator: Comparator::LE,
+        })
+    );
+}
+
+#[test]
+fn trigger_nth_draw_non_leading_disjunction_is_not_narrowed() {
+    // "first or third" is not a leading run; it must not silently collapse to
+    // "first" (EQ 1) — the nth-draw parser declines it.
+    let def = parse_trigger_line(
+        "Whenever you draw your first or third card each turn, you gain 1 life.",
+        "Some Card",
+    );
+    assert_ne!(
+        def.constraint,
+        Some(TriggerConstraint::NthDrawThisTurn {
+            n: 1,
+            comparator: Comparator::EQ,
+        })
     );
 }
 
@@ -17049,7 +17093,10 @@ fn trigger_nth_draw_you_in_a_turn_phrasing() {
     );
     assert_eq!(
         def.constraint,
-        Some(TriggerConstraint::NthDrawThisTurn { n: 3 })
+        Some(TriggerConstraint::NthDrawThisTurn {
+            n: 3,
+            comparator: Comparator::EQ
+        })
     );
 }
 
@@ -17068,7 +17115,10 @@ fn trigger_nth_draw_opponent_second() {
     );
     assert_eq!(
         def.constraint,
-        Some(TriggerConstraint::NthDrawThisTurn { n: 2 })
+        Some(TriggerConstraint::NthDrawThisTurn {
+            n: 2,
+            comparator: Comparator::EQ
+        })
     );
 }
 
@@ -17082,7 +17132,10 @@ fn trigger_nth_draw_any_player() {
     assert_eq!(def.valid_target, None);
     assert_eq!(
         def.constraint,
-        Some(TriggerConstraint::NthDrawThisTurn { n: 3 })
+        Some(TriggerConstraint::NthDrawThisTurn {
+            n: 3,
+            comparator: Comparator::EQ
+        })
     );
 }
 
@@ -17100,7 +17153,10 @@ fn trigger_nth_draw_any_player_during_their_turn() {
     assert_eq!(def.valid_target, None);
     assert_eq!(
         def.constraint,
-        Some(TriggerConstraint::NthDrawThisTurn { n: 2 })
+        Some(TriggerConstraint::NthDrawThisTurn {
+            n: 2,
+            comparator: Comparator::EQ
+        })
     );
     assert_eq!(
         def.condition,
