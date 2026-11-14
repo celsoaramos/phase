@@ -127,6 +127,10 @@ expression: "&ir"
                               {
                                 "type": "WithKeyword",
                                 "value": "FirstStrike"
+                              },
+                              {
+                                "type": "InZone",
+                                "zone": "Battlefield"
                               }
                             ]
                           }
