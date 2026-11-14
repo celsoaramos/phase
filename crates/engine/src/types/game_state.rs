@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -11567,8 +11567,12 @@ pub struct TargetSelectionSlot {
 /// signed number so the stored game fact says which way the change goes even
 /// when the magnitude is irrelevant, mirroring [`TapStateChange`] for the
 /// tap/untap axis.
+///
+/// Externally tagged (a bare variant name) on purpose: it only travels inside
+/// the internally tagged [`TargetEffectDetail::Modification`], whose own `type`
+/// tag would collide with an inner `type` tag — the duplicate key collapsed to
+/// `{"type":"Increase"}` on export and the state no longer restored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type")]
 pub enum PtDirection {
     /// CR 613.4: A modification that raises power and/or toughness.
     Increase,
@@ -11606,7 +11610,7 @@ pub enum PtDirection {
 /// whenever the distinction is intrinsic to the effect rather than to this
 /// one announcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(tag = "type")]
+#[serde(tag = "type", from = "TargetEffectDetailWire")]
 pub enum TargetEffectDetail {
     /// The kind is self-describing; no extra fact is needed (the default, and
     /// the honest answer whenever the deciding value is not statically known).
@@ -11620,6 +11624,31 @@ pub enum TargetEffectDetail {
     /// when the modification is dynamic (X or count-based) or genuinely
     /// opposing ("+2/-2"), because then no direction is true.
     Modification(PtDirection),
+}
+
+/// Decoding form of [`TargetEffectDetail`]: the current shape plus the
+/// collapsed `{"type":"Increase"}` / `{"type":"Decrease"}` that states exported
+/// while [`PtDirection`] was itself internally tagged still carry.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum TargetEffectDetailWire {
+    None,
+    Destination(Zone),
+    Modification(PtDirection),
+    Increase,
+    Decrease,
+}
+
+impl From<TargetEffectDetailWire> for TargetEffectDetail {
+    fn from(wire: TargetEffectDetailWire) -> Self {
+        match wire {
+            TargetEffectDetailWire::None => Self::None,
+            TargetEffectDetailWire::Destination(zone) => Self::Destination(zone),
+            TargetEffectDetailWire::Modification(direction) => Self::Modification(direction),
+            TargetEffectDetailWire::Increase => Self::Modification(PtDirection::Increase),
+            TargetEffectDetailWire::Decrease => Self::Modification(PtDirection::Decrease),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -13944,7 +13973,13 @@ fn zone_change_fingerprint(
     {
         return Err("ZoneChanged record is missing its zone-change shape".to_string());
     }
-    let stamp_free = without_occurrence_stamps(record);
+    let mut stamp_free = without_occurrence_stamps(record);
+    // CR 603.10a: `co_departed` is stamped onto the emitted event after the
+    // simultaneous batch finishes, while the ledger row was committed at the
+    // move itself; not every batch producer mirrors the stamp back into the
+    // ledger. It annotates the occurrence rather than identifying it, so it
+    // takes no part in binding a record to its ledger occurrence.
+    stamp_free.remove("co_departed");
     let typed = ZoneChangeRecord::deserialize(&stamp_free).map_err(|error| {
         format!("ZoneChanged record does not decode as a zone-change record: {error}")
     })?;
@@ -14674,6 +14709,35 @@ pub(crate) fn validate_return_result_occurrence_coherence(state: &GameState) -> 
     Ok(())
 }
 
+/// CR 603.7c: a one-shot delayed trigger leaves `delayed_triggers` when it
+/// fires, and the rules journal holding its install command is truncated at
+/// every step and phase boundary (`reset_resolved_rules_journal`). A fired
+/// carrier (pending, deferred, ordered, stack, resolving) of a trigger installed
+/// in an earlier step is then the only remaining copy of its provenance: it
+/// roots itself, and every other carrier of the same key must agree with it.
+fn root_fired_delayed_carrier(
+    roots: &BTreeMap<(u64, u64), DelayedTriggerOrigin>,
+    fired_roots: &mut BTreeMap<(u64, u64), DelayedTriggerOrigin>,
+    provenance: DelayedTriggerOrigin,
+    carrier: &str,
+) -> Result<(), String> {
+    let key = (provenance.token.0, provenance.instance.0);
+    let aliases_root = roots
+        .keys()
+        .any(|(token, instance)| *token == key.0 || *instance == key.1);
+    if aliases_root
+        || fired_roots
+            .get(&key)
+            .is_some_and(|root| *root != provenance)
+    {
+        return Err(format!(
+            "{carrier} delayed-trigger provenance aliases a different install root"
+        ));
+    }
+    fired_roots.insert(key, provenance);
+    Ok(())
+}
+
 /// Validates the private CR 603.7 identity transport after raw-state migration.
 ///
 /// A delayed-install command is the durable installation root. A still-live
@@ -14767,6 +14831,7 @@ pub(crate) fn validate_trigger_firing_coherence(state: &GameState) -> Result<(),
         }
     }
 
+    let fired_roots = RefCell::new(BTreeMap::new());
     let validate_firing =
         |firing: TriggerFiring, source_id: ObjectId, carrier: &str| -> Result<(), String> {
             match firing {
@@ -14785,9 +14850,12 @@ pub(crate) fn validate_trigger_firing_coherence(state: &GameState) -> Result<(),
                         Some(_) => Err(format!(
                             "{carrier} delayed-trigger provenance aliases a different install root"
                         )),
-                        None => Err(format!(
-                            "{carrier} delayed-trigger provenance has no install root"
-                        )),
+                        None => root_fired_delayed_carrier(
+                            &roots,
+                            &mut fired_roots.borrow_mut(),
+                            provenance,
+                            carrier,
+                        ),
                     }
                 }
             }
