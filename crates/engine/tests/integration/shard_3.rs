@@ -251,6 +251,7 @@ mod ghyrson_starn;
 mod giada_angel_counters;
 mod giada_metallic_mimic;
 mod giant_ox_crew_toughness;
+mod gideon_blackblade_prevention_during_your_turn;
 mod gideon_blackblade_turn_conditional_creature_1155;
 mod gideon_jura_forced_attack_planeswalker;
 mod gideon_the_oathless;
