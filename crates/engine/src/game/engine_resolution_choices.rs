@@ -477,6 +477,32 @@ fn retain_triggers_of_resumed_span(
     retain_delayed_triggers_of_resumed_span(state, events, start);
 }
 
+/// CR 603.2 + CR 614.12a: an as-enters optional reveal (the Snarl cycle) paused
+/// the permanent's entry; `capture_deferred_entry_events_if_mid_entry_choice`
+/// stashed its battlefield-entry event. Once the reveal is answered (revealed or
+/// declined) and the entry is settled, replay it through the shared
+/// deferred-entry authority so landfall and other enters observers fire. A
+/// reveal that was not an entry choice stashed nothing and this is a no-op.
+fn replay_reveal_entry(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> Result<Option<WaitingFor>, EngineError> {
+    if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+        return Ok(None);
+    }
+    let Some(source) = state.deferred_entry_events.iter().find_map(|event| match event {
+        GameEvent::ZoneChanged {
+            object_id,
+            to: Zone::Battlefield,
+            ..
+        } => Some(*object_id),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    crate::game::engine_replacement::replay_deferred_entry_events(state, source, events)
+}
+
 /// CR 603.2 + CR 603.2c: collect the ordinary observers of `events[start..]`,
 /// the span the instructions resumed by a departure produced. The span is a
 /// whole continuation drain, not one owner's completion slice: a `ChangeZone`
@@ -5708,6 +5734,9 @@ pub(super) fn handle_resolution_choice(
                         .clear_active_ability_continuation_or_batch_delivery_child()
                         .expect("declined reveal cannot clear a buried continuation");
                 }
+                if let Some(waiting_for) = replay_reveal_entry(state, events)? {
+                    return Ok(ResolutionChoiceOutcome::WaitingFor(waiting_for));
+                }
                 return Ok(ResolutionChoiceOutcome::WaitingFor(
                     state.waiting_for.clone(),
                 ));
@@ -5769,6 +5798,9 @@ pub(super) fn handle_resolution_choice(
             }
             super::engine::resume_pending_continuation_if_priority(state, events)
                 .expect("a settled reveal choice must resume its continuation");
+            if let Some(waiting_for) = replay_reveal_entry(state, events)? {
+                return Ok(ResolutionChoiceOutcome::WaitingFor(waiting_for));
+            }
             ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
         }
         (

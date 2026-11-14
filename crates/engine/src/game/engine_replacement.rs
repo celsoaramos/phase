@@ -4435,7 +4435,7 @@ pub(crate) fn apply_pending_post_replacement_effect(
     // single producer site so both the stack-resolution path (non-optional
     // copy replacements) and the `handle_replacement_choice` path (optional
     // "you may have this enter as a copy" replacements) defer uniformly.
-    capture_deferred_entry_events_if_mid_entry_choice(state, waiting_for.as_ref(), events);
+    capture_deferred_entry_events_if_mid_entry_choice(state, waiting_for.as_ref(), source, events);
     waiting_for
 }
 
@@ -4496,9 +4496,32 @@ fn is_enters_counter_choice(branches: &[AbilityDefinition]) -> bool {
 fn capture_deferred_entry_events_if_mid_entry_choice(
     state: &mut GameState,
     waiting_for: Option<&WaitingFor>,
+    entering: Option<ObjectId>,
     events: &mut Vec<GameEvent>,
 ) {
     let source_id = match waiting_for {
+        // CR 603.2 + CR 614.12a: "As this land enters, you may reveal a Forest or
+        // Island card from your hand. If you don't, this land enters tapped." (the
+        // Snarl cycle, Port Town, the Gilt-Leaf Palace class) pauses the entry on an
+        // optional `RevealChoice`, which names no source. The drain's own entering
+        // object is the source; only capture when this action holds that object's
+        // battlefield-entry event, so a reveal that is not an entry choice leaves
+        // `deferred_entry_events` untouched. Without this, landfall (Tireless
+        // Tracker, Lotus Cobra) never saw the land enter.
+        Some(WaitingFor::RevealChoice { .. }) => match entering {
+            Some(id)
+                if events.iter().any(|event| {
+                    matches!(
+                        event,
+                        GameEvent::ZoneChanged { object_id, to, .. }
+                            if *object_id == id && *to == Zone::Battlefield
+                    )
+                }) =>
+            {
+                id
+            }
+            _ => return,
+        },
         Some(WaitingFor::CopyTargetChoice { source_id, .. }) => *source_id,
         // CR 614.12a: enters-with-your-choice-of-counter defers its entry event
         // exactly like the copy-target choice does, so the watcher's ETB trigger
