@@ -481,6 +481,13 @@ pub enum ExileCardPool {
     ThisTurn,
     /// Lifetime per-source `exile_links` pool (`linked_exile_cards_for_source`).
     Persistent,
+    /// CR 406.6 + CR 122.1: Every card in exile, not just the cards linked to
+    /// the source. The static's `affected` filter is the only scope — Tinybones,
+    /// Bauble Burglar: "you may play cards you don't own with stash counters on
+    /// them from exile" names the counter marker, not the exiling object, so a
+    /// card stashed by an earlier Tinybones (or before Tinybones left and came
+    /// back) stays playable.
+    AnyExile,
 }
 
 impl fmt::Display for ExileCardPool {
@@ -488,6 +495,7 @@ impl fmt::Display for ExileCardPool {
         match self {
             ExileCardPool::ThisTurn => write!(f, "this_turn"),
             ExileCardPool::Persistent => write!(f, "persistent"),
+            ExileCardPool::AnyExile => write!(f, "any_exile"),
         }
     }
 }
@@ -499,6 +507,7 @@ impl FromStr for ExileCardPool {
         match s {
             "this_turn" => Ok(ExileCardPool::ThisTurn),
             "persistent" => Ok(ExileCardPool::Persistent),
+            "any_exile" => Ok(ExileCardPool::AnyExile),
             other => Err(format!("unknown ExileCardPool: {other}")),
         }
     }
@@ -3570,7 +3579,7 @@ impl fmt::Display for StaticMode {
                 if matches!(cost, ExileCastCost::WithoutPayingManaCost) {
                     write!(f, ",free")?;
                 }
-                if matches!(pool, ExileCardPool::Persistent) {
+                if !matches!(pool, ExileCardPool::ThisTurn) {
                     write!(f, ",pool={pool}")?;
                 }
                 if matches!(timing, ExileCastTiming::YourTurnOnly) {
