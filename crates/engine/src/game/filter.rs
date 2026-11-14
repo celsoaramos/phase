@@ -13,8 +13,8 @@ use crate::game::game_object::GameObject;
 use crate::game::game_object::ObjectIncarnationRefExt;
 use crate::game::keywords::HeldObject;
 use crate::game::quantity::{
-    counter_count_from_map, quantity_expr_characteristic_reads_at, resolve_quantity,
-    resolve_quantity_with_ctx, resolve_quantity_with_targets, QuantityContext,
+    counter_count_from_map, quantity_expr_characteristic_reads_at, resolve_quantity_with_ctx,
+    resolve_quantity_with_targets, QuantityContext,
 };
 use crate::game::targeting::{DeclaredSlotBinding, SlotReferent};
 use crate::types::ability::{
@@ -8510,6 +8510,7 @@ pub(crate) fn spell_object_matches_filter_with_announced_x(
             // itself from the command zone — Eminence must not reduce its
             // own cost).
             spell_object_id: Some(spell_obj.id),
+            caster,
         }),
     )
 }
@@ -8550,6 +8551,10 @@ struct SpellFilterContext<'a> {
     /// `SpellCastRecord.spell_object_id` and is resolved in `game::quantity`'s
     /// own-cast exclusion arm, not through this context.
     spell_object_id: Option<ObjectId>,
+    /// CR 109.5: the player casting the spell. A prohibition's dynamic
+    /// comparand ("greater than the number of lands that player controls")
+    /// reads it through `ControllerRef::ScopedPlayer`.
+    caster: PlayerId,
 }
 
 fn spell_object_matches_filter_inner(
@@ -8712,11 +8717,14 @@ fn spell_object_matches_property(
                     let Some(context) = context else {
                         return false;
                     };
-                    resolve_quantity(
+                    // CR 109.5: "that player" in the comparand is the caster;
+                    // "you" stays the source's controller.
+                    crate::game::quantity::resolve_quantity_scoped(
                         context.state,
                         value,
-                        context.source_controller,
                         context.source_id,
+                        context.caster,
+                        None,
                     )
                 }
             };
