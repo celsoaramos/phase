@@ -110,11 +110,20 @@ pub(super) fn chain_created_demonstrative_binding(
     // non-self trigger subject re-anchors the reference to the triggering object
     // (Pip-Boy 3000), and only a chain that actually produced something can be
     // named at all.
-    let subject_allows_token = matches!(
-        ctx.subject,
-        None | Some(TargetFilter::SelfRef) | Some(TargetFilter::Any)
-    );
+    let subject_allows_token = subject_allows_chain_created_demonstrative(ctx);
     (ctx.token_created_in_chain && subject_allows_token).then_some(TargetFilter::LastCreated)
+}
+
+/// CR 608.2c + CR 608.2k: whether the trigger subject leaves a demonstrative
+/// free to name the chain-created permanent. No subject, the source itself or
+/// `Any` never re-anchor it; neither does a PLAYER subject ("When you unlock this
+/// door"), which can't be the antecedent of "that creature" (Slimy Aquarium).
+/// Any other subject is an object that re-anchors it (Pip-Boy 3000).
+fn subject_allows_chain_created_demonstrative(ctx: &ParseContext) -> bool {
+    match &ctx.subject {
+        None | Some(TargetFilter::SelfRef) | Some(TargetFilter::Any) => true,
+        Some(subject) => crate::parser::oracle_target::trigger_subject_is_player_actor(subject),
+    }
 }
 
 /// CR 608.2c: the demonstrative and definite back-reference forms.
@@ -184,10 +193,7 @@ pub(super) fn counter_anaphor_created_token_binding(
     // preserves that legacy binding. The bare object pronoun and its distributive
     // plural "each of them" have no such re-anchor, so their gate is only the
     // token flag.
-    let subject_allows_token = matches!(
-        ctx.subject,
-        None | Some(TargetFilter::SelfRef) | Some(TargetFilter::Any)
-    );
+    let subject_allows_token = subject_allows_chain_created_demonstrative(ctx);
     if ctx.token_created_in_chain && (it_pronoun || distributive_them || subject_allows_token) {
         Some(TargetFilter::LastCreated)
     } else {
