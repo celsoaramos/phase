@@ -43,6 +43,7 @@ mod lethality_awareness;
 mod life_total_resource;
 mod loop_shortcut;
 mod mana_efficiency;
+mod mana_sink_window;
 mod mill_targeting;
 mod momir_curve;
 pub mod mulligan;
