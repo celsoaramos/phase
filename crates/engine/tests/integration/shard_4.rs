@@ -377,6 +377,7 @@ mod momir_basic_emblem;
 mod momir_pool_excludes_transform_back_faces;
 mod momir_token_firebreathing_duration;
 mod moon_girl_second_draw_base_pt;
+mod moonmist_prevents_only_non_werewolf_wolf_damage;
 mod moraug_extra_combat_usable_7197;
 mod morbid_curiosity_cost_paid_mana_value_draw;
 mod mornsong_aria_scoped_player_search;
