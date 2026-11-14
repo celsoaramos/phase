@@ -1488,6 +1488,67 @@ mod tests {
             .is_some());
     }
 
+    // The reported symptom, at the layer where it hurt: the mana sits in the pool
+    // and the pool refuses to pay with it. Fíli and Kíli, Joyous makes {R}{R}
+    // "only to cast Dwarf, Equipment, and Saga spells"; Torbran, Thane of Red
+    // Fell is a Dwarf Noble, so the pool must hand the red over.
+    #[test]
+    fn spend_for_pays_a_dwarf_with_serial_list_restricted_mana() {
+        let mut pool = ManaPool::default();
+        pool.add(make_restricted_unit(
+            ManaType::Red,
+            ObjectId(1),
+            vec![ManaRestriction::OnlyForSpellType(
+                "Dwarf, Equipment, and Saga".to_string(),
+            )],
+        ));
+
+        let torbran = SpellMeta {
+            types: vec!["Legendary".to_string(), "Creature".to_string()],
+            subtypes: vec!["Dwarf".to_string(), "Noble".to_string()],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            colors: vec![],
+            has_x_in_cost: false,
+            is_face_down: false,
+            cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
+        };
+        assert!(pool
+            .spend_for(ManaType::Red, &PaymentContext::Spell(&torbran))
+            .is_some());
+
+        // And it stays restricted: an unlisted type still cannot touch it.
+        let mut pool = ManaPool::default();
+        pool.add(make_restricted_unit(
+            ManaType::Red,
+            ObjectId(1),
+            vec![ManaRestriction::OnlyForSpellType(
+                "Dwarf, Equipment, and Saga".to_string(),
+            )],
+        ));
+        let bolt = SpellMeta {
+            types: vec!["Instant".to_string()],
+            subtypes: vec![],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+            colors: vec![],
+            has_x_in_cost: false,
+            is_face_down: false,
+            cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
+        };
+        assert!(pool
+            .spend_for(ManaType::Red, &PaymentContext::Spell(&bolt))
+            .is_none());
+    }
+
     #[test]
     fn remove_from_source_removes_matching_units() {
         let mut pool = ManaPool::default();
