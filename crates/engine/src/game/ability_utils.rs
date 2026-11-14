@@ -4501,6 +4501,45 @@ fn validate_targets_in_chain_inner(
                 })
                 .collect(),
         )
+    } else if let Some(recipient_filter) = (validated.target_choice_timing
+        == TargetChoiceTiming::Stack)
+        .then(|| become_copy_recipient_slot_filter(&validated.effect))
+        .flatten()
+    {
+        // CR 115.1 + CR 608.2b: an announced copy RECIPIENT is its own instance
+        // of "target" ("target legendary creature you control becomes a copy of
+        // target creature card in exile", The Animus), declared FIRST — the
+        // order `collect_target_slots` surfaces and `become_copy::resolve`
+        // reads. Each occurrence is rechecked against ITS slot's filter: judged
+        // against the copy-source filter, the recipient on the battlefield
+        // failed "card in exile", was dropped, and the copy silently never
+        // happened.
+        let copy_filter = extract_target_filter_from_effect(&validated.effect).cloned();
+        NodeValidation::Verdicts(
+            (0..occurrence_count)
+                .map(|position| {
+                    let filter = if position == 0 {
+                        recipient_filter.clone()
+                    } else {
+                        match &copy_filter {
+                            Some(filter) => filter.clone(),
+                            None => return OccurrenceVerdict::PassThrough,
+                        }
+                    };
+                    occurrences_legal_for_slot(
+                        view,
+                        state,
+                        &[position],
+                        AbilityTargetSlot::Unpositioned(&filter),
+                        &validated,
+                    )
+                    .into_iter()
+                    .map(legal_or_dropped)
+                    .next()
+                    .unwrap_or(OccurrenceVerdict::Dropped)
+                })
+                .collect(),
+        )
     } else if let Some(verdicts) =
         validate_single_derived_role(view, state, &validated, target_origin)
     {

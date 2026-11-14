@@ -5697,6 +5697,7 @@ fn scan_count_scope(x: &CountScope) -> Axes {
         CountScope::Owner => Axes::NONE,
         CountScope::ScopedPlayer => Axes::NONE,
         CountScope::SourceChosenPlayer => Axes::NONE,
+        CountScope::RecipientController => Axes::NONE,
         CountScope::All => Axes::NONE,
         CountScope::Opponents => Axes::NONE,
     }

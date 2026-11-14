@@ -353,6 +353,7 @@ mod memory_vessel_std_s25;
 mod menace_requires_two_blockers;
 mod mercenaries_any_player_activate_prevention_scope;
 mod merieke_ri_berit_cant_regenerate;
+mod mf_relatos_20261118_19;
 mod metamorphic_alteration;
 mod mf_dice_rolls;
 mod mf_field_reports_alt_costs;

@@ -921,6 +921,15 @@ fn filter_binds_owned_you(filter: &TargetFilter) -> bool {
     }
 }
 
+/// CR 303.4m + CR 613.4c: the controller of the object a layer effect is
+/// being applied to (`CountScope::RecipientController`). `None` outside a
+/// per-recipient evaluation; callers fall back to the ability's controller.
+fn recipient_controller_for_context(state: &GameState, ctx: &QuantityContext) -> Option<PlayerId> {
+    ctx.recipient
+        .and_then(|id| state.objects.get(&id))
+        .map(|object| object.controller)
+}
+
 fn source_chosen_player_for_context(state: &GameState, ctx: &QuantityContext) -> Option<PlayerId> {
     source_lki_for_context(state, ctx).and_then(|lki| {
         lki.chosen_attributes
@@ -4898,6 +4907,26 @@ fn resolve_ref(
     // entry keeps its own meaning for `targets` and never feeds this.
     ability_targets: Option<ParkedTargets<'_>>,
 ) -> i32 {
+    // CR 303.4m + CR 608.2c: outside a per-recipient layer pass, "its
+    // controller's <zone>" names the first object target ("target creature
+    // gets -X/-X, where X is the number of creature cards in its controller's
+    // graveyard", Guest List) — the same fallback `PlayerScope::RecipientController`
+    // uses.
+    let mut ctx = ctx;
+    if ctx.recipient.is_none()
+        && matches!(
+            qty,
+            QuantityRef::ZoneCardCount {
+                scope: CountScope::RecipientController,
+                ..
+            }
+        )
+    {
+        ctx.recipient = targets.iter().find_map(|target| match target {
+            TargetRef::Object(id) => Some(*id),
+            TargetRef::Player(_) => None,
+        });
+    }
     let source_id = ctx.source;
     // Build a FilterContext that preserves ability scope (for `chosen_x`/targets
     // in nested filter thresholds) when available, falling back to the controller
@@ -7122,6 +7151,9 @@ fn scoped_players<'a>(
         CountScope::SourceChosenPlayer => {
             source_chosen_player_for_context(state, &ctx).is_some_and(|player| p.id == player)
         }
+        CountScope::RecipientController => {
+            p.id == recipient_controller_for_context(state, &ctx).unwrap_or(controller)
+        }
         // CR 104.5 + CR 800.4 + CR 800.4a: a player who has left the game is
         // not part of the live population these two scopes range over, and
         // CR 800.4a takes their owned objects out of the game with them. So
@@ -7210,6 +7242,9 @@ fn count_scope_owner_matches(
         CountScope::SourceChosenPlayer => {
             source_chosen_player_for_context(state, &ctx).is_some_and(|player| owner == player)
         }
+        CountScope::RecipientController => {
+            owner == recipient_controller_for_context(state, &ctx).unwrap_or(controller)
+        }
         // CR 800.4a: "all objects owned by that player leave the game" — so a
         // departed player's cards are not part of the exile population these
         // two scopes range over, even though this engine models leaving the
@@ -7255,6 +7290,9 @@ fn count_scope_actor_matches(
         CountScope::ScopedPlayer => actor == ctx.scoped_player.unwrap_or(controller),
         CountScope::SourceChosenPlayer => {
             source_chosen_player_for_context(state, &ctx).is_some_and(|player| actor == player)
+        }
+        CountScope::RecipientController => {
+            actor == recipient_controller_for_context(state, &ctx).unwrap_or(controller)
         }
         CountScope::All => true,
         CountScope::Opponents => actor != controller,

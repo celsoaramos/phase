@@ -15096,6 +15096,8 @@ fn count_scope_binding_diverges(scope: &crate::types::ability::CountScope) -> bo
         // CR 115.10: the RESOLVING ability's per-iteration player, which the
         // fire-time context derives from the matched event instead.
         CountScope::ScopedPlayer => true,
+        // CR 613.4c: the affected object's controller, bound per evaluation.
+        CountScope::RecipientController => true,
         // CR 109.5 + CR 108.3 + CR 613.1: controller-, owner- or
         // source-persisted keys the fire-time context carries.
         CountScope::Controller
