@@ -10,6 +10,7 @@ pub mod support;
 
 mod dark_confidant_upkeep;
 mod dark_depths_thespian_stage;
+mod dark_salvation_tokens_then_shrink;
 mod darkness_crystal_exiled_with_activation_8164;
 mod dawnbreak_reclaimer;
 mod dazzling_beauty_become_blocked;
