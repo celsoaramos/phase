@@ -3236,7 +3236,7 @@ fn legacy_effect(x: &Effect) -> bool {
         // ---- Single `TargetFilter` target (only tag-bearing field) ----
         Effect::PairWith { target }
         | Effect::Destroy { target, .. }
-        | Effect::Regenerate { target }
+        | Effect::Regenerate { target, .. }
         | Effect::RemoveAllDamage { target }
         | Effect::Counter { target, .. }
         | Effect::CounterAll { target }
