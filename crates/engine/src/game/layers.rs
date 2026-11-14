@@ -7695,6 +7695,27 @@ fn bucket_effects_by_layer(
         ) {
             continue;
         }
+        // CR 613.1d + CR 205.3d: "gain all creature types" (Mirror Entity,
+        // Amoeboid Changeling) is a type-changing effect — it lands in layer 4,
+        // before the layer-6 grants that read creature types. The parser keeps
+        // it as a granted Changeling keyword (layer 6), whose type expansion
+        // used to run only after every layer: Sliver Hivelord's "Sliver
+        // creatures you control have indestructible" had already looked, and a
+        // non-Sliver made every type by Mirror Entity died to Blasphemous Act.
+        // The keyword grant stays; its creature types now also apply in layer 4.
+        if !effect.characteristic_defining
+            && matches!(
+                effect.modification,
+                ContinuousModification::AddKeyword {
+                    keyword: Keyword::Changeling
+                }
+            )
+        {
+            let mut types = effect.clone();
+            types.modification = ContinuousModification::AddAllCreatureTypes;
+            types.layer = Layer::Type;
+            push_effect(&mut effects, Layer::Type, types);
+        }
         push_effect(&mut effects, effect.layer, effect);
     }
 

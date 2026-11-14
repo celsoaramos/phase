@@ -4379,6 +4379,15 @@ fn parse_type_phrase_folding_unbound<'a>(
         pos += consumed;
     }
 
+    // CR 301.5 + CR 303.4: "with a/an <Aura|Equipment|artifact or enchantment
+    // subtype> attached to it/them" — attachment presence (Starfleet
+    // Communicator's "other creatures you control with a Communicator
+    // attached to them").
+    if let Some((prop, consumed)) = parse_attachment_presence_suffix(&lower[pos..]) {
+        properties.push(prop);
+        pos += consumed;
+    }
+
     // CR 113.1 + CR 113.3: "<type> with no abilities" — an object with none of the
     // four ability categories. Narrow predicate combinator lives in oracle_nom/filter.rs;
     // this arm supplies the "with " lead + offset handling, mirroring parse_counter_suffix.
@@ -9906,8 +9915,8 @@ fn parse_other_than_exclusion(input: &str) -> OracleResult<'_, FilterProp> {
                     parse_attached_host_noun,
                 ),
                 |(kinds, _, _)| match kinds.as_slice() {
-                    [kind] => Some(FilterProp::Not {
-                        prop: Box::new(attachment_host_filter_prop(kind)),
+                    [kind] => attachment_host_filter_prop(kind).map(|prop| FilterProp::Not {
+                        prop: Box::new(prop),
                     }),
                     _ => None,
                 },
@@ -9948,12 +9957,66 @@ fn parse_attached_host_noun(input: &str) -> OracleResult<'_, ()> {
 /// CR 303.4b + CR 301.5a: the source-relative host predicate for one attachment
 /// kind — the object an Aura enchants / the creature an Equipment equips.
 /// Contrast `attachment_kinds_filter_prop`, which builds the attachment-PRESENCE
-/// predicate (`HasAttachment`) for the same kinds.
-fn attachment_host_filter_prop(kind: &AttachmentKind) -> FilterProp {
+/// predicate (`HasAttachment`) for the same kinds. A subtype-named attachment
+/// has no source-relative host adjective, so it has no host predicate.
+fn attachment_host_filter_prop(kind: &AttachmentKind) -> Option<FilterProp> {
     match kind {
-        AttachmentKind::Aura => FilterProp::EnchantedBy,
-        AttachmentKind::Equipment => FilterProp::EquippedBy,
+        AttachmentKind::Aura => Some(FilterProp::EnchantedBy),
+        AttachmentKind::Equipment => Some(FilterProp::EquippedBy),
+        AttachmentKind::Subtype(_) => None,
     }
+}
+
+/// CR 301.5 + CR 303.4 + CR 205.3g-h: the attachment-presence suffix "with
+/// a/an <noun> attached to it/them", where the noun is "Aura", "Equipment" or
+/// another artifact/enchantment subtype ("with a Communicator attached to
+/// them"). Builds the non-source-relative `HasAttachment` predicate — any
+/// qualifying attachment, whoever controls it. Returns the property and the
+/// bytes consumed (leading whitespace included).
+fn parse_attachment_presence_suffix(text: &str) -> Option<(FilterProp, usize)> {
+    fn attachment_noun(input: &str) -> OracleResult<'_, AttachmentKind> {
+        let Some((name, len)) = parse_subtype(input) else {
+            return Err(oracle_err(input));
+        };
+        let kind = match name.as_str() {
+            "Aura" => AttachmentKind::Aura,
+            "Equipment" => AttachmentKind::Equipment,
+            _ if matches!(
+                noncreature_subtype_set(&name),
+                Some(SubtypeSet::Artifact | SubtypeSet::Enchantment)
+            ) =>
+            {
+                AttachmentKind::Subtype(name)
+            }
+            _ => return Err(oracle_err(input)),
+        };
+        Ok((&input[len..], kind))
+    }
+
+    let trimmed = text.trim_start();
+    let ws = text.len() - trimmed.len();
+    let (rest, kind) = delimited(
+        (
+            tag::<_, _, OracleError<'_>>("with "),
+            alt((
+                tag("a "),
+                tag("an "),
+                tag("one or more "),
+                tag("at least one "),
+            )),
+        ),
+        attachment_noun,
+        terminated(
+            preceded(tag(" attached to "), alt((tag("them"), tag("it")))),
+            not(satisfy(|c: char| c.is_alphanumeric() || c == '\'')),
+        ),
+    )
+    .parse(trimmed)
+    .ok()?;
+    Some((
+        attachment_kinds_filter_prop(vec![kind], None),
+        ws + trimmed.len() - rest.len(),
+    ))
 }
 
 pub(crate) fn attachment_kinds_filter_prop(
@@ -17183,6 +17246,44 @@ mod tests {
         let (filter, rem) = parse_event_context_ref("that source and you draw a card").unwrap();
         assert_eq!(filter, TargetFilter::TriggeringSource);
         assert_eq!(rem, " and you draw a card");
+    }
+
+    /// CR 301.5 + CR 303.4 + CR 205.3g: "with a/an <attachment> attached to
+    /// it/them" is the attachment-presence predicate — the Aura/Equipment kinds
+    /// and any other artifact/enchantment subtype (Starfleet Communicator).
+    #[test]
+    fn attachment_presence_suffix_reads_kind_or_subtype() {
+        for (phrase, kind) in [
+            (
+                "creatures you control with a communicator attached to them",
+                AttachmentKind::Subtype("Communicator".to_string()),
+            ),
+            (
+                "creatures you control with an aura attached to them",
+                AttachmentKind::Aura,
+            ),
+            (
+                "creature with an equipment attached to it",
+                AttachmentKind::Equipment,
+            ),
+        ] {
+            let (f, rest) = parse_type_phrase_folding(phrase);
+            assert!(rest.trim().is_empty(), "{phrase}: leftover {rest:?}");
+            let TargetFilter::Typed(tf) = f else {
+                panic!("{phrase}: expected Typed, got {f:?}");
+            };
+            assert!(
+                tf.properties.contains(&FilterProp::HasAttachment {
+                    kind: kind.clone(),
+                    controller: None,
+                    exclude_source: crate::types::ability::SourceExclusion::Include,
+                }),
+                "{phrase}: {:?}",
+                tf.properties
+            );
+        }
+        // A creature subtype is not an attachment.
+        assert!(parse_attachment_presence_suffix(" with a human attached to it").is_none());
     }
 
     #[test]

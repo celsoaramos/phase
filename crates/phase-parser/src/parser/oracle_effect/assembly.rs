@@ -3392,6 +3392,13 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
         // `parse_target_with_ctx` during chunk parse. `Random` flips the engine
         // off the controller-choice path at target-selection time.
         def.target_selection_mode = clause_ir.target_selection_mode;
+        // CR 406.3: an exile clause that printed "face down" moves its card(s)
+        // into exile face down (`ClauseIr::exile_concealment`, derived at push).
+        // Only ever raises the concealment: a definition already marked face
+        // down by a continuation keeps it.
+        if clause_ir.exile_concealment.is_face_down() {
+            def.face_down_in_exile = clause_ir.exile_concealment;
+        }
         // CR 601.2c + CR 603.3d: copy the per-clause target chooser captured by
         // `parse_target_with_ctx` during chunk parse, so a targeted "of their
         // choice" routes target selection to the scoped (upkeep) player.

@@ -275,6 +275,8 @@ pub const ARTIFACT_SUBTYPES: &[&str] = &[
     "Bobblehead",
     "Book",
     "Clue",
+    // Starfleet Communicator (Star Trek): "Artifact — Communicator Equipment".
+    "Communicator",
     "Contraption",
     "Equipment",
     "Food",

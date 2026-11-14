@@ -16,10 +16,10 @@ use crate::parser::oracle_nom::filter::ChosenColorGrantReference;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
     ActivationManaPaymentRestriction, ActivationRestriction, ChoiceType, ChosenGroupId,
-    ControllerRef, CostReduction, DelayedTriggerCondition, Duration, Effect, ManaSpendPermission,
-    MultiTargetSpec, OpponentMayScope, PlayerFilter, QuantityExpr, QuantityRef,
-    ReturnResultReadSpec, RoundingMode, SiblingCondition, SubAbilityLink, TargetChoiceTiming,
-    TargetFilter, TargetReadOrigin, TargetSelectionMode, UnlessPayModifier,
+    ControllerRef, CostReduction, DelayedTriggerCondition, Duration, Effect, ExileConcealment,
+    ManaSpendPermission, MultiTargetSpec, OpponentMayScope, PlayerFilter, QuantityExpr,
+    QuantityRef, ReturnResultReadSpec, RoundingMode, SiblingCondition, SubAbilityLink,
+    TargetChoiceTiming, TargetFilter, TargetReadOrigin, TargetSelectionMode, UnlessPayModifier,
 };
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaExpiry;
@@ -1024,6 +1024,20 @@ pub(crate) struct ClauseIr {
     /// Floating Shield, the pool's only live consumer of this relation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) chosen_color_grant: Option<ChosenColorGrantReference>,
+    /// CR 406.3: this clause is an exile instruction that printed "face down"
+    /// at its tail ("exile a card from your hand face down" — Summoner's Egg,
+    /// Bane Alley Broker, Gustha's Scepter; "exile all cards from your hand face
+    /// down" — Ignorant Bliss). The exile grammar has no slot for the suffix and
+    /// dropped it, so the card went to exile FACE UP: its "turn the exiled card
+    /// face up" companion then found nothing to turn and never revealed it.
+    ///
+    /// DERIVED ONCE at `ClauseDraft::push` from the lowered effect and the
+    /// clause's verbatim fragment (the `chosen_color_grant` precedent), so no
+    /// `.push()` site can forget it and `absorb_clause` re-derives it. Assembly
+    /// stamps it onto the definition's `face_down_in_exile`, the same channel
+    /// the search-then-exile-face-down continuation writes.
+    #[serde(default, skip_serializing_if = "ExileConcealment::is_public")]
+    pub(crate) exile_concealment: ExileConcealment,
     /// CR 608.2c + CR 603.7a: where this clause's lowered definition attaches.
     /// `Sibling` (default) is promoted only when this clause continues an open
     /// delayed payload and is consumed by `assemble_effect_chain`'s relocation step.
@@ -1099,6 +1113,7 @@ impl ClauseIr {
             printed_color_choice,
             declared_player_group,
             chosen_color_grant,
+            exile_concealment,
             placement,
             head_window,
             _sealed: _,
@@ -1135,6 +1150,7 @@ impl ClauseIr {
         *printed_color_choice = None;
         *declared_player_group = None;
         *chosen_color_grant = None;
+        *exile_concealment = ExileConcealment::Public;
         *placement = ClausePlacement::Sibling;
         *head_window = None;
     }
@@ -1766,6 +1782,7 @@ impl ClauseDraft<'_> {
             .allocate_with_span(span, Some(&self.source_text))
             .expect("chain-relative clause span is contained by its chain item");
         self.builder.next_clause_id += 1;
+        let exile_concealment = classify_exile_concealment(&self.parsed.effect, &self.source_text);
         self.builder.clauses.push(ClauseIr {
             id,
             declares_chosen_clause,
@@ -1797,12 +1814,61 @@ impl ClauseDraft<'_> {
             chosen_color_grant: crate::parser::oracle_nom::filter::classify_chosen_color_grant(
                 &self.source_text,
             ),
+            exile_concealment,
             declared_player_group: self.declared_player_group,
             placement: self.placement,
             head_window: self.head_window,
             _sealed: (),
         });
     }
+}
+
+/// CR 406.3: whether an exile instruction printed "face down" at the tail of its
+/// clause ("exile a card from your hand face down", "exile all cards from your
+/// hand face down"). Only a `ChangeZone`/`ChangeZoneAll` into exile qualifies:
+/// every other face-down exile (Hideaway / Gonti looks, `ExileTop`, foretell,
+/// the search-result continuation) carries its concealment in its own effect
+/// or continuation and is left untouched.
+fn classify_exile_concealment(effect: &Effect, clause_text: &str) -> ExileConcealment {
+    use nom::branch::alt;
+    use nom::bytes::complete::tag;
+    use nom::character::complete::{char, space0};
+    use nom::combinator::{eof, opt, value};
+    use nom::Parser;
+
+    let into_exile = matches!(
+        effect,
+        Effect::ChangeZone {
+            destination: Zone::Exile,
+            ..
+        } | Effect::ChangeZoneAll {
+            destination: Zone::Exile,
+            ..
+        }
+    );
+    if !into_exile {
+        return ExileConcealment::Public;
+    }
+    let lower = clause_text.to_ascii_lowercase();
+    // "face down" closing the clause: only terminal punctuation may follow, so
+    // a mid-clause "face down" (a battlefield profile, "turn it face down")
+    // never matches.
+    let trailing_face_down =
+        crate::parser::oracle_nom::primitives::scan_at_word_boundaries(&lower, |input| {
+            value(
+                (),
+                (
+                    tag("face down"),
+                    space0,
+                    opt(alt((char('.'), char(',')))),
+                    space0,
+                    eof,
+                ),
+            )
+            .parse(input)
+        })
+        .is_some();
+    ExileConcealment::from(trailing_face_down)
 }
 
 #[cfg(test)]

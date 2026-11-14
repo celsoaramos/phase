@@ -448,6 +448,108 @@ fn parse_chosen_cards_reference(input: &str) -> Result<(&str, ()), nom::Err<Orac
     .parse(input)
 }
 
+/// CR 614.1c + CR 614.12: "it enters with <count> additional <kind> counter(s)
+/// on it if it's a/an <type>", one or more riders joined by " and ", with an
+/// optional shared ", where x is <quantity>". `x` without a binding is the
+/// announced X. Each rider gates on the moved object's characteristics.
+fn parse_typed_entry_counter_riders(
+    lower: &str,
+) -> Option<Vec<(TargetFilter, CounterType, QuantityExpr)>> {
+    let trimmed = lower.trim().trim_end_matches('.');
+    let (body, where_x) = match trimmed.find(", where x is ") {
+        Some(at) => (&trimmed[..at], Some(&trimmed[at + ", where x is ".len()..])),
+        None => (trimmed, None),
+    };
+    let x_quantity = match where_x {
+        Some(text) => {
+            let text = text.trim();
+            Some(
+                crate::parser::oracle_quantity::parse_cda_quantity(text).or_else(|| {
+                    crate::parser::oracle_quantity::parse_quantity_ref(text)
+                        .map(|qty| QuantityExpr::Ref { qty })
+                })?,
+            )
+        }
+        None => None,
+    };
+    let (rest, _) = tag::<_, _, OracleError<'_>>("it enters with ")
+        .parse(body)
+        .ok()?;
+    let mut riders = Vec::new();
+    let mut input = rest;
+    loop {
+        let (r, count) = alt((
+            value(None, tag::<_, _, OracleError<'_>>("x additional ")),
+            value(Some(1u32), tag("an additional ")),
+            map(
+                terminated(nom_primitives::parse_number, tag(" additional ")),
+                Some,
+            ),
+        ))
+        .parse(input)
+        .ok()?;
+        let (r, counter_type) = nom_primitives::parse_counter_type_typed(r).ok()?;
+        let (r, _) = alt((
+            tag::<_, _, OracleError<'_>>(" counters on it if it's "),
+            tag(" counter on it if it's "),
+        ))
+        .parse(r)
+        .ok()?;
+        let (r, _) = alt((tag::<_, _, OracleError<'_>>("an "), tag("a ")))
+            .parse(r)
+            .ok()?;
+        let (type_text, after) = match r.find(" and ") {
+            Some(at) => (&r[..at], Some(&r[at + " and ".len()..])),
+            None => (r, None),
+        };
+        let (filter, leftover) = parse_type_phrase_folding(type_text);
+        if !leftover.trim().is_empty() || matches!(filter, TargetFilter::Any | TargetFilter::None) {
+            return None;
+        }
+        let count = match count {
+            Some(n) => QuantityExpr::Fixed { value: n as i32 },
+            None => x_quantity.clone().unwrap_or(QuantityExpr::Ref {
+                qty: QuantityRef::Variable {
+                    name: "X".to_string(),
+                },
+            }),
+        };
+        riders.push((filter, counter_type, count));
+        match after {
+            Some(next) => input = next,
+            None => break,
+        }
+    }
+    // A single fixed-count rider is the existing anaphoric voice; leave it to
+    // its own path so its gating and swallow detection stay unchanged.
+    let only_existing_voice =
+        riders.len() == 1 && where_x.is_none() && matches!(riders[0].2, QuantityExpr::Fixed { .. });
+    (!only_existing_voice).then_some(riders)
+}
+
+/// "[then] put the rest into your hand|graveyard[.]" — the whole clause, nothing
+/// after it. Returns the destination and the order rule shared with the other
+/// rest arms.
+fn parse_then_put_rest_into(lower: &str) -> Option<(Zone, DigRestOrder)> {
+    let trimmed = lower.trim();
+    let (rest, _) = opt(tag::<_, _, OracleError<'_>>("then "))
+        .parse(trimmed)
+        .ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>("put ").parse(rest).ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>("the rest").parse(rest).ok()?;
+    let (rest, destination) = alt((
+        value(Zone::Hand, tag::<_, _, OracleError<'_>>(" into your hand")),
+        value(Zone::Graveyard, tag(" into your graveyard")),
+    ))
+    .parse(rest)
+    .ok()?;
+    let (rest, _) = opt(tag::<_, _, OracleError<'_>>(".")).parse(rest).ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    Some((destination, DigRestOrder::Preserve))
+}
+
 pub(super) fn parse_rest_cards_reference(
     input: &str,
 ) -> Result<(&str, ()), nom::Err<OracleError<'_>>> {
@@ -1397,13 +1499,20 @@ fn parse_exile_n_of_them_face_down(lower: &str) -> Option<(u32, Vec<(CounterType
     // CR 701.20e + CR 406.3: "exile <number> of them|those cards face down" — the number
     // axis is the shared `parse_number` ("one" for Gonti, "two" for Black Cat), never
     // a per-count tag. Zero is not an exile instruction.
-    let (rest, (_, count, _, _, _, _)) = (
+    //
+    // The "of them" partitive is optional: Clone Shell prints the elided form
+    // "look at the top four cards of your library, exile one face down" — the
+    // same choice of one looked-at card. The private-`Dig` antecedent the caller
+    // requires is what scopes the bare number to the looked-at cards.
+    let (rest, (_, count, _, _)) = (
         tag::<_, _, OracleError<'_>>("exile "),
         verify(nom_primitives::parse_number, |n: &u32| *n >= 1),
         multispace1,
-        tag("of "),
-        alt((tag("them"), tag("those cards"))),
-        multispace1,
+        opt((
+            tag("of "),
+            alt((tag("them"), tag("those cards"))),
+            multispace1,
+        )),
     )
         .parse(trimmed)
         .ok()?;
@@ -6031,6 +6140,33 @@ pub(super) fn apply_clause_continuation(
                 }
             }
         }
+        ContinuationAst::PutIteratedRemainder { destination } => {
+            // CR 118.12 + CR 608.2c: an independent instruction, so it still
+            // runs when the iteration's unless cost was paid (a paid cost
+            // suppresses only the guarded move and its dependent steps).
+            let mut remainder = AbilityDefinition::new(
+                kind,
+                Effect::ChangeZone {
+                    actor: crate::types::ability::LibraryInstructionActor::Controller,
+                    library_shuffle: Default::default(),
+                    origin: Some(Zone::Library),
+                    destination,
+                    target: TargetFilter::ParentTarget,
+                    owner_library: false,
+                    enter_transformed: false,
+                    enters_under: None,
+                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                    enters_attacking: false,
+                    up_to: false,
+                    enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![],
+                    face_down_profile: None,
+                    enters_modified_if: None,
+                },
+            );
+            remainder.sub_link = crate::types::ability::SubAbilityLink::SequentialSibling;
+            defs.push(remainder);
+        }
         ContinuationAst::PutRest {
             destination,
             reorder_all,
@@ -7169,6 +7305,18 @@ pub(super) fn apply_clause_continuation(
                 enter_with_counters.push((counter_type, count));
             }
         }
+        ContinuationAst::TypedEntryCounterRiders { riders } => {
+            if let Some(previous) = defs.last_mut() {
+                if let Effect::ChangeZone {
+                    destination: Zone::Battlefield,
+                    conditional_enter_with_counters,
+                    ..
+                } = &mut *previous.effect
+                {
+                    conditional_enter_with_counters.extend(riders);
+                }
+            }
+        }
         ContinuationAst::PutCountersOnLastCreated {
             counter_type,
             count,
@@ -7893,6 +8041,7 @@ pub(super) fn continuation_absorbs_current(
         // rider is always absorbed into that effect (never a standalone effect).
         ContinuationAst::ExcessDamageToController { .. } => true,
         ContinuationAst::PutRest { .. } => true,
+        ContinuationAst::PutIteratedRemainder { .. } => true,
         // CR 701.20a + CR 701.20e: recognition is gated on a preceding reveal
         // instruction, and lowering appends the explicit `LastRevealed`
         // complement move as its own instruction.
@@ -7912,6 +8061,7 @@ pub(super) fn continuation_absorbs_current(
         ContinuationAst::BecomesForetold => true,
         ContinuationAst::EntersTappedAttacking { .. } => true,
         ContinuationAst::TokenEntersWithCounters { .. } => true,
+        ContinuationAst::TypedEntryCounterRiders { .. } => true,
         // CR 608.2c: recognition was gated on a preceding Token effect, and the
         // lowering appends the placement under it (or fails closed).
         ContinuationAst::PutCountersOnLastCreated { .. } => true,
@@ -9881,6 +10031,28 @@ pub(super) fn parse_followup_continuation_ast_with_search_destination(
                     .expect("guard parsed position"),
             })
         }
+        // CR 608.2c + CR 701.20e: Moonlight Bargain — "Look at the top five
+        // cards of your library. For each card, put that card into your
+        // graveyard unless you pay 2 life. Then put the rest into your hand."
+        // The per-card move iterates the looked-at cards (`ParentTarget`); "the
+        // rest" is the looked-at cards the loop left in the library. A
+        // member-driven loop repeats its whole chain, so a once-after-the-loop
+        // sibling is not expressible here; the remainder move runs per
+        // iteration instead, from the library only (see
+        // `ContinuationAst::PutIteratedRemainder`). Before this arm the
+        // sentence fell to the imperative "the rest" route, which read an exile
+        // tracked set and moved nothing — the paid-for cards stayed in the
+        // library.
+        Effect::ChangeZone {
+            target: TargetFilter::ParentTarget,
+            destination,
+            ..
+        } if *destination != Zone::Library
+            && parse_then_put_rest_into(&lower).is_some() =>
+        {
+            let (destination, _) = parse_then_put_rest_into(&lower).expect("guard matched");
+            Some(ContinuationAst::PutIteratedRemainder { destination })
+        }
         Effect::ChangeZone { .. } | Effect::ChooseFromZone { .. }
             if parse_becomes_foretold_continuation(&lower) =>
         {
@@ -10363,6 +10535,14 @@ pub(super) fn parse_followup_continuation_ast_with_search_destination(
         } if matches_put_rest_on_bottom_line(&lower) =>
         {
             Some(ContinuationAst::PutChoiceRemainderOnBottom)
+        }
+        // CR 614.1c + CR 614.12: type-gated entry-counter riders with a shared
+        // "where X is" (Chief Montgomery Scott).
+        Effect::ChangeZone {
+            destination: Zone::Battlefield,
+            ..
+        } if let Some(riders) = parse_typed_entry_counter_riders(&lower) => {
+            Some(ContinuationAst::TypedEntryCounterRiders { riders })
         }
         // CR 614.12 + CR 122.6: an unconditional "… enters with … counter(s) on it"
         // rider after a battlefield mover becomes that mover's own entry counters.
@@ -18180,6 +18360,17 @@ mod tests {
             Some((3, Vec::new()))
         );
         assert!(parse_exile_n_of_them_face_down("exile 0 of them face down").is_none());
+    }
+
+    /// Clone Shell: "look at the top four cards of your library, exile one face
+    /// down" elides the "of them" partitive — still a choice of one looked-at card.
+    #[test]
+    fn exile_one_face_down_without_partitive_captures_the_count() {
+        assert_eq!(
+            parse_exile_n_of_them_face_down("exile one face down"),
+            Some((1, Vec::new()))
+        );
+        assert!(parse_exile_n_of_them_face_down("exile one").is_none());
     }
 
     /// Black Cat: "exile two of them face down" after a private `Dig` is the plural

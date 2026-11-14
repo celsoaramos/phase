@@ -123,6 +123,14 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     let normalized = replace_self_refs(&text, card_name);
     let norm_lower = normalized.to_lowercase();
 
+    // The printed Devour shape ("As ~ enters, you may sacrifice any number of
+    // … . If you do, it enters with twice that many +1/+1 counters on it.")
+    // reads both sentences into one replacement, so it dispatches above the
+    // enters-with gate below.
+    if let Some(def) = parse_as_enters_sacrifice_for_counters(&norm_lower, &text) {
+        return Some(def);
+    }
+
     // CR 614.1c + CR 608.2c: a line of several sentences whose enters-with
     // sentence names this object or a distributive subset is the enters-with
     // parser's, and it fails closed there (`EntersWithGap::Clause`). Decline it
@@ -1427,6 +1435,122 @@ fn parse_as_enters_exile_from_graveyards(
                 decline: None, // No decline branch — enters normally if declined
             })
             .execute(continuation)
+            .valid_card(TargetFilter::SelfRef)
+            // CR 614.1c: battlefield-entry-scoped (see destination-gate note above).
+            .destination_zone(Zone::Battlefield)
+            .description(original_text.to_string()),
+    )
+}
+
+/// CR 614.1c + CR 614.12a: the printed Devour shape — "As ~ enters, you may
+/// sacrifice any number of [permanents]. If you do, it enters with twice that
+/// many +1/+1 counters on it." (Devouring Hellion) or "… with N +1/+1 counters
+/// on it for each [permanent] sacrificed this way."
+///
+/// Lowers to the same replacement `synthesize_devour` builds for the keyword
+/// (CR 702.82a): a `Moved` replacement on `SelfRef` whose execute is the ranged
+/// "sacrifice any number" choice (`min_count: 0` — an empty choice is the
+/// decline) chained to a `PutCounter` on `SelfRef` of `factor ×` the number
+/// sacrificed (`PreviousEffectCount`, stamped by the ranged Sacrifice).
+///
+/// The line has two sentences, so it must be dispatched above the
+/// line-owned enters-with gate (`is_line_owned_enters_with_clause`).
+fn parse_as_enters_sacrifice_for_counters(
+    norm_lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    let (rest, _) = (
+        tag::<_, _, OracleError<'_>>("as "),
+        alt((
+            tag("~ enters, "),
+            tag("this creature enters, "),
+            tag("this permanent enters, "),
+        )),
+        tag("you may "),
+    )
+        .parse(norm_lower)
+        .ok()?;
+    let (_, (sacrifice_text, continuation)) =
+        nom_primitives::split_once_on(rest, ". if you do, ").ok()?;
+    if !sacrifice_text.starts_with("sacrifice any number of ") {
+        return None;
+    }
+
+    // The counter clause: the per-sacrifice factor, either as a multiple of
+    // "that many" or as "N counter(s) … for each [permanent] sacrificed this way".
+    fn counter_factor(input: &str) -> OracleResult<'_, u32> {
+        let multiple_of_that_many = terminated(
+            alt((
+                value(2u32, tag("twice that many")),
+                terminated(nom_primitives::parse_number, tag(" times that many")),
+                value(1u32, tag("that many")),
+            )),
+            tag(" +1/+1 counters on it"),
+        );
+        let for_each_sacrificed = terminated(
+            alt((
+                value(1u32, alt((tag("a +1/+1 counter"), tag("an +1/+1 counter")))),
+                terminated(nom_primitives::parse_number, tag(" +1/+1 counters")),
+            )),
+            (
+                tag(" on it for each "),
+                take_until(" sacrificed this way"),
+                tag(" sacrificed this way"),
+            ),
+        );
+        alt((multiple_of_that_many, for_each_sacrificed)).parse(input)
+    }
+    let (_, factor) = all_consuming(delimited(
+        alt((
+            tag::<_, _, OracleError<'_>>("it enters with "),
+            tag("~ enters with "),
+        )),
+        counter_factor,
+        opt(tag(".")),
+    ))
+    .parse(continuation.trim_end())
+    .ok()?;
+    if factor == 0 {
+        return None;
+    }
+
+    // The ranged sacrifice choice, read by the shared imperative parser.
+    let sacrifice = parse_effect_chain(sacrifice_text, AbilityKind::Spell);
+    if sacrifice.sub_ability.is_some() || sacrifice.condition.is_some() {
+        return None;
+    }
+    let Effect::Sacrifice {
+        count: QuantityExpr::UpTo { .. },
+        min_count: 0,
+        ..
+    } = &*sacrifice.effect
+    else {
+        return None;
+    };
+
+    let sacrificed = QuantityExpr::Ref {
+        qty: QuantityRef::PreviousEffectCount,
+    };
+    let count = if factor == 1 {
+        sacrificed
+    } else {
+        QuantityExpr::Multiply {
+            factor: factor as i32,
+            inner: Box::new(sacrificed),
+        }
+    };
+    let execute = sacrifice.sub_ability(AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count,
+            target: TargetFilter::SelfRef,
+        },
+    ));
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::Moved)
+            .execute(execute)
             .valid_card(TargetFilter::SelfRef)
             // CR 614.1c: battlefield-entry-scoped (see destination-gate note above).
             .destination_zone(Zone::Battlefield)
@@ -21406,6 +21530,73 @@ mod tests {
                     }
                 ),
                 "{name}: execute is the any-amount life payment"
+            );
+        }
+    }
+
+    /// CR 614.1c + CR 702.82a: the printed Devour shape (Devouring Hellion) is
+    /// one `Moved` self-replacement — the ranged sacrifice chained to
+    /// `factor ×` the number sacrificed in +1/+1 counters — not the
+    /// `enters_with_clause` gap. Covers the "twice that many" and the
+    /// "for each … sacrificed this way" counter clauses.
+    #[test]
+    fn as_enters_sacrifice_any_number_for_counters_builds_devour_replacement() {
+        for (line, factor) in [
+            (
+                "As this creature enters, you may sacrifice any number of creatures and/or \
+                 planeswalkers. If you do, it enters with twice that many +1/+1 counters on it.",
+                2,
+            ),
+            (
+                "As this creature enters, you may sacrifice any number of creatures. If you \
+                 do, it enters with three +1/+1 counters on it for each creature sacrificed \
+                 this way.",
+                3,
+            ),
+            (
+                "As this creature enters, you may sacrifice any number of artifacts. If you \
+                 do, it enters with that many +1/+1 counters on it.",
+                1,
+            ),
+        ] {
+            let def = parse_replacement_line(line, "Devouring Hellion")
+                .unwrap_or_else(|| panic!("{line}: must produce a replacement"));
+            assert_eq!(def.event, ReplacementEvent::Moved, "{line}");
+            assert_eq!(def.valid_card, Some(TargetFilter::SelfRef), "{line}");
+            assert_eq!(def.destination_zone, Some(Zone::Battlefield), "{line}");
+            let execute = def.execute.as_ref().unwrap();
+            assert!(
+                matches!(
+                    *execute.effect,
+                    Effect::Sacrifice {
+                        count: QuantityExpr::UpTo { .. },
+                        min_count: 0,
+                        ..
+                    }
+                ),
+                "{line}: execute is the ranged sacrifice, got {:?}",
+                execute.effect
+            );
+            let sacrificed = QuantityExpr::Ref {
+                qty: QuantityRef::PreviousEffectCount,
+            };
+            let expected = if factor == 1 {
+                sacrificed
+            } else {
+                QuantityExpr::Multiply {
+                    factor,
+                    inner: Box::new(sacrificed),
+                }
+            };
+            let sub = execute.sub_ability.as_ref().expect("counter placement");
+            assert_eq!(
+                *sub.effect,
+                Effect::PutCounter {
+                    counter_type: CounterType::Plus1Plus1,
+                    count: expected,
+                    target: TargetFilter::SelfRef,
+                },
+                "{line}"
             );
         }
     }

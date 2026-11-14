@@ -563,6 +563,13 @@ pub(crate) enum ContinuationAst {
     ///
     /// `reorder_all` covers "put them back in any order": all looked-at cards
     /// stay in the library, and the submitted selection order becomes top order.
+    /// CR 608.2c + CR 701.20e: "Then put the rest into <zone>" after a per-card
+    /// loop over looked-at cards (Moonlight Bargain: "For each card, put that
+    /// card into your graveyard unless you pay 2 life. Then put the rest into
+    /// your hand."). Lowered as a per-iteration move of the current card from
+    /// the library: a card the loop already moved fails the origin check, so
+    /// exactly the remainder reaches `destination`.
+    PutIteratedRemainder { destination: Zone },
     PutRest {
         destination: Zone,
         reorder_all: bool,
@@ -686,6 +693,14 @@ pub(crate) enum ContinuationAst {
     TokenEntersWithCounters {
         counter_type: CounterType,
         count: QuantityExpr,
+    },
+    /// CR 614.1c + CR 614.12: "It enters with <N|X> additional <kind> counters
+    /// on it if it's a <type> [and <N|X> additional <kind> counters on it if
+    /// it's a <type>][, where X is …]" after a battlefield mover (Chief
+    /// Montgomery Scott). Each rider gates on the moved object's type and
+    /// patches the mover's `conditional_enter_with_counters`.
+    TypedEntryCounterRiders {
+        riders: Vec<(TargetFilter, CounterType, QuantityExpr)>,
     },
     /// CR 608.2c + CR 122.1: imperative "put N <type> counter(s) on it" after a
     /// create-token clause — a separate, later instruction on the token(s) that
