@@ -54,7 +54,7 @@ use crate::types::ability_visit::{
 };
 use crate::types::game_state_kinds::RetargetScope;
 use crate::types::keywords::{Keyword, WardCost};
-use crate::types::mana::{ManaCost, ManaExpiry, ManaSpellGrant};
+use crate::types::mana::{ManaColor, ManaCost, ManaExpiry, ManaSpellGrant};
 use crate::types::replacements::ReplacementEvent;
 use crate::types::statics::ActivationExemption;
 use crate::types::statics::{CastCostMode, StaticMode};
@@ -4100,6 +4100,90 @@ fn any_ability_has_plotted_grant(parsed: &ParsedAbilities) -> bool {
             .any(|t| t.execute.as_deref().is_some_and(def_tree_has_plotted_grant))
 }
 
+/// CR 105.2 + CR 613.1f: "Each creature you control has vigilance if it's white,
+/// hexproof if it's blue, …" (Scion of Draco). Each "<keyword> if it's <color>" pair is
+/// a per-object COLOR filter, not a game-state condition: the parser lowers it to one
+/// `Continuous` static per pair whose `affected` carries `HasColor(<color>)` and whose
+/// modification is `AddKeyword`. Returns the colors of the sentence when it is exactly
+/// that list, anchored at both ends.
+fn parse_color_conditional_keyword_list(
+    input: &str,
+) -> nom::IResult<&str, Vec<ManaColor>, OracleError<'_>> {
+    fn color(input: &str) -> nom::IResult<&str, ManaColor, OracleError<'_>> {
+        alt((
+            value(ManaColor::White, tag("white")),
+            value(ManaColor::Blue, tag("blue")),
+            value(ManaColor::Black, tag("black")),
+            value(ManaColor::Red, tag("red")),
+            value(ManaColor::Green, tag("green")),
+        ))
+        .parse(input)
+    }
+    fn pair(input: &str) -> nom::IResult<&str, ManaColor, OracleError<'_>> {
+        let (rest, _) = take_until(" if it's ").parse(input)?;
+        let (rest, _) = tag(" if it's ").parse(rest)?;
+        color(rest)
+    }
+    let (rest, _) = tag("each creature you control has ").parse(input)?;
+    let (mut rest, first) = pair(rest)?;
+    let mut colors = vec![first];
+    loop {
+        let Ok((after_sep, _)) = alt((
+            tag::<_, _, OracleError<'_>>(", and "),
+            tag(", "),
+            tag(" and "),
+        ))
+        .parse(rest) else {
+            break;
+        };
+        let (after_pair, next) = pair(after_sep)?;
+        colors.push(next);
+        rest = after_pair;
+    }
+    let (rest, _) = opt(tag(".")).parse(rest)?;
+    let (rest, _) = multispace0.parse(rest)?;
+    let (rest, _) = eof.parse(rest)?;
+    Ok((rest, colors))
+}
+
+/// True when every "if" sentence of the unit is a color-conditional keyword list whose
+/// every color has its own `HasColor` + `AddKeyword` static among the parsed statics.
+fn color_conditional_keyword_grant_is_only_if_marker(
+    stripped: &str,
+    parsed: &ParsedAbilities,
+) -> bool {
+    let granted_colors: Vec<ManaColor> = parsed
+        .statics
+        .iter()
+        .filter(|s| {
+            s.modifications
+                .iter()
+                .any(|m| matches!(m, ContinuousModification::AddKeyword { .. }))
+        })
+        .filter_map(|s| match &s.affected {
+            Some(TargetFilter::Typed(typed)) => typed.properties.iter().find_map(|p| match p {
+                FilterProp::HasColor { color } => Some(*color),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect();
+    let mut saw_list = false;
+    for sentence in split_sentence_units(stripped) {
+        if !scan_contains(sentence, "if ") {
+            continue;
+        }
+        let Ok((_, colors)) = parse_color_conditional_keyword_list(sentence) else {
+            return false;
+        };
+        if !colors.iter().all(|c| granted_colors.contains(c)) {
+            return false;
+        }
+        saw_list = true;
+    }
+    saw_list
+}
+
 fn plotted_grant_linkage_is_only_if_marker(stripped: &str) -> bool {
     let has_plot_link = stripped.contains("if you do, it becomes plotted"); // allow-noncombinator: swallow detector marker scan on classified text
     if !has_plot_link {
@@ -4972,6 +5056,11 @@ fn detect_condition_if(
     // the "if you do" is the optional-exile linkage, represented by the
     // chained `Plotted` casting-permission grant (see `any_ability_has_plotted_grant`).
     if any_ability_has_plotted_grant(parsed) && plotted_grant_linkage_is_only_if_marker(&stripped) {
+        return;
+    }
+    // CR 105.2 + CR 613.1f: "has <keyword> if it's <color>, …" (Scion of Draco) is a
+    // per-object color filter on each lowered keyword-grant static, not a condition.
+    if color_conditional_keyword_grant_is_only_if_marker(&stripped, parsed) {
         return;
     }
     // CR 608.2c + CR 701.20: "you may look at the top N cards ... If you do,
