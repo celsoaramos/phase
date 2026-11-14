@@ -5408,6 +5408,7 @@ fn fmt_static_condition(cond: &StaticCondition) -> String {
         SC::UnlessPay { .. } => "unless a cost is paid".into(),
         SC::Unrecognized { .. } => "unrecognized".into(),
         SC::DuringYourTurn => "during your turn".into(),
+        SC::DuringYourEndStep => "during your end step".into(),
         SC::DuringOpponentsTurn => "during an opponent's turn".into(),
         SC::SharesColorWithMostCommonColorAmongPermanents => {
             "shares a color with the most common color among all permanents".into()
@@ -11536,6 +11537,7 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::DuringYourTurn => ("DuringYourTurn", Handled),
         StaticCondition::FirstCombatPhaseOfTurn => ("FirstCombatPhaseOfTurn", Handled),
         StaticCondition::DuringOpponentsTurn => ("DuringOpponentsTurn", Handled),
+        StaticCondition::DuringYourEndStep => ("DuringYourEndStep", Handled),
         StaticCondition::DayNightIs { .. } => ("DayNightIs", Handled),
         StaticCondition::SharesColorWithMostCommonColorAmongPermanents => {
             ("SharesColorWithMostCommonColorAmongPermanents", Handled)

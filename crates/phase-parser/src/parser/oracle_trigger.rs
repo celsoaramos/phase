@@ -7195,6 +7195,7 @@ pub fn static_condition_to_trigger_condition(sc: &StaticCondition) -> Option<Tri
         StaticCondition::DuringOpponentsTurn => Some(TriggerCondition::DuringPlayersTurn {
             player: PlayerFilter::Opponent,
         }),
+        StaticCondition::DuringYourEndStep => None,
         // CR 500.8 + CR 506.1 + CR 608.2c: the phase-occurrence gate maps to its
         // trigger-condition sibling (the possessive composition arrives as an
         // `And`, bridged recursively).

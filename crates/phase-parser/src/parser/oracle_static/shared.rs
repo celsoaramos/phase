@@ -1230,6 +1230,7 @@ impl<'a> ZoneConditionNode<'a> {
             | StaticCondition::DuringYourTurn
             | StaticCondition::FirstCombatPhaseOfTurn
             | StaticCondition::DuringOpponentsTurn
+            | StaticCondition::DuringYourEndStep
             | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
             | StaticCondition::SourceEnteredThisTurn
             | StaticCondition::SourceHasDealtDamage

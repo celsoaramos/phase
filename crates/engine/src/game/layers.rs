@@ -2284,6 +2284,7 @@ fn static_condition_uses_object_population(condition: &StaticCondition) -> bool 
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::DuringYourTurn
         | StaticCondition::DuringOpponentsTurn
+        | StaticCondition::DuringYourEndStep
         | StaticCondition::SourceEnteredThisTurn
         | StaticCondition::SourceHasDealtDamage
         | StaticCondition::SourceExertedThisTurn
@@ -2455,6 +2456,7 @@ fn static_condition_characteristic_reads_at(
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::DuringYourTurn
         | StaticCondition::DuringOpponentsTurn
+        | StaticCondition::DuringYourEndStep
         | StaticCondition::SourceEnteredThisTurn
         | StaticCondition::SourceHasDealtDamage
         | StaticCondition::SourceExertedThisTurn
@@ -2587,6 +2589,7 @@ fn entered_object_perturbs_static_condition(
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::DuringYourTurn
         | StaticCondition::DuringOpponentsTurn
+        | StaticCondition::DuringYourEndStep
         | StaticCondition::SourceEnteredThisTurn
         | StaticCondition::SourceHasDealtDamage
         | StaticCondition::SourceExertedThisTurn
@@ -2849,6 +2852,18 @@ fn evaluate_condition_inner(
                     .unwrap_or(controller)
             });
             super::players::is_opponent(state, source_controller, state.active_player)
+        }
+        // CR 513.1: "During your end step" — the controller's own turn, in its End phase.
+        StaticCondition::DuringYourEndStep => {
+            let source_controller = context.ability_holder.unwrap_or_else(|| {
+                state
+                    .objects
+                    .get(&source_id)
+                    .map(|obj| obj.controller)
+                    .unwrap_or(controller)
+            });
+            state.phase == crate::types::phase::Phase::End
+                && state.active_player == source_controller
         }
         // CR 500.8 + CR 506.1 + CR 608.2c: the first combat phase of the turn
         // must be the phase in progress (shared predicate; the composed
@@ -5520,6 +5535,7 @@ fn static_condition_reads_life(condition: &StaticCondition) -> bool {
         | StaticCondition::Unrecognized { .. }
         | StaticCondition::DuringYourTurn
         | StaticCondition::DuringOpponentsTurn
+        | StaticCondition::DuringYourEndStep
         | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
         | StaticCondition::SourceEnteredThisTurn
         | StaticCondition::SourceHasDealtDamage

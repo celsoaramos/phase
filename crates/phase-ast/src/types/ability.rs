@@ -17665,6 +17665,10 @@ pub enum StaticCondition {
     /// `Not(DuringYourTurn)`: in team games, a teammate may be the active
     /// player while the controller's team still has the turn.
     DuringOpponentsTurn,
+    /// CR 513.1 + CR 102.1: It is the end step of a turn whose active player is
+    /// the controller of this static ability ("During your end step, …" —
+    /// Zurgo, Thunder's Decree).
+    DuringYourEndStep,
     /// CR 105.2 + CR 611.3a: True when the source permanent shares a color with
     /// the most common color among all permanents on the battlefield (including
     /// any color tied for most common). Used by Heroic Defiance's "gets +3/+3
@@ -17906,6 +17910,7 @@ impl StaticCondition {
             | StaticCondition::Unrecognized { .. }
             | StaticCondition::DuringYourTurn
             | StaticCondition::DuringOpponentsTurn
+            | StaticCondition::DuringYourEndStep
             | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
             | StaticCondition::SourceEnteredThisTurn
             | StaticCondition::SourceHasDealtDamage
@@ -18020,6 +18025,7 @@ impl StaticCondition {
             | StaticCondition::Unrecognized { .. }
             | StaticCondition::DuringYourTurn
             | StaticCondition::DuringOpponentsTurn
+            | StaticCondition::DuringYourEndStep
             | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
             | StaticCondition::SourceEnteredThisTurn
             | StaticCondition::SourceHasDealtDamage
@@ -18257,6 +18263,7 @@ impl StaticCondition {
             | StaticCondition::Unrecognized { .. }
             | StaticCondition::DuringYourTurn
             | StaticCondition::DuringOpponentsTurn
+            | StaticCondition::DuringYourEndStep
             | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
             | StaticCondition::SourceEnteredThisTurn
             | StaticCondition::SourceHasDealtDamage
@@ -18379,6 +18386,7 @@ impl StaticCondition {
             | StaticCondition::Unrecognized { .. }
             | StaticCondition::DuringYourTurn
             | StaticCondition::DuringOpponentsTurn
+            | StaticCondition::DuringYourEndStep
             | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
             | StaticCondition::SourceEnteredThisTurn
             | StaticCondition::SourceHasDealtDamage

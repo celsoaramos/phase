@@ -81,6 +81,18 @@ pub fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) -> Opti
         // `card_name` is empty (see `become_copy_except.rs::parse_name_override`).
         let (target_text, extra_keywords, additional_modifications) =
             split_token_except_clause(target_text, ctx);
+        // CR 508.4 + CR 506.3: a trailing "attacking that opponent / player" names the
+        // player the copy enters attacking (Mardu Siegebreaker: "create a tapped token
+        // that's a copy of the exiled card attacking that opponent"). It qualifies the
+        // ENTRY, not the copy source — left in the target phrase it turned "the exiled
+        // card" into an unresolvable tracked-set reference and dropped the attack flag.
+        let target_text = match strip_attacking_defender_suffix(target_text) {
+            Some(stripped) => {
+                enters_attacking = true;
+                stripped
+            }
+            None => target_text,
+        };
         let target_lower = target_text.trim().to_lowercase();
         let (mut target, target_remainder) = if parse_cost_paid_object_copy_target(&target_lower) {
             (TargetFilter::CostPaidObject, "")
@@ -223,6 +235,20 @@ pub(super) fn parse_copy_token_entry_modifiers(input: &str) -> OracleResult<'_, 
     ))
     .parse(rest)?;
     Ok((rest, flags))
+}
+
+/// Strip a trailing " attacking that opponent" / " attacking that player" from a
+/// copy-of-target phrase, returning the remaining target text.
+fn strip_attacking_defender_suffix(text: &str) -> Option<&str> {
+    let trimmed = text.trim_end().trim_end_matches('.');
+    let lower = trimmed.to_lowercase();
+    [" attacking that opponent", " attacking that player"]
+        .iter()
+        .find_map(|suffix| {
+            lower
+                .ends_with(suffix)
+                .then(|| &trimmed[..trimmed.len() - suffix.len()])
+        })
 }
 
 /// Parse an optional entry-state suffix after the copied-object target, such

@@ -42089,6 +42089,20 @@ fn sab_sunen_parity_gate_stays_unrecognized() {
     );
 }
 
+/// CR 701.21 + CR 513.1: Zurgo, Thunder's Decree — the "can't be sacrificed" grant
+/// belongs to the Warrior tokens, and only during the controller's end step.
+#[test]
+fn zurgo_end_step_warrior_tokens_cant_be_sacrificed() {
+    let def = parse_static_line(
+        "During your end step, Warrior tokens you control have \"This token can't be sacrificed.\"",
+    )
+    .expect("should parse");
+    assert_eq!(def.mode, StaticMode::Other("CantBeSacrificed".to_string()));
+    assert_eq!(def.condition, Some(StaticCondition::DuringYourEndStep));
+    assert_ne!(def.affected, Some(TargetFilter::SelfRef));
+    assert!(def.affected.is_some());
+}
+
 /// Every `GrantAbility` definition parsed out of `line`.
 fn granted_ability_definitions(line: &str) -> Vec<crate::types::ability::AbilityDefinition> {
     parse_static_line_multi(line)
