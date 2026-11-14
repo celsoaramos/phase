@@ -196,3 +196,92 @@ fn baleful_mastery_alternative_cost_makes_chosen_opponent_draw() {
         "draw must consume exactly one library card"
     );
 }
+
+/// CR 118.9 + CR 608.2c: casting for the PRINTED mana cost still exiles the
+/// target. The alternative-cost gate covers only the opponent's draw; the
+/// exile is the next instruction in written order and must resolve when the
+/// gate is false (MagicFinder field report, 2026-10-17: four lands tapped,
+/// spell went to the graveyard, creature stayed).
+#[test]
+fn baleful_mastery_printed_cost_still_exiles_without_draw() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P1, &["Opponent Draw"]);
+    let bear = scenario.add_creature(P1, "Grizzly Bear", 2, 2).id();
+
+    let mut spell_builder =
+        scenario.add_spell_to_hand_from_oracle(P0, "Baleful Mastery", true, BALEFUL_MASTERY_ORACLE);
+    spell_builder.with_mana_cost(ManaCost::Cost {
+        generic: 3,
+        shards: vec![ManaCostShard::Black],
+    });
+    let spell = spell_builder.id();
+
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Colorless, spell, false, vec![]),
+            ManaUnit::new(ManaType::Colorless, spell, false, vec![]),
+            ManaUnit::new(ManaType::Colorless, spell, false, vec![]),
+            ManaUnit::new(ManaType::Black, spell, false, vec![]),
+        ],
+    );
+
+    let mut runner = scenario.build();
+    let p1_hand_before = runner.state().players[P1.0 as usize].hand.len();
+    let card_id = runner.state().objects[&spell].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: spell,
+            card_id,
+            targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("cast should start");
+
+    for _ in 0..32 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OptionalCostChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalCost { pay: false })
+                    .expect("declining the alternative cost should succeed");
+            }
+            WaitingFor::TargetSelection { target_slots, .. } => {
+                assert_cast_target_slots(&target_slots);
+                runner
+                    .act(GameAction::SelectTargets {
+                        targets: vec![TargetRef::Object(bear)],
+                    })
+                    .expect("exile target selection should succeed");
+            }
+            WaitingFor::ManaPayment { .. } => {
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("mana payment should auto-finalize");
+            }
+            WaitingFor::NamedChoice { .. } => {
+                panic!("printed-cost cast must not ask for an opponent to draw");
+            }
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
+            WaitingFor::Priority { .. } => runner.pass_both_players(),
+            _ => runner.pass_both_players(),
+        }
+    }
+
+    assert_eq!(
+        runner.state().objects[&spell].zone,
+        Zone::Graveyard,
+        "the spell must have resolved"
+    );
+    assert_eq!(
+        runner.state().objects[&bear].zone,
+        Zone::Exile,
+        "printed-cost Baleful Mastery must still exile its target"
+    );
+    assert_eq!(
+        runner.state().players[P1.0 as usize].hand.len(),
+        p1_hand_before,
+        "no opponent draws when the alternative cost was not paid"
+    );
+}
