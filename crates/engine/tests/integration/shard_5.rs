@@ -191,6 +191,7 @@ mod stack_entry_declared_targets;
 mod stack_entry_node_reach;
 mod stack_object_keyword_grants;
 mod stack_session_batch_authority;
+mod star_athlete_decline_damage;
 mod stargaze_dynamic_keep;
 mod starting_intensity_keyword;
 mod starting_player_choice;
