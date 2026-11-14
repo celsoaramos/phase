@@ -44645,10 +44645,11 @@ fn try_parse_repeat_until_stop_conditions(
 ///   Grist and repeat this process"). The chunk loop emits the structural
 ///   repeat-directive node when the directive trails a comma-joined clause, so
 ///   it is reached only through that clause's gate (CR 608.2c).
-/// - `ConsumeOnly` — the "if you do" form (Primal Surge) and "any number of
-///   times" are recognized so the directive is consumed rather than producing an
-///   `Unimplemented` gap, but they set no predicate (their game-state-predicate
-///   semantics stay deferred).
+/// - `ConsumeOnly` — a capped "if you do" form and "any number of times" are
+///   recognized so the directive is consumed rather than producing an
+///   `Unimplemented` gap, but they set no predicate. (The uncapped "if you do"
+///   form — Primal Surge, Cultivator Colossus — is a `Continuation` gated on
+///   `OptionalEffectPerformed`.)
 #[derive(Debug)]
 enum RepeatProcessOutcome {
     Continuation(crate::types::ability::RepeatContinuation),
@@ -44667,7 +44668,10 @@ enum RepeatProcessOutcome {
 /// stripped via the shared condition helpers and threaded into a
 /// `WhileCondition` predicate; the trailing "once"/"N times" sets its
 /// `max_iterations` cap. With no condition, "you may repeat …" maps to
-/// `ControllerChoice`, the bare form is the structural `Bare` outcome (reached only through the gate of the comma-joined clause it trails), and the "if you do" forms are consumed only.
+/// `ControllerChoice`, "if you do, repeat …" to a `WhileCondition` on the
+/// process's own "you may" (`OptionalEffectPerformed`), and the bare form is the
+/// structural `Bare` outcome (reached only through the gate of the comma-joined
+/// clause it trails).
 fn try_parse_repeat_process_directive(
     text: &str,
     ctx: &mut ParseContext,
@@ -44708,8 +44712,8 @@ fn try_parse_repeat_process_directive(
     let body_lower = body.to_lowercase();
     let (parsed_directive, _) = nom_on_lower(body.as_str(), &body_lower, |i| {
         let (i, you_may) = opt(tag::<_, _, OracleError<'_>>("you may ")).parse(i)?;
-        // The bare/"if you do" forms have no condition and no "you may". The "if you do"
-        // form stays recognized consume-only so it doesn't leak Unimplemented gaps; the bare form is `Bare`.
+        // The bare/"if you do" forms have no condition and no "you may"; the bare
+        // form is `Bare`.
         let (i, if_you_do) = opt(alt((
             tag::<_, _, OracleError<'_>>("if you do, "),
             tag("if you do "),
@@ -44776,6 +44780,22 @@ fn try_parse_repeat_process_directive(
     if you_may {
         return Some(RepeatProcessOutcome::Continuation(
             RepeatContinuation::ControllerChoice,
+        ));
+    }
+    // CR 608.2c + CR 118.12: "If you do, repeat this process" (Cultivator Colossus,
+    // Primal Surge) re-follows the process while the process's own "you may"
+    // instruction was performed. The loop gate is the same `OptionalEffectPerformed`
+    // signal the "if you do" rider reads; the runtime evaluates it against the
+    // iteration that just resolved (`should_repeat_while_condition`), so declining —
+    // or having nothing left to put — ends the process.
+    if if_you_do && cap.is_none() {
+        return Some(RepeatProcessOutcome::Continuation(
+            RepeatContinuation::WhileCondition {
+                condition: Box::new(AbilityCondition::EffectOutcome {
+                    signal: EffectOutcomeSignal::OptionalEffectPerformed,
+                }),
+                max_iterations: None,
+            },
         ));
     }
     // CR 608.2c: an unconditional, mandatory "repeat this process once / twice /
@@ -48336,9 +48356,11 @@ fn parse_effect_chain_ir_body(
         //     while the leading condition holds, capped by the trailing count.
         //   - "you may repeat this process [any number of times]" → a
         //     per-iteration controller decision (`ControllerChoice`).
-        //   - bare / "if you do, repeat this process" — recognized and consumed
-        //     so the directive doesn't leak an `Unimplemented` gap, but it sets
-        //     no predicate (its game-state-predicate form stays deferred).
+        //   - "if you do, repeat this process" → `WhileCondition` on the
+        //     process's own "you may" (`OptionalEffectPerformed`).
+        //   - bare "repeat this process" — the structural `Bare` outcome when it
+        //     trails a comma-joined clause (reached only through that clause's
+        //     gate); after a sentence break it is consumed without a predicate.
         if let Some(outcome) = try_parse_repeat_process_directive(normalized_text, ctx) {
             match outcome {
                 RepeatProcessOutcome::Continuation(continuation) => {

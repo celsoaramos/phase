@@ -344,6 +344,7 @@ mod ichneumon_druid;
 mod identity_crisis_multi_zone_exile;
 mod idol_of_false_gods_counter_animation;
 mod if_you_do_declined_gate_later_instruction_p7;
+mod if_you_do_repeat_process;
 mod illuminated_folio_reveal_cost;
 mod incredible_hulk_enrage_attacking;
 mod indestructible_survives_destroy;
