@@ -254,10 +254,25 @@ fn classify(
     }
 }
 
+/// Interaction that answers the opponent's spells and permanents: removal,
+/// countermagic and bounce. Countering a spell or bouncing a creature is the
+/// control deck's "removal"; counting only destroy/damage left a 12-counter,
+/// 4-Unsummon blue deck with `removal_ratio` 0 and classified it as COMBO
+/// (`combo_score` 1.50 vs `control_score` 0.44: few creatures + card draw).
+/// Under the Combo multipliers a card in hand is worth 2.5 x `hand_size`
+/// (6.25 late) and the board half, so a resolved 4/4 flyer (4.2) scored
+/// BELOW the card it came from and the AI never cast a creature in the blue
+/// mirror (`ai-ladder --probe`, v0.102.0: Air Elemental resolved, tactical
+/// -2.05 against passing). Counted as interaction, the same deck is Control
+/// (1.39 vs 1.27), where the flyer is worth +0.9 over the card.
 fn is_removal_effect(effect: &Effect) -> bool {
     matches!(
         effect,
-        Effect::Destroy { .. } | Effect::DealDamage { .. } | Effect::DestroyAll { .. }
+        Effect::Destroy { .. }
+            | Effect::DealDamage { .. }
+            | Effect::DestroyAll { .. }
+            | Effect::Counter { .. }
+            | Effect::Bounce { .. }
     )
 }
 
@@ -364,6 +379,71 @@ mod tests {
         assert_eq!(profile.archetype, DeckArchetype::Control);
         assert!(profile.removal_ratio > 0.3);
         assert!(profile.draw_ratio > 0.3);
+    }
+
+    fn counter_entry(mv: u32) -> DeckEntry {
+        DeckEntry {
+            card: CardFace {
+                card_type: CardType {
+                    core_types: vec![CoreType::Instant],
+                    ..Default::default()
+                },
+                mana_cost: ManaCost::generic(mv),
+                abilities: vec![make_ability(Effect::Counter {
+                    target: TargetFilter::Any,
+                    source_rider: None,
+                    countered_spell_zone: None,
+                })],
+                ..Default::default()
+            },
+            count: 4,
+        }
+    }
+
+    fn bounce_entry(mv: u32) -> DeckEntry {
+        DeckEntry {
+            card: CardFace {
+                card_type: CardType {
+                    core_types: vec![CoreType::Instant],
+                    ..Default::default()
+                },
+                mana_cost: ManaCost::generic(mv),
+                abilities: vec![make_ability(Effect::Bounce {
+                    target: TargetFilter::Any,
+                    destination: None,
+                    selection: Default::default(),
+                })],
+                ..Default::default()
+            },
+            count: 4,
+        }
+    }
+
+    /// The duel-suite "Blue Control" shape: 12 counters, 4 bounce, 12 draw
+    /// spells and 8 creatures over 26 Islands. Countermagic and bounce are the
+    /// deck's removal; without them it classified as Combo and the eval priced
+    /// a card in hand above any creature it could become.
+    #[test]
+    fn classify_counter_and_bounce_control_deck_as_control_not_combo() {
+        let deck = vec![
+            counter_entry(2),
+            counter_entry(2),
+            counter_entry(2),
+            bounce_entry(1),
+            draw_entry(3),
+            draw_entry(1),
+            draw_entry(2),
+            creature_entry(5),
+            creature_entry(6),
+        ];
+        let profile = DeckProfile::analyze(&deck);
+        assert_eq!(
+            profile.archetype,
+            DeckArchetype::Control,
+            "counters and bounce are interaction: {:?}",
+            profile.classification
+        );
+        assert!(profile.removal_ratio > 0.4, "{}", profile.removal_ratio);
     }
 
     #[test]
