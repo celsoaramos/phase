@@ -25794,7 +25794,7 @@ fn resolve_mana_entry_counter_count(
     if matches!(
         count,
         QuantityExpr::Ref {
-            qty: QuantityRef::CommanderCastFromCommandZoneCount
+            qty: QuantityRef::CommanderCastFromCommandZoneCount { commander: None }
         }
     ) && cast_origin == Some(Zone::Command)
     {
@@ -25962,6 +25962,19 @@ fn apply_mana_spell_grants(
             let timestamp = state.next_timestamp() as u32;
             let resolved =
                 super::ability_utils::build_resolved_from_def(ability, unit.source_id, caster);
+            // CR 603.2 + CR 106.6: the trigger event is spending this mana to
+            // cast THIS spell, so "it"/"that spell" in the effect is the spell
+            // (Study Hall's per-commander cast count reads it through the
+            // trigger event).
+            let trigger_event = state
+                .objects
+                .get(&spell_id)
+                .map(|spell| GameEvent::SpellCast {
+                    card_id: spell.card_id,
+                    controller: caster,
+                    object_id: spell_id,
+                    cast_mana_value: None,
+                });
             super::triggers::defer_pending_trigger(
                 state,
                 super::triggers::PendingTrigger {
@@ -25972,7 +25985,7 @@ fn apply_mana_spell_grants(
                     timestamp,
                     target_constraints: Vec::new(),
                     distribute: None,
-                    trigger_event: None,
+                    trigger_event,
                     modal: None,
                     mode_abilities: vec![],
                     description: ability.description.clone(),
@@ -33042,8 +33055,13 @@ fn quantity_ref_reads_target_object(qty: &QuantityRef, read: TargetRead) -> bool
         | QuantityRef::ConvokedCreatureCount
         | QuantityRef::TimesCostPaidThisResolution
         | QuantityRef::ColorsInCommandersColorIdentity
-        | QuantityRef::CommanderCastFromCommandZoneCount
         | QuantityRef::VoteCount { .. } => false,
+        // CR 903.8: a per-commander count reads the target only through an
+        // `AbilityTarget` scope.
+        QuantityRef::CommanderCastFromCommandZoneCount { commander } => {
+            read.includes_bindable()
+                && *commander == Some(crate::types::ability::CastManaObjectScope::AbilityTarget)
+        }
     }
 }
 

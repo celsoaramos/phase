@@ -4452,6 +4452,20 @@ fn parse_type_phrase_folding_unbound<'a>(
         }
     }
 
+    // CR 301.5a + CR 303.4b + CR 701.3a: "<type> attached to a/an <type
+    // phrase>" — the bare postnominal INDEFINITE host form ("target Aura
+    // attached to a land", Savaen Elves). The relative-clause form ("that's
+    // attached to a creature") is `parse_attached_to_host_relative_clause_suffix`
+    // inside `parse_that_clause_suffix`.
+    {
+        let after_ws = lower[pos..].trim_start();
+        let ws = lower[pos..].len() - after_ws.len();
+        if let Some((prop, consumed)) = parse_attached_to_indefinite_host_suffix(after_ws, ctx) {
+            properties.push(prop);
+            pos += ws + consumed;
+        }
+    }
+
     // CR 700.9 (modified) + CR 109.4 (control): "<typed filter> other than ~"
     // excludes the ability source from the population. The `FilterProp::Another`
     // arm of `filter::matches_filter_prop` matches every object except the
@@ -7302,6 +7316,43 @@ fn parse_combat_relation_suffix(text: &str, ctx: &ParseContext) -> Option<(Filte
 /// postnominal "creature attacking your opponents"; both resolve to the same
 /// `Attacking { defender }` property, so the intro is stripped here rather than
 /// forking a second attacking grammar in the `that's`-clause path.
+/// CR 301.5a + CR 303.4b + CR 701.3a: bare postnominal "attached to a/an
+/// <type phrase>" → `FilterProp::AttachedTo { Host }` ("Destroy target Aura
+/// attached to a creature"). The "that's/that aren't attached to …" relative
+/// clauses are `parse_attached_to_host_relative_clause_suffix`.
+///
+/// Only the indefinite article opens the host: the anaphoric referents
+/// ("attached to it"/"that creature") need per-clause binding and stay with
+/// the effect layer, and "attached to enchanted player" has its own
+/// self-referential arm. A host that reads as a player ("attached to an
+/// opponent") is not an object host and declines. Returns the property and the
+/// bytes consumed from `text`.
+fn parse_attached_to_indefinite_host_suffix(
+    text: &str,
+    ctx: &mut ParseContext,
+) -> Option<(FilterProp, usize)> {
+    let (host_text, _) = (
+        tag::<_, _, OracleError<'_>>("attached to "),
+        peek(alt((tag("a "), tag("an ")))),
+    )
+        .parse(text)
+        .ok()?;
+    let (host, rest) = parse_type_phrase_folding_with_ctx(host_text, ctx);
+    if rest.len() == host_text.len()
+        || !super::oracle_effect::imperative::is_object_host_filter(&host)
+    {
+        return None;
+    }
+    Some((
+        FilterProp::AttachedTo {
+            to: AttachmentReferent::Host {
+                filter: Box::new(host),
+            },
+        },
+        text.len() - rest.len(),
+    ))
+}
+
 fn parse_attacking_defender_suffix(text: &str) -> Option<(FilterProp, usize)> {
     let trimmed_outer = text.trim_start();
     let trimmed = opt(alt((

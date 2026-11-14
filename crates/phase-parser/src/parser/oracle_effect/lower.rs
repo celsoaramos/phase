@@ -6206,7 +6206,7 @@ pub(super) fn strip_for_each_repeat_suffix(text: &str) -> (Option<QuantityExpr>,
             // fieldless-Investigate seam via `for_each_repeatable_repeat_for`.
             if matches!(
                 &qty,
-                QuantityRef::CommanderCastFromCommandZoneCount
+                QuantityRef::CommanderCastFromCommandZoneCount { .. }
                     | QuantityRef::SpellsCastBeforeTriggeringSpell { .. }
             ) || zada_repeat_for_implies_distinct_copy_targets(&QuantityExpr::Ref {
                 qty: qty.clone(),
@@ -18265,7 +18265,7 @@ mod dq_d_player_set_lift_tests {
             matches!(
                 qty,
                 Some(QuantityExpr::Ref {
-                    qty: QuantityRef::CommanderCastFromCommandZoneCount
+                    qty: QuantityRef::CommanderCastFromCommandZoneCount { .. }
                 })
             ),
             "CommanderCast lift must survive the refactor: {qty:?}"

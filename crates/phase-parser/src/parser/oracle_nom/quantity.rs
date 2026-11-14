@@ -7235,11 +7235,14 @@ fn parse_for_each_commander_cast_count(input: &str) -> OracleResult<'_, Quantity
     let (rest, _) = tag("time").parse(input)?;
     let (rest, _) = opt(tag("s")).parse(rest)?;
     let (rest, _) = tag(" ").parse(rest)?;
-    let (rest, _) = alt((
-        // CR 903.8: "a commander" / "your commander" both count the controller's
-        // command-zone casts; the resolver sums over every commander the player owns.
+    // CR 903.8: "you've cast your/a commander" sums every commander the
+    // controller owns; "it's been cast" names the ONE commander spell the
+    // trigger event carries (Study Hall: "When you spend this mana to cast your
+    // commander, scry X, where X is the number of times it's been cast from the
+    // command zone this game"), so a partner's casts are not added in.
+    let (rest, commander) = alt((
         value(
-            (),
+            None,
             (
                 alt((tag("you've"), tag("youve"))),
                 tag(" cast "),
@@ -7247,12 +7250,8 @@ fn parse_for_each_commander_cast_count(input: &str) -> OracleResult<'_, Quantity
                 tag(" commander"),
             ),
         ),
-        // CR 903.8: "it's been cast" — the anaphor is the commander spell the
-        // mana was just spent on (Study Hall: "When you spend this mana to cast
-        // your commander, scry X, where X is the number of times it's been cast
-        // from the command zone this game").
         value(
-            (),
+            Some(CastManaObjectScope::TriggeringSpell),
             (
                 alt((tag("it's been"), tag("its been"), tag("it has been"))),
                 tag(" cast"),
@@ -7261,7 +7260,10 @@ fn parse_for_each_commander_cast_count(input: &str) -> OracleResult<'_, Quantity
     ))
     .parse(rest)?;
     let (rest, _) = tag(" from the command zone this game").parse(rest)?;
-    Ok((rest, QuantityRef::CommanderCastFromCommandZoneCount))
+    Ok((
+        rest,
+        QuantityRef::CommanderCastFromCommandZoneCount { commander },
+    ))
 }
 
 /// CR 400.7 + CR 700.4: Parse a trailing "that died [under your control] this
@@ -14697,14 +14699,20 @@ mod tests {
             "times you've cast your commander from the command zone this game",
         )
         .unwrap();
-        assert_eq!(q, QuantityRef::CommanderCastFromCommandZoneCount);
+        assert_eq!(
+            q,
+            QuantityRef::CommanderCastFromCommandZoneCount { commander: None }
+        );
         assert_eq!(rest, "");
 
         let (rest, q) = parse_for_each_clause_ref(
             "time youve cast your commander from the command zone this game",
         )
         .unwrap();
-        assert_eq!(q, QuantityRef::CommanderCastFromCommandZoneCount);
+        assert_eq!(
+            q,
+            QuantityRef::CommanderCastFromCommandZoneCount { commander: None }
+        );
         assert_eq!(rest, "");
     }
 
@@ -14716,7 +14724,11 @@ mod tests {
             "times youve cast a commander from the command zone this game",
         ] {
             let (rest, q) = parse_for_each_clause_ref(text).unwrap();
-            assert_eq!(q, QuantityRef::CommanderCastFromCommandZoneCount, "{text}");
+            assert_eq!(
+                q,
+                QuantityRef::CommanderCastFromCommandZoneCount { commander: None },
+                "{text}"
+            );
             assert_eq!(rest, "");
         }
         assert!(parse_for_each_clause_ref(

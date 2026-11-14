@@ -3216,7 +3216,7 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
         },
         QuantityRef::ManaSpentToCast { .. } => Axes::CONSERVATIVE,
         QuantityRef::ColorsInCommandersColorIdentity => Axes::NONE,
-        QuantityRef::CommanderCastFromCommandZoneCount => Axes::NONE,
+        QuantityRef::CommanderCastFromCommandZoneCount { .. } => Axes::NONE,
         QuantityRef::CommanderManaValue { owner, .. } => {
             let mut acc = Axes::NONE;
             acc = acc.or(scan_controller_ref(owner));
@@ -10706,7 +10706,7 @@ mod tests {
         ));
         assert!(!replacement_condition_reads_projected_resource(
             &ReplacementCondition::CastFromZone {
-                zone: crate::types::zones::Zone::Graveyard
+                zone: Some(crate::types::zones::Zone::Graveyard)
             }
         ));
         assert!(!duration_reads_projected_resource(

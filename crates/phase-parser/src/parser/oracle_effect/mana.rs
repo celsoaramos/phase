@@ -2650,7 +2650,7 @@ pub(crate) fn parse_conditional_enters_with_counters_grant(lower: &str) -> Optio
                     (
                         counter_type,
                         QuantityExpr::Ref {
-                            qty: QuantityRef::CommanderCastFromCommandZoneCount,
+                            qty: QuantityRef::CommanderCastFromCommandZoneCount { commander: None },
                         },
                     )
                 },
@@ -4207,7 +4207,7 @@ mod tests {
                 filter: TargetFilter::Typed(TypedFilter { properties, .. }),
                 counter_type: CounterType::Plus1Plus1,
                 count: QuantityExpr::Ref {
-                    qty: QuantityRef::CommanderCastFromCommandZoneCount,
+                    qty: QuantityRef::CommanderCastFromCommandZoneCount { commander: None },
                 },
             }] if properties == &[FilterProp::IsCommander]
         ));

@@ -2372,7 +2372,7 @@ fn legacy_quantity_ref(x: &QuantityRef) -> bool {
         | QuantityRef::AdditionalCostPaymentCountFor { .. }
         | QuantityRef::ConvokedCreatureCount
         | QuantityRef::ColorsInCommandersColorIdentity
-        | QuantityRef::CommanderCastFromCommandZoneCount
+        | QuantityRef::CommanderCastFromCommandZoneCount { .. }
         | QuantityRef::CommanderManaValue { .. }
         | QuantityRef::Speed { .. }
         | QuantityRef::VoteCount { .. }
@@ -7060,7 +7060,7 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
         | QuantityRef::LandsPlayedThisTurn { .. }
         | QuantityRef::DungeonsCompleted
         | QuantityRef::ColorsInCommandersColorIdentity
-        | QuantityRef::CommanderCastFromCommandZoneCount
+        | QuantityRef::CommanderCastFromCommandZoneCount { .. }
         | QuantityRef::CommanderManaValue { .. }
         | QuantityRef::Speed { .. } => RwProfile::empty(),
         QuantityRef::ZoneCardCount {
