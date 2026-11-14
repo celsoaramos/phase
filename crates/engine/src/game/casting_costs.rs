@@ -522,6 +522,18 @@ pub(crate) fn additional_cost_declaration_is_offerable(
     if matches!(cost, AbilityCost::Unimplemented { .. }) {
         return Ok(false);
     }
+    // CR 601.2b: a choice of costs (forage's "exile three cards from your
+    // graveyard or sacrifice a Food") is declarable when any of its legs is; the
+    // leg is picked when the branch is paid (`handle_decide_additional_cost`).
+    // Splitting the unresolved choice errored and refused the whole cast.
+    if let AbilityCost::OneOf { costs } = &cost {
+        for leg in costs {
+            if additional_cost_declaration_is_offerable(state, player, pending, leg.clone())? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
     // CR 601.2a + CR 609.4b + CR 611.2f: the cast is priced under the terms of
     // the graveyard grant it is announced under (Whispersteel Dagger's
     // concession), which ride its ability until it becomes the pending cast.
@@ -805,6 +817,48 @@ pub(crate) fn handle_decide_additional_cost(
             );
         }
         _ => {}
+    }
+
+    // CR 601.2b + CR 701.61a: a Choice whose paid branch is itself a choice of
+    // costs (Feed the Cycle: "forage or pay {B}", where forage = "exile three
+    // cards from your graveyard or sacrifice a Food") — the player now picks
+    // which way to forage. One payable leg is paid directly; two or more are
+    // asked as a second Choice between the legs ("not pay" = the other leg).
+    if pay && !answers_alternative_cost {
+        if let AdditionalCost::Choice(AbilityCost::OneOf { costs }, fallback) = additional_cost {
+            let mut legs: Vec<AbilityCost> = Vec::new();
+            for leg in costs {
+                if additional_cost_declaration_is_offerable(state, player, &pending, leg.clone())? {
+                    legs.push(leg.clone());
+                }
+            }
+            let mut pending = pending;
+            return match legs.len() {
+                0 => Err(EngineError::ActionNotAllowed(
+                    "No branch of the chosen additional cost can be paid".to_string(),
+                )),
+                1 => {
+                    let single = AdditionalCost::Choice(legs.remove(0), fallback.clone());
+                    if pending.additional_cost_flow.is_some() {
+                        pending.additional_cost_flow = Some(single.clone());
+                    }
+                    handle_decide_additional_cost(state, player, pending, &single, true, events)
+                }
+                _ => {
+                    let first = legs.remove(0);
+                    let rest = if legs.len() == 1 {
+                        legs.remove(0)
+                    } else {
+                        AbilityCost::OneOf { costs: legs }
+                    };
+                    let next = AdditionalCost::Choice(first, rest);
+                    if pending.additional_cost_flow.is_some() {
+                        pending.additional_cost_flow = Some(next.clone());
+                    }
+                    Ok(make_optional_cost_choice(state, player, next, 0, pending))
+                }
+            };
+        }
     }
 
     let pending_before = pending.clone();
