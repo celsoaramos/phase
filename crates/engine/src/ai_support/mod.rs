@@ -1022,6 +1022,27 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
         (WaitingFor::BlightChoice { creatures, .. }, GameAction::SelectCards { cards: chosen }) => {
             selection_mismatch(chosen, creatures, Some(1))
         }
+        // CR 608.2c: "discard N cards unless you discard a [type] card" (Winternight
+        // Stories, Thirst for Knowledge) — a single card that matches the unless
+        // filter is a complete answer, exactly as the resolver accepts it. Without
+        // this arm the exact-count check below dropped the single-card candidates,
+        // so a client that offers only listed selections could never take the
+        // shortcut.
+        (
+            WaitingFor::DiscardChoice {
+                cards,
+                count,
+                up_to: false,
+                unless_filter: Some(filter),
+                source_id,
+                ..
+            },
+            GameAction::SelectCards { cards: chosen },
+        ) if chosen.len() == 1 && *count > 1 => {
+            let ctx = crate::game::filter::FilterContext::from_source(state, *source_id);
+            selection_mismatch(chosen, cards, Some(1))
+                || !crate::game::filter::matches_target_filter(state, chosen[0], filter, &ctx)
+        }
         (
             WaitingFor::EffectZoneChoice {
                 player: _,
