@@ -42,7 +42,7 @@ use super::oracle_nom::target::{
 use super::oracle_quantity::capitalize_first;
 use super::oracle_util::{
     merge_or_filters, parse_subtype, strip_possessive, strip_where_x_is_clause, TextPair,
-    SELF_REF_PARSE_ONLY_PHRASES, SELF_REF_TYPE_PHRASES,
+    OUTLAW_SUBTYPES, SELF_REF_PARSE_ONLY_PHRASES, SELF_REF_TYPE_PHRASES,
 };
 use crate::types::text_grammar::{
     parse_color_prefix, parse_color_quality_prefix, parse_core_type, parse_exile_visibility_prefix,
@@ -5336,6 +5336,17 @@ fn classify_negation(negated: &str) -> NegationResult {
                 "instant" => TypeFilter::Instant,
                 "sorcery" => TypeFilter::Sorcery,
                 "planeswalker" => TypeFilter::Planeswalker,
+                // CR 700.12: "outlaw" is not a subtype — it names the Assassin,
+                // Mercenary, Pirate, Rogue, and Warlock creature types. The
+                // catch-all below would emit `Non(Subtype("Outlaw"))`, which no
+                // object has, so "non-outlaw creature" (Shoot the Sheriff,
+                // Caught in the Crossfire) matched every creature.
+                "outlaw" | "outlaws" => TypeFilter::AnyOf(
+                    OUTLAW_SUBTYPES
+                        .iter()
+                        .map(|s| TypeFilter::Subtype((*s).to_string()))
+                        .collect(),
+                ),
                 other => TypeFilter::Subtype(capitalize_first(other)),
             };
             NegationResult::Type(TypeFilter::Non(Box::new(inner)))
@@ -12382,6 +12393,28 @@ mod tests {
     /// reordered: `classify_negation` still classifies "sorcery" through its
     /// own core-type arm, never falling into the catch-all that would emit a
     /// vacuous `Non(Subtype("Sorcery"))`.
+    /// CR 700.12: "non-outlaw creature" (Shoot the Sheriff) negates the five
+    /// outlaw creature types, never a literal `Subtype("Outlaw")`.
+    #[test]
+    fn non_outlaw_creature_negates_outlaw_subtypes() {
+        let (filter, rest) = parse_type_phrase_folding("non-outlaw creature");
+        assert_eq!(rest.trim(), "");
+        let tf = typed_leg(&filter).expect("expected typed filter");
+        let outlaws = TypeFilter::AnyOf(
+            ["Assassin", "Mercenary", "Pirate", "Rogue", "Warlock"]
+                .iter()
+                .map(|s| TypeFilter::Subtype((*s).to_string()))
+                .collect(),
+        );
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+        assert!(
+            tf.type_filters
+                .contains(&TypeFilter::Non(Box::new(outlaws))),
+            "got {:?}",
+            tf.type_filters
+        );
+    }
+
     #[test]
     fn parse_type_phrase_except_for_card_type_plural() {
         let (filter, rest) = parse_type_phrase_folding("permanents except for sorceries");
