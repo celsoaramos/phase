@@ -354,6 +354,7 @@ mod menace_requires_two_blockers;
 mod mercenaries_any_player_activate_prevention_scope;
 mod merieke_ri_berit_cant_regenerate;
 mod metamorphic_alteration;
+mod mf_dice_rolls;
 mod mf_field_reports_alt_costs;
 mod mf_relatos_1028;
 mod mf_relatos_20261026;

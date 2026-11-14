@@ -54,10 +54,34 @@ use crate::types::zones::Zone;
 /// same `parse_quantity_ref` / `parse_number` primitives used for plain quantities.
 pub fn parse_quantity(input: &str) -> OracleResult<'_, QuantityExpr> {
     alt((
+        parse_die_result_choice_expr,
         parse_max_quantity,
         parse_fraction_rounded,
         map(parse_quantity_ref, |qty| QuantityExpr::Ref { qty }),
         map(parse_number, |n| QuantityExpr::Fixed { value: n as i32 }),
+    ))
+    .parse(input)
+}
+
+/// CR 706.2 + CR 608.2d: "that result" / "the other result" after "roll two
+/// dN and choose one result" (Endeavor cycle) — the chosen die result and the
+/// roll total minus it. Single grammar shared by the effect-quantity and
+/// filter-threshold parsers.
+pub fn parse_die_result_choice_expr(input: &str) -> OracleResult<'_, QuantityExpr> {
+    alt((
+        value(
+            crate::parser::oracle_quantity::chosen_die_result(),
+            tag("that result"),
+        ),
+        value(
+            QuantityExpr::Difference {
+                left: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                }),
+                right: Box::new(crate::parser::oracle_quantity::chosen_die_result()),
+            },
+            tag("the other result"),
+        ),
     ))
     .parse(input)
 }
