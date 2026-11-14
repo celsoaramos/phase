@@ -3970,11 +3970,18 @@ impl RootDecisionContext {
     /// Classify the root decision. Precedence: target selection, then a stack holding an
     /// entry another player controls, then the AI's own Upkeep/Draw window, then everything else.
     fn classify(state: &GameState, ai_player: PlayerId) -> Self {
+        // CR 608.2d: a named choice (colour, card name, creature type) has the
+        // same shape as a target choice — the payoff is decided by the answer
+        // and the search usually can't see it (a named discard resolves
+        // against a hand the AI can only sample), so every option evaluates
+        // the same and a 0.1 policy nudge drowns in the softmax. It takes the
+        // target-selection weight.
         if matches!(
             state.waiting_for,
             WaitingFor::TargetSelection { .. }
                 | WaitingFor::TriggerTargetSelection { .. }
                 | WaitingFor::MultiTargetSelection { .. }
+                | WaitingFor::NamedChoice { .. }
         ) {
             return Self::TargetSelection;
         }
