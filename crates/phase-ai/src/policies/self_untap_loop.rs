@@ -118,6 +118,28 @@ impl TacticalPolicy for SelfUntapLoopPolicy {
             return neutral("self_untap_loop_na");
         }
 
+        // 1b. Non-mana price on an already-untapped source (Devoted Druid:
+        //     "Put a -1/-1 counter on this creature: Untap this creature").
+        //     CR 701.26b: untapping an untapped permanent does nothing, so the
+        //     price — a counter that shrinks the creature, life, a sacrifice —
+        //     buys nothing at all. Field report 2026-11-13: the AI put a fourth
+        //     -1/-1 counter on an untapped Druid during the opponent's draw
+        //     step. The mana-priced arm below needs the "mana source" framing
+        //     because its loop is self-funded; a non-mana price is a pure loss
+        //     on any permanent, creature or not, so `untap_has_use` (4b) does
+        //     not apply — an untapped creature gains no combat value from being
+        //     untapped again. Only an own-board payoff for the activation or
+        //     for the counter it places (Hapatra, Rings of Brighthearth) stands
+        //     the veto down.
+        if !source.tapped && pays_non_mana_price(def) {
+            if has_tap_payoff_trigger(ctx.state, ctx.ai_player)
+                || has_counter_payoff_trigger(ctx.state, ctx.ai_player)
+            {
+                return neutral("self_untap_loop_trigger_payoff");
+            }
+            return PolicyVerdict::reject(PolicyReason::new("self_untap_noop_priced"));
+        }
+
         // 2. The class is "a mana source that untaps itself".
         if !source.abilities.iter().any(is_mana_ability) {
             return neutral("self_untap_loop_na");
@@ -182,6 +204,30 @@ fn untaps_only_itself(def: &AbilityDefinition) -> bool {
                 state: TapStateChange::Untap,
             }
         )
+}
+
+/// True iff `def` charges something other than plain mana — an effect cost
+/// (Devoted Druid's -1/-1 counter), life, a sacrifice, or a composite. A free
+/// untap (`cost: None`) and a plain mana cost are not this class.
+fn pays_non_mana_price(def: &AbilityDefinition) -> bool {
+    !matches!(def.cost.as_ref(), None | Some(AbilityCost::Mana { .. }))
+}
+
+/// True iff the AI controls a battlefield permanent that triggers on counters
+/// being placed (Hapatra, Vizier of Poisons; Nest of Scarabs) — the one payoff
+/// that makes a counter-priced no-op untap worth activating.
+fn has_counter_payoff_trigger(state: &GameState, ai_player: PlayerId) -> bool {
+    battlefield_active_triggers(state).any(|(obj, active)| {
+        obj.controller == ai_player
+            && matches!(
+                active.definition.mode,
+                TriggerMode::CounterAdded
+                    | TriggerMode::CounterAddedOnce
+                    | TriggerMode::CounterAddedAll
+                    | TriggerMode::CounterPlayerAddedAll
+                    | TriggerMode::CounterTypeAddedAll
+            )
+    })
 }
 
 /// True iff untapping `source` restores a use other than its mana ability: the
@@ -382,6 +428,69 @@ mod tests {
         assert_rejected(
             activate_verdict(&mut state, source, UNTAP_INDEX),
             "self_untap_loop_untapped",
+        );
+    }
+
+    /// Devoted Druid: `{T}: Add {G}` + "Put a -1/-1 counter on this creature:
+    /// Untap this creature".
+    fn devoted_druid(state: &mut GameState, tapped: bool) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(7),
+            AI,
+            "Devoted Druid".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.tapped = tapped;
+        let abilities = Arc::make_mut(&mut obj.abilities);
+        abilities.push(colorless_mana_ability());
+        let mut untap = untap_ability(TargetFilter::SelfRef);
+        untap.cost = Some(AbilityCost::EffectCost {
+            effect: Box::new(Effect::PutCounter {
+                counter_type: engine::types::counter::CounterType::Minus1Minus1,
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::SelfRef,
+            }),
+        });
+        abilities.push(untap);
+        id
+    }
+
+    /// Field report 2026-11-13 (flag 010d46fd): an untapped Devoted Druid paid a
+    /// -1/-1 counter to "untap" during the opponent's draw step.
+    #[test]
+    fn untapped_devoted_druid_untap_is_rejected() {
+        let mut state = GameState::new_two_player(42);
+        let source = devoted_druid(&mut state, false);
+        assert_rejected(
+            activate_verdict(&mut state, source, UNTAP_INDEX),
+            "self_untap_noop_priced",
+        );
+    }
+
+    /// A tapped Druid untapping for another mana is the card's whole point.
+    #[test]
+    fn tapped_devoted_druid_is_not_rejected() {
+        let mut state = GameState::new_two_player(42);
+        let source = devoted_druid(&mut state, true);
+        let verdict = activate_verdict(&mut state, source, UNTAP_INDEX);
+        assert!(
+            matches!(verdict, PolicyVerdict::Score { .. }),
+            "tapped Druid must stay activatable"
+        );
+    }
+
+    /// Hapatra-style counter payoff on our board: the no-op untap is a token engine.
+    #[test]
+    fn counter_payoff_trigger_stands_down_priced_untap() {
+        let mut state = GameState::new_two_player(42);
+        let source = devoted_druid(&mut state, false);
+        permanent_with_trigger(&mut state, AI, TriggerMode::CounterAdded);
+        assert_neutral(
+            activate_verdict(&mut state, source, UNTAP_INDEX),
+            "self_untap_loop_trigger_payoff",
         );
     }
 
