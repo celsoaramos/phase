@@ -2664,6 +2664,10 @@ fn try_parse_whenever_this_turn_from(
     } else {
         inner
     };
+    // CR 603.7 + CR 608.2c: a body that counts the creating chain's set ("for
+    // each creature card put into your graveyard this way") must make the
+    // producer publish it; see `ability_definition_uses_tracked_set`.
+    let uses_tracked_set = ability_definition_uses_tracked_set(&inner);
 
     Some(ParsedEffectClause {
         optional_targeting: false,
@@ -2674,7 +2678,7 @@ fn try_parse_whenever_this_turn_from(
                 expiry,
             },
             effect: Box::new(inner),
-            uses_tracked_set: false,
+            uses_tracked_set,
         },
         duration: None,
         sub_ability: None,
@@ -41581,6 +41585,13 @@ fn ability_definition_uses_tracked_set(def: &AbilityDefinition) -> bool {
     if let Effect::CreateDelayedTrigger { effect, .. } = def.effect.as_ref() {
         uses_tracked_set |= ability_definition_uses_tracked_set(effect);
     }
+    // CR 608.2c: a quantity that counts the chain's set ("for each creature card
+    // put into your graveyard this way" — Song of Blood) consumes it just like a
+    // `TrackedSet` filter does. Same authority the runtime publish gate uses.
+    def.effect.for_each_quantity_expr(&mut |qty| {
+        uses_tracked_set |=
+            crate::types::tracked_set_refs::quantity_expr_references_tracked_set(qty);
+    });
     uses_tracked_set
         || def
             .sub_ability

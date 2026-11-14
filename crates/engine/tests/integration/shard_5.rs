@@ -150,6 +150,7 @@ mod slow_motion_upkeep_sacrifice_return;
 mod snow_mana_production;
 mod solar_tide_entwine_non_mana;
 mod solitude_up_to_one_exile_lifegain_rider;
+mod song_of_blood_attack_pump;
 mod song_of_inspiration_target_set_aggregate;
 mod sorcery_timing_queries;
 mod sothera_supervoid_edict_reanimate;

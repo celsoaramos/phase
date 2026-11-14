@@ -27,6 +27,7 @@ pub mod text_grammar;
 pub mod text_word_carriers;
 pub mod token_presets;
 pub mod token_spec;
+pub mod tracked_set_refs;
 pub mod triggers;
 pub mod un_actions;
 pub mod zones;
