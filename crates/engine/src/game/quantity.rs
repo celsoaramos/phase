@@ -6002,69 +6002,9 @@ fn resolve_ref(
             if crate::types::ability::member_filter_has_unsupported_selected_ref(filter) {
                 return 0;
             }
-            let Some((set_id, ids)) = state.tracked_object_sets.iter().max_by_key(|(id, _)| id.0)
-            else {
-                return 0;
-            };
-            let count = ids
-                .iter()
-                .filter(|&&oid| {
-                    // CR 608.2c + CR 614.6: an action-bound count ("the number of
-                    // creatures sacrificed this way") tallies only members whose
-                    // recorded producer action equals the bound cause —
-                    // independent of final zone; `None` counts every filtered
-                    // member (legacy parity).
-                    let cause_ok = match caused_by {
-                        None => true,
-                        Some(cause) => state
-                            .tracked_set_member_causes
-                            .get(set_id)
-                            .and_then(|causes| causes.get(&oid))
-                            .is_some_and(|member_cause| member_cause == cause),
-                    };
-                    // CR 608.2h + CR 400.7: a member stamped with its producing
-                    // departure reads that departure's snapshot; one stamped from a
-                    // zone that records no LKI reads live. An unstamped member that
-                    // is now in a library was never moved by the producing action
-                    // (a reveal, CR 701.20b), so its live characteristics are
-                    // authoritative and any cached snapshot is an earlier,
-                    // unrelated departure.
-                    let read_live = |oid| {
-                        crate::game::filter::matches_target_filter(state, oid, filter, &filter_ctx)
-                    };
-                    let read_snapshot = |oid, lki| {
-                        crate::game::filter::matches_target_filter_on_lki_snapshot(
-                            state,
-                            oid,
-                            lki,
-                            filter,
-                            &filter_ctx,
-                        )
-                    };
-                    let matches_filter =
-                        match tracked_member_read_authority(state, Some(*set_id), oid) {
-                            TrackedMemberRead::Snapshot(lki) => read_snapshot(oid, lki),
-                            TrackedMemberRead::Live => read_live(oid),
-                            TrackedMemberRead::Legacy
-                                if state.battlefield.contains(&oid)
-                                    || state
-                                        .objects
-                                        .get(&oid)
-                                        .is_some_and(|obj| obj.zone == Zone::Library) =>
-                            {
-                                read_live(oid)
-                            }
-                            // CR 608.2h: an unstamped member that left the
-                            // battlefield is filtered by last-known information.
-                            TrackedMemberRead::Legacy => state
-                                .lki_cache
-                                .get(&oid)
-                                .map_or_else(|| read_live(oid), |lki| read_snapshot(oid, lki)),
-                        };
-                    cause_ok && matches_filter
-                })
-                .count();
-            usize_to_i32_saturating(count)
+            usize_to_i32_saturating(
+                filtered_tracked_set_members(state, filter, caused_by.as_ref(), &filter_ctx).len(),
+            )
         }
         // CR 400.7 + CR 608.2c: Read the per-resolution counter populated by
         // ChangeZoneAll when it exiles cards from a hand. Used by "draws a card
@@ -10444,6 +10384,92 @@ fn resolve_event_context_player_count(
     }
 
     usize_to_i32_saturating(players.len())
+}
+
+/// CR 608.2c: The members of the most recently published tracked set that
+/// satisfy `filter` and, when `caused_by` is bound, whose recorded producer
+/// action equals it. Single authority for [`QuantityRef::FilteredTrackedSetSize`]:
+/// the count is this list's length, and a `repeat_for` loop over that quantity
+/// binds its i-th iteration to the i-th member (CR 109.5), so count and
+/// bindings cannot diverge.
+fn filtered_tracked_set_members(
+    state: &GameState,
+    filter: &TargetFilter,
+    caused_by: Option<&ThisWayCause>,
+    filter_ctx: &FilterContext<'_>,
+) -> Vec<ObjectId> {
+    let Some((set_id, ids)) = state.tracked_object_sets.iter().max_by_key(|(id, _)| id.0) else {
+        return Vec::new();
+    };
+    ids.iter()
+        .copied()
+        .filter(|&oid| {
+            // CR 608.2c + CR 614.6: an action-bound count ("the number of
+            // creatures sacrificed this way") tallies only members whose
+            // recorded producer action equals the bound cause —
+            // independent of final zone; `None` counts every filtered
+            // member (legacy parity).
+            let cause_ok = match caused_by {
+                None => true,
+                Some(cause) => state
+                    .tracked_set_member_causes
+                    .get(set_id)
+                    .and_then(|causes| causes.get(&oid))
+                    .is_some_and(|member_cause| member_cause == cause),
+            };
+            // CR 608.2h + CR 400.7: a member stamped with its producing
+            // departure reads that departure's snapshot; one stamped from a
+            // zone that records no LKI reads live. An unstamped member that
+            // is now in a library was never moved by the producing action
+            // (a reveal, CR 701.20b), so its live characteristics are
+            // authoritative and any cached snapshot is an earlier,
+            // unrelated departure.
+            let read_live =
+                |oid| crate::game::filter::matches_target_filter(state, oid, filter, filter_ctx);
+            let read_snapshot = |oid, lki| {
+                crate::game::filter::matches_target_filter_on_lki_snapshot(
+                    state, oid, lki, filter, filter_ctx,
+                )
+            };
+            let matches_filter = match tracked_member_read_authority(state, Some(*set_id), oid) {
+                TrackedMemberRead::Snapshot(lki) => read_snapshot(oid, lki),
+                TrackedMemberRead::Live => read_live(oid),
+                TrackedMemberRead::Legacy
+                    if state.battlefield.contains(&oid)
+                        || state
+                            .objects
+                            .get(&oid)
+                            .is_some_and(|obj| obj.zone == Zone::Library) =>
+                {
+                    read_live(oid)
+                }
+                // CR 608.2h: an unstamped member that left the
+                // battlefield is filtered by last-known information.
+                TrackedMemberRead::Legacy => state
+                    .lki_cache
+                    .get(&oid)
+                    .map_or_else(|| read_live(oid), |lki| read_snapshot(oid, lki)),
+            };
+            cause_ok && matches_filter
+        })
+        .collect()
+}
+
+/// CR 608.2c + CR 109.5: [`filtered_tracked_set_members`] in `ability`'s
+/// filter context — the iteration members of a `repeat_for:
+/// FilteredTrackedSetSize` loop ("for each creature exiled this way, its
+/// controller ...").
+pub(crate) fn filtered_tracked_set_member_ids(
+    state: &GameState,
+    filter: &TargetFilter,
+    caused_by: Option<&ThisWayCause>,
+    ability: &ResolvedAbility,
+) -> Vec<ObjectId> {
+    if crate::types::ability::member_filter_has_unsupported_selected_ref(filter) {
+        return Vec::new();
+    }
+    let filter_ctx = FilterContext::from_ability(ability);
+    filtered_tracked_set_members(state, filter, caused_by, &filter_ctx)
 }
 
 #[cfg(test)]

@@ -24469,6 +24469,22 @@ fn resolve_chain_body(
                     .chain_tracked_set_id
                     .and_then(|id| state.tracked_object_sets.get(&id).cloned())
                     .unwrap_or_default(),
+                // CR 608.2c + CR 109.5: "For each creature exiled this way, its
+                // controller ..." — the filtered, cause-bound count iterates the
+                // very members it counts (same authority as the quantity), so the
+                // i-th iteration's "its controller" is the i-th counted member's.
+                // Without this arm no member is bound and every iteration reads
+                // the ability's own (absent) target — the caster.
+                Some(QuantityExpr::Ref {
+                    qty: QuantityRef::FilteredTrackedSetSize { filter, caused_by },
+                }) if effect_refs_parent_target(&effective.effect) => {
+                    crate::game::quantity::filtered_tracked_set_member_ids(
+                        state,
+                        filter,
+                        caused_by.as_ref(),
+                        effective,
+                    )
+                }
                 Some(QuantityExpr::Ref {
                     qty: QuantityRef::ObjectCount { filter },
                 }) if effect_iterates_over_parent_target(&effective.effect) => {
