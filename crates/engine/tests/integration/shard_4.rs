@@ -356,6 +356,7 @@ mod metamorphic_alteration;
 mod mf_field_reports_alt_costs;
 mod mf_relatos_1028;
 mod mf_relatos_20261026;
+mod mf_relatos_20261031;
 mod militant_angel_attacked_opponents;
 mod mill_double_redirect_choice_continuation;
 mod mill_rest_in_peace_redirect;
