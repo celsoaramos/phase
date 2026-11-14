@@ -327,3 +327,49 @@ fn kaalia_attacks_to_put_an_angel_into_play() {
         "Kaalia attacks: the Angel she brings kills the 8/8"
     );
 }
+
+/// An anthem lord: losing it shrinks every other attacker, so the trade looks
+/// worse on the board than it plays.
+const LORD: &str = "Other creatures you control get +1/+1.";
+
+/// Field report (MagicFinder, 2026-11-01, "jogada ruim do robô"): at 24 life
+/// against 5, with four attack-ready creatures facing four blockers, the robot
+/// declared nothing. Every attacker carries at least 4 power, so the defender
+/// must throw its board in front of them (CR 509.1a) — at worst the 6/6 eats
+/// the lifelink lord and three small bodies die. What that buys is the next
+/// turn: one blocker short of covering four attackers at 5 life is dead on
+/// the following swing. The replay scored the lord it loses and never the
+/// swing the attack sets up, so "stay home" won by ten points.
+#[test]
+fn attacks_into_forced_chumps_that_set_up_lethal() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    s.with_life(P0, 24);
+    s.with_life(P1, 5);
+    let lord = s
+        .add_creature_from_oracle(P0, "Questcaller", 5, 5, LORD)
+        .lifelink()
+        .id();
+    let a = s.add_creature(P0, "Warrenguard", 3, 4).id();
+    let b = s.add_creature(P0, "Scout", 3, 4).id();
+    let c = s.add_creature(P0, "Sentry", 4, 4).id();
+    s.add_creature(P0, "Host", 5, 5).with_summoning_sickness();
+    s.add_creature(P1, "Gravetide", 6, 6);
+    s.add_creature(P1, "Braider", 2, 2);
+    s.add_creature(P1, "Harbinger", 1, 1);
+    s.add_creature(P1, "Smokebraider", 1, 1);
+    let mut r = s.build();
+    at_attack(&mut r);
+
+    assert!(
+        attackers_of(&choose(r.state(), false)).is_empty(),
+        "heuristic: four blockers for four attackers, nobody swings"
+    );
+    let mut all = vec![lord, a, b, c];
+    all.sort_unstable();
+    assert_eq!(
+        attackers_of(&choose(r.state(), true)),
+        all,
+        "the forced chumps leave 5 life behind two blockers: lethal next turn"
+    );
+}
