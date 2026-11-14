@@ -50485,6 +50485,19 @@ fn parse_effect_chain_ir_body(
                 None
             }
         });
+        // CR 614.1a + CR 608.2c: mark the body of an "instead" override. Its
+        // condition is one of the `*Instead` gates and
+        // `strip_additional_cost_conditional` has already removed the word, so
+        // the text reaching the grammar below is the replacement effect alone —
+        // and a replacement inherits the replaced event's recipient, which the
+        // printed clause may therefore omit entirely (Dragon's Fire). Assigned
+        // on EVERY chunk (not just the override ones) so the flag never outlives
+        // the chunk that set it.
+        ctx.instead_override_body = matches!(
+            condition,
+            Some(AbilityCondition::AdditionalCostPaidInstead)
+                | Some(AbilityCondition::CastVariantPaidInstead { .. })
+        );
         // CR 608.2c + CR 608.2d + CR 118.12: an "any opponent / any player / any other
         // player may" body is performed by the player who accepts, so its third-person
         // anaphors name that player. Only when no rung above supplied a scope, the seed
