@@ -31,6 +31,7 @@ mod restricted_mana_mv_or_x;
 mod restricted_mana_not_from_zone;
 mod restricted_mana_x_cost_only;
 mod retarget_prompt_softlock;
+mod reveal_cost_fail_closed;
 mod reveal_hand_article_only_card_choice;
 mod reveal_this_way_single_execution;
 mod reveal_until_routed_damage_count;
