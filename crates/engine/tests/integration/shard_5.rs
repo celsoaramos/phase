@@ -270,6 +270,7 @@ mod tempt_with_discovery;
 mod tergrid_mirrormade_copy_on_effect_entry;
 mod termination_facilitator_bounty_damage_8379;
 mod terra_magical_adept_milled_enchantment;
+mod territorial_hellkite_last_combat;
 mod terror_of_the_peaks_issue_2911;
 mod text_substitution_cr612;
 mod teysa_wojek_investigate_per_opponent;
