@@ -133,7 +133,10 @@ fn payoff_effects_and_x_ref<'a>(
             facts
                 .primary_effects
                 .into_iter()
-                .map(definition_walk)
+                .map(|def| match effects_outside_x_repeat(def) {
+                    Some(effects) => AbilityWalk::of(def, effects),
+                    None => definition_walk(def),
+                })
                 .chain(
                     facts
                         .immediate_etb_triggers
@@ -150,10 +153,37 @@ fn payoff_effects_and_x_ref<'a>(
                 )
                 .collect()
         }
-        None => vec![AbilityWalk::unconditional(ability)],
+        None => vec![match effects_outside_x_repeat(ability) {
+            Some(effects) => AbilityWalk::of(ability, effects),
+            None => AbilityWalk::unconditional(ability),
+        }],
     };
     let object_level_x = x_reference::spell_object_references_x(ctx.state, object_id);
     (walks, object_level_x)
+}
+
+/// The spell's own effects, minus those of a node repeated X times. CR 608.2c:
+/// "Repeat the following process X times" resolves zero times at X=0, so a
+/// fixed per-iteration amount (Torment of Hailfire's "loses 3 life") is still
+/// X-scaled; the X itself is credited by `spell_object_references_x`, which
+/// reads `repeat_for`. Only the repeated node is dropped — a sibling without its
+/// own `repeat_for` stays a residual, so the gate fails open on it.
+/// `None` when the node is not X-repeated: the caller keeps its usual walk.
+fn effects_outside_x_repeat(def: &AbilityDefinition) -> Option<Vec<&Effect>> {
+    if !def
+        .repeat_for
+        .as_ref()
+        .is_some_and(QuantityExpr::contains_x)
+    {
+        return None;
+    }
+    Some(
+        def.sub_ability
+            .iter()
+            .chain(def.else_ability.iter())
+            .flat_map(|next| collect_definition_effects(next))
+            .collect(),
+    )
 }
 
 /// The reviewer's unified predicate, made chain-aware (v3 CORRECTION 1): the
@@ -785,6 +815,17 @@ mod tests {
         ability
     }
 
+    // Torment of Hailfire: "Repeat the following process X times. Each opponent
+    // loses 3 life unless …" — a FIXED per-iteration amount under repeat_for X.
+    fn torment_ability() -> AbilityDefinition {
+        let mut ability = spell(Effect::LoseLife {
+            amount: QuantityExpr::Fixed { value: 3 },
+            target: None,
+        });
+        ability.repeat_for = Some(x_expr());
+        ability
+    }
+
     fn helix_ability() -> AbilityDefinition {
         activated(
             Effect::PutCounter {
@@ -1130,6 +1171,51 @@ mod tests {
             x_bb_manacost(),
         );
         add_pool(&mut state, AI, 3);
+        assert_not_reject(&verdict_for_cast(&state, obj, card));
+    }
+
+    // --- Torment of Hailfire: X is the repeat count, not an amount -----------
+
+    #[test]
+    fn torment_repeat_x_zero_rejected() {
+        let mut state = base_state();
+        let (obj, card) = spell_source(
+            &mut state,
+            "Torment of Hailfire",
+            torment_ability(),
+            x_bb_manacost(),
+        );
+        assert_reject(&verdict_for_cast(&state, obj, card), "x_cast_zero_no_op");
+        assert_reject(
+            &verdict_for_cast_with_facts(&state, obj, card),
+            "x_cast_zero_no_op",
+        );
+    }
+
+    #[test]
+    fn torment_repeat_x_one_not_rejected() {
+        let mut state = base_state();
+        let (obj, card) = spell_source(
+            &mut state,
+            "Torment of Hailfire",
+            torment_ability(),
+            x_bb_manacost(),
+        );
+        add_pool(&mut state, AI, 3);
+        assert_not_reject(&verdict_for_cast(&state, obj, card));
+    }
+
+    #[test]
+    fn repeat_x_with_fixed_sibling_fails_open() {
+        // Only the repeated node is X-scaled; a fixed "then draw two" after it
+        // still happens at X=0, so the cast is not a no-op.
+        let mut ability = torment_ability();
+        ability.sub_ability = Some(Box::new(spell(Effect::Draw {
+            count: QuantityExpr::Fixed { value: 2 },
+            target: TargetFilter::Controller,
+        })));
+        let mut state = base_state();
+        let (obj, card) = spell_source(&mut state, "Repeat Then Draw", ability, x_bb_manacost());
         assert_not_reject(&verdict_for_cast(&state, obj, card));
     }
 
