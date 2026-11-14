@@ -82,6 +82,7 @@ use crate::policies::stack_awareness::{
 use crate::policies::strategy_helpers::{can_pay_ward_cost, ward_cost_against_ai};
 
 mod mf_flags_1107;
+mod mf_flags_1115;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateDecision {
@@ -300,6 +301,12 @@ fn assess_candidate(ctx: &PolicyContext<'_>) -> GateDecision {
         // `search::fallback_action`, which emits CancelCast when the scored
         // pool is empty.
         GameAction::CancelCast => GateDecision::Reject,
+        // 15/11/2026 ("jogada ruim do robô" 798f877a, 5ea1eee8): saddling a Mount
+        // that has no attack left this turn taps the saddlers through the
+        // opponent's turn for nothing. Proof-backed; fails open.
+        GameAction::SaddleMount { .. } => {
+            mf_flags_1115::assess_saddle(ctx).unwrap_or(GateDecision::Allow)
+        }
         _ => GateDecision::Allow,
     }
 }
