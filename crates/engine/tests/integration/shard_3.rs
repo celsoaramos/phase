@@ -220,6 +220,7 @@ mod force_of_rage_delayed_sacrifice;
 mod forced_retarget_multi_role_mana_6056;
 mod foreign_subject_split_guard;
 mod foretell_pipeline;
+mod forge_of_heroes_type_gated_counters;
 mod fra_bloodline_recollector;
 mod fractalize;
 mod frameless_discard_pause_records_discard;
