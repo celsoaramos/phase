@@ -153,6 +153,7 @@ use crate::types::ability::{
 // Imported on its own line rather than folded into the block above: that block
 // is the busiest merge point in this file, and a one-name addition inside it
 // conflicts with every sibling branch that adds one too.
+use crate::types::ability::CardCopyTemplate;
 use crate::types::ability::NameDistinctness;
 // `DoubleTarget` has no production use in this module since the counter-doubling
 // discriminator moved to `Effect::is_counter_multiplication()`; the child
@@ -15196,15 +15197,24 @@ fn try_parse_create_card_copy_by_name(tp: TextPair) -> Option<Effect> {
         .parse(tp.lower)
         .ok()?;
     let rest = rest.trim_end().trim_end_matches('.').trim_end();
-    // The copy object is the chosen-name referent and nothing else; `all_consuming`
-    // is what makes that exact rather than a prefix match.
-    all_consuming(tag::<_, _, OracleError<'_>>(
-        "the card with the chosen name",
-    ))
+    // The copy object is the chosen-name referent or the ability's own source
+    // card, and nothing else; `all_consuming` is what makes that exact rather
+    // than a prefix match. CR 707.12: "this card" (Q, Stacking the Deck's granted
+    // ability) names the object the ability is on — `~` is the same referent
+    // after self-reference normalization.
+    let (_, template) = all_consuming(alt((
+        value(
+            CardCopyTemplate::NamedCard,
+            tag::<_, _, OracleError<'_>>("the card with the chosen name"),
+        ),
+        value(CardCopyTemplate::AbilitySource, tag("this card")),
+        value(CardCopyTemplate::AbilitySource, tag("~")),
+    )))
     .parse(rest)
     .ok()?;
     Some(Effect::CreateCardCopyByName {
         name: None,
+        template,
         // CR 707.12: the copy has to be somewhere a card can be cast FROM for the
         // "you may cast the copy" tail to mean anything, and CR 704.5e removes it
         // from exile the moment the resolution that created it ends without a cast.

@@ -1212,6 +1212,27 @@ pub enum NumberDistinctness {
 /// the existing `CardName` card-data stays byte-stable. Mirrors
 /// `NumberDistinctness`'s axis on the sibling `NumberRange` choice — the same
 /// Oracle cue ("that hasn't been chosen") on a different domain.
+/// CR 707.12 + CR 707.2: what a created card copy takes its characteristics from.
+/// Parse-detected; static; serialized only when non-default so the existing
+/// `CreateCardCopyByName` card-data stays byte-stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CardCopyTemplate {
+    /// A card identified by NAME (the effect's `name`, or the name chosen on the
+    /// source) — materialized from the card registry (Garth One-Eye).
+    #[default]
+    NamedCard,
+    /// "Create a copy of this card": the ability's own source OBJECT, wherever it
+    /// is, read through its current copiable values (Q, Stacking the Deck's
+    /// granted ability on an exiled card).
+    AbilitySource,
+}
+
+impl CardCopyTemplate {
+    pub fn is_named_card(&self) -> bool {
+        matches!(self, Self::NamedCard)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum NameDistinctness {
     /// The default for the entire existing `CardName` pool — repeats allowed.
@@ -1560,7 +1581,10 @@ impl ChoiceType {
     /// dependent instruction ("discards a card with that name") reads it from
     /// the resolution's owned source context rather than the source's history.
     pub fn needs_choice_source_context(&self) -> bool {
-        matches!(self, Self::CardPredicateGuess { .. } | Self::CardName { .. })
+        matches!(
+            self,
+            Self::CardPredicateGuess { .. } | Self::CardName { .. }
+        )
     }
 
     pub fn card_predicate_labels(options: &[CardPredicateChoice]) -> Vec<String> {
@@ -26744,6 +26768,10 @@ pub enum Effect {
         /// name, for a future "create a copy of a card named X".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        /// CR 707.12: whether the copy is of a named card (the default, and the
+        /// only reading of `name`) or of the ability's own source object.
+        #[serde(default, skip_serializing_if = "CardCopyTemplate::is_named_card")]
+        template: CardCopyTemplate,
         /// CR 707.12: where the copy is created. Exile is the default because a
         /// copy created to be cast has to be somewhere a card can be cast FROM,
         /// and exile is the zone whose contents are public and untouched by the

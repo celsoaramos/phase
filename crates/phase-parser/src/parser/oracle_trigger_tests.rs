@@ -43235,11 +43235,12 @@ fn q_stacking_the_deck_trigger_reads_self_etb_and_grants_to_the_found_card() {
 }
 
 /// Q, Stacking the Deck: the granted ability's body ("Create a copy of this
-/// card. You may cast the copy.") still parses as `Effect::Unimplemented`.
-/// This pins that gap so coverage keeps the card unsupported until the body is
-/// actually implemented; when it is, update this test with the real effect.
+/// card. You may cast the copy.") is the card-copy producer over the ability's
+/// own source object, followed by a paid cast of that copy during the
+/// resolution (CR 707.12). This test pinned the body as `Unimplemented` until
+/// it was implemented; it now pins the real effect.
 #[test]
-fn q_stacking_the_deck_granted_ability_body_stays_unimplemented() {
+fn q_stacking_the_deck_granted_ability_body_copies_its_own_card_and_casts_the_copy() {
     let text = "When Q enters, shuffle your library, then exile cards from the top of your library until you exile a nonland card. That nonland card gains \"Exile a card from your hand: Create a copy of this card. You may cast the copy. Activate only during your turn and only if this card is exiled.\"";
     let owned = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let parsed = parse_oracle_text(
@@ -43270,10 +43271,32 @@ fn q_stacking_the_deck_granted_ability_body_stays_unimplemented() {
         })
         .expect("granted activated ability");
     assert!(
-        matches!(*granted.effect, Effect::Unimplemented { .. }),
-        "the granted body must stay Unimplemented so Q remains unsupported, got {:?}",
+        matches!(
+            *granted.effect,
+            Effect::CreateCardCopyByName {
+                name: None,
+                template: crate::types::ability::CardCopyTemplate::AbilitySource,
+                destination: Zone::Exile,
+                ..
+            }
+        ),
+        "\"create a copy of this card\" copies the ability's own source, got {:?}",
         granted.effect
     );
+    let cast = granted.sub_ability.as_deref().expect("the cast tail");
+    assert!(
+        matches!(
+            *cast.effect,
+            Effect::CastFromZone {
+                target: TargetFilter::LastCreated,
+                without_paying_mana_cost: false,
+                ..
+            }
+        ),
+        "\"you may cast the copy\" is a paid cast of the created copy, got {:?}",
+        cast.effect
+    );
+    assert!(cast.optional, "\"you may\"");
 }
 
 /// Niambi, Beloved Protector (verbatim Scryfall Oracle text). CR 113.1a +

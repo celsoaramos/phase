@@ -38,6 +38,7 @@ use crate::parser::oracle_ir::ast::*;
 use crate::parser::oracle_ir::context::{ParseContext, PlayerAntecedents};
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::parser::oracle_ir::effect_chain::{AcceptingPlayerBinding, ClauseIr, EffectChainIr};
+use crate::types::ability::CardCopyTemplate;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
     AttackSubject, CardTypeSetSource, CastCostModifier, CastFromZoneDriver,
@@ -4187,7 +4188,11 @@ fn unimplement_card_copy_without_a_name_choice(defs: &mut [AbilityDefinition]) {
     for i in 0..defs.len() {
         if !matches!(
             *defs[i].effect,
-            Effect::CreateCardCopyByName { name: None, .. }
+            Effect::CreateCardCopyByName {
+                name: None,
+                template: CardCopyTemplate::NamedCard,
+                ..
+            }
         ) {
             continue;
         }

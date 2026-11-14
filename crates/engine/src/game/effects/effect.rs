@@ -1,4 +1,5 @@
 use crate::game::filter;
+use crate::game::game_object::ObjectIncarnationRefExt;
 use crate::game::layers::evaluate_condition;
 use crate::game::quantity::resolve_quantity_with_targets;
 use crate::types::ability::{
@@ -10,6 +11,7 @@ use crate::types::events::GameEvent;
 use crate::types::game_state::{EndEffectPermission, GameState, TransientContinuousEffectBindings};
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
+use crate::types::zones::Zone;
 
 pub use crate::types::ability::{
     generic_effect_affected_uses_inherited_targets, generic_effect_application_filter,
@@ -182,10 +184,21 @@ pub fn resolve(
             // any other modification) are NOT promoted.
             let def_dur = if duration_from_fallback
                 && !static_def.modifications.is_empty()
-                && static_def
+                && (static_def
                     .modifications
                     .iter()
                     .all(|m| matches!(m, ContinuousModification::GrantReplacement { .. }))
+                    // CR 611.2a + CR 113.6b: a duration-less grant of abilities
+                    // that state an off-battlefield zone they function from (Q,
+                    // Stacking the Deck: "That nonland card gains \"… Activate
+                    // only during your turn and only if this card is exiled.\"")
+                    // is not a dropped "until end of turn" conjunct — the ability
+                    // is usable on later turns by its own text — so it lasts for
+                    // as long as the affected object exists.
+                    || static_def
+                        .modifications
+                        .iter()
+                        .all(grants_off_battlefield_zone_ability))
             {
                 Duration::Permanent
             } else {
@@ -281,6 +294,63 @@ fn evaluate_static_condition_for_ability(
 /// that forgets the permission is impossible to write: the parameter is
 /// positional and compiler-checked.
 #[allow(clippy::too_many_arguments)]
+/// CR 113.6b: a granted ability whose own activation restriction states an
+/// off-battlefield zone it functions from ("Activate only if this card is
+/// exiled" / "… is in your graveyard").
+fn grants_off_battlefield_zone_ability(modification: &ContinuousModification) -> bool {
+    use crate::types::ability::{ActivationRestriction, ParsedCondition};
+    fn states_off_battlefield_zone(condition: &ParsedCondition) -> bool {
+        match condition {
+            ParsedCondition::SourceInZone { zone } => *zone != Zone::Battlefield,
+            ParsedCondition::And { conditions } => {
+                conditions.iter().any(states_off_battlefield_zone)
+            }
+            _ => false,
+        }
+    }
+    let ContinuousModification::GrantAbility { definition } = modification else {
+        return false;
+    };
+    definition
+        .activation_restrictions
+        .iter()
+        .any(|restriction| {
+            matches!(
+                restriction,
+                ActivationRestriction::RequiresCondition { condition: Some(condition) }
+                    if states_off_battlefield_zone(condition)
+            )
+        })
+}
+
+/// CR 400.7: the incarnation a permanent-duration ability grant to a card in a
+/// graveyard, in exile or in a library is tied to. Such a grant lasts as long as
+/// that object exists; once the card changes zones it is a new object and the
+/// grant must not follow the id. Battlefield recipients keep their existing
+/// departure pruning, and a spell on the stack carries its grants onto the
+/// permanent it becomes (CR 400.7a), so neither is bound here.
+fn off_battlefield_grant_recipient(
+    state: &GameState,
+    duration: &Duration,
+    affected: &TargetFilter,
+    modifications: &[ContinuousModification],
+) -> Option<crate::types::identifiers::ObjectIncarnationRef> {
+    let TargetFilter::SpecificObject { id } = affected else {
+        return None;
+    };
+    if !matches!(duration, Duration::Permanent)
+        || modifications.is_empty()
+        || !modifications
+            .iter()
+            .all(|m| matches!(m, ContinuousModification::GrantAbility { .. }))
+    {
+        return None;
+    }
+    let object = state.objects.get(id)?;
+    matches!(object.zone, Zone::Exile | Zone::Graveyard | Zone::Library)
+        .then(|| crate::types::identifiers::ObjectIncarnationRef::from_object(object))
+}
+
 fn install_transient(
     state: &mut GameState,
     end_permission: Option<&EndEffectPermission>,
@@ -291,6 +361,8 @@ fn install_transient(
     condition: Option<StaticCondition>,
 ) -> Option<u64> {
     let mut modifications = modifications;
+    let affected_recipient =
+        off_battlefield_grant_recipient(state, &duration, &affected, &modifications);
     // CR 201.5a + CR 400.7 + CR 113.7: a grant names the object whose ability resolved, as
     // it was then; a resolving spell is still on the stack (CR 608.2n).
     if let Some(granter) = ability.source_ref(state) {
@@ -316,6 +388,7 @@ fn install_transient(
         // CR 201.5a: a granted ability's effect names the object that granted it.
         TransientContinuousEffectBindings {
             granting_object: ability.context.granting_object,
+            affected_recipient,
             ..TransientContinuousEffectBindings::default()
         },
         // CR 113.7a: an event deadline is bound to the creating ability's own
