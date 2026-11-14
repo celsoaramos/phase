@@ -2393,6 +2393,23 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) -> u32 {
         }
     }
 
+    // CR 603.12a + CR 608.2c: a COMPLETED repeated-payment frame (no pending
+    // offer) only exists to hold K while the reflexive's modal is open. At a
+    // Priority window that modal is answered — the reflexive is already on the
+    // stack — so nothing reads K any more. It was discarded only by the depth-0
+    // prelude of the NEXT top-level resolution, which can never begin: the
+    // parent trigger's carrier cannot settle while the frame is live, and the
+    // carrier check below refuses to pop. Every pass then reopened the same
+    // window (Hawkeye, Master Marksman froze 4 of 6 MagicFinder AI x AI games).
+    if matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && state
+            .active_repeated_optional_payment_frame()
+            .is_some_and(|frame| frame.pending.is_none())
+    {
+        state
+            .take_active_repeated_optional_payment_frame()
+            .expect("completed repeated-payment frame must remain active");
+    }
     // CR 608.2n + CR 405.5: a resolution whose paused instructions completed has
     // its final part run before another object begins resolving. When it runs
     // here nothing is popped: the pass's pipeline puts its batch on the stack
