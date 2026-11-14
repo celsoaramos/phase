@@ -2172,7 +2172,7 @@ fn target_filter_uses_filter_prop(
     filter_contains_filter_prop(filter, pred)
 }
 
-fn append_sub_ability(chain: &mut AbilityDefinition, tail: AbilityDefinition) {
+pub(crate) fn append_sub_ability(chain: &mut AbilityDefinition, tail: AbilityDefinition) {
     let mut cursor = chain;
     while let Some(ref mut next) = cursor.sub_ability {
         cursor = next;
@@ -2830,6 +2830,7 @@ fn coordinated_exile_play_effect(effect: &Effect) -> Option<Effect> {
     match effect {
         Effect::CastFromZone {
             target: TargetFilter::ExiledBySource,
+            caster: TargetFilter::Controller,
             without_paying_mana_cost,
             mode: CardPlayMode::Cast,
             cast_transformed: false,

@@ -3802,6 +3802,7 @@ mod duration_distribution_tests_7923 {
 
     fn cast_from_zone(duration: Option<Duration>) -> Effect {
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::Any,
             without_paying_mana_cost: false,
             mode: CardPlayMode::Cast,
@@ -3834,6 +3835,7 @@ mod duration_distribution_tests_7923 {
                 additional_cost,
                 ..
             } => Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target,
                 without_paying_mana_cost,
                 mode,

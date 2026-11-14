@@ -770,6 +770,7 @@ fn cast_effect(
     mana_spend_permission: Option<ManaSpendPermission>,
 ) -> Effect {
     Effect::CastFromZone {
+        caster: TargetFilter::Controller,
         target,
         without_paying_mana_cost: free,
         mode: CardPlayMode::Cast,

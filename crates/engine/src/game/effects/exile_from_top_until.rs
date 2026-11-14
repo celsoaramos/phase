@@ -668,6 +668,7 @@ mod tests {
         );
         let mut cast = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -777,6 +778,7 @@ mod tests {
         );
         let mut cast = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -1278,6 +1280,7 @@ mod tests {
 
         let cast_sub = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::And {
                     filters: vec![TargetFilter::ExiledBySource, nonland_filter()],
                 },
@@ -1454,6 +1457,7 @@ mod tests {
         // cast_from_zone::resolve materializes every linked exile card.
         let cast_sub = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::And {
                     filters: vec![TargetFilter::ExiledBySource, nonland_filter()],
                 },
@@ -2510,6 +2514,7 @@ mod tests {
         );
         let mut cast = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,

@@ -10753,6 +10753,7 @@ impl FreeCastWindowResume {
             mana_spend_permission: None,
             additional_cost: None,
             cast_cost_modifier: None,
+            caster: crate::types::ability::TargetFilter::Controller,
         };
         let mut instruction = ResolvedAbility::new(
             effect,

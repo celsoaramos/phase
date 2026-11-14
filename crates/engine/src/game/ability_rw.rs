@@ -6226,6 +6226,7 @@ fn rw_effect(
         }
         Effect::CastFromZone {
             target: _,
+            caster: _,
             without_paying_mana_cost: _,
             mode: _,
             cast_transformed: _,

@@ -16967,6 +16967,24 @@ fn try_parse_next_matches_until(input: &str) -> Option<UntilCondition> {
         None => crate::parser::oracle_util::parse_count_expr(rest)?,
     };
 
+    // CR 201.2c: "… card with a different name than that spell" (Tibalt's
+    // Trickery) — the name relation is read against the parent object target
+    // (the countered spell, still the same object id in its owner's graveyard).
+    let (rest, different_name_from_parent) = match terminated(
+        take_until::<_, _, OracleError<'_>>(" with a different name than that "),
+        (
+            tag(" with a different name than that "),
+            alt((tag("spell"), tag("card"), tag("creature"), tag("permanent"))),
+            opt(tag(".")),
+            eof,
+        ),
+    )
+    .parse(rest)
+    {
+        Ok((_, head)) => (head, true),
+        Err(_) => (rest, false),
+    };
+
     // Extract the filter from "nonland card", "creature card", etc. The
     // downstream `parse_target` call does the actual filter parsing with
     // combinators; this is just punctuation/suffix cleanup on the chunk.
@@ -16990,6 +17008,20 @@ fn try_parse_next_matches_until(input: &str) -> Option<UntilCondition> {
         // Delegate to existing target parsing for other filter types
         let (parsed, _) = parse_target(filter_text);
         parsed
+    };
+    let filter = if different_name_from_parent {
+        let TargetFilter::Typed(typed) = filter else {
+            return None;
+        };
+        let mut properties = typed.properties.clone();
+        properties.push(FilterProp::SharesQuality {
+            quality: SharedQuality::Name,
+            reference: Some(Box::new(TargetFilter::ParentTarget)),
+            relation: SharedQualityRelation::DoesNotShare,
+        });
+        TargetFilter::Typed(typed.properties(properties))
+    } else {
+        filter
     };
 
     Some(UntilCondition::NextMatches { filter, count })
@@ -17664,6 +17696,13 @@ fn try_parse_per_grantee_play_grant(
     in_trigger: bool,
 ) -> Option<ParsedEffectClause> {
     let lower = tp.lower;
+    // CR 118.9: "without paying its mana cost" is a free-cast alternative cost,
+    // not a lingering permission — defer to `try_parse_cast_effect`, mirroring
+    // the guard in `try_parse_play_from_exile` (Tibalt's Trickery: "They may
+    // cast that card without paying its mana cost").
+    if scan_contains_phrase(lower, "without paying") {
+        return None;
+    }
 
     let per_owner_mode = parse_per_owner_exiled_this_way(lower)
         .ok()
@@ -23537,6 +23576,25 @@ fn try_parse_verb_and_target<'a>(
                 rem,
             ));
         }
+        // CR 122.1 + CR 608.2c: a typed counter list on one recipient ("put a
+        // +1/+1 counter and a lifelink counter on that creature") — its
+        // remainder may continue with a second recipient ("and a +1/+1 counter
+        // and a lifelink counter on ~", Arwen, Mortal Queen), which the
+        // compound splitter reads as its own instruction.
+        if let Some((entries, target, rem, multi_target)) =
+            counter::try_parse_put_counter_chain(lower, text, ctx)
+        {
+            return Some((
+                TargetedImperativeAst::ZoneCounterProxy(Box::new(
+                    ZoneCounterImperativeAst::PutCounterList {
+                        entries,
+                        target,
+                        multi_target,
+                    },
+                )),
+                rem,
+            ));
+        }
         if let Some((
             Effect::PutCounter {
                 counter_type,
@@ -23723,10 +23781,21 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
         return None;
     }
 
-    // Lower the primary AST to an Effect
-    let primary_effect = match primary_ast {
-        TargetedImperativeAst::ZoneCounterProxy(ast) => lower_zone_counter_ast(*ast),
-        other => lower_targeted_action_ast(other),
+    // Lower the primary AST to an Effect. A counter list lowers to a chain of
+    // `PutCounter` links on one recipient; the continuation hangs off its tail.
+    let (primary_effect, primary_list) = match primary_ast {
+        TargetedImperativeAst::ZoneCounterProxy(ast) => match *ast {
+            ZoneCounterImperativeAst::PutCounterList {
+                entries,
+                target,
+                multi_target,
+            } => {
+                let list = imperative::lower_put_counter_list(entries, target, multi_target);
+                (list.effect, Some((list.sub_ability, list.multi_target)))
+            }
+            ast => (lower_zone_counter_ast(ast), None),
+        },
+        other => (lower_targeted_action_ast(other), None),
     };
 
     let sub_lower = sub_text.to_lowercase();
@@ -24075,6 +24144,13 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
         ));
     }
 
+    // CR 608.2c: a counter list only splits off a SECOND RECIPIENT of counters
+    // (Arwen). Any other conjunct keeps the whole clause fail-closed as
+    // `put_counter_tail`, so the list never resolves without its tail.
+    if primary_list.is_some() && !matches!(sub_clause.effect, Effect::PutCounter { .. }) {
+        return None;
+    }
+
     // If the remainder contains anaphoric references ("it", "that creature", "them"),
     // replace the sub_effect's target with ParentTarget so it inherits the parent's targets.
     // CR 608.2k carve-out (issue #319): in typed-trigger-subject context the
@@ -24142,6 +24218,9 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
     // (`ChosenColorQualifierScope` rule 1) — only the recovered `multi` bound
     // is kept, the derived contexts are dropped.
     let primary_multi_target = match &primary_effect {
+        Effect::PutCounter { .. } if primary_list.is_some() => {
+            primary_list.as_ref().and_then(|(_, multi)| multi.clone())
+        }
         Effect::PutCounter { .. } => {
             let primary_clause = &text[..text.len() - remainder.len()];
             let primary_lower = primary_clause.to_ascii_lowercase();
@@ -24165,12 +24244,21 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
         _ => None,
     };
 
+    // CR 608.2c: the continuation follows every counter of the primary list.
+    let sub_ability = match primary_list.and_then(|(chain, _)| chain) {
+        Some(mut chain) => {
+            crate::parser::oracle::append_sub_ability(&mut chain, sub_ability);
+            chain
+        }
+        None => Box::new(sub_ability),
+    };
+
     Some(ParsedEffectClause {
         optional_targeting: false,
         unlowered_guard: None,
         effect: primary_effect,
         duration: None,
-        sub_ability: Some(Box::new(sub_ability)),
+        sub_ability: Some(sub_ability),
         distribute: None,
         multi_target: primary_multi_target,
         condition: None,
@@ -27409,6 +27497,7 @@ fn try_parse_per_opponent_graveyard_free_cast(lower: &str) -> Option<Effect> {
     );
 
     Some(Effect::CastFromZone {
+        caster: TargetFilter::Controller,
         target: filter,
         without_paying_mana_cost: true,
         mode: CardPlayMode::Cast,
@@ -34466,6 +34555,23 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst, origin
         {
             *player = subject_filter;
         }
+        // CR 701.13a + CR 109.5: "[subject] exiles cards from the top of their
+        // library until …" — whose library is the subject's ("Its controller
+        // mills that many cards, then exiles cards from the top of their
+        // library until …" — Tibalt's Trickery), not the ability controller's.
+        Effect::ExileFromTopUntil { player, .. }
+            if *player == TargetFilter::Controller && subject_names_player =>
+        {
+            *player = subject_filter;
+        }
+        // CR 601.2 + CR 109.5: "[subject] may cast that card …" — the subject
+        // casts the card (Tibalt's Trickery's "They", Possibility Storm's "That
+        // player"), not the ability's controller.
+        Effect::CastFromZone { caster, .. }
+            if *caster == TargetFilter::Controller && subject_names_player =>
+        {
+            *caster = subject_filter;
+        }
         // CR 400.7: "shuffle [subject]'s graveyard into their library" — inject
         // subject target for zone-wide changes and shuffles.
         Effect::ChangeZoneAll { ref mut target, .. }
@@ -35598,6 +35704,7 @@ fn from_among_batch_cast_effect(
         }
     };
     Effect::CastFromZone {
+        caster: TargetFilter::Controller,
         target,
         without_paying_mana_cost: without_paying,
         mode,
@@ -37231,6 +37338,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
             TargetFilter::ParentTarget
         };
         return Some(Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target,
             without_paying_mana_cost: without_paying,
             mode,
@@ -37570,6 +37678,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
             _ => TargetFilter::ExiledBySource,
         };
         return Some(Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target,
             without_paying_mana_cost: without_paying,
             mode,
@@ -37608,6 +37717,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
             let mut typed_filter = type_list.unwrap_or(single_type);
             ensure_exile_zone_on_cast_target(&mut typed_filter);
             return Some(Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::And {
                     filters: vec![typed_filter, TargetFilter::ExiledBySource],
                 },
@@ -37671,6 +37781,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
             ],
         };
         return Some(Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::Or {
                 filters: vec![owned_card, lesser_card],
             },
@@ -37765,6 +37876,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
             ));
         }
         let mut effect = Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: filter,
             without_paying_mana_cost: without_paying,
             mode,
@@ -37792,6 +37904,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
 
     // Branch 3: bare fallback.
     Some(Effect::CastFromZone {
+        caster: TargetFilter::Controller,
         target: TargetFilter::Any,
         without_paying_mana_cost: without_paying,
         mode,
@@ -53322,7 +53435,18 @@ fn parse_effect_chain_ir_body(
         // either; the owner scope below is its own, unconditional, single-shot
         // local. This rung keeps the extra `is_optional` leg the pin does not
         // need, purely so no shape that armed at base stops arming.
-        if leading_subject_application.as_ref().is_some_and(|app| {
+        // A subject-less ", then <act>" continuation inherits the armed
+        // subject (Tibalt's Trickery: "Its controller mills …, then exiles …"),
+        // so the antecedent survives it for the following sentence's "they".
+        let continues_seeded_subject = seeded_parent_target_controller_this_chunk
+            && leading_subject_application.is_none()
+            && matches!(
+                chunk_idx
+                    .checked_sub(1)
+                    .and_then(|prev| chunks[prev].boundary_after),
+                Some(ClauseBoundary::Then | ClauseBoundary::Comma)
+            );
+        if continues_seeded_subject || leading_subject_application.as_ref().is_some_and(|app| {
             app.affected == TargetFilter::ParentTargetController
                 && (app.is_optional
                     || matches!(

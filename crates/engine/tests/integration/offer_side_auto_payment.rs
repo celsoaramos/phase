@@ -878,6 +878,7 @@ fn setup_face_of_boe(add_plain_red_source: bool) -> Option<(GameRunner, ObjectId
             AbilityDefinition::new(
                 AbilityKind::Activated,
                 Effect::CastFromZone {
+                    caster: TargetFilter::Controller,
                     target: TargetFilter::Typed(
                         TypedFilter::default()
                             .with_type(TypeFilter::Card)
@@ -1072,6 +1073,7 @@ fn setup_free_hand_pick() -> (GameRunner, ObjectId, ObjectId) {
             AbilityDefinition::new(
                 AbilityKind::Activated,
                 Effect::CastFromZone {
+                    caster: TargetFilter::Controller,
                     target: TargetFilter::Typed(
                         TypedFilter::card()
                             .controller(ControllerRef::You)
@@ -1168,6 +1170,7 @@ fn setup_direct_graveyard_free_cast(optional: bool) -> (GameRunner, ObjectId, Ob
     let mut runner = scenario.build();
     let mut ability = engine::types::ability::ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Cast,

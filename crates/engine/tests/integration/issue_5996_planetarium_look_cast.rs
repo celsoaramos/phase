@@ -478,6 +478,7 @@ fn missing_look_referent_does_not_play_inherited_unrelated_object() {
 
     let mut optional_play = ResolvedAbility::new(
         Effect::CastFromZone {
+            caster: engine::types::ability::TargetFilter::Controller,
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: true,
             mode: CardPlayMode::Play,

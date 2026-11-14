@@ -4443,6 +4443,7 @@ mod tests {
         // the parent-target propagation guard applies.
         let cast_tail = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
@@ -4609,6 +4610,7 @@ mod tests {
         // walk below can pick it out from the remaining-opponent DealDamage nodes.
         let mut cast_tail = ResolvedAbility::new(
             Effect::CastFromZone {
+                caster: TargetFilter::Controller,
                 target: TargetFilter::ParentTarget,
                 without_paying_mana_cost: true,
                 mode: CardPlayMode::Cast,
