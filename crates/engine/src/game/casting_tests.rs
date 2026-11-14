@@ -16394,6 +16394,10 @@ fn snuff_out_from_card_database_alt_cost_destroys_target() {
         target.base_toughness = Some(2);
     }
 
+    // Cast through the production action entry, like the hand-built variant
+    // above: the announcement's trigger carrier is opened and closed by the
+    // action boundary (`begin_action` / `end_action`), so a bare
+    // `handle_cast_spell` call would leave it in flight for the next action.
     // Route through the production action boundary (as the hand-built sibling
     // does): targeting now stages announcement events, which requires the
     // boundary's end_action to drain the spell trigger carrier.
