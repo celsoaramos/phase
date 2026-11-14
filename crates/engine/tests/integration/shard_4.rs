@@ -375,6 +375,7 @@ mod mf_relatos_20261115_14;
 mod mf_relatos_20261115_19;
 mod mf_relatos_20261116_00;
 mod mf_temporada_case_uneaten_feast;
+mod mf_temporada_picard_luminary;
 mod mf_temporada_scion_of_draco;
 mod mf_temporada_tron_lands;
 mod militant_angel_attacked_opponents;

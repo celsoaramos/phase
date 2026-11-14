@@ -24118,14 +24118,19 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
     // "a loyalty counter on each planeswalker you control" — a verbless counter
     // clause starting with an article. Prepend the primary verb so it becomes
     // "put a loyalty counter on each planeswalker you control".
+    // CR 122.1: a NUMBER-led conjunct carries the same verb ("put a +1/+1 counter
+    // on up to one other target creature and two charge counters on up to one
+    // target Spacecraft" — Jean-Luc Picard, Luminary).
     if matches!(sub_clause.effect, Effect::Unimplemented { .. })
         && alt((
-            tag::<_, _, OracleError<'_>>("a "),
-            tag::<_, _, OracleError<'_>>("an "),
+            value((), tag::<_, _, OracleError<'_>>("a ")),
+            value((), tag::<_, _, OracleError<'_>>("an ")),
+            value((), (nom_primitives::parse_number, tag(" "))),
         ))
         .parse(sub_lower.as_str())
         .is_ok()
-        && nom_primitives::scan_contains(&sub_lower, "counter on")
+        && (nom_primitives::scan_contains(&sub_lower, "counter on")
+            || nom_primitives::scan_contains(&sub_lower, "counters on"))
     {
         if let Some(verb) = extract_effect_verb(&primary_effect) {
             let reparsed_text = format!("{verb} {sub_text}");
