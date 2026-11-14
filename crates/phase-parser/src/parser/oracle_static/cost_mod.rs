@@ -811,25 +811,32 @@ fn parse_alternative_keyword_cost_body(text: &str) -> Option<StaticDefinition> {
     let after_cost = TextPair::new(&tp.original[cost_len..], after_cost_lower);
     let after_cost = nom_tag_tp(&after_cost, " rather than pay ")?;
 
-    // Keyword remainder: "[optional-possessive][keyword] cost[s]". Scan for the
-    // keyword word + "cost" marker (the possessive prefix, e.g. "heart of
-    // kiran's ", is structurally irrelevant — the keyword identifies the class).
+    // Keyword remainder: "[optional-possessive][keyword] cost[s][frequency]". The
+    // possessive prefix (e.g. "heart of kiran's ", "the ") is structurally
+    // irrelevant — the keyword marker identifies the class.
     let kw_lower = after_cost.lower.trim_end_matches('.').trim();
+    let (tail, keyword) = alt((
+        keyword_cost_marker("cycling cost", KeywordKind::Cycling),
+        keyword_cost_marker("crew cost", KeywordKind::Crew),
+        // CR 702.6a: Kíli the Resourceful / Forge Anew — "the equip cost of …".
+        keyword_cost_marker("equip cost", KeywordKind::Equip),
+    ))
+    .parse(kw_lower)
+    .ok()?;
 
-    let keyword = if nom_primitives::scan_contains(kw_lower, "cycling cost") {
-        KeywordKind::Cycling
-    } else if nom_primitives::scan_contains(kw_lower, "crew cost") {
-        KeywordKind::Crew
-    } else {
-        return None;
-    };
-
-    // Frequency: detect "the first card you [keyword] each turn" pattern.
-    let frequency = if nom_primitives::scan_contains(kw_lower, "first card you cycle each turn") {
-        Some(CastFrequency::OncePerTurn)
-    } else {
-        None
-    };
+    // CR 118.9 + CR 602.2b: the tail is either nothing ("crew cost", "cycling
+    // costs") or a first-use-per-turn scope. Anything else (an unrecognized
+    // scope) refuses the line: dropping a scope would grant the alternative cost
+    // to every activation, strictly more permissive than printed.
+    let (_, frequency) = all_consuming(alt((
+        value(
+            Some(CastFrequency::OncePerTurn),
+            parse_first_keyword_use_each_turn,
+        ),
+        value(None, opt(tag::<_, _, VE<'_>>("s"))),
+    )))
+    .parse(tail)
+    .ok()?;
 
     Some(
         StaticDefinition::new(StaticMode::AlternativeKeywordCost {
@@ -840,6 +847,31 @@ fn parse_alternative_keyword_cost_body(text: &str) -> Option<StaticDefinition> {
         .description(text.to_string())
         .active_zones(vec![Zone::Battlefield]),
     )
+}
+
+/// "[…]<keyword> cost" → the keyword, leaving the text after the marker.
+fn keyword_cost_marker<'a>(
+    marker: &'static str,
+    keyword: KeywordKind,
+) -> impl Parser<&'a str, Output = KeywordKind, Error = OracleError<'a>> {
+    value(keyword, (take_until(marker), tag(marker)))
+}
+
+/// CR 118.9 + CR 602.2b: the first-use-per-turn scope of an alternative keyword
+/// cost — " of the first card you cycle each turn" (Gavi, Nest Warden), " of the
+/// first equip ability you activate each turn" (Kíli the Resourceful), and the
+/// "during each of your turns" wording (Forge Anew, whose own-turn gate is its
+/// leading "as long as it's your turn" condition).
+fn parse_first_keyword_use_each_turn(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        (
+            tag(" of the first "),
+            alt((tag("card you cycle"), tag("equip ability you activate"))),
+            alt((tag(" each turn"), tag(" during each of your turns"))),
+        ),
+    )
+    .parse(input)
 }
 
 /// CR 118.9 + CR 601.2b: Parse a "cast [filter] by paying life equal to its
