@@ -210,6 +210,7 @@ mod foil_alternative_cost;
 mod fold_into_aether_counter_put;
 mod for_each_put_counter_head;
 mod for_the_ancestors_chosen_creature_type_4834;
+mod force_of_rage_delayed_sacrifice;
 mod forced_retarget_multi_role_mana_6056;
 mod foreign_subject_split_guard;
 mod foretell_pipeline;
