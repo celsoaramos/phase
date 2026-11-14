@@ -99,6 +99,11 @@
 //! ChooseOneOfBranch more than 200 B apart, so `WaitingFor` carries an intentional
 //! `#[allow(clippy::large_enum_variant)]`; the GameState ceiling above is the bound.
 //!
+//! `FormatConfig.house_emblems` (MagicFinder fork, `Vec<String>`, +24 B inline
+//! through `GameState::format_config`) put the fork's integration build at the
+//! 14,848 ceiling on x86_64-unknown-linux-gnu. `pending_liminal_entry_resume`
+//! (184 B inline, populated only while a liminal token/meld entry waits on a
+//! copy choice) is boxed to pay for it.
 //! `GameState` re-measured on x86_64-pc-windows-msvc at 14,864 B when the
 //! CR 603.10d control-change evidence tables (`control_change_captures`,
 //! `control_change_observations`, and their two `u64` id counters) landed.

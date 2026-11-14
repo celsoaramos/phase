@@ -2129,6 +2129,9 @@ fn load_decks(state: &mut GameState, payload: &DeckPayload, records: PrintingRec
         }
     }
 
+    // House-rule emblems ("regra da semana"): one command-zone emblem per
+    // `FormatConfig::house_emblems` text, before the first turn (CR 114.1).
+    crate::game::house_emblems::grant_house_emblems(state);
     // Horde Magic: grant the Horde seat its game-start command-zone emblem
     // (haste + forced attackers on the Horde's creatures). Mirrors the Momir
     // emblem grant above; scoped to the single Horde seat, unlike Momir's
