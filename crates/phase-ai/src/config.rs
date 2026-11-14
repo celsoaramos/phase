@@ -1375,6 +1375,26 @@ pub struct AiConfig {
     /// one (`combat_sim`). On for the tiers the MagicFinder table serves as
     /// "Difícil" (VeryHard) and above.
     pub combat_simulation: bool,
+    /// MagicFinder (2026-10-27): at a main-phase decision of its own turn, play
+    /// the best root actions out to the start of its next turn with the
+    /// heuristic AI on both seats and keep a line that clearly wins
+    /// (`turn_sim`). On for "Difícil" (VeryHard) and above.
+    pub turn_simulation: bool,
+    /// Whether policies may run uncached multi-turn projections at all. Off
+    /// only inside a `turn_sim` playout: the playout already plays the
+    /// opponent's turn, and a projection per policy call per step is what made
+    /// a single decision cost seconds.
+    pub projections: bool,
+    /// Whether the priority shortcut withholds its pass/low-value answer when a
+    /// fetch-then-cast route certifies (`has_certified_fetch_then_cast_route`,
+    /// which replays the fetch through the reducer). Off only inside a
+    /// `turn_sim` playout: measured 01/11/2026 on a landfall mirror, that check
+    /// was ~28% of the turn simulation's time, paid at every playout step.
+    pub fetch_route_check: bool,
+    /// Wall clock for the turn playouts even in measurement mode. `None` in
+    /// every preset; the lab sets it (`tsim_ms=`) to stand in for the slower
+    /// browser so it measures what the browser can actually finish.
+    pub turn_simulation_clock_ms: Option<u32>,
     pub search: SearchConfig,
     pub weights: EvalWeightSet,
     pub keyword_bonuses: KeywordBonuses,
@@ -1591,6 +1611,10 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
         play_lookahead,
         combat_lookahead,
         combat_simulation: difficulty >= AiDifficulty::VeryHard,
+        turn_simulation: difficulty >= AiDifficulty::VeryHard,
+        projections: true,
+        fetch_route_check: true,
+        turn_simulation_clock_ms: None,
         search,
         weights: EvalWeightSet::learned(),
         keyword_bonuses: KeywordBonuses::default(),

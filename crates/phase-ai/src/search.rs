@@ -280,6 +280,19 @@ pub fn choose_action_with_session(
     choose_action_with_session_inner(state, config, rng, session, &contract, true, false).action
 }
 
+/// The chooser as a `turn_sim` playout uses it: no durable Pact route is armed
+/// (a playout's position is not the real one).
+pub(crate) fn choose_action_for_playout(
+    state: &GameState,
+    ai_player: PlayerId,
+    config: &AiConfig,
+    rng: &mut impl Rng,
+    session: &Arc<AiSession>,
+) -> Option<GameAction> {
+    let contract = issue_chooser_contract(state, ai_player);
+    choose_action_with_session_inner(state, config, rng, session, &contract, false, false).action
+}
+
 /// [`choose_action_with_session`] for a caller that already holds the decision
 /// contract issued for this exact state, as the AI action driver does to
 /// validate the chosen action. The candidate domain is then enumerated once per
@@ -811,8 +824,9 @@ fn fast_priority_action(
     }
 
     if large_board_main_phase_has_no_development_sources(state, ai_player) {
-        return (!has_certified_fetch_then_cast_route(state, ai_player))
-            .then_some(GameAction::PassPriority);
+        return (!(config.fetch_route_check
+            && has_certified_fetch_then_cast_route(state, ai_player)))
+        .then_some(GameAction::PassPriority);
     }
 
     // While the engine's pass authority holds, the issued contract holds every
@@ -849,7 +863,9 @@ fn fast_priority_action(
         })
     });
     // One fetch-then-cast filter covers both answers.
-    action.filter(|_| !has_certified_fetch_then_cast_route(state, ai_player))
+    action.filter(|_| {
+        !(config.fetch_route_check && has_certified_fetch_then_cast_route(state, ai_player))
+    })
 }
 
 /// The certified lethal-reach answer to the AI's decision — the next step of a
@@ -3171,6 +3187,51 @@ fn score_candidates_uncertified(
     root: RootReuse<'_>,
     prompt_answers: PromptAnswerValidation,
 ) -> Vec<(GameAction, f64)> {
+    let scored = score_candidates_uncertified_searched(
+        root_domain,
+        config,
+        session,
+        deadline,
+        root_deadline,
+        root,
+        prompt_answers,
+    );
+    let (state, ai_player) = (root_domain.state, root_domain.ai_player);
+    if !config.turn_simulation || !crate::turn_sim::applies(state, ai_player) {
+        return scored;
+    }
+    let context = build_ai_context_with_session(state, ai_player, config, Arc::clone(session));
+    let weights = context.adjusted_weights.for_turn(state.turn_number);
+    let input = crate::turn_sim::TurnSimInput {
+        state,
+        player: ai_player,
+        config,
+        session,
+        weights,
+        deadline: match (config.execution_mode, config.turn_simulation_clock_ms) {
+            // The lab may impose a clock to stand in for the browser's.
+            (_, Some(ms)) => Some(engine::util::Deadline::after(ms)),
+            (crate::config::ExecutionMode::Measurement { .. }, None) => None,
+            (crate::config::ExecutionMode::Interactive, None) => {
+                Some(engine::util::Deadline::after(TURN_SIM_BUDGET_MS))
+            }
+        },
+    };
+    crate::turn_sim::refine_root_turn(&input, scored, |action| {
+        priority_action_is_pass_or_mana(state, action)
+    })
+}
+
+/// [`score_candidates_uncertified`] before the turn simulation looks further.
+fn score_candidates_uncertified_searched(
+    root_domain: &RootPriorityDomain<'_>,
+    config: &AiConfig,
+    session: &Arc<AiSession>,
+    deadline: engine::util::Deadline,
+    root_deadline: &mut RootSearchDeadline,
+    root: RootReuse<'_>,
+    prompt_answers: PromptAnswerValidation,
+) -> Vec<(GameAction, f64)> {
     let (state, ai_player) = (root_domain.state, root_domain.ai_player);
     // Attacker declarations are public-state tactical choices. Running K hidden
     // information samples cannot improve them, but would multiply the bounded
@@ -5364,6 +5425,10 @@ pub(crate) fn deterministic_choice(
 /// Wall-clock guard for the combat replays in interactive play. Combat is the
 /// decision a person watches the AI take, so it gets more than a priority pass.
 const COMBAT_SIM_BUDGET_MS: u32 = 1200;
+
+/// Wall-clock guard for the turn playouts (`turn_sim`) in interactive play, on
+/// top of the root search. The owner's ceiling for a big decision is ~3 s.
+const TURN_SIM_BUDGET_MS: u32 = 1500;
 
 /// MagicFinder (2026-10-26): replay the heuristic's root combat declaration
 /// against a few alternatives through the reducer (`combat_sim`) and keep the

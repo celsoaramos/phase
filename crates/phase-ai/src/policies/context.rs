@@ -103,7 +103,7 @@ impl<'a> PolicyContext<'a> {
     /// the duel suite's attribution mode, so a flip would also silently change
     /// trace output.
     pub fn can_afford_projection(&self) -> bool {
-        if self.context.deadline.expired() {
+        if !self.config.projections || self.context.deadline.expired() {
             return false;
         }
         let floor = self.config.search.projection_min_budget_ms;
