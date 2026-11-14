@@ -1810,11 +1810,23 @@ fn reapply_printed_faces_from_card_db(state: &mut GameState, db: &CardDatabase) 
     let mut changed_battlefield = false;
 
     for object_id in object_ids {
-        let Some(printed_ref) = state
-            .objects
-            .get(&object_id)
-            .and_then(|obj| obj.printed_ref.clone())
-        else {
+        // CR 707.2 + CR 613.1a: the face to re-stamp is the object's OWN printed
+        // face. `printed_ref` is the layer-evaluated display pointer, which a
+        // layer-1 copy effect overrides with the copied card's identity; reading
+        // it here re-based a temporary copy (Scion of the Ur-Dragon, Mirage
+        // Mirror: "becomes a copy ... until end of turn") onto the copied card on
+        // every restore, so the copy outlived its duration (CR 514.2).
+        // `base_printed_ref` is the baseline every face install keeps in sync. An
+        // object with no display pointer (face-down, concealed) is still skipped,
+        // and one without a baseline (legacy state) keeps the old read.
+        let Some(printed_ref) = state.objects.get(&object_id).and_then(|obj| {
+            let display = obj.printed_ref.as_ref()?;
+            Some(
+                obj.base_printed_ref
+                    .clone()
+                    .unwrap_or_else(|| display.clone()),
+            )
+        }) else {
             continue;
         };
 
@@ -3655,14 +3667,13 @@ mod tests {
             object.back_face = Some(snapshot_object_face(object));
         }
         state.objects.get_mut(missing_ref).unwrap().printed_ref = None;
-        state
-            .objects
-            .get_mut(missing_face)
-            .unwrap()
-            .printed_ref
-            .as_mut()
-            .unwrap()
-            .oracle_id = "missing-face".to_string();
+        {
+            // The face lookup reads the object's own baseline (`base_printed_ref`),
+            // so a face missing from the database is one the baseline names.
+            let object = state.objects.get_mut(missing_face).unwrap();
+            object.printed_ref.as_mut().unwrap().oracle_id = "missing-face".to_string();
+            object.base_printed_ref = object.printed_ref.clone();
+        }
         // Bounded branch isolation before the existing finalizer: saved markers
         // on tokens/face-down objects deliberately distinguish exclusion from
         // this new ordinary-refresh batch. Public valid-form lifecycles are
