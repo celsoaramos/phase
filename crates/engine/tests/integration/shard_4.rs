@@ -374,6 +374,7 @@ mod mf_relatos_20261115_00;
 mod mf_relatos_20261115_14;
 mod mf_relatos_20261115_19;
 mod mf_relatos_20261116_00;
+mod mf_relatos_20261117;
 mod mf_temporada_case_uneaten_feast;
 mod mf_temporada_jace_multiverse_architect;
 mod mf_temporada_nethergoyf;
