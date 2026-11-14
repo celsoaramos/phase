@@ -449,6 +449,7 @@ mod opposition_agent_final;
 mod optional_chain_link_prompt_description;
 mod optional_discard_infeasibility;
 mod optional_effect_remember_legal_actions;
+mod optional_frame_across_replacement_choice;
 mod optional_replacement_decline_keeps_resident_drain;
 mod optional_replacement_decline_unreplaced_event;
 mod oracle_of_the_alpha_conjure_power_nine;
