@@ -2250,6 +2250,39 @@ fn spend_selected(
     Some(pool.swap_remove(slot))
 }
 
+/// Ordem em que a reserva é gasta, entre unidades JÁ elegíveis para este custo.
+///
+/// CR 601.2h deixa a escolha com o jogador; quando o motor escolhe por ele, a
+/// escolha certa é gastar o recurso ESTREITO primeiro. Uma unidade restrita que
+/// serve AQUI não serve em qualquer lugar (Eldrazi Temple: "gaste esta mana
+/// apenas para conjurar mágicas Eldrazi incolores ou ativar habilidades de
+/// Eldrazi incolores"), enquanto a livre paga tudo que a restrita paga e mais.
+/// Gastar a livre e deixar a restrita flutuando só empobrece o turno: foi o
+/// relato de campo de 16/09 — Templo + Ugin's Labyrinth, quatro mana, a Eldrazi
+/// de três conjurada e o {1} de equipar impossível, porque o que sobrou foi a
+/// mana restrita.
+///
+/// A chave mantém como desempate a preferência antiga por fonte que NÃO produz
+/// duas ou mais cores (reservada para o símbolo `{Z}`), então nenhum caso que
+/// não tenha mana restrita muda de comportamento.
+fn spend_order_key(unit: &ManaShape) -> (bool, bool) {
+    (
+        unit.restrictions.is_empty(),
+        unit.source_could_produce_two_or_more_colors,
+    )
+}
+
+/// A primeira unidade (na ordem da reserva) da classe de `spend_order_key`
+/// mais estreita que tenha alguma unidade aceita por `allows`.
+fn first_in_spend_order<'a>(
+    pool: &'a ManaPool,
+    allows: impl Fn(&ManaShape) -> bool,
+) -> Option<(PoolSlot, &'a ManaShape)> {
+    [(false, false), (false, true), (true, false), (true, true)]
+        .into_iter()
+        .find_map(|key| pool.first_where(|unit| spend_order_key(unit) == key && allows(unit)))
+}
+
 fn spend_color_prefer_non_z(
     pool: &mut ManaPool,
     color: ManaType,
@@ -2257,17 +2290,11 @@ fn spend_color_prefer_non_z(
     allows: impl Fn(&ManaShape) -> bool,
 ) -> Option<ManaUnit> {
     // CR 118.3a: a player-pinned eligible unit of this color is spent first;
-    // otherwise the legacy non-`Z`-then-any ordering is preserved exactly.
+    // otherwise `spend_order_key` decides: restricted-but-eligible mana goes
+    // before unrestricted, and the legacy non-`Z` preference breaks the tie.
     spend_selected(pool, |pool| {
         pool.first_pinned_where(pins, |unit| unit.color == color && allows(unit))
-            .or_else(|| {
-                pool.first_where(|unit| {
-                    unit.color == color
-                        && !unit.source_could_produce_two_or_more_colors
-                        && allows(unit)
-                })
-            })
-            .or_else(|| pool.first_where(|unit| unit.color == color && allows(unit)))
+            .or_else(|| first_in_spend_order(pool, |unit| unit.color == color && allows(unit)))
     })
 }
 
@@ -2678,11 +2705,10 @@ fn spend_generic_non_demanded(
         }
     };
 
+    // Mesma ordem do caminho por cor: restrita elegível antes da livre, com a
+    // preferência por fonte não-`Z` como desempate.
     spend_selected(pool, |pool| {
-        pool.first_where(|unit| {
-            !unit.source_could_produce_two_or_more_colors && is_spendable(pool, unit)
-        })
-        .or_else(|| pool.first_where(|unit| is_spendable(pool, unit)))
+        first_in_spend_order(pool, |unit| is_spendable(pool, unit))
     })
 }
 
@@ -4195,6 +4221,69 @@ mod tests {
                 life_colors: crate::types::mana::LifePaymentColors::EMPTY
             }
         ));
+    }
+
+    /// CR 601.2h: quando o motor escolhe a mana por quem paga, ele gasta o
+    /// recurso ESTREITO primeiro. Relato de campo (16/09): Eldrazi Temple (dois
+    /// {C} restritos a Eldrazi incolor) + Ugin's Labyrinth (dois {C} livres),
+    /// quatro na reserva; conjurada uma Eldrazi incolor de três, o que sobrou
+    /// foi a mana RESTRITA e o {1} de Equipar ficou impagável. Deve sobrar a
+    /// livre: ela paga tudo que a restrita paga, e mais.
+    #[test]
+    fn restricted_mana_is_spent_before_unrestricted_when_both_are_eligible() {
+        let restriction = ManaRestriction::OnlyForTypeSpellsOrAbilities {
+            spell_type: "Colorless Eldrazi".to_string(),
+            ability: crate::types::mana::AbilityActivationScope::OfSpellType,
+        };
+        let mut pool = ManaPool::default();
+        for _ in 0..2 {
+            pool.add(ManaUnit {
+                color: ManaType::Colorless,
+                source_id: ObjectId(1),
+                pip_id: crate::types::mana::ManaPipId(0),
+                supertype: None,
+                source_could_produce_two_or_more_colors: false,
+                restrictions: vec![restriction.clone()],
+                grants: vec![],
+                expiry: None,
+            });
+        }
+        for _ in 0..2 {
+            pool.add(make_unit(ManaType::Colorless));
+        }
+
+        // Só os campos que o teste exercita; o resto vem do Default. Literal
+        // exaustivo aqui quebra a compilação toda vez que o upstream acrescenta
+        // um campo a SpellMeta (foi o que a v0.86.0 fez, com #8905).
+        let eldrazi = SpellMeta {
+            types: vec!["Creature".to_string(), "Colorless".to_string()],
+            subtypes: vec!["Eldrazi".to_string()],
+            ..Default::default()
+        };
+        let ctx = PaymentContext::Spell(&eldrazi);
+        let cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Colorless],
+            generic: 2,
+        };
+
+        let (spent, _) = pay_cost_with_demand(&mut pool, &cost, None, Some(&ctx), None)
+            .expect("a Eldrazi incolor é pagável com os quatro mana");
+
+        assert_eq!(spent.len(), 3, "três mana pagam {{2}}{{C}}");
+        assert_eq!(
+            spent.iter().filter(|u| !u.restrictions.is_empty()).count(),
+            2,
+            "as DUAS restritas têm de ser gastas antes de qualquer livre"
+        );
+        assert_eq!(pool.total(), 1, "sobra um mana na reserva");
+        assert!(
+            pool.units()
+                .next()
+                .expect("sobra uma")
+                .restrictions
+                .is_empty(),
+            "o que sobra tem de ser a mana LIVRE (é ela que ainda paga Equipar {{1}})"
+        );
     }
 
     #[test]
