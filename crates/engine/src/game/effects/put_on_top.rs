@@ -235,6 +235,10 @@ pub fn resolve(
             );
         }
     }
+    // The zone the tracked-set members offered below actually sit in, and
+    // whether the milled-set scan ran (finding nothing there is a legal no-op).
+    let mut tracked_members_zone = Zone::Library;
+    let mut tracked_set_scan = false;
     if collected_targets.is_empty()
         && matches!(
             target_filter,
@@ -258,21 +262,38 @@ pub fn resolve(
                 .unwrap_or_default(),
             _ => state.objects.keys().copied().collect(),
         };
-        collected_targets = candidate_ids
-            .into_iter()
-            .filter(|id| {
-                state
-                    .objects
-                    .get(id)
-                    .is_some_and(|obj| obj.zone == Zone::Library)
-                    && crate::game::filter::matches_target_filter(
-                        state,
-                        *id,
-                        &effective_filter,
-                        &ctx,
-                    )
-            })
-            .collect();
+        let members_in = |zone: Zone| -> Vec<ObjectId> {
+            candidate_ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    state.objects.get(id).is_some_and(|obj| obj.zone == zone)
+                        && crate::game::filter::matches_target_filter(
+                            state,
+                            *id,
+                            &effective_filter,
+                            &ctx,
+                        )
+                })
+                .collect()
+        };
+        collected_targets = members_in(Zone::Library);
+        // CR 701.17c: an effect that refers to a milled card finds it in the
+        // zone it moved to. "Put a <filter> card from among the milled cards on
+        // top of your library" (Lluwen, Imperfect Naturalist) reads the mill's
+        // tracked set, whose members sit in the graveyard. Only a bound tracked
+        // set is read this way — never the whole-object fallback above.
+        if collected_targets.is_empty()
+            && matches!(
+                effective_filter,
+                TargetFilter::TrackedSet { .. } | TargetFilter::TrackedSetFiltered { .. }
+            )
+        {
+            collected_targets = members_in(Zone::Graveyard);
+            tracked_members_zone = Zone::Graveyard;
+            // No library member and no milled member: nothing to place.
+            tracked_set_scan = true;
+        }
     }
 
     // CR 115.1 + CR 400.2: When the filter specifies a private zone (hand/library)
@@ -425,7 +446,7 @@ pub fn resolve(
         // resolve as a legal no-op: the spell still shuffled, it just placed no
         // card on top. Only `Any` (the "the card you found" forward target) is
         // treated this way; a concrete filter resolving to nothing is a real bug.
-        if matches!(target_filter, TargetFilter::Any) {
+        if matches!(target_filter, TargetFilter::Any) || tracked_set_scan {
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::PutAtLibraryPosition,
                 source_id: ability.source_id,
@@ -440,7 +461,17 @@ pub fn resolve(
 
     // CR 115.1 + CR 608.2c: When more tracked-set library candidates exist
     // than the placement count allows, prompt before auto-picking the first.
-    if collected_targets.len() > expected && expected > 0 {
+    // An up-to pick from the milled set ("you may put a <filter> card from among
+    // the milled cards on top") is always offered, even with a single candidate:
+    // choosing none is part of the instruction.
+    let milled_may_pick =
+        count_is_up_to && tracked_members_zone == Zone::Graveyard && !collected_targets.is_empty();
+    let expected = if milled_may_pick {
+        expected.min(collected_targets.len())
+    } else {
+        expected
+    };
+    if (collected_targets.len() > expected || milled_may_pick) && expected > 0 {
         state.waiting_for = WaitingFor::EffectZoneChoice {
             performed_by: None,
             player: ability.controller,
@@ -483,7 +514,7 @@ pub fn resolve(
             zone: target_filter
                 .extract_in_zone()
                 .filter(|z| z.is_library_relocation_origin())
-                .unwrap_or(Zone::Library),
+                .unwrap_or(tracked_members_zone),
             destination: None,
             enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             enter_transformed: false,

@@ -6630,6 +6630,39 @@ pub(super) fn apply_clause_continuation(
                             },
                         ));
                     }
+                    // CR 701.17c + CR 401.4: "put a <filter> card from among the
+                    // milled cards on top of your library" (Lluwen, Imperfect
+                    // Naturalist). `ChangeZone` to a library shuffles it, so the
+                    // singular library-top form is a `PutAtLibraryPosition` over
+                    // the milled set; its resolver reads the tracked set's
+                    // members in the zone the mill moved them to.
+                    PutCount::Up(_) | PutCount::Exactly(_)
+                        if kept_dest == Some(Zone::Library)
+                            && face_down_profile.is_none()
+                            && enters_under.is_none() =>
+                    {
+                        defs.push(AbilityDefinition::new(
+                            kind,
+                            Effect::PutAtLibraryPosition {
+                                target: TargetFilter::TrackedSetFiltered {
+                                    id: crate::types::identifiers::TrackedSetId(0),
+                                    filter: Box::new(card_filter),
+                                    caused_by,
+                                },
+                                // "a <filter> card" is a may-pick (CR 608.2d):
+                                // the resolver offers 0..=N of the milled cards.
+                                count: match &quantity {
+                                    PutCount::Up(max) => QuantityExpr::up_to(max.clone()),
+                                    PutCount::Exactly(n) => n.clone(),
+                                    PutCount::All | PutCount::AnyNumber => {
+                                        QuantityExpr::Fixed { value: 1 }
+                                    }
+                                },
+                                position: crate::types::ability::LibraryPosition::Top,
+                                arranger: None,
+                            },
+                        ));
+                    }
                     PutCount::AnyNumber | PutCount::Up(_) | PutCount::Exactly(_) => {
                         let is_any_number = matches!(quantity, PutCount::AnyNumber);
                         let is_up_to = matches!(quantity, PutCount::AnyNumber | PutCount::Up(_));
@@ -8453,7 +8486,12 @@ fn parse_dig_from_among_destination(lower: &str) -> Option<(Option<Zone>, bool, 
         take_until::<_, _, OracleError<'_>>("from among"),
         (
             tag::<_, _, OracleError<'_>>("from among "),
-            alt((tag("them"), tag("those cards"), tag("those"))),
+            alt((
+                tag("them"),
+                tag("those cards"),
+                tag("those"),
+                tag("the milled cards"),
+            )),
         ),
     )
     .parse(lower)
@@ -10371,6 +10409,18 @@ pub(super) fn parse_followup_continuation_ast_with_search_destination(
                     || nom_primitives::scan_contains(&lower, "into their hand")
                     || nom_primitives::scan_contains(&lower, "to your hand")
                     || nom_primitives::scan_contains(&lower, "to their hand")) =>
+        {
+            parse_dig_from_among(&lower, text, ctx)
+        }
+        // CR 701.17c + CR 401.4: "[you may] put a <filter> card from among the
+        // milled cards on top of your library" (Lluwen, Imperfect Naturalist) —
+        // the same milled-set continuation, routed to the library top. Without
+        // it the clause lowered to a bare `PutAtLibraryPosition` whose
+        // `Or[Creature, Land]` filter targeted any permanent on the battlefield.
+        Effect::Mill { .. }
+            if nom_primitives::scan_contains(&lower, "from among the milled cards")
+                && (nom_primitives::scan_contains(&lower, "on top of your library")
+                    || nom_primitives::scan_contains(&lower, "on top of their library")) =>
         {
             parse_dig_from_among(&lower, text, ctx)
         }
