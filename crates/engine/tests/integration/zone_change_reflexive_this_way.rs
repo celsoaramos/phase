@@ -1297,11 +1297,17 @@ fn reflexive_whose_event_is_not_the_preceding_instruction_fails_closed() {
 /// CR 603.3d: a reflexive created by a zone change has no announced parent
 /// target, so a body whose recipient was rebound to the parent's target can
 /// never choose one. Not claimed.
+///
+/// (MagicFinder fork, temporada 2026-12: this used to pin Seasoned Cryomancer,
+/// whose "… and put a stun counter on each of them" names the reflexive's OWN
+/// "up to that many target creatures" — now supported, see
+/// `mf_temporada_seasoned_cryomancer.rs`. The probe below keeps the guard honest
+/// with a body whose pronoun has no target of its own to name.)
 #[test]
 fn reflexive_with_an_unbound_recipient_fails_closed() {
     let parsed = parse_oracle_text(
-        "When this creature enters, draw two cards, then discard two cards. When you discard one or more nonland cards this way, tap up to that many target creatures and put a stun counter on each of them.",
-        "Seasoned Cryomancer",
+        "When this creature enters, draw two cards, then discard two cards. When you discard one or more nonland cards this way, put a stun counter on it.",
+        "Unbound Probe",
         &[],
         &["Creature".to_string()],
         &[],

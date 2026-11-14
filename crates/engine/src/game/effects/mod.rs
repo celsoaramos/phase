@@ -4180,6 +4180,38 @@ fn try_materialize_reflexive_trigger(
     .map(|progress| progress.is_some())
 }
 
+/// CR 603.12 + CR 608.2c: the number of objects in the zone-change ledger that
+/// match a reflexive creation gate's `ZoneChangedThisWay` filter (and arrival
+/// zone, when the wording names one). `None` when the reflexive carries no such
+/// gate.
+fn filtered_reflexive_this_way_count(
+    state: &GameState,
+    reflexive: &ResolvedAbility,
+) -> Option<i32> {
+    let condition = reflexive.condition.as_ref()?;
+    if !condition.has_when_you_do_marker() {
+        return None;
+    }
+    let AbilityCondition::ZoneChangedThisWay {
+        filter,
+        destination,
+    } = condition.zone_changed_this_way_head()?
+    else {
+        return None;
+    };
+    let ctx = crate::game::filter::FilterContext::from_ability(reflexive);
+    let count = state
+        .last_zone_changed_ids
+        .iter()
+        .filter(|&&id| {
+            crate::game::filter::matches_target_filter(state, id, filter, &ctx)
+                && destination
+                    .is_none_or(|zone| state.objects.get(&id).is_some_and(|obj| obj.zone == zone))
+        })
+        .count();
+    Some(i32::try_from(count).unwrap_or(i32::MAX))
+}
+
 fn try_materialize_reflexive_trigger_step(
     state: &mut GameState,
     reflexive: &ResolvedAbility,
@@ -4189,6 +4221,16 @@ fn try_materialize_reflexive_trigger_step(
     depth: u32,
 ) -> Result<Option<ResolutionProgress>, EffectError> {
     let missing_reason = state.last_parent_target_missing_reason;
+    // CR 603.12 + CR 608.2c: "When you discard one or more NONLAND cards this way,
+    // tap up to THAT MANY target creatures" (Seasoned Cryomancer) — "that many"
+    // counts the zone-changed objects the creation gate names, not every object
+    // the instruction moved. While the reflexive is built (target slots, frozen
+    // subject count), the resolution-local count reads the filtered ledger.
+    let filtered_this_way_count = filtered_reflexive_this_way_count(state, reflexive);
+    let saved_effect_count = state.last_effect_count;
+    if let (Some(count), Some(_)) = (filtered_this_way_count, saved_effect_count) {
+        state.last_effect_count = Some(count);
+    }
     let result = crate::game::quantity::with_reflexive_resolution_scope(|| {
         try_materialize_reflexive_trigger_inner(
             state,
@@ -4199,6 +4241,9 @@ fn try_materialize_reflexive_trigger_step(
             depth,
         )
     });
+    if filtered_this_way_count.is_some() {
+        state.last_effect_count = saved_effect_count;
+    }
     // CR 603.12 + CR 608.2c: A probe that creates nothing is not the actual
     // parent-to-child handoff; preserve its one-shot result for that handoff.
     if matches!(result, Ok(None)) {

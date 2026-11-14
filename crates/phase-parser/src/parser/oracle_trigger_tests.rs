@@ -5349,10 +5349,15 @@ fn event_source_tap_lift_preserves_reflexive_and_untap_referents() {
         "When Snaremaster Sprite enters, you may pay {2}. When you do, tap target creature an opponent controls and put a stun counter on it.",
         "Snaremaster Sprite",
     );
+    // MagicFinder fork (temporada 2026-12): the reflexive's head announces its OWN
+    // target ("tap target creature an opponent controls"); only the continuation's
+    // "it" names it back. The head used to be rebound to the parent (the optional
+    // {2} payment, which has no target), losing the creature filter — fixed with
+    // Seasoned Cryomancer's compound (`anaphor_only_in_compound_continuation`).
     assert!(matches!(
         snare.execute.as_deref().and_then(first_tap),
         Some(Effect::SetTapState {
-            target: TargetFilter::ParentTarget,
+            target: TargetFilter::Typed(_),
             state: TapStateChange::Tap,
             ..
         })
