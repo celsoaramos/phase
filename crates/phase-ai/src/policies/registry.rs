@@ -143,6 +143,9 @@ pub enum PolicyId {
     XValue,
     LandAnimation,
     MillTargeting,
+    /// CR 701.34a: proliferate only what helps the proliferating player
+    /// (never the opponent's energy or +1/+1 counters).
+    ProliferateChoice,
     MillPayoff,
     EnergyPayoff,
     ChaliceAvoidance,
@@ -453,6 +456,7 @@ impl Default for PolicyRegistry {
             Box::new(super::control_change_awareness::ControlChangeAwarenessPolicy),
             Box::new(super::land_animation::LandAnimationPolicy),
             Box::new(super::mill_targeting::MillTargetingPolicy),
+            Box::new(super::proliferate_choice::ProliferateChoicePolicy),
             Box::new(PayoffPolicy::new(&MILL_PAYOFF)),
             Box::new(PayoffPolicy::new(&ENERGY_PAYOFF)),
             Box::new(ChaliceAvoidancePolicy),
