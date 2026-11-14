@@ -334,28 +334,32 @@ fn v3_o1a_rider_under_its_cast_from_zone_owner_survives() {
     assert_no_live_guard_mark(&parsed, "V3");
 }
 
-/// V4. The same body, the same guard, under a head that consumes nothing: Mission
-/// Briefing's rider hangs below `GrantCastingPermission`, which carries no redirect.
-/// Owning by *shape* rather than by *parent* would keep it.
+/// V4. CR 608.2c + CR 614.1a + CR 608.2n: Mission Briefing's "You may cast it this turn"
+/// names the card chosen IN THE GRAVEYARD, so the cast is a lingering
+/// `CastFromZone { ParentTarget }` — the same owner Torrential Gearhulk's rider has — and
+/// the "would be put into your graveyard, exile it instead" rider is consumed by it, as in
+/// V3. (Before the MagicFinder fork's Mission Briefing fix the head was a
+/// `GrantCastingPermission` that consumed nothing and the body gapped; that parse left the
+/// chosen card uncastable and exiled Mission Briefing itself.)
 #[test]
-fn v4_o1a_body_under_a_non_consuming_head_gaps() {
+fn v4_o1a_rider_under_mission_briefings_cast_from_zone_owner_survives() {
     let parsed = parse(MISSION_BRIEFING, "Mission Briefing", &[], &["Sorcery"]);
 
-    // Reach-guard: the chain assembled far enough to reach the non-consuming head.
+    // Reach-guard: the owning head the fix produces.
     assert!(
         all_effects(&parsed)
             .iter()
-            .any(|effect| matches!(effect, Effect::GrantCastingPermission { .. })),
-        "V4 reach-guard: the GrantCastingPermission head must be present"
+            .any(|effect| matches!(effect, Effect::CastFromZone { .. })),
+        "V4 reach-guard: the CastFromZone head must be present"
     );
     assert!(
-        gap_names(&parsed).contains(&"unparsed_replacement".to_string()),
-        "V4: the EVENT guard's body must be recorded as an unparsed_replacement, got {:?}",
+        has_exile_parent_target_rider(&parsed),
+        "V4: the rider must survive as ChangeZone {{ Exile, ParentTarget }} under its owner"
+    );
+    assert!(
+        gaps(&parsed).is_empty(),
+        "V4: an owned body gaps nowhere, got {:?}",
         gaps(&parsed)
-    );
-    assert!(
-        !has_exile_parent_target_rider(&parsed),
-        "V4: the rider must be emitted nowhere — it has no owner here"
     );
     assert_no_live_guard_mark(&parsed, "V4");
 }
