@@ -6916,9 +6916,33 @@ pub(crate) fn parse_cant_attack_defended_scope_nom(
             AttackTargetFilter::Planeswalker,
             tag(" planeswalkers you control"),
         ),
+        parse_planeswalker_type_defended_scope,
         value(AttackTargetFilter::Player, tag(" you")),
     )))
     .parse(input)
+}
+
+/// CR 508.1c + CR 205.3j: " <planeswalker type>s you control" ("can't attack Jaces
+/// you control" — Jace, Multiverse Architect). The type word is read by the shared
+/// subtype vocabulary (plural form), so an unknown word never matches.
+fn parse_planeswalker_type_defended_scope(
+    input: &str,
+) -> OracleResult<'_, crate::types::triggers::AttackTargetFilter> {
+    let (after_space, _) = tag(" ").parse(input)?;
+    let Some((subtype, consumed)) = crate::types::text_grammar::parse_subtype(after_space) else {
+        return Err(crate::parser::oracle_nom::error::oracle_err(input));
+    };
+    // Plural only: "Jaces", never the bare singular.
+    if !after_space[..consumed].to_ascii_lowercase().ends_with('s')
+        || subtype.to_ascii_lowercase().ends_with('s')
+    {
+        return Err(crate::parser::oracle_nom::error::oracle_err(input));
+    }
+    let (rest, _) = tag(" you control").parse(&after_space[consumed..])?;
+    Ok((
+        rest,
+        crate::types::triggers::AttackTargetFilter::PlaneswalkerWithSubtype { subtype },
+    ))
 }
 
 /// CR 508.1c + CR 508.6: "a player it has already attacked this turn" — the

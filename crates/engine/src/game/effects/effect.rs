@@ -1659,7 +1659,8 @@ fn defended_scope_uses_source_controller_anchor(
         | AttackTargetFilter::Planeswalker
         | AttackTargetFilter::PlayerOrPlaneswalker
         | AttackTargetFilter::Battle
-        | AttackTargetFilter::PlayerOrPermanents => true,
+        | AttackTargetFilter::PlayerOrPermanents
+        | AttackTargetFilter::PlaneswalkerWithSubtype { .. } => true,
         AttackTargetFilter::Owner
         | AttackTargetFilter::OwnerOrPlaneswalker
         // CR 508.6: source-OBJECT relative like `Owner` — the history belongs to

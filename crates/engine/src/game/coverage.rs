@@ -5353,6 +5353,8 @@ fn fmt_attack_target_filter(filter: &crate::types::triggers::AttackTargetFilter)
         // CR 508.6: the source's own attack history, so the label names the
         // history rather than a player class the card does not print.
         ATF::PlayerAttackedBySourceThisTurn => "a player it has already attacked this turn",
+        // CR 205.3j: planeswalkers of the named planeswalker type ("Jaces").
+        ATF::PlaneswalkerWithSubtype { .. } => "planeswalkers of that type they control",
     }
 }
 

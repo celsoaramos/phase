@@ -2795,6 +2795,19 @@ pub(crate) fn attack_target_matches_defended_scope(
             .get(&source_id)
             .is_some_and(|defenders| defenders.contains(p)),
         (AttackTargetFilter::PlayerAttackedBySourceThisTurn, _) => false,
+        // CR 508.1c + CR 205.3j: only a planeswalker of the named type that the
+        // protected player controls ("Jaces you control").
+        (
+            AttackTargetFilter::PlaneswalkerWithSubtype { subtype },
+            AttackTarget::Planeswalker(pw_id),
+        ) => state.objects.get(pw_id).is_some_and(|obj| {
+            obj.controller == source_controller
+                && obj
+                    .card_types
+                    .subtypes
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(subtype))
+        }),
         _ => false,
     }
 }

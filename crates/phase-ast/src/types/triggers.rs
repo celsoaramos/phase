@@ -227,6 +227,13 @@ pub enum AttackTargetFilter {
     /// restriction, so the runtime matcher needs that object's id, not the
     /// controller the `you`-scoped variants resolve.
     PlayerAttackedBySourceThisTurn,
+    /// CR 508.1c + CR 205.3j: "<planeswalker type>s you control" — the defended
+    /// scope names only planeswalkers of one planeswalker type the protected
+    /// player controls ("creatures they control can't attack Jaces you control" —
+    /// Jace, Multiverse Architect). Never matches a player or a battle.
+    PlaneswalkerWithSubtype {
+        subtype: String,
+    },
 }
 
 /// CR 701.31 + CR 701.31d: which role the trigger's source must occupy in the

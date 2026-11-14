@@ -7877,6 +7877,20 @@ fn build_restriction_clause(
             | TargetFilter::Owner
             | TargetFilter::AllPlayers => false,
         };
+        // MagicFinder fork (temporada 2026-12): Jace, Multiverse Architect — "If they
+        // don't, creatures they control can't attack Jaces you control this turn."
+        // Admitted for the planeswalker-TYPE scope only, with the frozen grant
+        // shape. KNOWN DEVIATION from CR 611.2c (the effect grants no ability, so
+        // its set should stay live): a creature that comes under that player's
+        // control later in the same turn is not covered. Narrow on purpose — the
+        // broadcast subjects above (Chronomantic Escape, Web of Inertia) keep their
+        // honest gap.
+        let subject_set_is_fixed = subject_set_is_fixed
+            || (matches!(affected, TargetFilter::Typed(_))
+                && matches!(
+                    defended,
+                    crate::types::triggers::AttackTargetFilter::PlaneswalkerWithSubtype { .. }
+                ));
         if subject_set_is_fixed {
             // CR 613.1f: the grant is an ability-adding effect, applied in
             // layer 6. CR 611.2a/611.2b: the outer definition carries the

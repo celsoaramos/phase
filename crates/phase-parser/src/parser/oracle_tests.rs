@@ -24168,7 +24168,8 @@ fn attack_anaphor_rebind_gate_covers_only_player_yielding_attack_scopes() {
             | AttackTargetFilter::Owner
             | AttackTargetFilter::OwnerOrPlaneswalker
             | AttackTargetFilter::PlayerOrPermanents
-            | AttackTargetFilter::PlayerAttackedBySourceThisTurn => false,
+            | AttackTargetFilter::PlayerAttackedBySourceThisTurn
+            | AttackTargetFilter::PlaneswalkerWithSubtype { .. } => false,
         };
         assert_eq!(
             attack_intervening_if_anaphor_is_defending_player(&base(Some(scope.clone()))),
