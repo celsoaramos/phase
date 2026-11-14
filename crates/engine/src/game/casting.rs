@@ -24486,6 +24486,7 @@ pub(super) fn pay_mana_cost_with_choices(
         phyrexian_choices,
         None,
         events,
+        &[],
     )? {
         ManaCostPayment::Paid(()) => Ok(()),
         ManaCostPayment::Paused { .. } => Err(EngineError::InvalidAction(
@@ -24543,6 +24544,7 @@ fn pay_life_components(
 /// CR 107.4f + CR 601.2f-h + CR 605.3b + CR 616.1: A submitted Phyrexian
 /// payment can be interrupted by a costed auto-tapped mana source. Preserve
 /// the finalization root rather than deriving a generic priority resume.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn pay_mana_cost_with_choices_and_resume(
     state: &mut GameState,
     player: PlayerId,
@@ -24551,6 +24553,7 @@ pub(super) fn pay_mana_cost_with_choices_and_resume(
     phyrexian_choices: Option<&[crate::types::game_state::ShardChoice]>,
     resume: Option<&ManaAbilityResume>,
     events: &mut Vec<GameEvent>,
+    payment_targets: &[ObjectId],
 ) -> Result<ManaCostPayment<()>, EngineError> {
     super::layers::flush_layers(state);
 
@@ -24566,6 +24569,7 @@ pub(super) fn pay_mana_cost_with_choices_and_resume(
         phyrexian_choices,
         events,
         resume,
+        payment_targets,
     )?;
     let (spent_units, remaining_life_payments) = match payment {
         ManaCostPayment::Paid(spent_units) => (spent_units, None),
@@ -25031,6 +25035,7 @@ fn pay_ability_mana_cost_with_choices_excluding_and_parent(
         sub_cost_demand,
         resume,
         parent,
+        &[],
     )?;
     consume_waterbend_tap_markers(state, player, source_id, waterbend_taps)?;
 
@@ -25468,6 +25473,7 @@ fn auto_tap_and_pay_cost(
     phyrexian_choices: Option<&[crate::types::game_state::ShardChoice]>,
     events: &mut Vec<GameEvent>,
     resume: Option<&ManaAbilityResume>,
+    payment_targets: &[ObjectId],
 ) -> Result<ManaCostPayment<Vec<crate::types::mana::ManaUnit>>, EngineError> {
     auto_tap_and_pay_cost_excluding(
         state,
@@ -25481,6 +25487,7 @@ fn auto_tap_and_pay_cost(
         None,
         resume,
         None,
+        payment_targets,
     )
 }
 
@@ -25497,6 +25504,7 @@ fn auto_tap_and_pay_cost_excluding(
     sub_cost_demand: Option<&mana_payment::ColorDemand>,
     resume: Option<&ManaAbilityResume>,
     parent: Option<&ManaAbilityCostParent>,
+    payment_targets: &[ObjectId],
 ) -> Result<ManaCostPayment<Vec<crate::types::mana::ManaUnit>>, EngineError> {
     let events_before = events.len();
     let life_colors = super::static_abilities::player_life_payment_colors(state, player);
@@ -25515,6 +25523,7 @@ fn auto_tap_and_pay_cost_excluding(
         None,
         resume,
         parent,
+        payment_targets,
     );
     if mana_ability_cost_payment_is_paused(state) {
         return Err(EngineError::InvalidAction(
