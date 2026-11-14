@@ -19,6 +19,7 @@
 //! existing eligibility helpers in sibling modules rather than reimplementing
 //! the enumerations.
 
+use crate::types::ability::PlayerRecipientCost;
 use crate::types::ability::{
     is_variable_remove_counter_cost_count, AbilityCost, CardSelectionMode, Comparator,
     CounterCostSelection, DiscardSelfScope, FilterProp, NinjutsuVariant, PlayerFilter,
@@ -1939,9 +1940,18 @@ impl AbilityCostLegPayability for AbilityCost {
                 !super::keywords::returnable_creatures_for_variant(state, player, variant)
                     .is_empty()
             }
-            // CR 118.3: Effect-as-cost is conservatively treated as payable.
-            // Runtime resolution determines actual outcome.
-            AbilityCost::EffectCost { .. } => true,
+            // CR 118.3: Effect-as-cost is conservatively payable (runtime resolution
+            // determines the actual outcome), except a recipient effect-cost
+            // (CR 118.9 + CR 601.2b + CR 115.10a), offered only when the payer can
+            // choose at least one recipient; two or more are asked at payment
+            // (`ChooseGiftRecipient` with `CastOpponentChoicePurpose::EffectCost`).
+            AbilityCost::EffectCost { .. } => match self.player_recipient_cost() {
+                Some(PlayerRecipientCost::GainLife { recipient, .. }) => {
+                    !super::life_costs::life_gain_cost_recipients(state, player, source, recipient)
+                        .is_empty()
+                }
+                None => true,
+            },
             // CR 601.2b: Unimplemented costs are conservatively treated as payable
             // so the existing `Unimplemented` fallback paths are not further gated.
             AbilityCost::Unimplemented { .. } => true,
