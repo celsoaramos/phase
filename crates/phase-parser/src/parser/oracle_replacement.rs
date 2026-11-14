@@ -7,7 +7,7 @@ use nom::branch::alt;
 use nom::bytes::complete::{is_not, tag, tag_no_case, take_till, take_until, take_while1};
 use nom::character::complete::{anychar, char, multispace0, multispace1};
 use nom::combinator::{
-    all_consuming, cond, eof, map_opt, map_parser, not, opt, peek, recognize, rest, value,
+    all_consuming, cond, eof, map, map_opt, map_parser, not, opt, peek, recognize, rest, value,
 };
 use nom::multi::{many_till, separated_list1};
 use nom::sequence::{delimited, pair, preceded, terminated};
@@ -18,6 +18,7 @@ use super::oracle_effect::become_copy_except::parse_except_clause;
 use super::oracle_effect::lower::{
     apply_where_x_quantity_expression, parse_where_x_quantity_core, WhereXBinding,
 };
+use super::oracle_effect::sequence::try_parse_same_is_true_continuation;
 use super::oracle_effect::{
     excise_selection_qualifier, parse_effect_chain, parse_effect_chain_with_context,
     parse_effect_clause, parse_named_choice_object, try_parse_named_choice,
@@ -53,6 +54,7 @@ use super::oracle_util::{
     first_sentence, merge_or_filters, normalize_card_name_refs, parse_count_expr, parse_number,
     parse_ordinal, rewrite_quantity_expr_rounding, strip_after, strip_reminder_text, TextPair,
 };
+use crate::types::ability::{AbilityCondition, SiblingCondition, ThisWayCause};
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, CastVariantPaid, ChoiceType, ChooseOneOfKind,
     CoinFlipRun, CombatDamageScope, Comparator, ContinuousModification, ControllerRef,
@@ -70,7 +72,8 @@ use crate::types::ability::{
 use crate::types::ability::{CardPlayMode, CastingPermission, PlayerScope};
 use crate::types::ability_visit::{visit_ability_def_scoped, ResolutionScope};
 use crate::types::card_type::Supertype;
-use crate::types::counter::{CounterMatch, CounterType};
+use crate::types::counter::{CounterMatch, CounterType, KEYWORD_COUNTERS};
+use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaColor, ManaCost, ManaType};
 use crate::types::replacements::ReplacementEvent;
 use crate::types::statics::CastFrequency;
@@ -12367,6 +12370,143 @@ pub(crate) fn parse_as_enters_one_shot_replacement(
     if !as_enters_one_shot_is_admissible(&execute) {
         return None;
     }
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::Moved)
+            .valid_card(TargetFilter::SelfRef)
+            .destination_zone(Zone::Battlefield)
+            .execute(execute)
+            .description(text.to_string()),
+    )
+}
+
+/// The byte length of the first sentence of a multi-sentence body, without its
+/// terminator.
+fn parse_leading_sentence(input: &str) -> OracleResult<'_, usize> {
+    map(terminated(take_until(". "), tag(". ")), str::len).parse(input)
+}
+
+/// CR 122.1b: "it enters with a <keyword> counter on it if a card discarded this
+/// way has <keyword>." — yields the placed counter's word and the gated
+/// keyword's word; the caller requires them to be the same keyword.
+fn parse_enters_with_discarded_keyword_counter(input: &str) -> OracleResult<'_, (String, String)> {
+    let (input, _) = alt((tag("it enters with "), tag("~ enters with "))).parse(input)?;
+    let (input, _) = alt((tag("a "), tag("an "))).parse(input)?;
+    let (input, placed) =
+        take_until(" counter on it if a card discarded this way has ").parse(input)?;
+    let (input, _) = tag(" counter on it if a card discarded this way has ").parse(input)?;
+    let (input, gated) = is_not(".").parse(input)?;
+    let (input, _) = char('.').parse(input)?;
+    let (input, _) = multispace0.parse(input)?;
+    Ok((input, (placed.to_string(), gated.to_string())))
+}
+
+/// CR 614.1c + CR 614.12a: "As ~ enters, discard any number of <type> cards. It
+/// enters with a <keyword> counter on it if a card discarded this way has
+/// <keyword>. [The same is true for <keyword list>.]" (Indominus Rex, Alpha).
+///
+/// The entry replacement carries the discard as its execute and one keyword
+/// counter placement per listed keyword, each gated on its own "a card
+/// discarded this way has <keyword>" check over the discard's tracked set
+/// (`ThisWayCause::Discarded`). CR 608.2c: every placement is an independent
+/// OR-branch — the same sibling shape the "repeat this process for <keyword
+/// list>" counter class uses — so a keyword none of the discarded cards has
+/// does not stop the ones after it. CR 122.1b: a keyword counter grants its
+/// keyword; one counter per kind however many discarded cards share it.
+///
+/// Like Devour (CR 702.82a), the engine runs the choice in the post-entry
+/// drain. The frame's other instruction kinds ("remove all counters …", "you
+/// may reveal …") stay with the `enters_with_clause` gap: this arm reads only
+/// the discard instruction with the keyword-presence gate.
+pub(crate) fn parse_as_enters_discard_keyword_counters(
+    text: &str,
+    card_name: &str,
+) -> Option<ReplacementDefinition> {
+    let text = strip_reminder_text(text);
+    let normalized = replace_self_refs(&text, card_name);
+    let lower = normalized.to_lowercase();
+    let ((), body) = nom_on_lower(&normalized, &lower, parse_as_self_enters_frame)?;
+    let body_lower = body.to_lowercase();
+    let (discard_len, tail) = nom_on_lower(body, &body_lower, parse_leading_sentence)?;
+    let discard_sentence = &body[..discard_len];
+
+    // The discard instruction itself is the effect parser's: "discard any
+    // number of <type> cards" → a filtered `Discard` with an `UpTo` count.
+    let discard = parse_effect_chain(discard_sentence, AbilityKind::Spell);
+    let Effect::Discard {
+        count,
+        filter: Some(_),
+        ..
+    } = &*discard.effect
+    else {
+        return None;
+    };
+    if !count.is_up_to() || discard.sub_ability.is_some() || discard.condition.is_some() {
+        return None;
+    }
+
+    let tail_lower = tail.to_lowercase();
+    let ((placed, gated), same_is_true) = nom_on_lower(
+        tail,
+        &tail_lower,
+        parse_enters_with_discarded_keyword_counter,
+    )?;
+    // CR 122.1b: the counter placed and the keyword checked are the same word.
+    if placed != gated {
+        return None;
+    }
+    let first: Keyword = placed.parse().ok()?;
+    let mut keywords = vec![first];
+    let same_is_true = same_is_true.trim();
+    if !same_is_true.is_empty() {
+        keywords.extend(try_parse_same_is_true_continuation(same_is_true)?);
+    }
+    // Only keywords that exist as keyword counters can be placed.
+    if keywords.iter().any(|keyword| {
+        !KEYWORD_COUNTERS
+            .iter()
+            .any(|(_, kind)| *kind == keyword.kind())
+    }) {
+        return None;
+    }
+
+    let placement = |keyword: &Keyword, sibling_condition: SiblingCondition| {
+        let mut def = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::PutCounter {
+                counter_type: CounterType::Keyword(keyword.kind()),
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::SelfRef,
+            },
+        )
+        .condition(AbilityCondition::QuantityCheck {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::FilteredTrackedSetSize {
+                    filter: Box::new(TargetFilter::Typed(TypedFilter {
+                        properties: vec![FilterProp::HasKeywordKind {
+                            value: keyword.kind(),
+                        }],
+                        ..Default::default()
+                    })),
+                    caused_by: Some(ThisWayCause::Discarded),
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        });
+        def.sub_link = SubAbilityLink::SequentialSibling;
+        def.sibling_condition = sibling_condition;
+        def
+    };
+    let mut chain: Option<AbilityDefinition> = None;
+    for keyword in keywords.iter().rev() {
+        let mut def = placement(keyword, SiblingCondition::ReplicatedOrBranch);
+        if let Some(next) = chain.take() {
+            def = def.sub_ability(next);
+        }
+        chain = Some(def);
+    }
+    let execute = discard.sub_ability(chain?);
+
     Some(
         ReplacementDefinition::new(ReplacementEvent::Moved)
             .valid_card(TargetFilter::SelfRef)

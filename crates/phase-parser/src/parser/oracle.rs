@@ -125,10 +125,10 @@ use super::oracle_replacement::{
     as_long_as_gate_is_unparsed, damage_prevention_fails_closed, enters_with_fails_closed,
     find_copy_verb_present, is_as_self_enters_frame, lower_as_enters_becomes_choice_modal,
     lower_as_enters_or_face_up_counters, lower_replacement_ir,
-    parse_as_enters_one_shot_replacement, parse_bidirectional_damage_prevention,
-    parse_oneshot_damage_replacement, parse_replacement_line, parse_replacement_line_ir,
-    parse_whenever_you_cast_enters_with_outcome, parse_windowed_graveyard_redirect_install,
-    CastEntersWithOutcome, EntersWithGap,
+    parse_as_enters_discard_keyword_counters, parse_as_enters_one_shot_replacement,
+    parse_bidirectional_damage_prevention, parse_oneshot_damage_replacement,
+    parse_replacement_line, parse_replacement_line_ir, parse_whenever_you_cast_enters_with_outcome,
+    parse_windowed_graveyard_redirect_install, CastEntersWithOutcome, EntersWithGap,
 };
 use super::oracle_saga::{is_saga_chapter, parse_saga_chapters};
 use super::oracle_spacecraft::parse_spacecraft_threshold_lines;
@@ -588,6 +588,26 @@ fn emit_as_enters_one_shot(
     card_name: &str,
 ) -> bool {
     let Some(definition) = parse_as_enters_one_shot_replacement(line, card_name) else {
+        return false;
+    };
+    emitter.emit_at(
+        item_line,
+        OracleNodeIr::Replacement(ReplacementIr::from_definition(line, definition)),
+        OuterRoute::Replacement,
+    );
+    true
+}
+
+/// CR 614.1c + CR 614.12a: emit the "As ~ enters, discard any number of … It
+/// enters with a <keyword> counter on it if a card discarded this way has
+/// <keyword>" replacement when the arm reads the whole line.
+fn emit_as_enters_discard_keyword_counters(
+    emitter: &mut DocEmitter<'_>,
+    item_line: usize,
+    line: &str,
+    card_name: &str,
+) -> bool {
+    let Some(definition) = parse_as_enters_discard_keyword_counters(line, card_name) else {
         return false;
     };
     emitter.emit_at(
@@ -7848,6 +7868,18 @@ fn parse_normalized_oracle_ir(
         {
             emitter.static_ir_at(item_line, StaticIr::from_definition(&line, permission));
             emitter.casting_restriction_at(item_line, restriction);
+            i += 1;
+            continue;
+        }
+
+        // CR 614.1c + CR 614.12a: "As ~ enters, discard any number of <type>
+        // cards. It enters with a <keyword> counter on it if a card discarded
+        // this way has <keyword>." (Indominus Rex, Alpha). Ahead of the
+        // enters-with routes below, which own the second sentence and would land
+        // the whole line as one `enters_with_clause` gap.
+        if is_as_self_enters_frame(&lower)
+            && emit_as_enters_discard_keyword_counters(&mut emitter, item_line, &line, card_name)
+        {
             i += 1;
             continue;
         }
