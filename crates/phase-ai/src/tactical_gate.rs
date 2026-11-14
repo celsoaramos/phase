@@ -393,6 +393,10 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return GateDecision::Reject;
     }
 
+    if is_proven_conditional_destroy_whiff(ctx) {
+        return GateDecision::Reject;
+    }
+
     if is_redundant_creature_only_removal(ctx, &effects) {
         return GateDecision::Reject;
     }
@@ -1589,6 +1593,37 @@ fn target_is_provably_futile(
         return false;
     };
 
+    // CR 608.2c: a target the conditional removal won't destroy (Fatal Push
+    // on a 3-drop without revolt) is futile while another opposing target
+    // WOULD die. Only then — with no live alternative, rejecting every target
+    // would just force a cancel.
+    if let Some(source) = ctx.source_object() {
+        if let Some(nodes) = conditional_destroy_nodes(source) {
+            let kills = |id: ObjectId| conditional_destroy_kills(ctx.state, source, &nodes, id);
+            let live_alternative = || {
+                ctx.decision.candidates.iter().any(|candidate| {
+                    matches!(
+                        candidate.action,
+                        GameAction::ChooseTarget {
+                            target: Some(TargetRef::Object(other)),
+                        } if other != *object_id
+                            && ctx.state.objects.get(&other).is_some_and(|o| {
+                                engine::game::players::is_opponent(
+                                    ctx.state,
+                                    ctx.ai_player,
+                                    o.controller,
+                                )
+                            })
+                            && kills(other)
+                    )
+                })
+            };
+            if !kills(*object_id) && live_alternative() {
+                return true;
+            }
+        }
+    }
+
     // CR 701.8 + CR 702.12b: destroy-based removal can't destroy an
     // indestructible permanent.
     let is_destroy = effects.iter().any(|e| matches!(e, Effect::Destroy { .. }));
@@ -2267,6 +2302,149 @@ fn is_proven_damage_whiff(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> bool 
     damage_only
         && !ctx.can_kill_any_legal_target()
         && !caster_has_cast_payoff(ctx.state, *object_id)
+}
+
+/// A spell whose ONLY effects are creature-only `Destroy`, gated at resolution
+/// on what the target is (CR 608.2c) — Fatal Push: "Destroy target creature if
+/// it has mana value 2 or less. Revolt — ... mana value 4 or less instead if a
+/// permanent you controlled left the battlefield this turn." Targeting checks
+/// only "target creature" (CR 601.2c), so a 3-drop without revolt is a legal
+/// target that the spell then fails to destroy: the card is spent for nothing.
+///
+/// Field report (2026-10-17): the bot pushed Ezuri, Renegade Leader (mana
+/// value 3) with no permanent of its own gone that turn; Ezuri stayed.
+///
+/// The condition is evaluated by the ENGINE (`evaluate_condition`) against a
+/// hypothetical resolution with each legal target, so Revolt, mana value and
+/// any other leaf are read exactly as resolution will read them. Evaluated on
+/// the CURRENT state: a permanent that leaves between cast and resolution
+/// (a fetch cracked in response) is not anticipated.
+fn is_proven_conditional_destroy_whiff(ctx: &PolicyContext<'_>) -> bool {
+    let GameAction::CastSpell { object_id, .. } = &ctx.candidate.action else {
+        return false;
+    };
+    let Some(source) = ctx.source_object() else {
+        return false;
+    };
+    let Some(nodes) = conditional_destroy_nodes(source) else {
+        return false;
+    };
+    let Some(filter) = extract_target_filter(&nodes[0].node.effect) else {
+        return false;
+    };
+    !ctx.has_legal_opponent_creature_target(filter, source.id, |id| {
+        conditional_destroy_kills(ctx.state, source, &nodes, id)
+    }) && !caster_has_cast_payoff(ctx.state, *object_id)
+}
+
+/// One `Destroy` node of a Fatal Push-class chain, with the conditions of the
+/// condition-only frames it sits under (`gates`). Since v0.118.0 the revolt line
+/// lowers to a `NoOp` frame carrying the `ConditionInstead` revolt check, with
+/// "destroy that creature if it has mana value 4 or less" beneath it: that
+/// `Destroy` happens only when its own condition AND every gate above it hold.
+struct ConditionalDestroyNode<'a> {
+    node: &'a AbilityDefinition,
+    gates: Vec<&'a AbilityCondition>,
+}
+
+/// The chain (root, sub, else) of a Fatal Push-class spell, or `None` outside
+/// the class. Fail-open: modal spells, more than one spell ability, any node
+/// that is neither a harmful creature-only `Destroy` nor a condition-only frame
+/// below the root, or no node whose condition reads the target keep the spell
+/// out.
+fn conditional_destroy_nodes(
+    source: &engine::game::game_object::GameObject,
+) -> Option<Vec<ConditionalDestroyNode<'_>>> {
+    let mut spells = source
+        .abilities
+        .iter()
+        .filter(|ability| ability.kind == AbilityKind::Spell);
+    let root = spells.next()?;
+    if spells.next().is_some() {
+        return None;
+    }
+    let mut nodes: Vec<ConditionalDestroyNode<'_>> = Vec::new();
+    let mut reads_target = false;
+    let mut pending = vec![(root, Vec::new())];
+    while let Some((node, gates)) = pending.pop() {
+        if node.modal.is_some() || !node.mode_abilities.is_empty() {
+            return None;
+        }
+        reads_target |= node.condition.as_ref().is_some_and(condition_reads_target);
+        let effect = node.effect.as_ref();
+        // CR 608.2c: a condition-only frame below the root ("Revolt — … instead
+        // if …") does nothing itself; it gates the instructions under it.
+        if matches!(effect, Effect::NoOp) && !nodes.is_empty() {
+            let condition = node.condition.as_ref()?;
+            let mut inner = gates.clone();
+            inner.push(condition);
+            pending.extend(node.sub_ability.as_deref().map(|sub| (sub, inner.clone())));
+            pending.extend(node.else_ability.as_deref().map(|other| (other, gates)));
+            continue;
+        }
+        // The root picks the target; a sub/else leg may destroy "that
+        // creature" (`ParentTarget`) — Fatal Push's revolt line.
+        let destroys_the_target = match effect {
+            Effect::Destroy {
+                target: TargetFilter::ParentTarget,
+                ..
+            } => !nodes.is_empty(),
+            Effect::Destroy { .. } => {
+                matches!(effect_polarity(effect), EffectPolarity::Harmful)
+                    && targets_creatures_only(effect)
+            }
+            _ => false,
+        };
+        if !destroys_the_target {
+            return None;
+        }
+        pending.extend(node.sub_ability.as_deref().map(|sub| (sub, gates.clone())));
+        pending.extend(
+            node.else_ability
+                .as_deref()
+                .map(|other| (other, gates.clone())),
+        );
+        nodes.push(ConditionalDestroyNode { node, gates });
+    }
+    reads_target.then_some(nodes)
+}
+
+fn condition_reads_target(condition: &AbilityCondition) -> bool {
+    match condition {
+        AbilityCondition::TargetMatchesFilter { .. } => true,
+        AbilityCondition::ConditionInstead { inner } => condition_reads_target(inner),
+        AbilityCondition::Not { condition } => condition_reads_target(condition),
+        AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
+            conditions.iter().any(condition_reads_target)
+        }
+        _ => false,
+    }
+}
+
+/// Would some node of the chain destroy `target` if the spell resolved now?
+/// A node destroys when its own condition (none = unconditional) and every
+/// gate above it hold; an `else` leg counts as a possible destroy too
+/// (over-approximation = fail-open).
+fn conditional_destroy_kills(
+    state: &GameState,
+    source: &engine::game::game_object::GameObject,
+    nodes: &[ConditionalDestroyNode<'_>],
+    target: ObjectId,
+) -> bool {
+    nodes.iter().any(|entry| {
+        let resolved = engine::game::ability_utils::build_resolved_from_def_with_targets(
+            entry.node,
+            source.id,
+            source.controller,
+            vec![TargetRef::Object(target)],
+        );
+        entry
+            .gates
+            .iter()
+            .copied()
+            .chain(entry.node.condition.as_ref())
+            .all(|condition| engine::game::effects::evaluate_condition(condition, state, &resolved))
+    })
 }
 
 /// Does a permanent the spell's caster controls trigger on casting it?
