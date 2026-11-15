@@ -1,3 +1,9 @@
 # Tag do phase-rs em que o build do motor se apoia. Vazio (só comentários) = a mais recente.
 # 07/11/2026: fixada em v0.119.0 enquanto as branches eram portadas para a v0.120.0
 # (tipos no crate phase-ast, testes em shards). Porte feito em 08/11/2026: pino vazio.
+# 15/11/2026: fixada em v0.125.0. A v0.126.0 (16:23 UTC) conflita em código com 13 branches
+# (card/arlinn-packs-hope, card/garth-one-eye, card/regenerate-all-mass,
+# card/invigorate-opponent-choice, card/composite-alt-cost-base, card/mf-cobertura-1103,
+# card/house-emblems, card/mf-relatos-20261107, -20261107-04, -20261107-05, -20261108,
+# card/dice-rolls-mf, card/mf-relatos-20261115-14). Tirar o pino depois do porte.
+v0.125.0
