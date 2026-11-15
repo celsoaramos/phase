@@ -75,6 +75,11 @@ impl TacticalPolicy for OptionalBenefitAcceptPolicy {
         let Some(ability) = parked_optional_ability(ctx.state) else {
             return neutral();
         };
+        if ability.controller == ctx.ai_player {
+            if let Some(verdict) = exile_keep_verdict(ctx.state, ctx.ai_player, ability, accept) {
+                return verdict;
+            }
+        }
         if ability.controller != ctx.ai_player
             || !chain_is_beneficial(ctx.state, ctx.ai_player, ability)
         {
@@ -109,6 +114,79 @@ fn parked_optional_ability(state: &GameState) -> Option<&ResolvedAbility> {
             _ => None,
         })
         .last()
+}
+
+/// CR 608.2c: "Exile the top card of your library. You may put that card into
+/// your hand …" — the keep step of Tainted Pact's repeat process, and of every
+/// exile-then-keep instruction. The parked link is a `ChangeZone` to hand over
+/// `ParentTarget` with no declared origin, so the allow-list below does not see
+/// it; the projection scores both answers alike and the tie went to DECLINE on
+/// every iteration — the bot exiled its whole library (MagicFinder bad-play flag
+/// of 2026-11-15, 90 cards).
+///
+/// Declining is rejected when the card on offer is a spell, when it is a land
+/// the AI still needs (fewer than four lands on its battlefield), or when the
+/// library is nearly gone. A land offered to an AI with lands and a deep
+/// library is left to the search: digging one card further for a spell is a
+/// fair line, and the next spell ends the dig.
+fn exile_keep_verdict(
+    state: &GameState,
+    ai: PlayerId,
+    ability: &ResolvedAbility,
+    accept: bool,
+) -> Option<PolicyVerdict> {
+    let Effect::ChangeZone {
+        origin: None,
+        destination: Zone::Hand,
+        target: TargetFilter::ParentTarget,
+        enters_under: None,
+        ..
+    } = &ability.effect
+    else {
+        return None;
+    };
+    if ability.else_ability.is_some()
+        || ability.sub_ability.is_some()
+        || ability.unless_pay.is_some()
+    {
+        return None;
+    }
+    let mut cards = ability.targets.iter().filter_map(|t| match t {
+        engine::types::ability::TargetRef::Object(id) => state.objects.get(id),
+        engine::types::ability::TargetRef::Player(_) => None,
+    });
+    let card = cards.next()?;
+    if cards.next().is_some() || card.owner != ai || card.zone != Zone::Exile {
+        return None;
+    }
+    let is_land = card
+        .card_types
+        .core_types
+        .contains(&engine::types::card_type::CoreType::Land);
+    let own_lands = state
+        .battlefield
+        .iter()
+        .filter_map(|id| state.objects.get(id))
+        .filter(|o| {
+            o.controller == ai
+                && o.card_types
+                    .core_types
+                    .contains(&engine::types::card_type::CoreType::Land)
+        })
+        .count();
+    let library = state
+        .players
+        .get(ai.0 as usize)
+        .map_or(0, |p| p.library.len());
+    let must_keep = !is_land || own_lands < 4 || library <= 10;
+    if !must_keep {
+        return None;
+    }
+    Some(if accept {
+        PolicyVerdict::critical(CRITICAL_MAX, PolicyReason::new("exile_keep_accept"))
+    } else {
+        PolicyVerdict::reject(PolicyReason::new("exile_keep_decline_burns_library"))
+    })
 }
 
 fn chain_is_beneficial(state: &GameState, ai: PlayerId, ability: &ResolvedAbility) -> bool {
