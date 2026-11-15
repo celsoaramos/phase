@@ -78,6 +78,23 @@ fn transform_effect_in_place(effect: &mut Effect) {
         return;
     }
 
+    // CR 702.96a + CR 400.2: A move out of a hidden zone never carries the word
+    // "target" — a card in a library or hand cannot be announced as one — so it
+    // is a later instruction acting on cards an earlier one found. Winds of
+    // Abandon's "Those players put those cards onto the battlefield tapped"
+    // (`ChangeZone { origin: Library, target: Any }`) must stay the single move
+    // that reads the search result: promoted to `ChangeZoneAll` it would put
+    // every card of every library onto the battlefield.
+    if let Effect::ChangeZone {
+        origin: Some(origin),
+        ..
+    } = effect
+    {
+        if !origin.is_public() {
+            return;
+        }
+    }
+
     let owned = std::mem::replace(effect, placeholder);
     *effect = match owned {
         Effect::Destroy {
@@ -351,6 +368,38 @@ mod tests {
                 }
             }
             ref other => panic!("expected ChangeZoneAll, got {other:?}"),
+        }
+    }
+
+    /// CR 702.96a + CR 400.2: a move out of a library is not a "target"
+    /// instruction (Winds of Abandon's "put those cards onto the battlefield
+    /// tapped") and survives the overload text change untouched.
+    #[test]
+    fn hidden_zone_origin_change_zone_is_not_promoted() {
+        for origin in [Zone::Library, Zone::Hand] {
+            let mut def = leaf(Effect::ChangeZone {
+                actor: crate::types::ability::LibraryInstructionActor::Controller,
+                library_shuffle: Default::default(),
+                origin: Some(origin),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Any,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Tapped,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
+            });
+            let before = def.clone();
+            transform_ability_def(&mut def);
+            assert_eq!(
+                def, before,
+                "a move out of {origin:?} keeps its single-move shape"
+            );
         }
     }
 
