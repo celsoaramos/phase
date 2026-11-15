@@ -116,7 +116,12 @@ fn table(with_milled_creature: bool) -> Table {
         state.battlefield.retain(|x| *x != id);
         let obj = state.objects.get_mut(&id).unwrap();
         obj.zone = Zone::Library;
-        let library = &mut state.players.iter_mut().find(|p| p.id == P0).unwrap().library;
+        let library = &mut state
+            .players
+            .iter_mut()
+            .find(|p| p.id == P0)
+            .unwrap()
+            .library;
         library.insert(1, id);
     }
     Table {
@@ -176,7 +181,13 @@ fn cast_and_settle(t: &mut Table, pick: Option<ObjectId>) -> Vec<Vec<ObjectId>> 
 }
 
 fn library_top(runner: &GameRunner) -> ObjectId {
-    runner.state().players.iter().find(|p| p.id == P0).unwrap().library[0]
+    runner
+        .state()
+        .players
+        .iter()
+        .find(|p| p.id == P0)
+        .unwrap()
+        .library[0]
 }
 
 #[test]
@@ -184,7 +195,11 @@ fn lluwen_puts_the_only_milled_land_on_top_and_touches_no_permanent() {
     let mut t = table(false);
     let land = t.milled_land;
     let offered = cast_and_settle(&mut t, Some(land));
-    assert_eq!(offered, vec![vec![land]], "the single milled land is offered, not forced");
+    assert_eq!(
+        offered,
+        vec![vec![land]],
+        "the single milled land is offered, not forced"
+    );
 
     let state = t.runner.state();
     assert_eq!(state.objects[&t.their_land].zone, Zone::Battlefield);
@@ -198,7 +213,11 @@ fn lluwen_puts_the_only_milled_land_on_top_and_touches_no_permanent() {
     );
     assert_eq!(library_top(&t.runner), land);
     let graveyard = &state.players.iter().find(|p| p.id == P0).unwrap().graveyard;
-    assert_eq!(graveyard.len(), 3, "the other three milled cards stay milled");
+    assert_eq!(
+        graveyard.len(),
+        3,
+        "the other three milled cards stay milled"
+    );
 }
 
 #[test]
@@ -212,7 +231,10 @@ fn lluwen_offers_only_the_milled_creature_and_land() {
     cards.sort();
     let mut expected = vec![t.milled_land, creature];
     expected.sort();
-    assert_eq!(cards, expected, "only milled creature/land cards are offered");
+    assert_eq!(
+        cards, expected,
+        "only milled creature/land cards are offered"
+    );
 
     let state = t.runner.state();
     assert_eq!(library_top(&t.runner), creature);

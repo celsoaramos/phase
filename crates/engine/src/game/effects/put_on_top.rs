@@ -464,9 +464,8 @@ pub fn resolve(
     // An up-to pick from the milled set ("you may put a <filter> card from among
     // the milled cards on top") is always offered, even with a single candidate:
     // choosing none is part of the instruction.
-    let milled_may_pick = count_is_up_to
-        && tracked_members_zone == Zone::Graveyard
-        && !collected_targets.is_empty();
+    let milled_may_pick =
+        count_is_up_to && tracked_members_zone == Zone::Graveyard && !collected_targets.is_empty();
     let expected = if milled_may_pick {
         expected.min(collected_targets.len())
     } else {
