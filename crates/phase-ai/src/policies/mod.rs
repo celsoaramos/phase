@@ -45,6 +45,7 @@ mod mana_efficiency;
 mod mill_targeting;
 mod momir_curve;
 pub mod mulligan;
+mod optional_benefit_accept;
 mod payment_selection;
 mod payoff;
 mod pile_partition;
