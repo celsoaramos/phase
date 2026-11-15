@@ -5941,6 +5941,7 @@ fn rw_effect(
         // zone the effect names, and the copy's `count` is a read.
         Effect::CreateCardCopyByName {
             name: _,
+            template: _,
             destination,
             count,
         } => {

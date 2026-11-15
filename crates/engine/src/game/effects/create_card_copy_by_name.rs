@@ -1,11 +1,20 @@
-use crate::game::printed_cards::apply_card_face_to_object;
+use crate::game::printed_cards::{apply_card_face_to_object, install_copiable_values_as_base};
 use crate::game::quantity::resolve_quantity_with_targets;
 use crate::game::zones;
-use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility};
+use crate::types::ability::{CardCopyTemplate, Effect, EffectError, EffectKind, ResolvedAbility};
+use crate::types::card::CardFace;
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
 use crate::types::identifiers::{CardId, ObjectId};
 use crate::types::zones::Zone;
+
+/// What the copy takes its characteristics from (CR 707.2).
+enum CopyIdentity {
+    /// A registry face, for a card identified by name.
+    Face(Box<CardFace>),
+    /// The current copiable values of an object in the game.
+    Object(Box<crate::types::ability::CopiableValues>),
+}
 
 /// CR 707.12 + CR 201.2a: create a copy of a card identified by NAME.
 ///
@@ -29,12 +38,13 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let (name, destination, count) = match &ability.effect {
+    let (name, template, destination, count) = match &ability.effect {
         Effect::CreateCardCopyByName {
             name,
+            template,
             destination,
             count,
-        } => (name.clone(), *destination, count.clone()),
+        } => (name.clone(), *template, *destination, count.clone()),
         _ => {
             return Err(EffectError::MissingParam(
                 "CreateCardCopyByName".to_string(),
@@ -42,17 +52,40 @@ pub fn resolve(
         }
     };
 
-    // CR 201.2a: an absent literal name means "the card with the chosen name" —
-    // the name this source committed through a preceding `Effect::Choose`.
-    let card_name = match name {
-        Some(name) => Some(name),
-        None => state
-            .objects
-            .get(&ability.source_id)
-            .and_then(|source| source.chosen_card_name())
-            .map(str::to_string),
+    let identity = match template {
+        // CR 707.12 + CR 707.2: "create a copy of this card" — the ability's own
+        // source object, read through its current copiable values. The object is
+        // in the game (Q, Stacking the Deck's exiled card), so the registry —
+        // a scoped preload of statically named cards — is the wrong source.
+        CardCopyTemplate::AbilitySource => {
+            crate::game::layers::compute_current_copiable_values(state, ability.source_id)
+                .map(|values| CopyIdentity::Object(Box::new(values)))
+        }
+        CardCopyTemplate::NamedCard => {
+            // CR 201.2a: an absent literal name means "the card with the chosen
+            // name" — the name this source committed through a preceding
+            // `Effect::Choose`.
+            let card_name = match name {
+                Some(name) => Some(name),
+                None => state
+                    .objects
+                    .get(&ability.source_id)
+                    .and_then(|source| source.chosen_card_name())
+                    .map(str::to_string),
+            };
+            // The registry is keyed by lowercase name (see `conjure.rs`). A name
+            // that is not in it is one the engine has no characteristics for.
+            card_name
+                .and_then(|card_name| {
+                    state
+                        .card_face_registry
+                        .get(&card_name.to_lowercase())
+                        .cloned()
+                })
+                .map(|face| CopyIdentity::Face(Box::new(face)))
+        }
     };
-    let Some(card_name) = card_name else {
+    let Some(identity) = identity else {
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::CreateCardCopyByName,
             source_id: ability.source_id,
@@ -60,20 +93,9 @@ pub fn resolve(
         });
         return Ok(());
     };
-
-    // The registry is keyed by lowercase name (see `conjure.rs`). A name that is
-    // not in it is one the engine has no characteristics for.
-    let Some(face) = state
-        .card_face_registry
-        .get(&card_name.to_lowercase())
-        .cloned()
-    else {
-        events.push(GameEvent::EffectResolved {
-            kind: EffectKind::CreateCardCopyByName,
-            source_id: ability.source_id,
-            subject: None,
-        });
-        return Ok(());
+    let copy_name = match &identity {
+        CopyIdentity::Face(face) => face.name.clone(),
+        CopyIdentity::Object(values) => values.name.clone(),
     };
 
     let copies = resolve_quantity_with_targets(state, &count, ability).max(0) as u32;
@@ -84,7 +106,7 @@ pub fn resolve(
             state,
             CardId(0),
             ability.controller,
-            face.name.clone(),
+            copy_name.clone(),
             destination,
         );
 
@@ -94,7 +116,10 @@ pub fn resolve(
         let entry_timestamp = (destination == Zone::Battlefield).then(|| state.next_timestamp());
 
         if let Some(obj) = state.objects.get_mut(&obj_id) {
-            apply_card_face_to_object(obj, &face);
+            match &identity {
+                CopyIdentity::Face(face) => apply_card_face_to_object(obj, face),
+                CopyIdentity::Object(values) => install_copiable_values_as_base(obj, values),
+            }
             // CR 707.12a: the copy is not represented by a card. `is_token` stays
             // false (it is a copy of a card, not a token — CR 704.5d and CR 704.5e
             // are different sweeps with different legal zones), and `is_copy` is
@@ -122,7 +147,7 @@ pub fn resolve(
         created_ids.push(obj_id);
         events.push(GameEvent::CardCopyCreated {
             object_id: obj_id,
-            name: face.name.clone(),
+            name: copy_name.clone(),
         });
     }
 

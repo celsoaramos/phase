@@ -616,6 +616,43 @@ fn runtime_granted_top_of_library_plot_abilities(
     )]
 }
 
+/// CR 611.2a + CR 613.1f + CR 113.6b: activated abilities granted to ONE card in
+/// a graveyard or in exile by a resolved spell or ability (Q, Stacking the Deck:
+/// "That nonland card gains \"Exile a card from your hand: Create a copy of this
+/// card. …\""). The layer pass materializes ability grants on battlefield
+/// objects only, so — like the granted graveyard keywords above — a grant to a
+/// card in these zones is served here, on demand, from the live transient
+/// effects bound to exactly this object. Whether the ability functions from the
+/// card's zone is the activation gate's question (CR 113.6b), not this one's.
+fn runtime_granted_off_battlefield_activated_abilities(
+    state: &GameState,
+    source_id: ObjectId,
+) -> Vec<AbilityDefinition> {
+    let Some(obj) = state.objects.get(&source_id) else {
+        return Vec::new();
+    };
+    if !matches!(obj.zone, Zone::Exile | Zone::Graveyard) {
+        return Vec::new();
+    }
+    state
+        .transient_continuous_effects
+        .iter()
+        .filter(
+            |tce| matches!(tce.affected, TargetFilter::SpecificObject { id } if id == source_id),
+        )
+        .filter(|tce| super::layers::transient_effect_is_live(state, tce))
+        .flat_map(|tce| tce.modifications.iter())
+        .filter_map(|modification| match modification {
+            crate::types::ability::ContinuousModification::GrantAbility { definition }
+                if definition.kind == AbilityKind::Activated =>
+            {
+                Some((**definition).clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn activated_ability_definitions(
     state: &GameState,
     source_id: ObjectId,
@@ -643,6 +680,11 @@ pub fn activated_ability_definitions(
             // LAST — the identical append order is REQUIRED in
             // `activation_ability_definition` so `ability_index` stays consistent.
             .chain(runtime_granted_equip_abilities(state, source_id))
+            // CR 613.1f: resolution-granted abilities on a graveyard/exile card,
+            // LAST — same order in `activation_ability_definition`.
+            .chain(runtime_granted_off_battlefield_activated_abilities(
+                state, source_id,
+            ))
             .enumerate()
             .map(|(offset, ability)| (printed_len + offset, ability)),
     );
@@ -673,6 +715,9 @@ pub(crate) fn activation_ability_definition(
                 state, source_id,
             ))
             .chain(runtime_granted_equip_abilities(state, source_id))
+            .chain(runtime_granted_off_battlefield_activated_abilities(
+                state, source_id,
+            ))
             .nth(offset)?
     };
     if let Some(ref cost) = ability.cost {
