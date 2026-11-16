@@ -11561,8 +11561,12 @@ pub struct TargetSelectionSlot {
 /// signed number so the stored game fact says which way the change goes even
 /// when the magnitude is irrelevant, mirroring [`TapStateChange`] for the
 /// tap/untap axis.
+///
+/// Externally tagged (a bare variant name) on purpose: it only travels inside
+/// the internally tagged [`TargetEffectDetail::Modification`], whose own `type`
+/// tag would collide with an inner `type` tag — the duplicate key collapsed to
+/// `{"type":"Increase"}` on export and the state no longer restored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type")]
 pub enum PtDirection {
     /// CR 613.4: A modification that raises power and/or toughness.
     Increase,
@@ -11600,7 +11604,7 @@ pub enum PtDirection {
 /// whenever the distinction is intrinsic to the effect rather than to this
 /// one announcement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(tag = "type")]
+#[serde(tag = "type", from = "TargetEffectDetailWire")]
 pub enum TargetEffectDetail {
     /// The kind is self-describing; no extra fact is needed (the default, and
     /// the honest answer whenever the deciding value is not statically known).
@@ -11614,6 +11618,31 @@ pub enum TargetEffectDetail {
     /// when the modification is dynamic (X or count-based) or genuinely
     /// opposing ("+2/-2"), because then no direction is true.
     Modification(PtDirection),
+}
+
+/// Decoding form of [`TargetEffectDetail`]: the current shape plus the
+/// collapsed `{"type":"Increase"}` / `{"type":"Decrease"}` that states exported
+/// while [`PtDirection`] was itself internally tagged still carry.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum TargetEffectDetailWire {
+    None,
+    Destination(Zone),
+    Modification(PtDirection),
+    Increase,
+    Decrease,
+}
+
+impl From<TargetEffectDetailWire> for TargetEffectDetail {
+    fn from(wire: TargetEffectDetailWire) -> Self {
+        match wire {
+            TargetEffectDetailWire::None => Self::None,
+            TargetEffectDetailWire::Destination(zone) => Self::Destination(zone),
+            TargetEffectDetailWire::Modification(direction) => Self::Modification(direction),
+            TargetEffectDetailWire::Increase => Self::Modification(PtDirection::Increase),
+            TargetEffectDetailWire::Decrease => Self::Modification(PtDirection::Decrease),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

@@ -143,3 +143,29 @@ fn fired_delayed_triggers_from_an_earlier_turn_round_trip_in_the_order_prompt() 
     round_trip(&runner);
 }
 
+/// A target slot's P/T direction (`Effect::Pump` "+N/+N" / "-N/-N") must
+/// survive export: the inner `type` tag of the direction used to collide with
+/// the outer one and the export read `{"type":"Increase"}`, which no longer
+/// decoded ("unknown variant `Increase`") — undo failed while choosing the
+/// target of every pump spell.
+#[test]
+fn target_slot_pump_direction_survives_export() {
+    use engine::types::game_state::{PtDirection, TargetEffectDetail};
+    for direction in [PtDirection::Increase, PtDirection::Decrease] {
+        let detail = TargetEffectDetail::Modification(direction);
+        // The persisted state goes through `serde_json::Value`, whose map keeps
+        // one value per key.
+        let value = serde_json::to_value(detail).expect("detail serializes");
+        let back: TargetEffectDetail = serde_json::from_value(value).expect("detail decodes");
+        assert_eq!(back, detail);
+    }
+    // States exported before the fix carry the collapsed form; they decode to
+    // the direction they lost the outer tag of.
+    let legacy: TargetEffectDetail =
+        serde_json::from_str(r#"{"type":"Decrease"}"#).expect("legacy form decodes");
+    assert_eq!(
+        legacy,
+        TargetEffectDetail::Modification(PtDirection::Decrease)
+    );
+}
+
