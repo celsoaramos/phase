@@ -154,23 +154,25 @@ fn tree_has_unimplemented(parsed: &ParsedAbilities) -> bool {
             .any(|replacement| visit_replacement(replacement, &mut visitor).is_break())
 }
 
-/// Is the unit's rules-bearing graveyard permission carried as
-/// `ContinuousModification::AddStaticMode { mode: GraveyardCastPermission }`
-/// anywhere in the ability tree (the residual Kethis/Case shape)?
-fn carries_add_static_mode_graveyard_permission(parsed: &ParsedAbilities) -> bool {
+/// Is the unit's graveyard permission carried as the controller-anchored
+/// `GrantStaticAbility { GraveyardCastPermission }` (the Chainer / Gaea's Will shape
+/// the cast authority reads), and never as the old card-level `AddStaticMode`?
+fn carries_controller_granted_graveyard_permission(parsed: &ParsedAbilities) -> bool {
     parsed.abilities.iter().any(|def| match &*def.effect {
         Effect::GenericEffect {
             static_abilities, ..
-        } => static_abilities.iter().any(|definition| {
-            definition.modifications.iter().any(|modification| {
-                matches!(
-                    modification,
-                    ContinuousModification::AddStaticMode {
-                        mode: StaticMode::GraveyardCastPermission { .. }
-                    }
-                )
-            })
-        }),
+        } => {
+            static_abilities.iter().all(|definition| {
+                definition.affected == Some(TargetFilter::Controller)
+                && definition.modifications.iter().all(|modification| {
+                    matches!(
+                        modification,
+                        ContinuousModification::GrantStaticAbility { definition }
+                            if matches!(definition.mode, StaticMode::GraveyardCastPermission { .. })
+                    )
+                })
+            }) && !static_abilities.is_empty()
+        }
         _ => false,
     })
 }
@@ -383,15 +385,15 @@ fn hades_graveyard_play_permission_is_limited_to_your_turns() {
     assert_cast_rejected(&mut runner, second);
 }
 
-/// CR 207.2d + CR 604.2 + CR 305.1: the quoted grants on Kethis and Case of the
-/// Uneaten Feast are carried as `ContinuousModification::AddStaticMode`, which
-/// `static_carries_optional_modification` does not yet recognize — so their
-/// Optional_YouMay warnings must survive and keep the cards demoted.
-/// Conservative-red by design: the fix's scope deliberately excludes the
-/// `AddStaticMode` recognition arm, and dropping these warnings without that arm
-/// would be a false green.
+/// CR 601.2a + CR 611.2c: the quoted grants on Kethis and Case of the Uneaten Feast
+/// ("<cards> in your graveyard gain 'You may cast/play this card from your
+/// graveyard'") used to be carried as a card-level `AddStaticMode`, which the layer
+/// system never installs on a card in a graveyard — the cast was refused, and the
+/// Optional_YouMay warning kept the cards honestly red. They now lower to the
+/// controller-anchored `GrantStaticAbility` the cast authority reads (MagicFinder
+/// fork, temporada 2026-12), so the "you may" is represented and the warning goes.
 #[test]
-fn kethis_and_case_of_the_uneaten_feast_stay_red_honest() {
+fn kethis_and_case_of_the_uneaten_feast_grant_a_working_graveyard_permission() {
     for (oracle, name, types) in [
         (KETHIS_ORACLE, "Kethis, the Hidden Hand", &["Creature"][..]),
         (
@@ -407,17 +409,15 @@ fn kethis_and_case_of_the_uneaten_feast_stay_red_honest() {
             &types.iter().map(|ty| (*ty).to_string()).collect::<Vec<_>>(),
             &[],
         );
-        // Reach guard: the quoted grant IS parsed, as a typed permission carried by
-        // `AddStaticMode` — the unit is not short-circuited by an Unimplemented, so
-        // the surviving warning is a verdict on that carrier.
         assert!(
-            carries_add_static_mode_graveyard_permission(&parsed),
-            "{name}: the AddStaticMode {{ GraveyardCastPermission }} carrier must be present"
+            carries_controller_granted_graveyard_permission(&parsed),
+            "{name}: the controller-anchored GrantStaticAbility {{ GraveyardCastPermission }} \
+             carrier must be present: {:?}",
+            parsed.abilities
         );
         assert!(
-            has_swallowed_detector(&parsed, "Optional_YouMay"),
-            "{name}'s AddStaticMode-carried grant is not recognized as an optionality \
-             carrier yet and must stay red: {:?}",
+            !has_swallowed_detector(&parsed, "Optional_YouMay"),
+            "{name}: the represented grant must not warn: {:?}",
             parsed.parse_warnings
         );
     }
