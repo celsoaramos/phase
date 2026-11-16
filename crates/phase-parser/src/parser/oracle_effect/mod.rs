@@ -50940,6 +50940,20 @@ fn parse_effect_chain_ir_body(
         // ChangeZone/DealDamage/Destroy/GainControl) that a full parse-diff against
         // main surfaced. See the Sacrifice-specific fixup immediately below instead,
         // which is scoped to exactly the reported bug class.
+        // CR 608.2c + CR 115.1: in a compound whose HEAD announces its own target and
+        // whose continuation carries the pronoun ("tap up to that many target
+        // creatures and put a stun counter on each of them" — Seasoned Cryomancer;
+        // "tap target creature and put a stun counter on it"), the pronoun names the
+        // head's own target: the compound split already bound the continuation to
+        // `ParentTarget`. Rebinding the HEAD to the parent's referent would discard
+        // the target the clause itself announces.
+        let anaphor_only_in_compound_continuation = clause.sub_ability.is_some()
+            && has_typed_target(&clause.effect)
+            && take_until::<_, _, OracleError<'_>>(" and ")
+                .parse(recipient_anaphor_lower.as_str())
+                .is_ok_and(|(_, head)| {
+                    scan_contains_phrase(head, "target") && !has_anaphoric_reference(head)
+                });
         if condition.is_some()
             && !is_distributed_chunk
             // CR 608.2c: a gate that measures the chain's tracked set ("If all
@@ -50956,6 +50970,7 @@ fn parse_effect_chain_ir_body(
             && !binds_source_counter_pronoun
             && !builder.is_empty()
             && has_anaphoric_reference(&recipient_anaphor_lower)
+            && !anaphor_only_in_compound_continuation
             && !matches!(if_you_do_anchor, Some(TargetFilter::SelfRef))
             && !typed_trigger_subject
             && !explicit_any_target_clause(&clause.effect, &text_lower)
