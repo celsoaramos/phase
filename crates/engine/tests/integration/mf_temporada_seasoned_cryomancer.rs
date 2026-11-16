@@ -218,3 +218,81 @@ fn two_land_discards_create_no_reflexive_trigger() {
         .iter()
         .all(|id| !b.runner.state().objects[id].tapped));
 }
+
+/// The same compound behind a "you may pay {2}. When you do, …" reflexive
+/// (Snaremaster Sprite): the head keeps "target creature an opponent controls"
+/// instead of being rebound to the (target-less) payment.
+#[test]
+fn snaremaster_sprite_taps_and_stuns_the_chosen_opposing_creature() {
+    const SNAREMASTER: &str = "Flying\nWhen this creature enters, you may pay {2}. When you \
+do, tap target creature an opponent controls and put a stun counter on it.";
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(
+        P0,
+        (0..5)
+            .map(|_| ManaUnit::new(ManaType::Blue, ObjectId(0), false, vec![]))
+            .collect(),
+    );
+    let sprite = {
+        let mut b =
+            scenario.add_creature_to_hand_from_oracle(P0, "Snaremaster Sprite", 2, 1, SNAREMASTER);
+        b.with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue],
+            generic: 2,
+        });
+        b.id()
+    };
+    let mine = scenario.add_creature(P0, "My Bear", 2, 2).id();
+    let theirs = scenario.add_creature(P1, "Their Bear", 2, 2).id();
+    let mut runner = scenario.build();
+    let card_id = runner.state().objects[&sprite].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: sprite,
+            card_id,
+            targets: vec![],
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+        })
+        .expect("castable");
+    let mut offered_mine = false;
+    for _ in 0..40 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OptionalCostChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalCost { pay: true })
+                    .expect("pay {2}");
+            }
+            WaitingFor::OptionalEffectChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept: true })
+                    .expect("pay {2}");
+            }
+            WaitingFor::TriggerTargetSelection {
+                target_slots,
+                selection,
+                ..
+            } => {
+                let legal = &target_slots[selection.current_slot].legal_targets;
+                offered_mine |= legal.contains(&TargetRef::Object(mine));
+                runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Object(theirs)),
+                    })
+                    .expect("their creature is a legal target");
+            }
+            WaitingFor::Priority { .. } => {
+                if runner.state().stack.is_empty() {
+                    break;
+                }
+                runner.act(GameAction::PassPriority).expect("pass");
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+    }
+    assert!(!offered_mine, "only a creature an opponent controls");
+    let obj = &runner.state().objects[&theirs];
+    assert!(obj.tapped);
+    assert_eq!(obj.counters.get(&CounterType::Stun).copied(), Some(1));
+    assert!(!runner.state().objects[&mine].tapped);
+}
