@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -14647,6 +14647,35 @@ pub(crate) fn validate_return_result_occurrence_coherence(state: &GameState) -> 
     Ok(())
 }
 
+/// CR 603.7c: a one-shot delayed trigger leaves `delayed_triggers` when it
+/// fires, and the rules journal holding its install command is truncated at
+/// every step and phase boundary (`reset_resolved_rules_journal`). A fired
+/// carrier (pending, deferred, ordered, stack, resolving) of a trigger installed
+/// in an earlier step is then the only remaining copy of its provenance: it
+/// roots itself, and every other carrier of the same key must agree with it.
+fn root_fired_delayed_carrier(
+    roots: &BTreeMap<(u64, u64), DelayedTriggerOrigin>,
+    fired_roots: &mut BTreeMap<(u64, u64), DelayedTriggerOrigin>,
+    provenance: DelayedTriggerOrigin,
+    carrier: &str,
+) -> Result<(), String> {
+    let key = (provenance.token.0, provenance.instance.0);
+    let aliases_root = roots
+        .keys()
+        .any(|(token, instance)| *token == key.0 || *instance == key.1);
+    if aliases_root
+        || fired_roots
+            .get(&key)
+            .is_some_and(|root| *root != provenance)
+    {
+        return Err(format!(
+            "{carrier} delayed-trigger provenance aliases a different install root"
+        ));
+    }
+    fired_roots.insert(key, provenance);
+    Ok(())
+}
+
 /// Validates the private CR 603.7 identity transport after raw-state migration.
 ///
 /// A delayed-install command is the durable installation root. A still-live
@@ -14740,6 +14769,7 @@ pub(crate) fn validate_trigger_firing_coherence(state: &GameState) -> Result<(),
         }
     }
 
+    let fired_roots = RefCell::new(BTreeMap::new());
     let validate_firing =
         |firing: TriggerFiring, source_id: ObjectId, carrier: &str| -> Result<(), String> {
             match firing {
@@ -14758,9 +14788,12 @@ pub(crate) fn validate_trigger_firing_coherence(state: &GameState) -> Result<(),
                         Some(_) => Err(format!(
                             "{carrier} delayed-trigger provenance aliases a different install root"
                         )),
-                        None => Err(format!(
-                            "{carrier} delayed-trigger provenance has no install root"
-                        )),
+                        None => root_fired_delayed_carrier(
+                            &roots,
+                            &mut fired_roots.borrow_mut(),
+                            provenance,
+                            carrier,
+                        ),
                     }
                 }
             }

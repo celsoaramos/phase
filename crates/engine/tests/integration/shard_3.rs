@@ -35,6 +35,7 @@ mod delayed_departure_lookback;
 mod delayed_parent_target_incarnation;
 mod delayed_trigger_binds_added_combat;
 mod delayed_trigger_continuation;
+mod delayed_trigger_fired_round_trip;
 mod delayed_trigger_occurrence_fanout;
 mod demilich_helbrute_graveyard_exile_cost;
 mod demon_of_fates_design;
