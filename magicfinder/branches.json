@@ -499,5 +499,8 @@
   },
   {
     "branch": "card/seasoned-cryomancer-reflexive-stun"
+  },
+  {
+    "branch": "ai/mf-flags-1116"
   }
 ]
