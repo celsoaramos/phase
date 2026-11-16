@@ -1968,7 +1968,8 @@ fn legacy_target_constraint(c: &TargetSelectionConstraint) -> bool {
         TargetSelectionConstraint::TotalManaValue { value, .. } => legacy_quantity_expr(value),
         TargetSelectionConstraint::DifferentTargetPlayers
         | TargetSelectionConstraint::DifferentObjectControllers
-        | TargetSelectionConstraint::SameZoneOwner { .. } => false,
+        | TargetSelectionConstraint::SameZoneOwner { .. }
+        | TargetSelectionConstraint::DistinctCardTypes => false,
     }
 }
 
@@ -4857,7 +4858,8 @@ fn rw_target_constraint(c: &TargetSelectionConstraint) -> RwProfile {
     match c {
         TargetSelectionConstraint::DifferentTargetPlayers => RwProfile::empty(),
         TargetSelectionConstraint::DifferentObjectControllers => RwProfile::empty(),
-        TargetSelectionConstraint::SameZoneOwner { zone: _ } => RwProfile::empty(),
+        TargetSelectionConstraint::SameZoneOwner { zone: _ }
+        | TargetSelectionConstraint::DistinctCardTypes => RwProfile::empty(),
         TargetSelectionConstraint::TotalManaValue {
             value,
             comparator: _,
@@ -6190,6 +6192,7 @@ fn rw_effect(
             target: _,
             count,
             cost: _,
+            ..
         } => {
             let mut p = ext_write(StateKind::StackShape);
             p.writes_external.set(StateKind::SetMembership);

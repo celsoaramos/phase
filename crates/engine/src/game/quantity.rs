@@ -1445,7 +1445,8 @@ fn target_constraint_is_cast_stable_for_pre_cast(constraint: &TargetSelectionCon
         }
         TargetSelectionConstraint::DifferentTargetPlayers
         | TargetSelectionConstraint::DifferentObjectControllers
-        | TargetSelectionConstraint::SameZoneOwner { .. } => true,
+        | TargetSelectionConstraint::SameZoneOwner { .. }
+        | TargetSelectionConstraint::DistinctCardTypes => true,
     }
 }
 

@@ -383,6 +383,7 @@ fn recast_trigger(
             target: TargetFilter::None,
             cost: ManaCost::zero(),
             count: None,
+            constraint: None,
         },
         vec![TargetRef::Object(card_id)],
         creature_id,

@@ -11126,6 +11126,34 @@ fn assign_selected_slots_after_deferred_effect(
 /// game state using the ability's controller/source provenance. Fixed caps only
 /// need `state`, so stack-announcement/random-selection callsites still enforce
 /// those when a stateful validation path is available.
+/// CR 205.2a: can each set be assigned a distinct card type from its own types
+/// (a bipartite matching; the sets are small — one per announced target)?
+pub(crate) fn admits_distinct_card_type_assignment(
+    type_sets: &[Vec<crate::types::card_type::CoreType>],
+) -> bool {
+    fn assign(
+        index: usize,
+        type_sets: &[Vec<crate::types::card_type::CoreType>],
+        used: &mut Vec<crate::types::card_type::CoreType>,
+    ) -> bool {
+        let Some(types) = type_sets.get(index) else {
+            return true;
+        };
+        for core_type in types {
+            if used.contains(core_type) {
+                continue;
+            }
+            used.push(*core_type);
+            if assign(index + 1, type_sets, used) {
+                return true;
+            }
+            used.pop();
+        }
+        false
+    }
+    assign(0, type_sets, &mut Vec::new())
+}
+
 fn validate_target_constraints(
     state: Option<&GameState>,
     targets: &[TargetRef],
@@ -11203,6 +11231,30 @@ fn validate_target_constraints(
                         Some(_) => {}
                         None => zone_owner = Some(object.owner),
                     }
+                }
+            }
+            // CR 115.1 + CR 205.2a + CR 601.2c: "up to one target … of each card
+            // type" — every chosen object must stand for its own card type.
+            // Checked on every prefix, so a third creature-only card is refused as
+            // soon as it is picked.
+            TargetSelectionConstraint::DistinctCardTypes => {
+                let Some(state) = state else {
+                    continue;
+                };
+                let type_sets: Vec<Vec<crate::types::card_type::CoreType>> = targets
+                    .iter()
+                    .filter_map(|target| match target {
+                        TargetRef::Object(id) => state
+                            .objects
+                            .get(id)
+                            .map(|obj| obj.card_types.core_types.clone()),
+                        TargetRef::Player(_) => None,
+                    })
+                    .collect();
+                if !admits_distinct_card_type_assignment(&type_sets) {
+                    return Err(EngineError::InvalidAction(
+                        "Selected targets must each have a different card type".to_string(),
+                    ));
                 }
             }
             TargetSelectionConstraint::TotalManaValue { comparator, value } => {

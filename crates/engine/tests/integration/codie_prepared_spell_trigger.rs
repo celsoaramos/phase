@@ -633,6 +633,7 @@ fn codie_prepared_spell_cast_copy_of_card_clears_marker() {
             target: TargetFilter::None,
             cost: ManaCost::zero(),
             count: None,
+            constraint: None,
         },
         vec![TargetRef::Object(source)],
         ObjectId(99),

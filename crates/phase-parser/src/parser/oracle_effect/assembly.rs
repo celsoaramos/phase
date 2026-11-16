@@ -59,17 +59,17 @@ use super::lower::{
     nest_whenever_this_turn_token_cleanup_delayed_trigger,
     normalize_exile_until_cast_bottom_cleanup, normalize_linked_exile_cast_bottom_cleanup,
     parse_controlled_by_different_players_target_constraint,
-    parse_same_zone_owner_target_constraint, parse_total_mana_value_target_constraint,
-    patch_choose_from_zone_counter_continuation_target, patch_population_head_tap_anaphor,
-    patch_self_ref_head_tap_anaphor, rebind_zone_changed_this_way_pronoun_to_moved_object,
-    relink_gated_token_referent_consumers, relink_gated_tracked_set_consumers,
-    resolve_populated_token_anaphors, resolve_populated_unsuspect_anaphors,
-    resolve_those_tokens_anaphors, rewire_result_anchored_subchain,
-    rewrite_counter_instead_target_from_antecedent, rewrite_else_event_context_to_stable,
-    rewrite_else_parent_target_to_self_ref, rewrite_player_anaphor_targets_in_definition,
-    rewrite_those_tokens_from_antecedent, rewrite_two_target_counter_chain,
-    target_choice_timing_for_clause, thread_chosen_damage_source_into_oneshot_effects,
-    timed_clause_sub_chain,
+    parse_distinct_card_types_target_constraint, parse_same_zone_owner_target_constraint,
+    parse_total_mana_value_target_constraint, patch_choose_from_zone_counter_continuation_target,
+    patch_population_head_tap_anaphor, patch_self_ref_head_tap_anaphor,
+    rebind_zone_changed_this_way_pronoun_to_moved_object, relink_gated_token_referent_consumers,
+    relink_gated_tracked_set_consumers, resolve_populated_token_anaphors,
+    resolve_populated_unsuspect_anaphors, resolve_those_tokens_anaphors,
+    rewire_result_anchored_subchain, rewrite_counter_instead_target_from_antecedent,
+    rewrite_else_event_context_to_stable, rewrite_else_parent_target_to_self_ref,
+    rewrite_player_anaphor_targets_in_definition, rewrite_those_tokens_from_antecedent,
+    rewrite_two_target_counter_chain, target_choice_timing_for_clause,
+    thread_chosen_damage_source_into_oneshot_effects, timed_clause_sub_chain,
 };
 use super::sequence::{
     apply_clause_continuation, clause_is_dig_lookback_transparent, def_bears_retargetable_copy,
@@ -3744,6 +3744,20 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
         if let Some(constraint) = parse_total_mana_value_target_constraint(
             clause_ir.source.fragment().unwrap_or_default(),
         ) {
+            def = def.target_constraint(constraint);
+        }
+        if let Some(constraint) = parse_distinct_card_types_target_constraint(
+            clause_ir.source.fragment().unwrap_or_default(),
+        ) {
+            // CR 115.1 + CR 205.2a: "up to one … of each card type" announces up to
+            // one target per card type; the constraint keeps the set honest.
+            if def.multi_target.is_some() {
+                def.multi_target = Some(crate::types::ability::MultiTargetSpec::up_to(
+                    QuantityExpr::Fixed {
+                        value: super::lower::EACH_CARD_TYPE_TARGET_CEILING,
+                    },
+                ));
+            }
             def = def.target_constraint(constraint);
         }
         // CR 601.2d: Propagate distribute flag.

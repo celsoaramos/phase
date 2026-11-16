@@ -13109,6 +13109,7 @@ this spell's mana cost.\nDestroy target attacking creature without flying.",
             },
             cost: ManaCost::zero(),
             count: None,
+            constraint: None,
         };
         assert!(super::effect_has_internal_optionality(&effect));
     }
@@ -16284,6 +16285,7 @@ mod detect_condition_if_replacement_exemption_tests {
                 },
                 cost: ManaCost::zero(),
                 count: None,
+                constraint: None,
             },
         ))
     }

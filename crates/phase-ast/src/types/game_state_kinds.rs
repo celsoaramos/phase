@@ -53,6 +53,11 @@ pub enum TargetSelectionConstraint {
         comparator: Comparator,
         value: QuantityExpr,
     },
+    /// CR 115.1 + CR 205.2a + CR 601.2c: "up to one target … of each card type"
+    /// (Uldaros Theorix) — the chosen object targets must admit an injective
+    /// assignment to distinct card types (a multi-type card may stand for any one
+    /// of its types).
+    DistinctCardTypes,
 }
 
 /// CR 601.2d: What is being distributed (damage, counters, life).
