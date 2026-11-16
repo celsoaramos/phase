@@ -1708,7 +1708,6 @@ face = [
   { key = "neriv, crackling vanguard", class = "wrong_duration", clauses = ["During any turn you attacked with a commander, you may play those cards."] },
   { key = "nessian boar", class = "missing_effect", clauses = ["All creatures able to block this creature do so."] },
   { key = "nessian game warden", class = "wrong_zone", clauses = ["Put the rest on the bottom of your library in any order."] },
-  { key = "nethergoyf", class = "cost_wrong", clauses = ["Escape—{2}{B}, Exile any number of other cards from your graveyard with four or more card types among them."] },
   { key = "nethroi, apex of death", class = "dropped_qualifier", clauses = ["Whenever this creature mutates, return any number of target creature cards with total power 10 or less from your graveyard to the battlefield."] },
   { key = "nettling nuisance", class = "missing_effect", clauses = ["The token is goaded for the rest of the game."] },
   { key = "nevermore", class = "dropped_qualifier", clauses = ["As this enchantment enters, choose a nonland card name."] },

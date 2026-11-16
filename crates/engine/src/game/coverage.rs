@@ -1560,6 +1560,7 @@ fn fmt_aggregate_function(f: AggregateFunction) -> &'static str {
         AggregateFunction::Max => "max",
         AggregateFunction::Min => "min",
         AggregateFunction::Sum => "sum",
+        AggregateFunction::DistinctCardTypes => "distinct card types",
     }
 }
 
@@ -1671,7 +1672,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             aggregate,
         } => {
             let func = match aggregate {
-                AggregateFunction::Max => "greatest",
+                AggregateFunction::Max | AggregateFunction::DistinctCardTypes => "greatest",
                 AggregateFunction::Min => "fewest",
                 AggregateFunction::Sum => "total",
             };
@@ -1870,6 +1871,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 AggregateFunction::Max => "max",
                 AggregateFunction::Min => "min",
                 AggregateFunction::Sum => "total",
+                AggregateFunction::DistinctCardTypes => "distinct card types among",
             };
             let prop = match aggregate.property() {
                 ObjectProperty::Power => "power",
@@ -2022,9 +2024,10 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             // an engine structure; no CR governs its shape, so none is cited for it.)
             // No parser path builds that pair today; the arm exists so the renderer
             // stays honest if one ever does.
-            (crate::types::ability::DamageChannel::Total, AggregateFunction::Max) => {
-                "greatest single player's amount from preceding effect".into()
-            }
+            (
+                crate::types::ability::DamageChannel::Total,
+                AggregateFunction::Max | AggregateFunction::DistinctCardTypes,
+            ) => "greatest single player's amount from preceding effect".into(),
             (crate::types::ability::DamageChannel::Total, AggregateFunction::Min) => {
                 "least single player's amount from preceding effect".into()
             }
@@ -2268,7 +2271,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             relation,
         } => {
             let func = match aggregate {
-                AggregateFunction::Max => "most",
+                AggregateFunction::Max | AggregateFunction::DistinctCardTypes => "most",
                 AggregateFunction::Min => "fewest",
                 AggregateFunction::Sum => "total",
             };
