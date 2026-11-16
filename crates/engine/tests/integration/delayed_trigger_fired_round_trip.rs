@@ -169,3 +169,57 @@ fn target_slot_pump_direction_survives_export() {
     );
 }
 
+/// CR 603.10a: creatures destroyed together carry each other in `co_departed`
+/// on the emitted events, a stamp written after the per-turn ledger row was
+/// committed. The dies triggers waiting on that batch must still restore: the
+/// stamp annotates the occurrence, it does not identify it ("current-turn
+/// ZoneChanged record has no ledger occurrence" broke undo after every board
+/// wipe or simultaneous combat death).
+#[test]
+fn dies_triggers_of_a_simultaneous_batch_round_trip() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(
+        P0,
+        "Death Watcher",
+        "Whenever a creature you control dies, you gain 1 life.",
+    );
+    scenario.add_creature(P0, "Bear A", 2, 2);
+    scenario.add_creature(P0, "Bear B", 2, 2);
+    let wrath = {
+        let mut builder =
+            scenario.add_spell_to_hand_from_oracle(P0, "Wipe", false, "Destroy all creatures.");
+        builder.with_mana_cost(ManaCost::generic(0));
+        builder.id()
+    };
+    let mut runner = scenario.build();
+    drop(runner.cast(wrath).commit());
+    // Pass priority until the wipe resolves and its dies triggers wait.
+    for _ in 0..8 {
+        let state = runner.state();
+        if matches!(state.waiting_for, WaitingFor::OrderTriggers { .. })
+            || state
+                .stack
+                .iter()
+                .any(|entry| matches!(entry.kind, StackEntryKind::TriggeredAbility { .. }))
+        {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("passing priority must be accepted");
+    }
+
+    let state = runner.state();
+    let triggers_waiting = matches!(state.waiting_for, WaitingFor::OrderTriggers { .. })
+        || state
+            .stack
+            .iter()
+            .any(|entry| matches!(entry.kind, StackEntryKind::TriggeredAbility { .. }));
+    assert!(
+        triggers_waiting,
+        "the two dies triggers must be waiting, got {:?}",
+        state.waiting_for
+    );
+    round_trip(&runner);
+}

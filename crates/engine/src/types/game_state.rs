@@ -13946,7 +13946,13 @@ fn zone_change_fingerprint(
     {
         return Err("ZoneChanged record is missing its zone-change shape".to_string());
     }
-    let stamp_free = without_occurrence_stamps(record);
+    let mut stamp_free = without_occurrence_stamps(record);
+    // CR 603.10a: `co_departed` is stamped onto the emitted event after the
+    // simultaneous batch finishes, while the ledger row was committed at the
+    // move itself; not every batch producer mirrors the stamp back into the
+    // ledger. It annotates the occurrence rather than identifying it, so it
+    // takes no part in binding a record to its ledger occurrence.
+    stamp_free.remove("co_departed");
     let typed = ZoneChangeRecord::deserialize(&stamp_free).map_err(|error| {
         format!("ZoneChanged record does not decode as a zone-change record: {error}")
     })?;
