@@ -6834,6 +6834,23 @@ pub enum AttachmentKind {
     Aura,
     /// CR 301.5: Equipment — artifact subtype that attaches via Equip ability.
     Equipment,
+    /// CR 205.3g + CR 301.5: an attachment named by one of its other subtypes
+    /// ("creatures you control with a Communicator attached to them", Starfleet
+    /// Communicator — an Artifact — Communicator Equipment). Matches an
+    /// attachment carrying that subtype, whatever attaches it.
+    Subtype(String),
+}
+
+impl AttachmentKind {
+    /// CR 205.3: the subtype an attachment of this kind carries — what the
+    /// attachment predicates match against.
+    pub fn subtype_name(&self) -> &str {
+        match self {
+            Self::Aura => "Aura",
+            Self::Equipment => "Equipment",
+            Self::Subtype(name) => name,
+        }
+    }
 }
 
 /// Qualities that can be shared across multi-target selections.

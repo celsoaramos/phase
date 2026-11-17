@@ -4,8 +4,16 @@
 //!   number of creatures and/or planeswalkers. If you do, it enters with twice
 //!   that many +1/+1 counters on it." — a linha inteira caía no gap
 //!   `enters_with_clause` e o Hellion entrava sem perguntar nada.
+//! - **Starfleet Communicator**: o equipado ganha "Whenever this creature
+//!   attacks, draw X cards, then you may put up to X land cards from your hand
+//!   onto the battlefield tapped, where X is the number of other creatures you
+//!   control with a Communicator attached to them." — o "where X" não era lido
+//!   (o filtro "with a Communicator attached to them" não existia) e ninguém
+//!   comprava carta.
 
-use engine::game::scenario::{GameRunner, GameScenario, P0};
+use engine::game::combat::AttackTarget;
+use engine::game::effects::attach;
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::game_state::WaitingFor;
@@ -89,4 +97,83 @@ fn devouring_hellion_prompt_excludes_itself_and_decline_enters_without_counters(
     assert_eq!(runner.state().objects[&bear].zone, Zone::Battlefield);
     assert_eq!(runner.state().objects[&walker].zone, Zone::Battlefield);
     assert_eq!(plus_counters(&runner, hellion), 0);
+}
+
+const STARFLEET_COMMUNICATOR: &str = "When you cast this spell, copy it. (The copy becomes a \
+token.)\nEquipped creature has \"Whenever this creature attacks, draw X cards, then you may put \
+up to X land cards from your hand onto the battlefield tapped, where X is the number of other \
+creatures you control with a Communicator attached to them.\"\nEquip {1}";
+
+fn communicator(scenario: &mut GameScenario, name: &str) -> ObjectId {
+    scenario
+        .add_artifact_from_oracle(P0, name, STARFLEET_COMMUNICATOR)
+        .with_subtypes(vec!["Communicator", "Equipment"])
+        .id()
+}
+
+#[test]
+fn starfleet_communicator_attack_draws_one_per_other_communicator_creature() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let maralen = scenario.add_creature(P0, "Maralen", 2, 3).id();
+    let oona = scenario.add_creature(P0, "Oona", 4, 4).id();
+    // A third creature with no Communicator does not count.
+    scenario.add_creature(P0, "Plain Bear", 2, 2);
+    let comm_a = communicator(&mut scenario, "Starfleet Communicator A");
+    let comm_b = communicator(&mut scenario, "Starfleet Communicator B");
+    scenario.with_library_top(P0, &["Card A", "Card B", "Card C"]);
+    let land = scenario.add_land_to_hand(P0, "Island").id();
+
+    let mut runner = scenario.build();
+    attach::attach_to(runner.state_mut(), comm_a, maralen);
+    attach::attach_to(runner.state_mut(), comm_b, oona);
+    let hand_before = runner.state().players[P0.0 as usize].hand.len();
+    let library_before = runner.state().players[P0.0 as usize].library.len();
+
+    runner.pass_both_players();
+    runner
+        .declare_attackers(&[(maralen, AttackTarget::Player(P1))])
+        .expect("Maralen attacks");
+    for _ in 0..16 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::EffectZoneChoice { cards, .. } => {
+                assert!(
+                    cards.contains(&land),
+                    "the land in hand is offered: {cards:?}"
+                );
+                runner
+                    .act(GameAction::SelectCards { cards: vec![land] })
+                    .expect("put the land onto the battlefield");
+            }
+            WaitingFor::OptionalEffectChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept: true })
+                    .expect("accept putting lands");
+            }
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass");
+            }
+            other => panic!("unexpected prompt: {other:?}"),
+        }
+    }
+
+    let library_after = runner.state().players[P0.0 as usize].library.len();
+    let hand_after = runner.state().players[P0.0 as usize].hand.len();
+    assert_eq!(
+        library_before - library_after,
+        1,
+        "X = 1 (Oona is the other creature with a Communicator): one card drawn"
+    );
+    assert_eq!(
+        hand_after, hand_before,
+        "one card drawn, the land left the hand"
+    );
+    let land_obj = &runner.state().objects[&land];
+    assert_eq!(
+        land_obj.zone,
+        Zone::Battlefield,
+        "up to X = 1 land put onto the battlefield"
+    );
+    assert!(land_obj.tapped, "the land enters tapped");
 }

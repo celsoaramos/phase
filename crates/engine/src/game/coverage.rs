@@ -1042,10 +1042,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                 controller,
                 exclude_source,
             } => {
-                let kind_s = match kind {
-                    crate::types::ability::AttachmentKind::Aura => "aura",
-                    crate::types::ability::AttachmentKind::Equipment => "equipment",
-                };
+                let kind_s = kind.subtype_name().to_lowercase();
                 let qualifier = if exclude_source.is_exclude() {
                     " another"
                 } else {
@@ -1062,10 +1059,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             FilterProp::HasAnyAttachmentOf { kinds, controller } => {
                 let kinds_s = kinds
                     .iter()
-                    .map(|k| match k {
-                        crate::types::ability::AttachmentKind::Aura => "aura",
-                        crate::types::ability::AttachmentKind::Equipment => "equipment",
-                    })
+                    .map(|k| k.subtype_name().to_lowercase())
                     .collect::<Vec<_>>()
                     .join(" or ");
                 match controller {
@@ -2238,8 +2232,8 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
         QuantityRef::CommanderManaValue { .. } => "mana value of a commander".into(),
         QuantityRef::AttachmentsOnLeavingObject { kind, controller } => {
             let kind_s = match kind {
-                crate::types::ability::AttachmentKind::Aura => "auras",
-                crate::types::ability::AttachmentKind::Equipment => "equipment",
+                crate::types::ability::AttachmentKind::Aura => "auras".to_string(),
+                other => other.subtype_name().to_lowercase(),
             };
             match controller {
                 None => format!("# of {kind_s} attached at ltb"),

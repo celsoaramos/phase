@@ -10544,14 +10544,11 @@ fn matches_filter_prop(
             if exclude_source.is_exclude() && att.id == source.id {
                 return false;
             }
-            let kind_matches = match kind {
-                crate::types::ability::AttachmentKind::Aura => {
-                    att.card_types.subtypes.iter().any(|s| s == "Aura")
-                }
-                crate::types::ability::AttachmentKind::Equipment => {
-                    att.card_types.subtypes.iter().any(|s| s == "Equipment")
-                }
-            };
+            let kind_matches = att
+                .card_types
+                .subtypes
+                .iter()
+                .any(|s| s == kind.subtype_name());
             if !kind_matches {
                 return false;
             }
@@ -10563,13 +10560,11 @@ fn matches_filter_prop(
         // `HasAttachment` to the "enchanted or equipped" compound-subject class.
         FilterProp::HasAnyAttachmentOf { kinds, controller } => phased_in_attachments(state, obj)
             .any(|att| {
-                let kind_matches = kinds.iter().any(|kind| match kind {
-                    crate::types::ability::AttachmentKind::Aura => {
-                        att.card_types.subtypes.iter().any(|s| s == "Aura")
-                    }
-                    crate::types::ability::AttachmentKind::Equipment => {
-                        att.card_types.subtypes.iter().any(|s| s == "Equipment")
-                    }
+                let kind_matches = kinds.iter().any(|kind| {
+                    att.card_types
+                        .subtypes
+                        .iter()
+                        .any(|s| s == kind.subtype_name())
                 });
                 if !kind_matches {
                     return false;
