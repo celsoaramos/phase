@@ -64,7 +64,12 @@ fn token_count(runner: &GameRunner, name: &str) -> usize {
 }
 
 /// Every `CountersOn` scope reachable from the first trigger's execute chain.
-fn counter_scopes(oracle: &str, name: &str, types: &[&str], trigger_index: usize) -> Vec<ObjectScope> {
+fn counter_scopes(
+    oracle: &str,
+    name: &str,
+    types: &[&str],
+    trigger_index: usize,
+) -> Vec<ObjectScope> {
     let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
     let parsed = parse_oracle_text(oracle, name, &[], &types, &[]);
     let trigger = &parsed.triggers[trigger_index];
@@ -159,7 +164,8 @@ fn transwarp_hub_lets_you_take_two_milled_artifacts() {
         }
     }
     let hub = {
-        let mut card = scenario.add_artifact_to_hand_from_oracle(P0, "Transwarp Hub", TRANSWARP_HUB);
+        let mut card =
+            scenario.add_artifact_to_hand_from_oracle(P0, "Transwarp Hub", TRANSWARP_HUB);
         card.with_mana_cost(FREE);
         card.id()
     };
