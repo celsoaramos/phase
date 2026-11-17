@@ -4984,7 +4984,23 @@ fn parse_type_phrase_folding_unbound<'a>(
         // suffix, relative pronoun, predicate verb, or referential comma clause.
         let name_end = named_filter_name_end(name_text);
         let raw_name = name_text[..name_end].trim();
-        if !raw_name.is_empty() {
+        // CR 201.5: the negated form is claimed here only for the card's own
+        // name ("not named ~" / the printed name — Staff of Eden, Clever
+        // Conjurer, Dutiful Replicator). Some passes carry no card name; then a
+        // literal name is claimed only when a "from <zone>" origin follows (a
+        // card chosen in another zone). Other shapes ("an artifact or creature
+        // not named X died this turn") keep their own owners and fail closed in
+        // this path.
+        let after_name = name_text[name_end..].trim_start();
+        let origin_follows = tag::<_, _, OracleError<'_>>("from ")
+            .parse(after_name)
+            .is_ok();
+        let claims_negation = match ctx.card_name.as_deref() {
+            Some(card) => raw_name == "~" || card.eq_ignore_ascii_case(raw_name),
+            None => raw_name != "~" && origin_follows,
+        };
+        let unclaimed_negation = negated_len > 0 && !claims_negation;
+        if !raw_name.is_empty() && !unclaimed_negation {
             // Reconstruct original-case name from the same position in `text`
             let orig_offset = pos + named_offset + "named ".len();
             let orig_name = text[orig_offset..orig_offset + raw_name.len()].trim();
@@ -5000,8 +5016,7 @@ fn parse_type_phrase_folding_unbound<'a>(
                 (Some(name), true) => properties.push(FilterProp::Not {
                     prop: Box::new(FilterProp::Named { name }),
                 }),
-                // CR 201.5: `~` with no known card name names no object; leave
-                // the predicate out rather than store an unmatchable name.
+                // Unreachable: guarded by `unclaimed_negation` above.
                 (None, _) => {}
             }
             pos += named_offset + "named ".len() + name_end;

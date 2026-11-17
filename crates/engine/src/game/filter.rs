@@ -4758,6 +4758,27 @@ pub(crate) fn matches_target_filter_on_entry_observation(
     )
 }
 
+/// CR 607.2a + CR 400.7: replace every `ExiledBySource` leaf with "is still in
+/// exile" — used when the enclosing tracked-set cause already proves the link
+/// (see the `TrackedSetFiltered` arm of `filter_inner_for_object`). The zone
+/// half stays: a member that left exile since (a card cast from among them —
+/// Epic Experiment) is no longer one of the "cards exiled this way".
+fn satisfy_exiled_by_source(filter: &TargetFilter) -> TargetFilter {
+    match filter {
+        TargetFilter::ExiledBySource => TargetFilter::Typed(
+            crate::types::ability::TypedFilter::default().properties(vec![
+                crate::types::ability::FilterProp::InZone {
+                    zone: crate::types::zones::Zone::Exile,
+                },
+            ]),
+        ),
+        TargetFilter::And { filters } => TargetFilter::And {
+            filters: filters.iter().map(satisfy_exiled_by_source).collect(),
+        },
+        other => other.clone(),
+    }
+}
+
 /// CR 701.20e + CR 608.2c: Look-then-cast chains publish cards via
 /// `last_revealed_ids` while the parser still binds later steps to
 /// `ExiledBySource`. When resolving those steps against library cards,
@@ -7323,6 +7344,20 @@ fn filter_inner_for_object(
                         .is_some_and(|member_cause| member_cause == cause),
                 }
             });
+            // CR 607.2a + CR 608.2c: a member whose producer action is the
+            // bound "exiled this way" exile WAS exiled with this source by the
+            // resolving ability itself; a nested `ExiledBySource` restates that
+            // fact and must not re-check it against the trigger's capture-time
+            // pile, which predates this resolution's own exiles (Deep Space 9:
+            // "exile the top four cards … Put all permanent cards exiled this
+            // way onto the battlefield").
+            let stripped;
+            let filter = if *caused_by == Some(crate::types::ability::ThisWayCause::Exiled) {
+                stripped = satisfy_exiled_by_source(filter);
+                &stripped
+            } else {
+                &**filter
+            };
             in_set
                 && filter_inner_for_object(
                     state,

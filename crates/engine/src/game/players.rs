@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::game::game_object::ObjectIncarnationRefExt;
 use crate::types::ability::{AggregateFunction, ControllerRef, PlayerRelation, SeatDirection};
 use crate::types::events::{GameEvent, PlayerActionKind};
 use crate::types::game_state::GameState;
@@ -455,29 +454,6 @@ pub fn linked_exile_pile(
             .any(|p| p.exiled_id == snap.exiled_id && p.incarnation == snap.incarnation)
         {
             pile.push(snap.clone());
-        }
-    }
-    // CR 607.2a + CR 400.7: while the bound incarnation is still the live
-    // object, cards it exiles AFTER the trigger was captured (an earlier
-    // instruction of the resolving ability itself — Deep Space 9's "exile the
-    // top four cards … Put all permanent cards exiled this way onto the
-    // battlefield") belong to the same pile. The capture-time snapshot alone
-    // cannot see them.
-    if bound.is_current(state) {
-        let reader = Some(bound.incarnation);
-        let live: Vec<LinkedExileSnapshot> =
-            crate::game::exile_links::links_for_reader(state, bound.object_id, reader)
-                .filter_map(|link| {
-                    crate::game::exile_links::exiled_card_snapshot(state, link.exiled_id)
-                })
-                .collect();
-        for snap in live {
-            if !pile
-                .iter()
-                .any(|p| p.exiled_id == snap.exiled_id && p.incarnation == snap.incarnation)
-            {
-                pile.push(snap);
-            }
         }
     }
     pile
