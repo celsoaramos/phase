@@ -120,6 +120,14 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     let normalized = replace_self_refs(&text, card_name);
     let norm_lower = normalized.to_lowercase();
 
+    // The printed Devour shape ("As ~ enters, you may sacrifice any number of
+    // … . If you do, it enters with twice that many +1/+1 counters on it.")
+    // reads both sentences into one replacement, so it dispatches above the
+    // enters-with gate below.
+    if let Some(def) = parse_as_enters_sacrifice_for_counters(&norm_lower, &text) {
+        return Some(def);
+    }
+
     // CR 614.1c + CR 608.2c: a line of several sentences whose enters-with
     // sentence names this object or a distributive subset is the enters-with
     // parser's, and it fails closed there (`EntersWithGap::Clause`). Decline it
@@ -129,13 +137,6 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     // Routes that consult `enters_with_fails_closed` record the line as the
     // `enters_with_clause` gap. An arm that reads every sentence of such a line
     // must dispatch above this gate.
-    //
-    // The printed Devour shape ("As ~ enters, you may sacrifice any number of
-    // … . If you do, it enters with twice that many +1/+1 counters on it.")
-    // reads both sentences into one replacement, so it dispatches here.
-    if let Some(def) = parse_as_enters_sacrifice_for_counters(&norm_lower, &text) {
-        return Some(def);
-    }
     if is_line_owned_enters_with_clause(&norm_lower) {
         return None;
     }
