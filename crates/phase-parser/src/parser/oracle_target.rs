@@ -4954,6 +4954,19 @@ fn parse_type_phrase_folding_unbound<'a>(
     // Handles "creature named X", "cards named X", "named X" patterns.
     let remaining_named = lower[pos..].trim_start();
     let named_offset = lower[pos..].len() - remaining_named.len();
+    // CR 201.2: "not named <name>" negates the name predicate. The card's own
+    // name arrives as the `~` self-reference token (CR 201.5); excluding it is a
+    // NAME exclusion (a second copy is excluded too), so it lowers to
+    // `Not(Named{<card name>})`, never to `Another` (Staff of Eden, Clever
+    // Conjurer, Dutiful Replicator).
+    let (remaining_named, negated_len) =
+        match tag::<_, _, OracleError<'_>>("not ").parse(remaining_named) {
+            Ok((rest, _)) if tag::<_, _, OracleError<'_>>("named ").parse(rest).is_ok() => {
+                (rest, "not ".len())
+            }
+            _ => (remaining_named, 0),
+        };
+    let named_offset = named_offset + negated_len;
     if let Ok((name_text, _)) = tag::<_, _, OracleError<'_>>("named ").parse(remaining_named) {
         // CR 201.2: The card name runs to the earliest *clause* boundary, NOT to
         // the first comma/period. Card names legitimately contain commas and the
@@ -4975,9 +4988,22 @@ fn parse_type_phrase_folding_unbound<'a>(
             // Reconstruct original-case name from the same position in `text`
             let orig_offset = pos + named_offset + "named ".len();
             let orig_name = text[orig_offset..orig_offset + raw_name.len()].trim();
-            properties.push(FilterProp::Named {
-                name: orig_name.to_string(),
-            });
+            // Only the negated form rewrites `~`: the positive "named ~" keeps
+            // its existing token.
+            let name = if orig_name == "~" && negated_len > 0 {
+                ctx.card_name.clone()
+            } else {
+                Some(orig_name.to_string())
+            };
+            match (name, negated_len > 0) {
+                (Some(name), false) => properties.push(FilterProp::Named { name }),
+                (Some(name), true) => properties.push(FilterProp::Not {
+                    prop: Box::new(FilterProp::Named { name }),
+                }),
+                // CR 201.5: `~` with no known card name names no object; leave
+                // the predicate out rather than store an unmatchable name.
+                (None, _) => {}
+            }
             pos += named_offset + "named ".len() + name_end;
 
             // CR 201.2 + CR 400.1: Re-run the zone-suffix pass now that the name
@@ -4998,6 +5024,23 @@ fn parse_type_phrase_folding_unbound<'a>(
                     pos += consumed;
                     if controller.is_none() {
                         controller = zone_ctrl;
+                    }
+                }
+            } else if negated_len > 0
+                && tag::<_, _, OracleError<'_>>("from ")
+                    .parse(after_named)
+                    .is_ok()
+            {
+                // CR 115.2 + CR 400.1: "target <card> not named X from a
+                // graveyard" (Staff of Eden) — the origin zone is also where the
+                // target is chosen. Record the zone on the filter without
+                // consuming the text, so the caller still reads the move origin
+                // from the remainder, exactly as for the un-named phrase.
+                if let Some((zone_props, _, _)) = parse_zone_suffix(&lower[pos..]) {
+                    for prop in zone_props {
+                        if !properties.contains(&prop) {
+                            properties.push(prop);
+                        }
                     }
                 }
             }

@@ -27505,7 +27505,18 @@ fn replace_target_with_self(effect: &mut Effect) {
 }
 
 fn effect_targets_self_ref(effect: &Effect) -> bool {
+    // CR 608.2c + CR 701.3d: "unattach ~" names the source as the object it acts
+    // on (the attachment), even though `UnattachAll` surfaces its host scope as
+    // the target filter — a following bare "it" ("then transform it", Elbrus)
+    // names the source.
     matches!(effect.target_filter(), Some(TargetFilter::SelfRef))
+        || matches!(
+            effect,
+            Effect::UnattachAll {
+                attachment: TargetFilter::SelfRef,
+                ..
+            }
+        )
 }
 
 fn ability_targets_self_ref(ability: &AbilityDefinition) -> bool {

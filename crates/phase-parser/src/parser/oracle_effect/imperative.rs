@@ -7569,6 +7569,28 @@ pub(super) fn parse_utility_imperative_ast(
             return Some(UtilityImperativeAst::UnattachAll { attachment, target });
         }
     }
+    // CR 701.3d: "unattach ~" / "unattach this Equipment|Aura" — the source
+    // attachment detaches itself from whatever it is attached to (Elbrus, the
+    // Binding Blade: "unattach Elbrus, then transform it"). The host scope is the
+    // object the source is attached to.
+    if nom_on_lower(text, lower, |input| {
+        let (input, _) = tag("unattach ").parse(input)?;
+        let (input, _) = alt((
+            tag("~"),
+            tag("this equipment"),
+            tag("this aura"),
+            tag("this fortification"),
+        ))
+        .parse(input)?;
+        Ok((input, ()))
+    })
+    .is_some_and(|((), rest)| rest.trim().trim_end_matches('.').is_empty())
+    {
+        return Some(UtilityImperativeAst::UnattachAll {
+            attachment: TargetFilter::SelfRef,
+            target: TargetFilter::AttachedTo,
+        });
+    }
     // CR 701.27 + CR 701.28: "transform" and "convert" are equivalent game actions.
     // CR 608.2k: the bare-pronoun and self-deictic arms ("transform it" /
     // "transform itself" / "transform this creature") split into two anaphor
