@@ -350,6 +350,7 @@ mod merieke_ri_berit_cant_regenerate;
 mod metamorphic_alteration;
 mod mf_relatos_1117_b;
 mod mf_relatos_20261117_22;
+mod mf_relatos_1117_a;
 mod militant_angel_attacked_opponents;
 mod mill_double_redirect_choice_continuation;
 mod mill_rest_in_peace_redirect;

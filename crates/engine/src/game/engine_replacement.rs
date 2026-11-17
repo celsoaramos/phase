@@ -108,8 +108,9 @@ fn finish_spell_resolution_exposed_by_child(
 /// CR 614.13a + CR 702.82a/c: matches the broad as-enters shape of a Devour
 /// sacrifice replacement — a `Moved` (ETB-style) event whose post-effect is a
 /// `Sacrifice` over a `Typed`/`Any` scope filter (the chooser-driven "sacrifice
-/// any number of creatures/permanents" pool). This is a structural shape match,
-/// NOT a Devour-specific one: other `Moved + Sacrifice{Typed|Any}` replacements
+/// any number of creatures/permanents" pool), or over a union of `Typed` pools
+/// ("creatures and/or planeswalkers", Devouring Hellion). This is a structural
+/// shape match, NOT a Devour-specific one: other `Moved + Sacrifice{Typed|Any}` replacements
 /// share it. Used both to suppress the source-as-pre-selected target injection
 /// and as the capture gate for the pre-entry eligible snapshot.
 /// (`ReplacementEvent` is Clone-not-Copy, so we borrow it.)
@@ -117,14 +118,19 @@ pub(crate) fn is_as_enters_sacrifice_scope_replacement(
     event: Option<&ReplacementEvent>,
     effect: &Effect,
 ) -> bool {
-    matches!(event, Some(ReplacementEvent::Moved))
-        && matches!(
-            effect,
-            Effect::Sacrifice {
-                target: TargetFilter::Typed(_) | TargetFilter::Any,
-                ..
-            }
-        )
+    if !matches!(event, Some(ReplacementEvent::Moved)) {
+        return false;
+    }
+    let Effect::Sacrifice { target, .. } = effect else {
+        return false;
+    };
+    match target {
+        TargetFilter::Typed(_) | TargetFilter::Any => true,
+        TargetFilter::Or { filters } => {
+            !filters.is_empty() && filters.iter().all(|f| matches!(f, TargetFilter::Typed(_)))
+        }
+        _ => false,
+    }
 }
 
 /// CR 614.13a + CR 702.82a/c: true if `id`'s self-referential replacement
