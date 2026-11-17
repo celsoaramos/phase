@@ -1499,13 +1499,20 @@ fn parse_exile_n_of_them_face_down(lower: &str) -> Option<(u32, Vec<(CounterType
     // CR 701.20e + CR 406.3: "exile <number> of them|those cards face down" — the number
     // axis is the shared `parse_number` ("one" for Gonti, "two" for Black Cat), never
     // a per-count tag. Zero is not an exile instruction.
-    let (rest, (_, count, _, _, _, _)) = (
+    //
+    // The "of them" partitive is optional: Clone Shell prints the elided form
+    // "look at the top four cards of your library, exile one face down" — the
+    // same choice of one looked-at card. The private-`Dig` antecedent the caller
+    // requires is what scopes the bare number to the looked-at cards.
+    let (rest, (_, count, _, _)) = (
         tag::<_, _, OracleError<'_>>("exile "),
         verify(nom_primitives::parse_number, |n: &u32| *n >= 1),
         multispace1,
-        tag("of "),
-        alt((tag("them"), tag("those cards"))),
-        multispace1,
+        opt((
+            tag("of "),
+            alt((tag("them"), tag("those cards"))),
+            multispace1,
+        )),
     )
         .parse(trimmed)
         .ok()?;
@@ -18036,6 +18043,17 @@ mod tests {
             Some((3, Vec::new()))
         );
         assert!(parse_exile_n_of_them_face_down("exile 0 of them face down").is_none());
+    }
+
+    /// Clone Shell: "look at the top four cards of your library, exile one face
+    /// down" elides the "of them" partitive — still a choice of one looked-at card.
+    #[test]
+    fn exile_one_face_down_without_partitive_captures_the_count() {
+        assert_eq!(
+            parse_exile_n_of_them_face_down("exile one face down"),
+            Some((1, Vec::new()))
+        );
+        assert!(parse_exile_n_of_them_face_down("exile one").is_none());
     }
 
     /// Black Cat: "exile two of them face down" after a private `Dig` is the plural

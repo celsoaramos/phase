@@ -348,6 +348,7 @@ mod menace_requires_two_blockers;
 mod mercenaries_any_player_activate_prevention_scope;
 mod merieke_ri_berit_cant_regenerate;
 mod metamorphic_alteration;
+mod mf_relatos_1117_b;
 mod mf_relatos_20261117_22;
 mod militant_angel_attacked_opponents;
 mod mill_double_redirect_choice_continuation;
