@@ -10001,7 +10001,8 @@ fn filter_count_scope_actor_matches(
         CountScope::Controller
         | CountScope::Owner
         | CountScope::ScopedPlayer
-        | CountScope::SourceChosenPlayer => actor == controller,
+        | CountScope::SourceChosenPlayer
+        | CountScope::RecipientController => actor == controller,
         CountScope::All => true,
         CountScope::Opponents => actor != controller,
     }

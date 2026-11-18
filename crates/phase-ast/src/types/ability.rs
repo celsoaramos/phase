@@ -3246,6 +3246,12 @@ pub enum CountScope {
     /// "the chosen player's <zone>" on cards whose source stored
     /// `ChosenAttribute::Player`.
     SourceChosenPlayer,
+    /// CR 303.4m + CR 613.4c: The controller of the object receiving the
+    /// effect — "creature cards in its controller's graveyard" on an Aura's
+    /// "enchanted creature gets -X/-X" (Death's Approach), where "its" names
+    /// the enchanted creature, not the Aura. Outside a layer evaluation the
+    /// first object target stands in, as for `PlayerScope::RecipientController`.
+    RecipientController,
     All,
     Opponents,
 }
@@ -28404,8 +28410,18 @@ pub fn quantity_ref_recipient_read(qty: &QuantityRef) -> RecipientRead {
         | QuantityRef::EnteredThisTurn { filter }
         | QuantityRef::DistinctCounterKindsAmong { filter } => filter_recipient_read(filter),
         QuantityRef::FilteredTrackedSetSize { filter, .. } => filter_recipient_read(filter),
-        QuantityRef::ZoneCardCount { filter, .. }
-        | QuantityRef::AttackedThisTurn { filter, .. } => filter
+        QuantityRef::ZoneCardCount { filter, scope, .. } => {
+            let scope_read = if matches!(scope, CountScope::RecipientController) {
+                RecipientRead::Characteristics
+            } else {
+                RecipientRead::Unread
+            };
+            filter
+                .as_ref()
+                .map_or(RecipientRead::Unread, filter_recipient_read)
+                .max(scope_read)
+        }
+        QuantityRef::AttackedThisTurn { filter, .. } => filter
             .as_ref()
             .map_or(RecipientRead::Unread, filter_recipient_read),
         QuantityRef::CounterAddedThisTurn { target, .. } => filter_recipient_read(target),

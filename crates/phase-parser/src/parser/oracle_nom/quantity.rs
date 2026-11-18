@@ -3245,7 +3245,21 @@ fn parse_zone_card_count(input: &str) -> OracleResult<'_, QuantityRef> {
             return Ok((after_zone, q));
         }
     }
-    let (rest, (zone, scope)) = parse_scoped_zone_ref(rest)?;
+    // CR 303.4m + CR 613.4c: "<type> cards in its controller's <zone>" — "its"
+    // is the object receiving the effect (Death's Approach: "enchanted creature
+    // gets -X/-X, where X is the number of creature cards in its controller's
+    // graveyard"), never the Aura's own controller. Typed counts only: the
+    // untyped "cards in its controller's graveyard" also appears inside target
+    // filters (Drown in the Loch), where "its" is the candidate object and no
+    // recipient binds it.
+    let typed = !card_types.is_empty() && card_types != vec![TypeFilter::Card];
+    let (rest, (zone, scope)) = match typed
+        .then(|| parse_recipient_controller_zone_ref(rest).ok())
+        .flatten()
+    {
+        Some(found) => found,
+        None => parse_scoped_zone_ref(rest)?,
+    };
     // CR 715.2: Hearth Elemental counts cards that are instants, sorceries,
     // and/or have an Adventure. Adventure cards have their permanent face's
     // types in the graveyard, so type filters alone undercount this set.
@@ -3845,7 +3859,7 @@ fn scoped_zone_card_filter(zone: ZoneRef, scope: CountScope) -> TargetFilter {
         CountScope::Opponents => Some(ControllerRef::Opponent),
         CountScope::All => None,
         CountScope::ScopedPlayer => Some(ControllerRef::ScopedPlayer),
-        CountScope::SourceChosenPlayer => None,
+        CountScope::SourceChosenPlayer | CountScope::RecipientController => None,
     };
     TargetFilter::Typed(filter)
 }
@@ -4317,6 +4331,21 @@ pub(crate) fn parse_their_opponents_zone_ref(
     map(preceded(tag("their "), parse_zone_ref_plural), |zone| {
         (zone, CountScope::Opponents)
     })
+    .parse(input)
+}
+
+fn parse_recipient_controller_zone_ref(input: &str) -> OracleResult<'_, (ZoneRef, CountScope)> {
+    map(
+        preceded(
+            alt((
+                tag("its controller's "),
+                tag("enchanted creature's controller's "),
+                tag("equipped creature's controller's "),
+            )),
+            parse_zone_ref_singular,
+        ),
+        |zone| (zone, CountScope::RecipientController),
+    )
     .parse(input)
 }
 
@@ -5920,6 +5949,7 @@ fn population_count_filter(qty: &QuantityRef) -> Option<TargetFilter> {
                 CountScope::All => {}
                 CountScope::ScopedPlayer
                 | CountScope::SourceChosenPlayer
+                | CountScope::RecipientController
                 | CountScope::Opponents => {
                     return None;
                 }

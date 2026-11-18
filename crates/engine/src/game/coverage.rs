@@ -2251,6 +2251,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 CountScope::Controller | CountScope::Owner => "you have",
                 CountScope::ScopedPlayer => "the scoped player has",
                 CountScope::SourceChosenPlayer => "the chosen player has",
+                CountScope::RecipientController => "its controller has",
                 CountScope::Opponents => "each opponent has",
                 CountScope::All => "each player has",
             };
@@ -2888,6 +2889,7 @@ fn fmt_count_scope(scope: &CountScope) -> &'static str {
         CountScope::Controller | CountScope::Owner => "your",
         CountScope::ScopedPlayer => "their",
         CountScope::SourceChosenPlayer => "the chosen player's",
+        CountScope::RecipientController => "its controller's",
         CountScope::All => "all",
         CountScope::Opponents => "opponents'",
     }
