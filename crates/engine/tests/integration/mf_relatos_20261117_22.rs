@@ -244,3 +244,57 @@ fn molten_echoes_naming_sliver_copies_an_entering_changeling() {
         "a changeling is a Sliver: Molten Echoes copies it"
     );
 }
+
+const LOST_IN_THE_MAZE: &str =
+    "Flash\nWhen this enchantment enters, tap X target creatures. Put a \
+stun counter on each of those creatures you don't control. (If a permanent with a stun counter \
+would become untapped, remove one from it instead.)\nTapped creatures you control have hexproof.";
+
+/// Relato de 17/11 22:28: "os dois marcadores de atordoamento que ativei nas
+/// criaturas do oponente não funcionaram" — a frase do marcador não era lida e
+/// as criaturas desviravam no turno do oponente.
+#[test]
+fn lost_in_the_maze_stuns_only_the_tapped_creatures_you_dont_control() {
+    use engine::game::scenario::P1;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let maze = scenario
+        .add_spell_to_hand_from_oracle(P0, "Lost in the Maze", false, LOST_IN_THE_MAZE)
+        .as_enchantment()
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![engine::types::mana::ManaCostShard::X],
+            generic: 0,
+        })
+        .id();
+    let mine = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+    let theirs_a = scenario.add_creature(P1, "Hill Giant", 3, 3).id();
+    let theirs_b = scenario.add_creature(P1, "Gray Ogre", 2, 2).id();
+
+    let mut runner = scenario.build();
+    fund(&mut runner, 3);
+    runner
+        .cast(maze)
+        .x(3)
+        .target_objects(&[mine, theirs_a, theirs_b])
+        .resolve();
+    runner.advance_until_stack_empty();
+
+    for id in [mine, theirs_a, theirs_b] {
+        assert!(runner.state().objects[&id].tapped, "all three are tapped");
+    }
+    let stun = |r: &GameRunner, id: ObjectId| {
+        r.state().objects[&id]
+            .counters
+            .get(&CounterType::Stun)
+            .copied()
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        stun(&runner, mine),
+        0,
+        "your own creature gets no stun counter"
+    );
+    assert_eq!(stun(&runner, theirs_a), 1);
+    assert_eq!(stun(&runner, theirs_b), 1);
+}

@@ -2065,7 +2065,12 @@ pub fn parse_target_with_syntax<'a>(
         // ("creatures"/"permanents"/"cards") with no trailing predicate yields
         // only a head `type_filter` and no properties → the plain `TrackedSet`.
         let (filter, remainder) = parse_type_phrase_folding_with_ctx(phrase, ctx);
-        if target_filter_carries_predicate_property(&filter) {
+        // A controller suffix ("each of those creatures you don't control",
+        // Lost in the Maze) is a predicate too: without it the bare-noun arm
+        // below returns the plain tracked set and leaves " you don't control"
+        // unparsed, which turned the whole clause into an unimplemented gap.
+        let has_controller = matches!(&filter, TargetFilter::Typed(tf) if tf.controller.is_some());
+        if target_filter_carries_predicate_property(&filter) || has_controller {
             return (
                 TargetFilter::TrackedSetFiltered {
                     id: TrackedSetId(0),
