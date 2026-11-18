@@ -2849,6 +2849,72 @@ fn mask_name_occurrences_in_segment(
     (out, refused)
 }
 
+/// CR 205.3m + CR 608.2c: "<creatures> of the creature type of your choice
+/// <do something>" (Witch's Vengeance, Extinction, Defensive Maneuvers, Tribal
+/// Unity, Karona, Riptide Chronologist) prints the creature-type choice inside
+/// the mass filter instead of as its own "Choose a creature type." sentence.
+/// The type is chosen as the effect resolves, then the filter reads it — the
+/// same two steps the explicit wording spells out (Kindred Dominance, Crippling
+/// Fear) — so the sentence is restated in that wording, which the effect parser
+/// already lowers to `Choose(CreatureType)` + `IsChosenCreatureType`.
+///
+/// Only an UNTARGETED sentence is restated: "target creatures of the creature
+/// type of your choice" (Selective Snare, Aphetto Dredging) chooses while
+/// targeting, before resolution, and "becomes the creature type of your choice"
+/// is a type change with its own parser. The choice is inserted at the start of
+/// the effect: after an activation cost ("{B}, {T}: …") or after a trigger
+/// condition's comma ("Whenever ~ attacks, …").
+pub(crate) fn rewrite_printed_creature_type_choice(text: &str) -> String {
+    const PHRASE: &str = "of the creature type of your choice";
+    if !text.contains(PHRASE) {
+        return text.to_string();
+    }
+    text.split('\n')
+        .map(|line| {
+            if !line.contains(PHRASE) {
+                return line.to_string();
+            }
+            let mut sentences: Vec<String> = Vec::new();
+            for sentence in line.split_inclusive(". ") {
+                sentences.push(rewrite_creature_type_choice_sentence(sentence, PHRASE));
+            }
+            sentences.concat()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn rewrite_creature_type_choice_sentence(sentence: &str, phrase: &str) -> String {
+    let Some(at) = sentence.find(phrase) else {
+        return sentence.to_string();
+    };
+    let lower = sentence.to_ascii_lowercase();
+    if lower.contains("target") || lower.contains("becomes the creature type") {
+        return sentence.to_string();
+    }
+    // Start of the effect: after a cost colon, then after a trigger condition.
+    let mut start = sentence[..at].rfind(": ").map_or(0, |i| i + 2);
+    let head = sentence[start..].to_ascii_lowercase();
+    if head.starts_with("when") || head.starts_with("at ") {
+        match sentence[start..at].find(", ") {
+            Some(comma) => start += comma + 2,
+            None => return sentence.to_string(),
+        }
+    }
+    let effect = sentence[start..].replacen(phrase, "of the chosen type", 1);
+    let mut chars = effect.chars();
+    let effect = match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => return sentence.to_string(),
+    };
+    let lead = if start == 0 || sentence[..start].ends_with(": ") {
+        "Choose a creature type. "
+    } else {
+        "choose a creature type. "
+    };
+    format!("{}{}{}", &sentence[..start], lead, effect)
+}
+
 pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
     normalize_card_name_refs_reporting(text, card_name).0
 }
@@ -2859,7 +2925,8 @@ pub fn normalize_card_name_refs_reporting(
     text: &str,
     card_name: &str,
 ) -> (String, BTreeSet<usize>) {
-    let pre = mask_ring_tempts_you_phrase(text);
+    let rewritten = rewrite_printed_creature_type_choice(text);
+    let pre = mask_ring_tempts_you_phrase(&rewritten);
     // CR 701.40a/701.58a/701.62a: protect the keyword-action body verb on cards
     // named after a keyword action ("Manifest Dread", "Cloak") so it survives
     // self-reference `~` normalization. The original casing is restored at the end.
