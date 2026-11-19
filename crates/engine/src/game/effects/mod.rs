@@ -19983,6 +19983,17 @@ fn player_scope_sacrifice_step(
                     && !crate::game::static_abilities::triggered_cause_sacrifice_or_exile_muzzled(
                         state, &scoped, *id, player,
                     )
+                    // CR 609.3 + CR 109.5: Tajuru Preserver / Sigarda, Host of Herons —
+                    // "Spells and abilities your opponents control can't cause you to
+                    // sacrifice permanents." The scoped copy rebinds `controller` to the
+                    // sacrificing player ("each opponent sacrifices", Soul Shatter), so
+                    // the cause is the ORIGINAL controller, not `scoped.controller`.
+                    && !crate::game::static_abilities::forced_action_muzzled(
+                        state,
+                        original_controller,
+                        player,
+                        crate::types::ability::CostCategory::SacrificesPermanent,
+                    )
             })
         })
         .collect();
