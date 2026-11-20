@@ -46,6 +46,11 @@ name = "ai-duel"
 path = "src/bin/ai_duel.rs"
 
 [[bin]]
+name = "ai-ladder"
+path = "src/bin/ai_ladder.rs"
+required-features = ["tune"]
+
+[[bin]]
 name = "ai-tune"
 path = "src/bin/ai_tune.rs"
 test = false

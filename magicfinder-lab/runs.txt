@@ -1,0 +1,17 @@
+# nome | argumentos do ai-ladder (o banco de cartas é passado pelo workflow)
+# Rodada 20/11/2026 — "experimento do teto" (Etapa 0 do plano do robô difícil).
+# Base = o motor servido (v0.125.0-mf.189d5a93, refeito pelos SHAs do source.json) + botões de laboratório.
+# B é sempre o robô do navegador hoje (veryhard, wasm, IA justa det=4). Espelhos dos decks do pool,
+# sementes pareadas: só a configuração muda. Pergunta: mais processamento compra força?
+# 1) "Treino sério" no navegador: o turno que simula com 3x o relógio (1,5 s × 0,5 s).
+clock-3x-a | --decks crates/phase-ai/duel_decks --a veryhard:wasm,det=4,tsim_ms=1500 --b veryhard:wasm,det=4,tsim_ms=500 --matchups izzet-delver-vs-izzet-delver,mono-red-prowess-vs-mono-red-prowess,selesnya-ouroboroid-vs-selesnya-ouroboroid --games 40 --audit
+clock-3x-b | --decks crates/phase-ai/duel_decks --a veryhard:wasm,det=4,tsim_ms=1500 --b veryhard:wasm,det=4,tsim_ms=500 --matchups kaladesh-energy-vs-kaladesh-energy,azorius-control-vs-azorius-control,dimir-mill-vs-dimir-mill --games 40 --audit
+# 2) 4x simulações do turno (8 linhas × 8 mundos, 4x passos), sem relógio nos dois lados.
+tsim-4x-a | --decks crates/phase-ai/duel_decks --a veryhard:wasm,det=4,tsim_lines=8,tsim_worlds=8,tsim_steps=9600 --b veryhard:wasm,det=4 --matchups izzet-delver-vs-izzet-delver,mono-red-prowess-vs-mono-red-prowess,selesnya-ouroboroid-vs-selesnya-ouroboroid --games 40 --audit
+tsim-4x-b | --decks crates/phase-ai/duel_decks --a veryhard:wasm,det=4,tsim_lines=8,tsim_worlds=8,tsim_steps=9600 --b veryhard:wasm,det=4 --matchups kaladesh-energy-vs-kaladesh-energy,azorius-control-vs-azorius-control,dimir-mill-vs-dimir-mill --games 40 --audit
+# 3) Busca sem o corte do WASM (profundidade 3, 64 nós × 2 e 42).
+search-native-a | --decks crates/phase-ai/duel_decks --a veryhard:native,det=4 --b veryhard:wasm,det=4 --matchups izzet-delver-vs-izzet-delver,mono-red-prowess-vs-mono-red-prowess,selesnya-ouroboroid-vs-selesnya-ouroboroid --games 40 --audit
+search-native-b | --decks crates/phase-ai/duel_decks --a veryhard:native,det=4 --b veryhard:wasm,det=4 --matchups kaladesh-energy-vs-kaladesh-energy,azorius-control-vs-azorius-control,dimir-mill-vs-dimir-mill --games 40 --audit
+# 4) Teto: ~10x em tudo (nativo, 8 mundos na busca, 200 nós, 10 linhas × 16 mundos no turno).
+ceil-10x-a | --decks crates/phase-ai/duel_decks --a veryhard:native,det=8,nodes=200,tsim_lines=10,tsim_worlds=16,tsim_steps=24000 --b veryhard:wasm,det=4 --matchups izzet-delver-vs-izzet-delver,mono-red-prowess-vs-mono-red-prowess,selesnya-ouroboroid-vs-selesnya-ouroboroid --games 20 --audit
+ceil-10x-b | --decks crates/phase-ai/duel_decks --a veryhard:native,det=8,nodes=200,tsim_lines=10,tsim_worlds=16,tsim_steps=24000 --b veryhard:wasm,det=4 --matchups kaladesh-energy-vs-kaladesh-energy,azorius-control-vs-azorius-control,dimir-mill-vs-dimir-mill --games 20 --audit

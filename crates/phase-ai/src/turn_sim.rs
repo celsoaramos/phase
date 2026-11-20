@@ -44,8 +44,10 @@ use crate::session::AiSession;
 
 /// Root actions compared, the incumbent included (pass is always one of them).
 const MAX_LINES: usize = 5;
+pub(crate) const DEFAULT_LINES: usize = MAX_LINES;
 /// Opponent worlds each line is played in.
 const WORLDS: u64 = 4;
+pub(crate) const DEFAULT_WORLDS: u64 = WORLDS;
 /// Worlds a line must share with the incumbent before it can replace it: one
 /// lucky draw never crowns a line.
 const MIN_WORLDS: usize = 2;
@@ -57,6 +59,7 @@ const MAX_STEPS: usize = 400;
 /// the same layer the browser runs; the incumbent is played first and always
 /// gets its share.
 const MAX_DECISION_STEPS: usize = 2_400;
+pub(crate) const DEFAULT_DECISION_STEPS: usize = MAX_DECISION_STEPS;
 /// An alternative must beat the incumbent by this much on average (evaluation
 /// units: a point of life ~0.5, a 2/2 ~6). Below it the search's own answer
 /// stands — two heuristic playouts are not precise enough to overrule it on a
@@ -155,6 +158,14 @@ fn by_score_desc(a: &(GameAction, f64), b: &(GameAction, f64)) -> Ordering {
 /// The lines to compare, incumbent first: the searched argmax, then the next
 /// best-scored root actions that are not a bare mana activation, then passing.
 fn lines(scored: &[(GameAction, f64)], is_mana: impl Fn(&GameAction) -> bool) -> Vec<GameAction> {
+    lines_up_to(scored, is_mana, MAX_LINES)
+}
+
+fn lines_up_to(
+    scored: &[(GameAction, f64)],
+    is_mana: impl Fn(&GameAction) -> bool,
+    max_lines: usize,
+) -> Vec<GameAction> {
     let mut ranked: Vec<&(GameAction, f64)> = scored.iter().collect();
     ranked.sort_by(|a, b| by_score_desc(a, b));
     let Some(((incumbent, _), rest)) = ranked.split_first() else {
@@ -165,7 +176,7 @@ fn lines(scored: &[(GameAction, f64)], is_mana: impl Fn(&GameAction) -> bool) ->
         .iter()
         .find(|(action, _)| matches!(action, GameAction::PassPriority))
         .map(|(action, _)| action.clone());
-    let room = MAX_LINES - usize::from(pass.is_some());
+    let room = max_lines.max(2) - usize::from(pass.is_some());
     for (action, _) in rest {
         if out.len() >= room {
             break;
@@ -284,14 +295,14 @@ fn measure_lines(
     scored: Vec<(GameAction, f64)>,
     is_mana: impl Fn(&GameAction) -> bool,
 ) -> Vec<(GameAction, f64)> {
-    let lines = lines(&scored, is_mana);
+    let lines = lines_up_to(&scored, is_mana, input.config.turn_simulation_lines);
     if lines.len() < 2 {
         return scored;
     }
 
     let base_seed =
         crate::planner::quick_state_hash(input.state).wrapping_add(input.state.rng_seed);
-    let worlds: Vec<(GameState, u64)> = (0..WORLDS)
+    let worlds: Vec<(GameState, u64)> = (0..input.config.turn_simulation_worlds.max(1))
         .map(|i| {
             let seed = base_seed.wrapping_add(crate::determinize::splitmix64(i));
             let world = if input.config.search.determinization_samples > 0 {
@@ -308,7 +319,7 @@ fn measure_lines(
     // keyed to the real position): they get their own copy.
     let session = Arc::new((**input.session).clone());
     let mut budget = Budget {
-        steps_left: MAX_DECISION_STEPS,
+        steps_left: input.config.turn_simulation_steps,
         deadline: input.deadline,
     };
 

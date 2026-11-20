@@ -3675,7 +3675,7 @@ pub(crate) fn crackback_damage(
 /// untapped and not summoning sick (CR 302.6) — a 5/5 that just entered is not
 /// a clock this turn. On another player's turn its board untaps and sheds
 /// summoning sickness before its own combat, so only defender bodies drop out.
-fn battlefield_power(state: &GameState, player: PlayerId) -> i32 {
+pub(crate) fn battlefield_power(state: &GameState, player: PlayerId) -> i32 {
     let is_active = state.active_player == player;
     state
         .battlefield
@@ -3770,7 +3770,7 @@ fn best_block_absorption(state: &GameState, attacker: PlayerId, defender: Player
     absorbed
 }
 
-fn sum_power(state: &GameState, ids: &[ObjectId]) -> i32 {
+pub(crate) fn sum_power(state: &GameState, ids: &[ObjectId]) -> i32 {
     ids.iter()
         .filter_map(|&id| {
             state
@@ -4236,7 +4236,7 @@ fn block_exchange(blocker: &BlockStats, attacker: &BlockStats) -> (bool, bool) {
 }
 
 /// Evaluate whether a single blocker kills the attacker and/or survives combat.
-fn evaluate_block_outcome(
+pub(crate) fn evaluate_block_outcome(
     blocker: &engine::game::game_object::GameObject,
     attacker: &engine::game::game_object::GameObject,
 ) -> (bool, bool) {

@@ -1482,6 +1482,12 @@ pub struct AiConfig {
     /// every preset; the lab sets it (`tsim_ms=`) to stand in for the slower
     /// browser so it measures what the browser can actually finish.
     pub turn_simulation_clock_ms: Option<u32>,
+    /// Lab knobs for the turn playouts (`tsim_lines=`, `tsim_worlds=`,
+    /// `tsim_steps=`): how many root lines, determinized worlds and engine
+    /// steps per decision. Every preset keeps the measured 5 / 4 / 2400.
+    pub turn_simulation_lines: usize,
+    pub turn_simulation_worlds: u64,
+    pub turn_simulation_steps: usize,
     pub search: SearchConfig,
     pub weights: EvalWeightSet,
     pub keyword_bonuses: KeywordBonuses,
@@ -1702,6 +1708,9 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
         projections: true,
         fetch_route_check: true,
         turn_simulation_clock_ms: None,
+        turn_simulation_lines: crate::turn_sim::DEFAULT_LINES,
+        turn_simulation_worlds: crate::turn_sim::DEFAULT_WORLDS,
+        turn_simulation_steps: crate::turn_sim::DEFAULT_DECISION_STEPS,
         search,
         weights: EvalWeightSet::learned(),
         keyword_bonuses: KeywordBonuses::default(),
