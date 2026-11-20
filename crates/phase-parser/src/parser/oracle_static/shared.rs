@@ -2657,6 +2657,61 @@ fn parse_subject_cant_attack_you_or_block_static(
     Some(vec![attack, block])
 }
 
+/// CR 509.1b + CR 508.1c: "<subject> can't <P0>, and they can't <P1>." — two
+/// restrictions sharing one subject, the second through the plural anaphor
+/// "they" (Varchild, Betrayer of Kjeldor: "Survivors your opponents control
+/// can't block, and they can't attack you or planeswalkers you control.").
+///
+/// Each half is re-parsed as its own sentence with the printed subject restored
+/// ("<subject> can't <P1>."), so every restriction the single-sentence grammar
+/// knows lowers here with the same scoping. Fails closed unless BOTH halves
+/// parse, both are restriction modes, and both name the SAME non-self subject:
+/// anything else would bind the anaphor to the wrong object.
+fn parse_subject_restriction_they_conjunction_static(
+    text: &str,
+    lower: &str,
+) -> Option<Vec<StaticDefinition>> {
+    const JOIN: &str = ", and they can't ";
+    let join = lower.find(JOIN)?;
+    if lower[join + JOIN.len()..].contains(JOIN) {
+        return None;
+    }
+    let head_lower = &lower[..join];
+    let subject_end = head_lower.find(" can't ")?;
+    let subject = text[..subject_end].trim();
+    if subject.is_empty() {
+        return None;
+    }
+    let first = format!("{}.", text[..join].trim_end_matches('.'));
+    let tail = text[join + JOIN.len()..].trim().trim_end_matches('.');
+    if tail.is_empty() {
+        return None;
+    }
+    let second = format!("{subject} can't {tail}.");
+    let is_restriction = |mode: &StaticMode| {
+        matches!(
+            mode,
+            StaticMode::CantBlock | StaticMode::CantAttack | StaticMode::CantAttackOrBlock
+        )
+    };
+    let mut defs = Vec::new();
+    for sentence in [first, second] {
+        let mut def = super::parse_static_line(&sentence)?;
+        if !is_restriction(&def.mode) {
+            return None;
+        }
+        def.description = Some(text.to_string());
+        defs.push(def);
+    }
+    let affected = defs[0].affected.clone()?;
+    if matches!(affected, TargetFilter::SelfRef)
+        || defs.iter().any(|d| d.affected.as_ref() != Some(&affected))
+    {
+        return None;
+    }
+    Some(defs)
+}
+
 /// CR 509.1b + CR 611.3a: the symmetric block conjunction in EITHER printed
 /// clause orientation — bare (`"<subject> can't block or be blocked by
 /// <object>."`) or under a leading gate (`"As long as <condition>, <subject>
@@ -3035,6 +3090,16 @@ fn parse_static_line_multi_dispatch(text: &str) -> Vec<StaticDefinition> {
     // and `token.rs::push_parsed_statics` (`:1260`) — which is why the 7
     // token-granting cards need no separate fix.
     if let Some(defs) = parse_symmetric_block_conjunction_static(&stripped, &lower) {
+        return defs;
+    }
+
+    // CR 509.1b + CR 508.1c: "<subject> can't block, and they can't attack you
+    // [or planeswalkers you control]" (Varchild, Betrayer of Kjeldor) — two
+    // restrictions on ONE subject, the second reached through the "they"
+    // anaphor. Must precede generic combat-rule dispatch, which collapses the
+    // line to a blanket `CantBlock { affected: SelfRef }` and drops the attack
+    // half (the source could not block; the subject could attack you).
+    if let Some(defs) = parse_subject_restriction_they_conjunction_static(&stripped, &lower) {
         return defs;
     }
 
