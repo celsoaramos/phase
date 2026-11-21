@@ -760,8 +760,7 @@ pub(crate) fn apply_damage_after_replacement(
                         .entry(CounterType::Minus1Minus1)
                         .or_insert(0);
                     *entry += actual_amount;
-                    // CR 702.2b: only damage actually dealt (amount > 0) is deathtouch damage.
-                    if ctx.has_deathtouch && actual_amount > 0 {
+                    if ctx.has_deathtouch {
                         target_obj.dealt_deathtouch_damage = true;
                     }
                 }
