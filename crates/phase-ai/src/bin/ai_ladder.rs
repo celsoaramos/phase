@@ -89,6 +89,7 @@ fn parse_spec(spec: &str) -> Result<Side, String> {
             "det" => config.search.determinization_samples = num()? as u32,
             "nodes" => config.search.max_nodes = num()? as u32,
             "branch" => config.search.max_branching = num()? as u32,
+            "search_ms" => config.search.time_budget_ms = Some(num()? as u32),
             "csim" => config.combat_simulation = num()? != 0.0,
             "tsim" => config.turn_simulation = num()? != 0.0,
             "tsim_ms" => config.turn_simulation_clock_ms = Some(num()? as u32),
