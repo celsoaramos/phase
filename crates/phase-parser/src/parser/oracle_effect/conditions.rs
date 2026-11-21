@@ -471,10 +471,59 @@ pub(crate) fn strip_routed_leading_general_conditional(
             .or_else(|| parse_control_count_as_ability_condition(cond_text).map(general))
             .or_else(|| parse_and_conjunction_condition(cond_text, ctx))
         {
+            let body = hoist_condition_target_player(cond_text, &body).unwrap_or(body);
             return (Some(routed), body);
         }
     }
     (None, text.to_string())
+}
+
+/// CR 115.1 + CR 601.2c + CR 608.2c: a leading condition that names "target
+/// player/opponent" ("If target player has exactly 10 life, ~ deals 10 damage to
+/// that player" — Hidetsugu's Second Rite) is where the spell ANNOUNCES its
+/// player target; the condition reads it through `PlayerScope::Target` (the first
+/// player target). The body's "that player" is that same target, so the first
+/// one is rewritten to the target phrase: the body then declares the slot the
+/// condition reads, instead of falling to an event-bound anaphor that a spell
+/// never binds. Only a "that player" that ends the noun phrase is rewritten
+/// ("to that player." / "that player's"), never one that qualifies another noun
+/// ("creature that player controls"), whose antecedent rules are separate.
+fn hoist_condition_target_player(cond_text: &str, body: &str) -> Option<String> {
+    let cond_lower = cond_text.to_lowercase();
+    let (_, target_phrase) = terminated(
+        alt((
+            tag::<_, _, OracleError<'_>>("target player"),
+            tag("target opponent"),
+        )),
+        tag(" has "),
+    )
+    .parse(cond_lower.as_str())
+    .ok()?;
+    let body_lower = body.to_lowercase();
+    // Byte offsets are taken on the lowercase copy; refuse a body whose
+    // lowercasing changes its length rather than slicing the original wrong.
+    if body_lower.len() != body.len() {
+        return None;
+    }
+    let anaphor_start = nom_primitives::scan_at_word_boundaries(body_lower.as_str(), |i| {
+        let (rest, _) = tag::<_, _, OracleError<'_>>("that player").parse(i)?;
+        let (_, _) = peek(alt((
+            tag::<_, _, OracleError<'_>>("'s"),
+            tag("."),
+            tag(","),
+            eof,
+        )))
+        .parse(rest)?;
+        Ok((rest, i))
+    })?;
+    let offset = body_lower.len() - anaphor_start.len();
+    let end = offset + "that player".len();
+    Some(format!(
+        "{}{}{}",
+        &body[..offset],
+        target_phrase,
+        &body[end..]
+    ))
 }
 
 /// CR 608.2c: Parse a top-level `"<cond> and <cond> [and …]"` conjunction into

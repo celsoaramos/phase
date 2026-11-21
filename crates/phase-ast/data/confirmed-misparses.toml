@@ -1115,7 +1115,6 @@ face = [
   { key = "hide in plain sight", class = "missing_effect", clauses = ["cloak two of them", "put the rest on the bottom of your library in a random order."] },
   { key = "hideous taskmaster", class = "wrong_object", clauses = ["When you cast this spell, for each opponent, gain control of up to one target creature that player controls until end of turn.", "They gain trample, haste, and annihilator 1 until end of turn."] },
   { key = "hidetsugu's poison rite", class = "target_wrong", clauses = ["Target player with exactly seven poison counters loses the game."] },
-  { key = "hidetsugu's second rite", class = "condition_wrong", clauses = ["If target player has exactly 10 life, Hidetsugu's Second Rite deals 10 damage to that player."] },
   { key = "hidetsugu, devouring chaos", class = "wrong_object", clauses = ["When you exile a nonland card this way, Hidetsugu deals damage equal to the exiled card's mana value to any target."] },
   { key = "higher level zone monster", class = "missing_effect", clauses = ["and it's the colors of your choice in addition to its other colors."] },
   { key = "hildibrand manderville", class = "wrong_zone", clauses = ["When Hildibrand Manderville dies, you may cast it from your graveyard as an Adventure until the end of your next turn."] },

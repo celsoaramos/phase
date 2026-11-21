@@ -5140,6 +5140,21 @@ fn parse_life_predicate(rest: &str, player: PlayerScope) -> Option<(&str, Static
         ));
     }
 
+    // CR 119 + CR 608.2c: "exactly N life" → scalar EQ comparison against the
+    // named player's life total, checked as the spell resolves ("If target
+    // player has exactly 10 life, …" — Hidetsugu's Second Rite). Mirrors the
+    // "you have exactly N life" arm for a non-controller subject.
+    if let Ok((after_n, n)) =
+        preceded(tag::<_, _, OracleError<'_>>("exactly "), parse_number).parse(rest)
+    {
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(" life").parse(after_n) {
+            return Some((
+                rest,
+                make_quantity_comparison(QuantityRef::LifeTotal { player }, Comparator::EQ, n),
+            ));
+        }
+    }
+
     // CR 119 + CR 603.4: "less/greater than <quantity>" → comparison of the
     // scoped player's life total against a composed quantity ("if that
     // player has less than half their starting life total"). The fractional
