@@ -42627,3 +42627,38 @@ fn repaired_grammar_neighbours_parse_to_their_meaning_or_an_explicit_gap() {
         );
     }
 }
+
+/// CR 303.4e + CR 702.11a: Canopy Cover — "Enchanted creature can't be the
+/// target of spells or abilities your opponents control." grants hexproof to
+/// the ENCHANTED creature, not to the Aura (relato da mesa de 21/11/2026: o
+/// subject era descartado e a Aura ficava com hexproof).
+#[test]
+fn enchanted_creature_cant_be_targeted_by_opponents_grants_hexproof_to_host() {
+    let def = parse_static_line(
+        "Enchanted creature can't be the target of spells or abilities your opponents control.",
+    )
+    .expect("must parse");
+    let Some(TargetFilter::Typed(tf)) = &def.affected else {
+        panic!(
+            "expected the enchanted creature as affected, got {:?}",
+            def.affected
+        );
+    };
+    assert!(tf.properties.contains(&FilterProp::EnchantedBy), "{tf:?}");
+    assert!(
+        def.modifications.iter().any(|m| matches!(
+            m,
+            ContinuousModification::AddKeyword {
+                keyword: Keyword::Hexproof
+            }
+        )),
+        "{:?}",
+        def.modifications
+    );
+
+    // Self-referential form keeps its old shape.
+    let own =
+        parse_static_line("~ can't be the target of spells or abilities your opponents control.")
+            .expect("must parse");
+    assert_eq!(own.affected, Some(TargetFilter::SelfRef));
+}
