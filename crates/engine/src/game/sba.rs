@@ -974,8 +974,11 @@ fn lethal_damage_candidates(state: &GameState, battlefield_snapshot: &[ObjectId]
                             && (
                                 // CR 704.5g: Normal lethal damage requires positive toughness and damage >= toughness.
                                 obj.damage_marked >= t as u32
-                                // CR 704.5h + CR 702.2b: Deathtouch lethal also requires positive toughness.
-                                || (obj.dealt_deathtouch_damage && obj.damage_marked > 0)
+                                // CR 704.5h + CR 702.2b: Any damage from a deathtouch source is
+                                // lethal. The flag alone is the evidence: wither/infect damage
+                                // (CR 702.80 / CR 702.90) arrives as -1/-1 counters and never
+                                // marks damage, so `damage_marked` can stay 0.
+                                || obj.dealt_deathtouch_damage
                             )
                     })
                     // CR 702.12b: Indestructible creatures are not destroyed by lethal damage.

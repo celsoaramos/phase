@@ -760,7 +760,8 @@ pub(crate) fn apply_damage_after_replacement(
                         .entry(CounterType::Minus1Minus1)
                         .or_insert(0);
                     *entry += actual_amount;
-                    if ctx.has_deathtouch {
+                    // CR 702.2b: only damage actually dealt (amount > 0) is deathtouch damage.
+                    if ctx.has_deathtouch && actual_amount > 0 {
                         target_obj.dealt_deathtouch_damage = true;
                     }
                 }
@@ -770,7 +771,7 @@ pub(crate) fn apply_damage_after_replacement(
                     // CR 120.3e: Damage to a creature marks damage.
                     target_obj.damage_marked += actual_amount;
                     // CR 702.2b: Track deathtouch for SBA lethal-damage check.
-                    if ctx.has_deathtouch {
+                    if ctx.has_deathtouch && actual_amount > 0 {
                         target_obj.dealt_deathtouch_damage = true;
                     }
                 }
