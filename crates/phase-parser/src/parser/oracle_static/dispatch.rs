@@ -4341,6 +4341,18 @@ fn parse_counters_cant_be_removed_static(
 
 /// Structural-marker site: "your opponents and/or planeswalkers they control"
 /// reads "they control" as a marker; the defender is the opponents either way.
+/// "enchanted creature can't be the target …" / "equipped creature cannot be
+/// targeted …": the attached-subject filter when the line's subject is the
+/// attached permanent (and nothing else stands between it and the predicate).
+fn attached_cant_be_targeted_subject(lower: &str) -> Option<TargetFilter> {
+    let (rest, filter) =
+        crate::parser::oracle_nom::condition::parse_attached_subject_target_filter(lower).ok()?;
+    let predicate_follows = [" can't be ", " cannot be "]
+        .iter()
+        .any(|p| rest.starts_with(p));
+    predicate_follows.then_some(filter)
+}
+
 #[cfg(test)]
 mod structural_marker_tests {
     use super::*;
@@ -4377,16 +4389,4 @@ mod structural_marker_tests {
             );
         }
     }
-}
-
-/// "enchanted creature can't be the target …" / "equipped creature cannot be
-/// targeted …": the attached-subject filter when the line's subject is the
-/// attached permanent (and nothing else stands between it and the predicate).
-fn attached_cant_be_targeted_subject(lower: &str) -> Option<TargetFilter> {
-    let (rest, filter) =
-        crate::parser::oracle_nom::condition::parse_attached_subject_target_filter(lower).ok()?;
-    let predicate_follows = [" can't be ", " cannot be "]
-        .iter()
-        .any(|p| rest.starts_with(p));
-    predicate_follows.then_some(filter)
 }
