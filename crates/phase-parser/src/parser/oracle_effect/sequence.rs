@@ -854,7 +854,10 @@ fn parse_revealed_remainder_destination(input: &str) -> OracleResult<'_, (Zone, 
 /// random order" / "... of that library in a random order").
 fn parse_put_rest_on_bottom_line(input: &str) -> OracleResult<'_, DigRestOrder> {
     let (input, _) = (
-        tag("put the rest on the bottom of "),
+        tag("put the rest "),
+        // "put the rest of the cards on the bottom" (Winota) is the same pile.
+        opt(alt((tag("of the cards "), tag("of them ")))),
+        tag("on the bottom of "),
         alt((
             value((), tag("that library")),
             value((), (parse_partition_owner_possessive, tag("library"))),
@@ -8671,6 +8674,13 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         // shuffling it for its "If you do" rider is an intervening instruction;
         // a later continuation may still refer to an earlier Dig.
         Effect::ExileFaceDownPile { .. } => true,
+        // CR 608.2c: a keyword/ability grant to the card just put from among
+        // the looked-at cards ("It gains indestructible until end of turn",
+        // Winota, Joiner of Forces) neither selects nor moves library cards, so
+        // a later "put the rest ..." still owns the Dig's remainder. Without
+        // this the rest clause lowered to a one-card bottom placement and the
+        // other looked-at cards stayed on top.
+        Effect::GenericEffect { .. } => true,
         // CR 406.3: turning the exiled card face up is its own resolving effect,
         // not a Dig-lookback-transparent clause.
         Effect::TurnFaceUp { .. } => false,
@@ -8760,7 +8770,6 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         | Effect::MoveCounters { .. }
         | Effect::Animate { .. }
         | Effect::RegisterBending { .. }
-        | Effect::GenericEffect { .. }
         | Effect::Cleanup { .. }
         | Effect::Mana { .. }
         | Effect::Discard { .. }

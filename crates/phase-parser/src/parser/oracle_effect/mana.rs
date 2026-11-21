@@ -1928,6 +1928,27 @@ fn parse_single_cast_clause(rest: &str) -> Option<ManaSpendRestriction> {
         return Some(ManaSpendRestriction::SpellWithColorCount { comparator, count });
     }
 
+    // CR 105.2c + CR 106.6: "a multicolored spell" / "multicolored spells"
+    // (Pillar of the Paruns, Obsidian Obelisk) and "monocolored spells" name a
+    // color count, not a card type: multicolored = two or more colors,
+    // monocolored = exactly one. Read as a type word, the restriction matched
+    // no spell and the mana could never be spent.
+    if let Some(((comparator, count), _)) = nom_on_lower(rest, &rest_lower, |i| {
+        all_consuming(terminated(
+            preceded(
+                opt(tag("a ")),
+                alt((
+                    value((Comparator::GE, 2), tag("multicolored")),
+                    value((Comparator::EQ, 1), tag("monocolored")),
+                )),
+            ),
+            alt((tag(" spells"), tag(" spell"))),
+        ))
+        .parse(i)
+    }) {
+        return Some(ManaSpendRestriction::SpellWithColorCount { comparator, count });
+    }
+
     // CR 106.6 + CR 702: "[a spell|spells] [with|that has|that have] <keyword>"
     // — keyword-gated spend, optionally with a "from <zone>" tail. Parameterized
     // over the keyword name so a single arm covers flashback, freerunning, etc.
