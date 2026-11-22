@@ -1705,6 +1705,27 @@ pub(crate) fn effect_targets_object(
     effect: &Effect,
     object_id: ObjectId,
 ) -> bool {
+    // CR 400.7 + CR 701.23a: a zone change with a declared ORIGIN only moves an
+    // object that is in that zone. Path to Exile's "put that card onto the
+    // battlefield" is `ChangeZone { origin: Library, target: Any }` — the land the
+    // search found, never the creature chosen for the exile leg. Counting it as
+    // an effect on the chosen object priced "+1 permanent onto the battlefield"
+    // against the exile's −1, so exiling the AI's OWN creature read as neutral and
+    // the own-permanent veto stood down (MagicFinder flag 14b59565).
+    if let Effect::ChangeZone {
+        origin: Some(origin),
+        ..
+    } = effect
+    {
+        if ctx
+            .state
+            .objects
+            .get(&object_id)
+            .is_some_and(|object| object.zone != *origin)
+        {
+            return false;
+        }
+    }
     let source_id = effect_source_id(ctx);
     let filter_ctx = FilterContext::from_source(ctx.state, source_id);
     extract_target_filter(effect)

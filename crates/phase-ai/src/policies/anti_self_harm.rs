@@ -3164,6 +3164,42 @@ mod tests {
         );
     }
 
+    /// MagicFinder flag 14b59565 (22/11/2026): the robot cast Path to Exile on its
+    /// OWN Winota while the opponent's Rin and Seri was legal in the same slot.
+    /// "Its controller may search for a basic land" rides on the target, and that
+    /// consolation land must not turn exiling our own creature into a value play.
+    #[test]
+    fn path_to_exile_own_creature_rejected_when_opponent_creature_is_legal() {
+        let mut state = make_state();
+        let own_creature = add_creature(&mut state, PlayerId(0), "Winota", 4, 4);
+        let opponent_creature = add_creature(&mut state, PlayerId(1), "Rin and Seri", 4, 4);
+        let abilities = parsed_abilities(
+            "Path to Exile",
+            "Exile target creature. Its controller may search their library for a basic land \
+             card, put that card onto the battlefield tapped, then shuffle.",
+            &[],
+            &["Instant"],
+        );
+
+        let verdict = target_verdict_for_definition(
+            &mut state,
+            "Path to Exile",
+            &abilities[0],
+            vec![
+                TargetRef::Object(own_creature),
+                TargetRef::Object(opponent_creature),
+            ],
+            TargetRef::Object(own_creature),
+        );
+
+        assert_eq!(
+            reject_kind(&verdict),
+            Some("anti_self_harm_own_permanent_with_opponent_target"),
+            "exiling our own creature with Path while an opponent's creature is legal must be \
+             vetoed, got {verdict:?}"
+        );
+    }
+
     #[test]
     fn own_permanent_allowed_when_it_is_the_only_legal_target() {
         let mut state = make_state();
