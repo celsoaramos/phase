@@ -1,0 +1,19 @@
+{
+  "izzet-delver": "Aggro",
+  "affinity": "Aggro",
+  "boros-energy": "Aggro",
+  "mono-white-equipment": "Aggro",
+  "mono-red-prowess": "Aggro",
+  "mono-green-landfall": "Aggro",
+  "kaladesh-energy": "Midrange",
+  "azorius-blink": "Midrange",
+  "selesnya-ouroboroid": "Midrange",
+  "azorius-control": "Control",
+  "niv-to-light": "Control",
+  "dimir-mill": "Control",
+  "lands": "Control",
+  "amulet-titan": "Ramp",
+  "elves": "Combo",
+  "orzhov-greasefang": "Combo",
+  "selesnya-enchantress": "Combo"
+}

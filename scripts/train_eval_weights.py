@@ -457,6 +457,7 @@ def extract_and_scale_weights(
 
 def load_selfplay_corpus(
     glob_pattern: str,
+    archetype: str | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict, list[str], set]:
     """Read JSONL harvest shards, skip meta lines, bucket rows by turn phase.
 
@@ -509,6 +510,10 @@ def load_selfplay_corpus(
                 if shard_schema is None:
                     excluded_reason = "missing harvest metadata"
                     break
+                # `--archetype`: keep only rows from that deck archetype (the
+                # `ai-ladder --harvest` tag); untagged rows never match.
+                if archetype is not None and obj.get("archetype") != archetype:
+                    continue
                 feats = obj["features"]
                 phase = turn_phase(int(obj["turn"]))
                 row = [float(feats[name]) for name in SELFPLAY_FEATURE_NAMES]
@@ -638,7 +643,9 @@ def run_selfplay(args) -> None:
     """Fit all 9 EvalWeights per phase from a self-play harvest corpus."""
     print("=== Self-Play Phase-Aware EvalWeights Training ===\n", file=sys.stderr)
 
-    phase_features, phase_labels, meta, files, seeds = load_selfplay_corpus(args.selfplay_glob)
+    phase_features, phase_labels, meta, files, seeds = load_selfplay_corpus(
+        args.selfplay_glob, args.archetype
+    )
 
     total_samples = sum(len(v) for v in phase_features.values())
     global_min = TINY_GLOBAL_MIN if args.allow_tiny_corpus else 1000
@@ -689,6 +696,7 @@ def run_selfplay(args) -> None:
     # Identity/provenance: the artifact is the identity-bearing object.
     output = {
         "kind": "selfplay_phase_weights",
+        "archetype": args.archetype,
         "source": "phase_ai_selfplay_harvest",
         "git_sha": meta.get("git_sha"),
         "card_data_hash": meta.get("card_data_hash"),
@@ -777,6 +785,12 @@ def main():
         "--selfplay-glob",
         default="data/selfplay/*.jsonl",
         help="Glob for self-play harvest JSONL shards (--source selfplay)",
+    )
+    parser.add_argument(
+        "--archetype",
+        default=None,
+        help="Fit only rows tagged with this deck archetype (Aggro, Midrange, "
+        "Control, Combo, Ramp — the ai-ladder --harvest tag)",
     )
     parser.add_argument(
         "--allow-tiny-corpus",

@@ -45,6 +45,7 @@ use rayon::prelude::*;
 use phase_ai::auto_play::{run_ai_actions, run_ai_actions_bounded};
 use phase_ai::blunder_audit::{audit_step, AuditTally, Blunder};
 use phase_ai::config::{create_config_for_players, AiConfig, AiDifficulty, Platform};
+use phase_ai::deck_profile::ArchetypeMultipliers;
 use phase_ai::duel_suite::harvest::{GameHarvester, HarvestMeta, HarvestRecord, HarvestSink};
 use phase_ai::duel_suite::{all_matchups, resolve_deck_ref};
 use phase_ai::eval::{EvalWeightSet, EvalWeights};
@@ -65,6 +66,95 @@ const MAX_TURNS: u32 = 60;
 struct Side {
     label: String,
     config: AiConfig,
+    /// `arch_weights=PATH`: per-archetype weights; each seat serves the set of
+    /// ITS deck's archetype with neutral archetype multipliers (the fit already
+    /// is that archetype's). An archetype missing from the file keeps `config`.
+    arch_weights: Option<ArchWeights>,
+    /// `arch=PATH`: `{deck: "Control", ...}` — evaluate that deck with the
+    /// multipliers of THIS archetype instead of the classified one (only the eval
+    /// weights change; the session's deck profile, seen by both seats, does not).
+    arch_override: Option<HashMap<String, String>>,
+    /// `mult=0`: neutral (all 1.0) archetype multipliers.
+    neutral_mult: bool,
+}
+
+fn neutral_multipliers() -> ArchetypeMultipliers {
+    let one = [1.0; 9];
+    ArchetypeMultipliers {
+        aggro: one,
+        midrange: one,
+        control: one,
+        combo: one,
+        ramp: one,
+    }
+}
+
+fn archetype_row(m: &ArchetypeMultipliers, name: &str) -> Option<[f64; 9]> {
+    Some(match name {
+        "Aggro" => m.aggro,
+        "Midrange" => m.midrange,
+        "Control" => m.control,
+        "Combo" => m.combo,
+        "Ramp" => m.ramp,
+        _ => return None,
+    })
+}
+
+type ArchWeights = HashMap<String, EvalWeightSet>;
+
+/// `arch_weights=PATH`: `{"archetypes": {"Aggro": <selfplay output>, ...}}`.
+fn load_arch_weight_file(path: &str) -> Result<ArchWeights, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("arch_weights={path}: {e}"))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("arch_weights={path}: {e}"))?;
+    let map = json
+        .get("archetypes")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| format!("arch_weights={path}: no `archetypes` object"))?;
+    let mut out = ArchWeights::new();
+    for (name, fit) in map {
+        out.insert(name.clone(), weight_set_from_json(fit, &format!("{path}:{name}"))?);
+    }
+    Ok(out)
+}
+
+/// The seat's config: per-deck / per-archetype fitted weights, archetype
+/// override and neutral multipliers, in that order of precedence.
+fn seat_config(
+    side: &Side,
+    session: &phase_ai::session::AiSession,
+    seat: PlayerId,
+    deck: &str,
+) -> AiConfig {
+    let mut config = side.config.clone();
+    let archetype = session
+        .deck_profile
+        .get(&seat)
+        .map(|p| format!("{:?}", p.archetype))
+        .unwrap_or_default();
+    if side.neutral_mult {
+        config.archetype_multipliers = neutral_multipliers();
+    }
+    if let Some(target) = side.arch_override.as_ref().and_then(|m| m.get(deck)) {
+        if let Some(row) = archetype_row(&config.archetype_multipliers, target) {
+            config.archetype_multipliers = ArchetypeMultipliers {
+                aggro: row,
+                midrange: row,
+                control: row,
+                combo: row,
+                ramp: row,
+            };
+        }
+    }
+    if let Some(map) = side.arch_weights.as_ref() {
+        // A per-DECK fit wins over a per-archetype one; either already is that
+        // deck's valuation, so the multipliers go neutral.
+        if let Some(set) = map.get(deck).or_else(|| map.get(&archetype)) {
+            config.weights = set.clone();
+            config.archetype_multipliers = neutral_multipliers();
+        }
+    }
+    config
 }
 
 /// `weights=PATH`: phase weights fitted by `train_eval_weights.py --source
@@ -73,6 +163,10 @@ fn load_weight_file(path: &str) -> Result<EvalWeightSet, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("weights={path}: {e}"))?;
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("weights={path}: {e}"))?;
+    weight_set_from_json(&json, &format!("weights={path}"))
+}
+
+fn weight_set_from_json(json: &serde_json::Value, path: &str) -> Result<EvalWeightSet, String> {
     let mut set = EvalWeightSet::learned();
     let mut loaded = 0;
     for (phase, slot) in [
@@ -82,12 +176,12 @@ fn load_weight_file(path: &str) -> Result<EvalWeightSet, String> {
     ] {
         if let Some(w) = json.pointer(&format!("/phases/{phase}/weights")) {
             *slot = serde_json::from_value::<EvalWeights>(w.clone())
-                .map_err(|e| format!("weights={path} phase {phase}: {e}"))?;
+                .map_err(|e| format!("{path} phase {phase}: {e}"))?;
             loaded += 1;
         }
     }
     if loaded == 0 {
-        return Err(format!("weights={path}: no phases.*.weights in the file"));
+        return Err(format!("{path}: no phases.*.weights in the file"));
     }
     Ok(set)
 }
@@ -105,6 +199,9 @@ fn parse_spec(spec: &str) -> Result<Side, String> {
         other => return Err(format!("unknown platform '{other}'")),
     };
     let mut config = create_config_for_players(AiDifficulty::from_label(diff), platform, 2);
+    let mut arch_weights = None;
+    let mut arch_override = None;
+    let mut neutral_mult = false;
     for kv in parts {
         let (k, v) = kv
             .split_once('=')
@@ -131,12 +228,25 @@ fn parse_spec(spec: &str) -> Result<Side, String> {
             "tsim_worlds" => config.turn_simulation_worlds = num()? as u64,
             "tsim_steps" => config.turn_simulation_steps = num()? as usize,
             "weights" => config.weights = load_weight_file(v)?,
+            "arch_weights" => arch_weights = Some(load_arch_weight_file(v)?),
+            "arch" => {
+                let text =
+                    std::fs::read_to_string(v).map_err(|e| format!("arch={v}: {e}"))?;
+                arch_override = Some(
+                    serde_json::from_str::<HashMap<String, String>>(&text)
+                        .map_err(|e| format!("arch={v}: {e}"))?,
+                );
+            }
+            "mult" => neutral_mult = num()? == 0.0,
             other => return Err(format!("unknown override key '{other}'")),
         }
     }
     Ok(Side {
         label: spec.to_string(),
         config,
+        arch_weights,
+        arch_override,
+        neutral_mult,
     })
 }
 
@@ -325,8 +435,9 @@ fn run_game(
     payload: &DeckPayload,
     db: &CardDatabase,
     seed: u64,
-    p0: &AiConfig,
-    p1: &AiConfig,
+    p0: &Side,
+    p1: &Side,
+    matchup: &str,
     audit: bool,
     harvest: Option<HarvestTag<'_>>,
 ) -> GameOut {
@@ -334,17 +445,22 @@ fn run_game(
     load_and_hydrate_decks(&mut state, payload, Some(db));
     let _ = start_game_skip_mulligan(&mut state);
     let players: HashSet<PlayerId> = [PlayerId(0), PlayerId(1)].into_iter().collect();
+    let session = phase_ai::session::AiSession::arc_from_game(&state);
+    // `x-vs-y`: seat 0 always plays the first deck (`payload_for`).
+    let (deck0, deck1) = matchup.split_once("-vs-").unwrap_or((matchup, matchup));
     let configs: HashMap<PlayerId, AiConfig> = [
-        (PlayerId(0), p0.clone().into_measurement(seed)),
+        (
+            PlayerId(0),
+            seat_config(p0, &session, PlayerId(0), deck0).into_measurement(seed),
+        ),
         (
             PlayerId(1),
-            p1.clone().into_measurement(seed.wrapping_add(1)),
+            seat_config(p1, &session, PlayerId(1), deck1).into_measurement(seed.wrapping_add(1)),
         ),
     ]
     .into_iter()
     .collect();
     let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed);
-    let session = phase_ai::session::AiSession::arc_from_game(&state);
     let mut harvesters: Option<[GameHarvester; 2]> = harvest.map(|tag| {
         [PlayerId(0), PlayerId(1)].map(|seat| {
             GameHarvester::for_seat(seed, tag.matchup.to_string(), tag.game_idx, seat, &session)
@@ -790,9 +906,9 @@ fn main() {
         .map(|&(m, s, a_is_p0)| {
             let game_seed = seed.wrapping_add(m as u64 * 100_000).wrapping_add(s as u64);
             let (p0, p1) = if a_is_p0 {
-                (&side_a.config, &side_b.config)
+                (&side_a, &side_b)
             } else {
-                (&side_b.config, &side_a.config)
+                (&side_b, &side_a)
             };
             (
                 m,
@@ -803,6 +919,7 @@ fn main() {
                     game_seed,
                     p0,
                     p1,
+                    &payloads[m].0,
                     audit,
                     harvest_out.as_ref().map(|_| HarvestTag {
                         matchup: &payloads[m].0,
