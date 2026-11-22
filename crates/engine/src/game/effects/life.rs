@@ -779,7 +779,35 @@ pub fn apply_damage_life_loss(
     amount: u32,
     events: &mut Vec<GameEvent>,
 ) -> Result<u32, ReplacementDeferred> {
+    let amount = saturate_lethal_damage_loss(state, player_id, amount);
     apply_life_loss(state, player_id, amount, events)
+}
+
+/// CR 120.3a + CR 704.5a: damage whose life loss would leave the life total
+/// below the `i32` floor is already lethal, so the engine's numeric capacity
+/// must not turn it into an unrepresentable change. Two attackers at the `i32`
+/// power cap (Ouroboroid + Branching Evolution reached ~2.3 billion +1/+1
+/// counters) made the combat-damage loss unrepresentable: the ingress window
+/// rejected the `PassPriority` that reached the damage step and handed back the
+/// same priority forever. The loss is cut to what reaches `i32::MIN` (and to
+/// what the per-turn lost-life counter holds) only when the cut still leaves the
+/// player at 0 or less. Direct life loss (debug, costs, effects) keeps the
+/// capacity policy unchanged.
+fn saturate_lethal_damage_loss(state: &GameState, pid: PlayerId, amount: u32) -> u32 {
+    let Some(player) = state.players.iter().find(|player| player.id == pid) else {
+        return amount;
+    };
+    let floor_room = i64::from(player.life) - i64::from(i32::MIN);
+    let counter_room = i64::from(u32::MAX - player.life_lost_this_turn);
+    let capped = i64::from(amount)
+        .min(floor_room)
+        .min(counter_room)
+        .min(i64::from(i32::MAX));
+    if capped < i64::from(amount) && i64::from(player.life) - capped <= 0 {
+        u32::try_from(capped).unwrap_or(amount)
+    } else {
+        amount
+    }
 }
 
 /// CR 119.3: Settle a post-replacement `ProposedEvent::LifeLoss`: the loss twin
