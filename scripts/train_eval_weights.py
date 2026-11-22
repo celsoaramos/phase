@@ -458,6 +458,7 @@ def extract_and_scale_weights(
 def load_selfplay_corpus(
     glob_pattern: str,
     archetype: str | None = None,
+    deck: str | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict, list[str], set]:
     """Read JSONL harvest shards, skip meta lines, bucket rows by turn phase.
 
@@ -514,6 +515,13 @@ def load_selfplay_corpus(
                 # `ai-ladder --harvest` tag); untagged rows never match.
                 if archetype is not None and obj.get("archetype") != archetype:
                     continue
+                # `--deck`: keep only that deck's seat. `ai-ladder` matchups are
+                # `x-vs-y` with seat 0 always playing `x`.
+                if deck is not None:
+                    sides = str(obj.get("matchup_id", "")).split("-vs-")
+                    seat = obj.get("seat")
+                    if seat is None or len(sides) != 2 or sides[int(seat)] != deck:
+                        continue
                 feats = obj["features"]
                 phase = turn_phase(int(obj["turn"]))
                 row = [float(feats[name]) for name in SELFPLAY_FEATURE_NAMES]
@@ -644,7 +652,7 @@ def run_selfplay(args) -> None:
     print("=== Self-Play Phase-Aware EvalWeights Training ===\n", file=sys.stderr)
 
     phase_features, phase_labels, meta, files, seeds = load_selfplay_corpus(
-        args.selfplay_glob, args.archetype
+        args.selfplay_glob, args.archetype, args.deck
     )
 
     total_samples = sum(len(v) for v in phase_features.values())
@@ -697,6 +705,7 @@ def run_selfplay(args) -> None:
     output = {
         "kind": "selfplay_phase_weights",
         "archetype": args.archetype,
+        "deck": args.deck,
         "source": "phase_ai_selfplay_harvest",
         "git_sha": meta.get("git_sha"),
         "card_data_hash": meta.get("card_data_hash"),
@@ -791,6 +800,11 @@ def main():
         default=None,
         help="Fit only rows tagged with this deck archetype (Aggro, Midrange, "
         "Control, Combo, Ramp — the ai-ladder --harvest tag)",
+    )
+    parser.add_argument(
+        "--deck",
+        default=None,
+        help="Fit only the rows of this deck's seat (ai-ladder matchups x-vs-y)",
     )
     parser.add_argument(
         "--allow-tiny-corpus",
