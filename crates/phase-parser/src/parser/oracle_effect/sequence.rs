@@ -4407,9 +4407,29 @@ fn cant_be_blocked_restriction_needs_subject_reattach(
     // Distortion Strike, You Come to a River, Elusive Spellfist) the two halves
     // are split anyway, and the evasion conjunct arrives subjectless with no
     // recipient: it never reached the creature. Re-attach conjunct 1's subject.
+    // A keyword grant ("gains hexproof … until end of turn and can't be blocked
+    // by …", Sungold Sentinel) stays inline: `parse_continuous_modifications`
+    // folds both halves. Only the P/T pump arm splits off on its own.
     let before_lower = before_and.trim_end().to_ascii_lowercase();
     nom_primitives::scan_contains(remainder_lower, "where ")
-        || conjunct_closes_turn_window(&before_lower).is_ok()
+        || (conjunct_closes_turn_window(&before_lower).is_ok()
+            && conjunct_is_pt_pump(&before_lower))
+}
+
+fn conjunct_is_pt_pump(before_lower: &str) -> bool {
+    let pump_at_start = alt((tag::<_, _, OracleError<'_>>("gets "), tag("get ")))
+        .parse(before_lower)
+        .is_ok_and(|(rest, _)| starts_with_pt_sign(rest));
+    pump_at_start
+        || ["gets +", "gets -", "get +", "get -"]
+            .iter()
+            .any(|needle| nom_primitives::scan_contains(before_lower, &format!(" {needle}")))
+}
+
+fn starts_with_pt_sign(input: &str) -> bool {
+    alt((tag::<_, _, OracleError<'_>>("+"), tag("-")))
+        .parse(input)
+        .is_ok()
 }
 
 fn conjunct_closes_turn_window(input: &str) -> OracleResult<'_, ()> {
