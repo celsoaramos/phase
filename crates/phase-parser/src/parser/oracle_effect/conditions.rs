@@ -4923,6 +4923,10 @@ pub(super) fn strip_routed_suffix_conditional(
         return (general(cond), effect_text);
     }
 
+    if let Some(cond) = parse_triggering_spell_all_colors_condition_text(condition_core) {
+        return (general(cond), effect_text);
+    }
+
     if let Some(cond) = parse_mana_spent_vs_mana_value_target_condition_text(condition_core) {
         return (general(cond), effect_text);
     }
@@ -5384,6 +5388,38 @@ fn parse_cast_using_teamwork_condition(input: &str) -> OracleResult<'_, AbilityC
     ))
 }
 
+/// CR 105.2 + CR 603.2: "if that spell was/is all colors" on a cast trigger
+/// (Jenson Carthalion, Druid Exile) — the triggering spell has each of the
+/// five colors. Reads the trigger event's object, so a two-color spell fails
+/// the check.
+fn parse_triggering_spell_all_colors_condition_text(text: &str) -> Option<AbilityCondition> {
+    let lower = text.to_ascii_lowercase();
+    nom_parse_lower(&lower, |input| {
+        all_consuming(parse_triggering_spell_all_colors_condition).parse(input)
+    })
+}
+
+fn parse_triggering_spell_all_colors_condition(input: &str) -> OracleResult<'_, AbilityCondition> {
+    let (rest, _) = (
+        alt((tag("that spell"), tag("the spell"))),
+        alt((tag(" was "), tag(" is "))),
+        alt((tag("all colors"), tag("every color"), tag("each color"))),
+    )
+        .parse(input)?;
+    Ok((
+        rest,
+        AbilityCondition::QuantityCheck {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectColorCount {
+                    scope: ObjectScope::EventSource,
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 5 },
+        },
+    ))
+}
+
 /// CR 601.2h + CR 608.2c: "if the amount of mana spent to cast it/that spell
 /// was less than its mana value" on a targeted spell effect — the spell
 /// anaphors to the ability's object target (Unravel-class riders).
@@ -5725,6 +5761,10 @@ pub(super) fn parse_condition_text(text: &str) -> Option<AbilityCondition> {
     }
 
     if let Some(condition) = parse_mana_spent_vs_mana_value_target_condition_text(text) {
+        return Some(condition);
+    }
+
+    if let Some(condition) = parse_triggering_spell_all_colors_condition_text(text) {
         return Some(condition);
     }
 

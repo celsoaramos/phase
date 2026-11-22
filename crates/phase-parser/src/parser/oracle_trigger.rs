@@ -9381,6 +9381,28 @@ fn try_extract_zone_change_object_filter_condition(
     ))
 }
 
+/// CR 603.2c + CR 510.2: "Whenever your opponents are dealt combat damage"
+/// (Mindblade Render) names the opponents as a GROUP: all combat damage is
+/// dealt simultaneously, so the ability triggers once per damage event no
+/// matter how many sources dealt it — the same batched semantics as "one or
+/// more opponents are dealt …".
+fn plural_players_dealt_damage(subject_text: &str, mode: &TriggerMode) -> bool {
+    if !matches!(mode, TriggerMode::DamageReceived) {
+        return false;
+    }
+    let subject = subject_text.trim().to_ascii_lowercase();
+    plural_players_subject(&subject).is_ok()
+}
+
+fn plural_players_subject(input: &str) -> OracleResult<'_, ()> {
+    let (rest, _) = all_consuming((
+        opt(tag::<_, _, OracleError<'_>>("your ")),
+        alt((tag("opponents"), tag("players"))),
+    ))
+    .parse(input)?;
+    Ok((rest, ()))
+}
+
 /// CR 603.4 + CR 120.1: "if any of that [combat] damage was dealt by
 /// <source-chain>" — intervening-if whose subject is the set of sources that
 /// dealt the triggering combat damage. An object that deals damage is the
@@ -13858,7 +13880,7 @@ pub fn parse_trigger_condition(
         {
             def.valid_card = def.valid_card.take().map(with_card_qualifier);
         }
-        if is_batched {
+        if is_batched || plural_players_dealt_damage(subject_text, &def.mode) {
             def.batched = true;
         }
         // CR 603.4: "an opponent who controls F draws a card" — the

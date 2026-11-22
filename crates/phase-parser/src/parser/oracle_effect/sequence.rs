@@ -4294,7 +4294,7 @@ fn combat_requirement_conjunct_prepend(
         && !super::subject::is_can_block_extra_predicate(&remainder_lower)
         && !super::subject::is_can_attack_despite_defender_predicate(&remainder_lower)
         && !(cant_be_blocked_restriction
-            && cant_be_blocked_restriction_needs_subject_reattach(&remainder_lower))
+            && cant_be_blocked_restriction_needs_subject_reattach(before_and, &remainder_lower))
     {
         return None;
     }
@@ -4393,12 +4393,33 @@ fn continuous_grant_subject_prepend(before_and: &str) -> Option<String> {
     }
 }
 
-fn cant_be_blocked_restriction_needs_subject_reattach(remainder_lower: &str) -> bool {
+fn cant_be_blocked_restriction_needs_subject_reattach(
+    before_and: &str,
+    remainder_lower: &str,
+) -> bool {
     // Plain inline evasion grants are owned by `parse_continuous_modifications`
     // and must stay in one static definition. The where-suffixed form needs a
     // split so the first conjunct's duration is not hidden behind the trailing
     // variable definition.
+    //
+    // CR 509.1b + CR 611.2c: when conjunct 1 already closed its own window
+    // ("gets +1/+0 until end of turn and can't be blocked this turn" —
+    // Distortion Strike, You Come to a River, Elusive Spellfist) the two halves
+    // are split anyway, and the evasion conjunct arrives subjectless with no
+    // recipient: it never reached the creature. Re-attach conjunct 1's subject.
+    let before_lower = before_and.trim_end().to_ascii_lowercase();
     nom_primitives::scan_contains(remainder_lower, "where ")
+        || conjunct_closes_turn_window(&before_lower).is_ok()
+}
+
+fn conjunct_closes_turn_window(input: &str) -> OracleResult<'_, ()> {
+    let (rest, _) = (
+        take_until::<_, _, OracleError<'_>>(" until end of turn"),
+        tag(" until end of turn"),
+        eof,
+    )
+        .parse(input)?;
+    Ok((rest, ()))
 }
 
 fn local_subject_before_continuous_verb(before_and: &str, before_verb_len: usize) -> Option<&str> {

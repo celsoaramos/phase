@@ -2128,6 +2128,16 @@ pub(crate) fn parse_event_context_quantity_with_context(
                 },
             })
         }
+        // CR 208.1 + CR 613.4: "its base power" (Curie, Emergent Intelligence) —
+        // the power the object has before layer-7 modifications (counters,
+        // pumps). Same anaphoric binding as "its power".
+        "its base power" => {
+            return Some(QuantityExpr::Ref {
+                qty: QuantityRef::BasePower {
+                    scope: ObjectScope::Anaphoric,
+                },
+            })
+        }
         "its mana value" | "its converted mana cost" => {
             return Some(QuantityExpr::Ref {
                 qty: QuantityRef::ObjectManaValue {
