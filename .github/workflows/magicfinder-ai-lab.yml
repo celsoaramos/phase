@@ -85,5 +85,11 @@ jobs:
           chmod +x lab-data/ai-ladder
           ./lab-data/ai-ladder lab-data ${{ matrix.run.args }} --json "out-${{ matrix.run.name }}.json" | tee table.md
           { echo "### ${{ matrix.run.name }}"; echo; echo '`${{ matrix.run.args }}`'; echo; cat table.md; } >> "$GITHUB_STEP_SUMMARY"
+      # `--harvest harvest-<nome>.jsonl` (corpus de treino da avaliação) sobe junto, quando existe.
       - uses: actions/upload-artifact@v4
-        with: { name: 'out-${{ matrix.run.name }}', path: 'out-${{ matrix.run.name }}.json', retention-days: 30 }
+        with:
+          name: 'out-${{ matrix.run.name }}'
+          path: |
+            out-${{ matrix.run.name }}.json
+            harvest-${{ matrix.run.name }}.jsonl
+          retention-days: 30

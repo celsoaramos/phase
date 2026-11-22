@@ -619,9 +619,13 @@ def extract_selfplay_weights(model: LogisticRegression, phase_name: str) -> tupl
         print(f"    {name}: {sign}{coef}{tag}", file=sys.stderr)
 
     fitted = {name: raw_coefs[name] for name in SELFPLAY_FEATURE_NAMES}
-    max_abs = max(abs(v) for v in fitted.values()) if fitted else 1.0
+    max_abs = max(max(v, 0.0) for v in fitted.values()) if fitted else 1.0
     scale_factor = MAX_WEIGHT_SCALE / max_abs if max_abs > 0 else 1.0
-    weights = {name: round(abs(coef) * scale_factor, 4) for name, coef in fitted.items()}
+    # A NEGATIVE coefficient (a feature that predicts losing once the correlated
+    # ones are accounted for) is clamped to 0, never `abs()`-ed: flipping its sign
+    # would make the planner chase the very thing that loses (MagicFinder lab,
+    # 2026-11-22 — late `card_advantage` came out -0.98 and `abs` served +2.2).
+    weights = {name: round(max(coef, 0.0) * scale_factor, 4) for name, coef in fitted.items()}
 
     print(f"  {phase_name} scaled weights (all self-play fitted):", file=sys.stderr)
     for name, val in weights.items():

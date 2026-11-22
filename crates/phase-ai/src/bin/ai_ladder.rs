@@ -22,6 +22,13 @@
 //! (`{name, main: [{name, count}]}`) is registered under its file stem
 //! (`boros-energy`), so `--matchups boros-energy-vs-affinity` works.
 //!
+//! `--harvest PATH` writes the Texel training corpus (JSONL, `duel_suite::harvest`
+//! shape): the last empty-stack position of every completed turn, from BOTH seats,
+//! labeled with that seat's final result and tagged with its deck archetype.
+//! `weights=PATH` (a side key) serves the `phases.{early,mid,late}.weights` of a
+//! `scripts/train_eval_weights.py --source selfplay` output instead of the shipped
+//! 17Lands weights — a phase missing from the file keeps the shipped one.
+//!
 //! `--audit` plays one AI decision per step and runs every decision through
 //! `phase_ai::blunder_audit` — a table of blunders per game per side follows
 //! the win table (and `--json` carries the counts).
@@ -38,7 +45,9 @@ use rayon::prelude::*;
 use phase_ai::auto_play::{run_ai_actions, run_ai_actions_bounded};
 use phase_ai::blunder_audit::{audit_step, AuditTally, Blunder};
 use phase_ai::config::{create_config_for_players, AiConfig, AiDifficulty, Platform};
+use phase_ai::duel_suite::harvest::{GameHarvester, HarvestMeta, HarvestRecord, HarvestSink};
 use phase_ai::duel_suite::{all_matchups, resolve_deck_ref};
+use phase_ai::eval::{EvalWeightSet, EvalWeights};
 
 use engine::database::CardDatabase;
 use engine::game::deck_loading::{
@@ -56,6 +65,31 @@ const MAX_TURNS: u32 = 60;
 struct Side {
     label: String,
     config: AiConfig,
+}
+
+/// `weights=PATH`: phase weights fitted by `train_eval_weights.py --source
+/// selfplay`. A phase the trainer skipped keeps the shipped (17Lands) weights.
+fn load_weight_file(path: &str) -> Result<EvalWeightSet, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("weights={path}: {e}"))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("weights={path}: {e}"))?;
+    let mut set = EvalWeightSet::learned();
+    let mut loaded = 0;
+    for (phase, slot) in [
+        ("early", &mut set.early),
+        ("mid", &mut set.mid),
+        ("late", &mut set.late),
+    ] {
+        if let Some(w) = json.pointer(&format!("/phases/{phase}/weights")) {
+            *slot = serde_json::from_value::<EvalWeights>(w.clone())
+                .map_err(|e| format!("weights={path} phase {phase}: {e}"))?;
+            loaded += 1;
+        }
+    }
+    if loaded == 0 {
+        return Err(format!("weights={path}: no phases.*.weights in the file"));
+    }
+    Ok(set)
 }
 
 fn parse_spec(spec: &str) -> Result<Side, String> {
@@ -96,6 +130,7 @@ fn parse_spec(spec: &str) -> Result<Side, String> {
             "tsim_lines" => config.turn_simulation_lines = num()? as usize,
             "tsim_worlds" => config.turn_simulation_worlds = num()? as u64,
             "tsim_steps" => config.turn_simulation_steps = num()? as usize,
+            "weights" => config.weights = load_weight_file(v)?,
             other => return Err(format!("unknown override key '{other}'")),
         }
     }
@@ -253,6 +288,26 @@ struct GameOut {
     panicked: bool,
     /// Blunders per seat (`--audit` only; empty otherwise).
     audit: AuditTally,
+    /// Training rows from both seats (`--harvest` only; empty otherwise, and
+    /// empty for draws, the turn cap and panics — an unlabeled game is useless).
+    harvest: Vec<HarvestRecord>,
+}
+
+/// Which game this is, for the harvest rows.
+struct HarvestTag<'a> {
+    matchup: &'a str,
+    game_idx: usize,
+}
+
+/// Close both seats' harvesters. A game without a winner yields nothing.
+fn finish_harvest(
+    harvesters: &mut Option<[GameHarvester; 2]>,
+    winner: Option<PlayerId>,
+) -> Vec<HarvestRecord> {
+    harvesters
+        .take()
+        .map(|hs| hs.into_iter().flat_map(|h| h.finish(winner)).collect())
+        .unwrap_or_default()
 }
 
 /// The seat that owns the decision `state` is waiting on (the AI actor
@@ -273,6 +328,7 @@ fn run_game(
     p0: &AiConfig,
     p1: &AiConfig,
     audit: bool,
+    harvest: Option<HarvestTag<'_>>,
 ) -> GameOut {
     let mut state = GameState::new_two_player(seed);
     load_and_hydrate_decks(&mut state, payload, Some(db));
@@ -289,6 +345,11 @@ fn run_game(
     .collect();
     let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed);
     let session = phase_ai::session::AiSession::arc_from_game(&state);
+    let mut harvesters: Option<[GameHarvester; 2]> = harvest.map(|tag| {
+        [PlayerId(0), PlayerId(1)].map(|seat| {
+            GameHarvester::for_seat(seed, tag.matchup.to_string(), tag.game_idx, seat, &session)
+        })
+    });
     let mut last_alive = snapshot(&state);
     let mut tally = AuditTally {
         games: 1,
@@ -305,6 +366,7 @@ fn run_game(
                 last_alive,
                 panicked: false,
                 audit: tally,
+                harvest: finish_harvest(&mut harvesters, *winner),
             };
         }
         if state.turn_number >= MAX_TURNS || steps > 20_000 {
@@ -314,6 +376,7 @@ fn run_game(
                 last_alive,
                 panicked: false,
                 audit: tally,
+                harvest: Vec::new(),
             };
         }
         steps += 1;
@@ -333,9 +396,17 @@ fn run_game(
                     last_alive,
                     panicked: false,
                     audit: tally,
+                    harvest: Vec::new(),
                 }
             }
             Ok(results) => {
+                if let Some(hs) = harvesters.as_mut() {
+                    for item in results.results.iter() {
+                        for h in hs.iter_mut() {
+                            h.observe(&item.state, &session);
+                        }
+                    }
+                }
                 if let Some(pre) = pre.as_ref() {
                     // Item i was decided in the state item i-1 left behind.
                     let mut before: &GameState = pre;
@@ -358,6 +429,7 @@ fn run_game(
                     last_alive,
                     panicked: true,
                     audit: tally,
+                    harvest: Vec::new(),
                 }
             }
         }
@@ -619,6 +691,7 @@ fn main() {
     let mut json_out: Option<PathBuf> = None;
     let mut probe: usize = 0;
     let mut audit = false;
+    let mut harvest_out: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         let take = |i: &mut usize| -> String {
@@ -638,6 +711,7 @@ fn main() {
             "--json" => json_out = Some(PathBuf::from(take(&mut i))),
             "--probe" => probe = take(&mut i).parse().expect("--probe"),
             "--audit" => audit = true,
+            "--harvest" => harvest_out = Some(PathBuf::from(take(&mut i))),
             "-h" | "--help" => {
                 eprintln!(
                     "{}",
@@ -723,10 +797,43 @@ fn main() {
             (
                 m,
                 a_is_p0,
-                run_game(&payloads[m].1, &db, game_seed, p0, p1, audit),
+                run_game(
+                    &payloads[m].1,
+                    &db,
+                    game_seed,
+                    p0,
+                    p1,
+                    audit,
+                    harvest_out.as_ref().map(|_| HarvestTag {
+                        matchup: &payloads[m].0,
+                        game_idx: s * 2 + usize::from(!a_is_p0),
+                    }),
+                ),
             )
         })
         .collect();
+
+    if let Some(path) = &harvest_out {
+        let meta = HarvestMeta {
+            // Same feature semantics as the suite harvest (schema 3), plus the
+            // optional `seat` / `archetype` row tags the trainer ignores.
+            schema: 3,
+            git_sha: std::env::var("GITHUB_SHA").ok(),
+            card_data_hash: None,
+            difficulty: format!("A={} B={}", side_a.label, side_b.label),
+        };
+        let mut sink = HarvestSink::create(path, &meta).unwrap_or_else(|e| {
+            eprintln!("--harvest {}: {e}", path.display());
+            std::process::exit(1)
+        });
+        let mut rows = 0usize;
+        for (_, _, out) in &results {
+            sink.write_records(&out.harvest).expect("write harvest");
+            rows += out.harvest.len();
+        }
+        sink.flush().expect("flush harvest");
+        eprintln!("harvest: {rows} rows -> {}", path.display());
+    }
 
     let mut tallies: Vec<Tally> = (0..payloads.len()).map(|_| Tally::default()).collect();
     for (m, a_is_p0, out) in &results {

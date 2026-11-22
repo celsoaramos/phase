@@ -162,20 +162,27 @@ impl FeatureRow {
 /// One labeled training row: a quiescent p0-perspective feature vector plus the
 /// per-game identity and the final win label.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct HarvestRecord {
+pub struct HarvestRecord {
     pub seed: u64,
     pub matchup_id: String,
     pub game_idx: usize,
     pub turn: u32,
     pub features: FeatureRow,
     pub won: bool,
+    /// Seat whose perspective this row takes (absent = p0, the suite harvest).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<u8>,
+    /// `DeckProfile` archetype of that seat (`Debug` label), so a trainer can fit
+    /// per-archetype weights. Absent in the suite harvest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archetype: Option<String>,
 }
 
 /// File-scoped provenance written as line 1 of each JSONL shard. Per-game
 /// identity (`seed`, `matchup_id`, `game_idx`) lives on each record, since one
 /// seed is ill-defined at file scope for a multi-matchup shard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct HarvestMeta {
+pub struct HarvestMeta {
     pub schema: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_sha: Option<String>,
@@ -196,7 +203,7 @@ struct MetaLine<'a> {
 /// `buffer` as the completed turn's quiescent record. A turn whose every
 /// batch-boundary observation had a non-empty stack produces zero records (a gap
 /// — sampling, not census).
-pub(crate) struct GameHarvester {
+pub struct GameHarvester {
     seed: u64,
     matchup_id: String,
     game_idx: usize,
@@ -205,6 +212,8 @@ pub(crate) struct GameHarvester {
     pending: Option<(u32, FeatureRow)>,
     /// Flushed quiescent snapshots of completed turns, in turn order.
     buffer: Vec<(u32, FeatureRow)>,
+    /// `Some` when built by [`GameHarvester::for_seat`]: tags each row.
+    seat_tag: Option<(u8, String)>,
 }
 
 impl GameHarvester {
@@ -217,6 +226,33 @@ impl GameHarvester {
             player: HARVEST_PERSPECTIVE,
             pending: None,
             buffer: Vec::new(),
+            seat_tag: None,
+        }
+    }
+
+    /// Harvester from `player`'s perspective (features and the win label are that
+    /// seat's), tagging every row with the seat and its deck archetype. Used by
+    /// `ai-ladder --harvest`, which harvests both seats of every game.
+    pub fn for_seat(
+        seed: u64,
+        matchup_id: String,
+        game_idx: usize,
+        player: PlayerId,
+        session: &AiSession,
+    ) -> Self {
+        let archetype = session
+            .deck_profile
+            .get(&player)
+            .map(|profile| format!("{:?}", profile.archetype))
+            .unwrap_or_else(|| "Unknown".to_string());
+        Self {
+            seed,
+            matchup_id,
+            game_idx,
+            player,
+            pending: None,
+            buffer: Vec::new(),
+            seat_tag: Some((player.0, archetype)),
         }
     }
 
@@ -249,6 +285,10 @@ impl GameHarvester {
             return Vec::new();
         };
         let won = winner == self.player;
+        let (seat, archetype) = match self.seat_tag {
+            Some((seat, archetype)) => (Some(seat), Some(archetype)),
+            None => (None, None),
+        };
         self.buffer
             .into_iter()
             .map(|(turn, features)| HarvestRecord {
@@ -258,6 +298,8 @@ impl GameHarvester {
                 turn,
                 features,
                 won,
+                seat,
+                archetype: archetype.clone(),
             })
             .collect()
     }
@@ -267,7 +309,7 @@ impl GameHarvester {
 /// single file-scoped meta line at construction, then appends every game's
 /// records through the same `BufWriter`. Per-matchup `File::create` is wrong — it
 /// would clobber the file and emit N meta lines under the sequential branch.
-pub(crate) struct HarvestSink {
+pub struct HarvestSink {
     writer: BufWriter<File>,
 }
 
