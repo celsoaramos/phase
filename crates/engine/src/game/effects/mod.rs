@@ -5907,6 +5907,16 @@ fn resolve_optional_effect_decision_step(
     // CR 608.2c: qualification is read from the state the prompt parked, before
     // the answer lowers optionality and strips the enclosing repeat driver.
     let accepted_move = AcceptedOptionalMove::qualify(state, &ability);
+    // CR 707.10 + CR 707.10c: lowering optionality erases the only mark that this
+    // was "that player may copy" — keep it on the copier so the inherited player
+    // target still names who puts the copy on the stack.
+    if let Effect::CopySpell {
+        copier: copier @ None,
+        ..
+    } = &mut ability.effect
+    {
+        *copier = Some(crate::types::ability::ControllerRef::TargetPlayer);
+    }
     ability.optional = false;
     // CR 608.2c: the enclosing repeat driver owns progression. This answer
     // performs only its current iteration, retaining optionality on the parent.

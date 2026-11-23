@@ -433,7 +433,15 @@ fn copy_controller(ability: &ResolvedAbility) -> PlayerId {
     // mandatory subjectless "copy that spell" is the controller's instruction,
     // even after an earlier clause targeted a player (Alania, Divergent Storm:
     // "you may have target opponent draw a card. If you do, copy that spell").
-    if !ability.optional {
+    let optional_copy = ability.optional
+        || matches!(
+            &ability.effect,
+            Effect::CopySpell {
+                copier: Some(ControllerRef::TargetPlayer),
+                ..
+            }
+        );
+    if !optional_copy {
         return ability.controller;
     }
     ability
