@@ -1854,6 +1854,18 @@ fn trigger_mode_polarity_for_host(
     let Some(execute) = trigger.execute.as_deref() else {
         return EffectPolarity::Contextual;
     };
+    // CR 303.4: "enchanted creature" in an Aura's trigger is the host, so the
+    // effect's own polarity (relative to its target) is the polarity for the
+    // host's controller: "At the beginning of your upkeep, put a +1/+1 counter
+    // on enchanted creature" (Forced Adaptation) is a buff, "this Aura deals 4
+    // damage to enchanted creature" (Fatal Attraction) a curse. Without this
+    // both read `Contextual` and the AI gave the buff to the opponent.
+    if extract_target_filter(&execute.effect).is_some_and(filter_is_attached_host) {
+        let polarity = effect_polarity(&execute.effect);
+        if !matches!(polarity, EffectPolarity::Contextual) {
+            return polarity;
+        }
+    }
     match trigger.mode {
         // "Whenever enchanted land is tapped for mana, its controller adds …"
         // — bonus mana goes to the host's controller.
@@ -1861,6 +1873,22 @@ fn trigger_mode_polarity_for_host(
             EffectPolarity::Beneficial
         }
         _ => EffectPolarity::Contextual,
+    }
+}
+
+/// The filter names the permanent the source is attached to ("enchanted
+/// creature" / "equipped creature").
+fn filter_is_attached_host(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::AttachedTo => true,
+        TargetFilter::Typed(typed) => typed.properties.iter().any(|p| {
+            matches!(
+                p,
+                engine::types::ability::FilterProp::EnchantedBy
+                    | engine::types::ability::FilterProp::EquippedBy
+            )
+        }),
+        _ => false,
     }
 }
 
@@ -6420,5 +6448,45 @@ mod controller_value_tests {
     fn temporary_pump_is_worth_nothing_by_itself() {
         let pump = r#"{"kind":"Spell","effect":{"type":"Pump","power":{"type":"Fixed","value":2},"toughness":{"type":"Fixed","value":0},"target":{"type":"SelfRef"}},"duration":"UntilEndOfTurn"}"#;
         assert_eq!(reading(value_at(pump, 20)), Reading::Nothing);
+    }
+}
+
+/// Relato de 23/11 (jogada ruim, Forced Adaptation): a Aura cujo benefício mora num
+/// GATILHO que age na criatura encantada ("At the beginning of your upkeep, put a +1/+1
+/// counter on enchanted creature") era `Contextual`, e o robô a pôs na criatura do
+/// oponente com a Corpsejack Menace dele em campo.
+#[cfg(test)]
+mod host_trigger_aura_polarity_tests {
+    use super::*;
+    use engine::game::scenario::{GameScenario, P0};
+
+    fn aura(text: &str, name: &str) -> EffectPolarity {
+        let mut scenario = GameScenario::new();
+        let id = scenario.add_enchantment_from_oracle(P0, name, text).id();
+        let state = scenario.build().state().clone();
+        let obj = &state.objects[&id];
+        aura_polarity(obj)
+    }
+
+    #[test]
+    fn upkeep_counter_on_enchanted_creature_is_beneficial() {
+        assert_eq!(
+            aura(
+                "Enchant creature\nAt the beginning of your upkeep, put a +1/+1 counter on enchanted creature.",
+                "Forced Adaptation"
+            ),
+            EffectPolarity::Beneficial
+        );
+    }
+
+    #[test]
+    fn upkeep_damage_to_enchanted_creature_is_harmful() {
+        assert_eq!(
+            aura(
+                "Enchant creature\nWhen this Aura enters, it deals 2 damage to enchanted creature.\nAt the beginning of your upkeep, this Aura deals 4 damage to enchanted creature.",
+                "Fatal Attraction"
+            ),
+            EffectPolarity::Harmful
+        );
     }
 }
