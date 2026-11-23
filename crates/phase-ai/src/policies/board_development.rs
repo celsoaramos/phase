@@ -1,8 +1,8 @@
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
-use engine::types::zones::Zone;
 use engine::types::game_state::GameState;
 use engine::types::player::PlayerId;
+use engine::types::zones::Zone;
 
 use super::activation::arch_times_turn;
 use super::context::PolicyContext;
@@ -109,7 +109,11 @@ fn score_cast(ctx: &PolicyContext<'_>) -> f64 {
     // passed, or cast a filler creature, with its commander castable and the
     // scores within 0.3 of each other. A fixed tiebreak toward casting it from
     // the command zone — never enough to beat a genuinely better play.
-    let commander_tiebreak = if object.zone == Zone::Command { 1.5 } else { 0.0 };
+    let commander_tiebreak = if object.zone == Zone::Command {
+        1.5
+    } else {
+        0.0
+    };
 
     0.12 + mana_scale + presence + etb_discount + commander_tiebreak
 }

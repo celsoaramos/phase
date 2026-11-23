@@ -154,6 +154,7 @@ impl DeckProfile {
             zone_quality: base.zone_quality * m[6],
             card_advantage: base.card_advantage * m[7],
             synergy: base.synergy * m[8],
+            library_pressure: base.library_pressure,
         }
     }
 }

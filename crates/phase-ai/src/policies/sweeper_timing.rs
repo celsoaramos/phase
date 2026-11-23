@@ -8,9 +8,9 @@
 use engine::game::filter::{matches_target_filter, FilterContext};
 use engine::game::players;
 use engine::types::ability::{AbilityDefinition, Effect};
-use engine::types::identifiers::ObjectId;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::GameState;
+use engine::types::identifiers::ObjectId;
 use engine::types::player::PlayerId;
 
 use super::context::PolicyContext;
@@ -71,7 +71,12 @@ impl TacticalPolicy for SweeperTimingPolicy {
         // 09/11/2026: o azorius-control conjurou Supreme Verdict com UMA ficha na mesa,
         // e ela era do próprio robô.
         if let Some(facts) = ctx.cast_facts() {
-            if sweeper_spares_every_opponent(ctx.state, ctx.ai_player, facts.object.id, &facts.object.abilities) {
+            if sweeper_spares_every_opponent(
+                ctx.state,
+                ctx.ai_player,
+                facts.object.id,
+                &facts.object.abilities,
+            ) {
                 return PolicyVerdict::Reject {
                     reason: PolicyReason::new("sweeper_hits_only_own_board"),
                 };
@@ -349,7 +354,9 @@ mod tests {
         state.objects.get_mut(&own).unwrap().controller = AI;
         let sweeper_id = make_sweeper_spell(&mut state, 0);
         match verdict_for(&state, sweeper_id) {
-            PolicyVerdict::Reject { reason } => assert_eq!(reason.kind, "sweeper_hits_only_own_board"),
+            PolicyVerdict::Reject { reason } => {
+                assert_eq!(reason.kind, "sweeper_hits_only_own_board")
+            }
             other => panic!("expected Reject, got {other:?}"),
         }
     }
@@ -359,7 +366,10 @@ mod tests {
         let mut state = GameState::new_two_player(42);
         make_opponent_creature(&mut state, 0);
         let sweeper_id = make_sweeper_spell(&mut state, 0);
-        assert!(matches!(verdict_for(&state, sweeper_id), PolicyVerdict::Score { .. }));
+        assert!(matches!(
+            verdict_for(&state, sweeper_id),
+            PolicyVerdict::Score { .. }
+        ));
     }
 
     #[test]

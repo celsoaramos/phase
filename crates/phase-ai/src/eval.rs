@@ -27,6 +27,12 @@ pub struct EvalWeights {
     pub card_advantage: f64,
     /// Weight for synergy strategic dimension (board synergy bonus).
     pub synergy: f64,
+    /// MagicFinder (Etapa 4): weight of the opponent's library depletion
+    /// (`library_pressure`). Zero everywhere except a deck whose guide wins by
+    /// milling (`deck_guide::WinPlan::Mill`) — without it the evaluation reads a
+    /// mill spell as a card spent for nothing.
+    #[serde(default)]
+    pub library_pressure: f64,
 }
 
 impl Default for EvalWeights {
@@ -41,6 +47,7 @@ impl Default for EvalWeights {
             zone_quality: 0.3,
             card_advantage: 0.3,
             synergy: 0.5,
+            library_pressure: 0.0,
         }
     }
 }
@@ -107,6 +114,7 @@ impl EvalWeightSet {
                 zone_quality: 0.3,
                 card_advantage: 2.5,
                 synergy: 0.5,
+                library_pressure: 0.0,
             },
             mid: EvalWeights {
                 life: 0.5838,
@@ -118,6 +126,7 @@ impl EvalWeightSet {
                 zone_quality: 0.3,
                 card_advantage: 2.5,
                 synergy: 0.5,
+                library_pressure: 0.0,
             },
             late: EvalWeights {
                 life: 0.4912,
@@ -129,6 +138,7 @@ impl EvalWeightSet {
                 zone_quality: 0.3,
                 card_advantage: 1.945,
                 synergy: 0.5,
+                library_pressure: 0.0,
             },
         }
     }
@@ -184,6 +194,9 @@ pub struct EvaluationBreakdown {
     /// reaches 90.0 at the source target, which would make `hand_size`
     /// uninterpretable.
     pub mana_development: f64,
+    /// MagicFinder (Etapa 4): the mill plan's progress, weighted — see
+    /// [`library_pressure`].
+    pub library_pressure: f64,
 }
 
 impl EvaluationBreakdown {
@@ -204,6 +217,7 @@ impl EvaluationBreakdown {
             aggression,
             card_advantage,
             mana_development,
+            library_pressure,
         } = self;
         life + board_presence
             + board_power
@@ -212,6 +226,7 @@ impl EvaluationBreakdown {
             + aggression
             + card_advantage
             + mana_development
+            + library_pressure
     }
 }
 
@@ -610,7 +625,11 @@ pub fn evaluate_state_breakdown(
         aggression: features.aggression * weights.aggression,
         card_advantage: features.card_advantage_breakdown * weights.card_advantage,
         mana_development: 0.0,
+        library_pressure: 0.0,
     };
+    if weights.library_pressure != 0.0 {
+        breakdown.library_pressure = weights.library_pressure * library_pressure(state, player);
+    }
 
     // CR 107.14: energy is a fixed-coefficient offset added AFTER weighting, so
     // `EvalFeatures::weighted_total` excludes it and it lands on `hand_size` here
@@ -624,6 +643,29 @@ pub fn evaluate_state_breakdown(
     breakdown.mana_development = features.mana_development_offset;
 
     Ok(breakdown)
+}
+
+/// Library size the mill value is measured from (a 60-card deck after the
+/// opening hand).
+const LIBRARY_BASELINE: f64 = 53.0;
+
+/// How far `player` has milled the opponent toward an empty library (CR 104.3c):
+/// a linear part (each card milled counts) plus a part that grows as the
+/// library nears zero, where each card is closer to the win. Per milled card it
+/// is worth ~0.6 with a full library and ~1.5 with three cards left — a card in
+/// hand is worth ~2.5 (`hand_size`), so a Tome Scour (five cards) is worth
+/// casting and the last cards are worth much more than the first.
+pub(crate) fn library_pressure(state: &GameState, player: PlayerId) -> f64 {
+    let Some(library) = players::opponents(state, player)
+        .iter()
+        .map(|opp| state.players[opp.0 as usize].library.len())
+        .min()
+    else {
+        return 0.0;
+    };
+    let left = library as f64;
+    let milled = (LIBRARY_BASELINE - left).max(0.0);
+    0.6 * milled + 48.0 / (left + 4.0)
 }
 
 /// Board statistics: (creature_count, total_power, total_toughness, non_creature_permanents).

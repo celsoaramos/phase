@@ -1,0 +1,177 @@
+{
+  "version": 1,
+  "about": "MagicFinder (2026-11-22, Etapa 4): guia de pilotagem dos desafiantes. Um guia vale para o deck que tem TODAS as cartas de `signature`. `win`: condição de vitória que a avaliação precisa enxergar (hoje só `mill`). `mulligan.lands`: terrenos aceitos numa mão de 7; `mulligan.needs_any`: a mão de 7 precisa de pelo menos uma carta de CADA grupo. `key`: cartas que não vão para o fundo no mulligan. `tutor`: ordem de preferência quando uma busca oferece mais de uma.",
+  "guides": [
+    {
+      "id": "dimir-mill",
+      "signature": ["Hedron Crab", "Archive Trap", "Tome Scour"],
+      "win": "mill",
+      "mulligan": {
+        "lands": [2, 4],
+        "needs_any": [["Hedron Crab", "Tome Scour", "Thought Scour", "Glimpse the Unthinkable", "Mind Sculpt", "Breaking", "Archive Trap", "Traumatize"]]
+      },
+      "key": ["Hedron Crab", "Traumatize"],
+      "tutor": []
+    },
+    {
+      "id": "amulet-titan",
+      "signature": ["Amulet of Vigor", "Primeval Titan", "Arboreal Grazer"],
+      "mulligan": {
+        "lands": [2, 5],
+        "needs_any": [["Amulet of Vigor", "Arboreal Grazer", "Spelunking", "Primeval Titan", "Green Sun's Zenith", "Summoner's Pact", "Scapeshift", "Urza's Saga"]]
+      },
+      "key": ["Amulet of Vigor", "Primeval Titan", "Spelunking", "Arboreal Grazer"],
+      "tutor": ["Primeval Titan", "Amulet of Vigor", "Arboreal Grazer", "Dryad Arbor", "Cultivator Colossus", "Aftermath Analyst", "Hanweir Battlements", "Urza's Saga", "Gruul Turf", "Simic Growth Chamber", "Lotus Field", "Tolaria West", "Boseiju, Who Endures", "Otawara, Soaring City", "Crumbling Vestige", "Forest"]
+    },
+    {
+      "id": "lands",
+      "signature": ["Life from the Loam", "Dark Depths", "Thespian's Stage"],
+      "mulligan": {
+        "lands": [2, 5],
+        "needs_any": [["Life from the Loam", "Exploration", "Mox Diamond", "Crop Rotation", "Urza's Saga", "Dark Depths", "Thespian's Stage", "Malevolent Rumble", "Expedition Map"]]
+      },
+      "key": ["Dark Depths", "Thespian's Stage", "Life from the Loam", "Exploration", "Crop Rotation"],
+      "tutor": ["Dark Depths", "Thespian's Stage", "Life from the Loam", "Urza's Saga", "Maze of Ith", "Wasteland", "Ancient Tomb", "Taiga", "Forest"]
+    },
+    {
+      "id": "azorius-control",
+      "signature": ["Teferi, Hero of Dominaria", "Supreme Verdict", "No More Lies"],
+      "mulligan": {
+        "lands": [3, 5],
+        "needs_any": [["No More Lies", "Get Lost", "March of Otherworldly Light", "Temporary Lockdown", "Supreme Verdict", "Farewell", "The Wandering Emperor", "Three Steps Ahead", "Dovin's Veto", "Consult the Star Charts", "Stock Up"]]
+      },
+      "key": ["Teferi, Hero of Dominaria", "The Wandering Emperor", "Supreme Verdict", "Farewell"],
+      "tutor": []
+    },
+    {
+      "id": "orzhov-greasefang",
+      "signature": ["Greasefang, Okiba Boss", "Parhelion II"],
+      "mulligan": {
+        "lands": [2, 4],
+        "needs_any": [["Greasefang, Okiba Boss", "Parhelion II", "Monument to Endurance", "Fleeting Spirit", "Guardian of New Benalia", "Iron-Shield Elf"]]
+      },
+      "key": ["Greasefang, Okiba Boss"],
+      "tutor": ["Parhelion II", "Greasefang, Okiba Boss"]
+    },
+    {
+      "id": "selesnya-enchantress",
+      "signature": ["Sythis, Harvest's Hand", "Setessan Champion", "Eidolon of Blossoms"],
+      "mulligan": {
+        "lands": [2, 4],
+        "needs_any": [["Utopia Sprawl", "Wild Growth", "Sythis, Harvest's Hand", "Setessan Champion", "Eidolon of Blossoms", "Sanctum Weaver", "Enchantress's Presence"]]
+      },
+      "key": ["Setessan Champion", "Sythis, Harvest's Hand", "Enchantress's Presence", "Sanctum Weaver"],
+      "tutor": []
+    },
+    {
+      "id": "niv-to-light",
+      "signature": ["Niv-Mizzet Reborn", "Bring to Light"],
+      "mulligan": {
+        "lands": [3, 5],
+        "needs_any": [["Up the Beanstalk", "Sylvan Caryatid", "Ancient Cornucopia", "Leyline Binding", "Bring to Light", "Omnath, Locus of Creation", "Lightning Helix", "Vanishing Verse"]]
+      },
+      "key": ["Niv-Mizzet Reborn", "Omnath, Locus of Creation", "Bring to Light"],
+      "tutor": ["Niv-Mizzet Reborn", "Omnath, Locus of Creation", "Elesh Norn, Mother of Machines", "Supreme Verdict", "Maelstrom Pulse", "Niv-Mizzet, Supreme", "Valki, God of Lies", "Ketria Triome", "Zagoth Triome", "Raugrin Triome", "Indatha Triome", "Jetmir's Garden", "Xander's Lounge", "Spara's Headquarters", "Ziatora's Proving Ground"]
+    },
+    {
+      "id": "azorius-blink",
+      "signature": ["Ephemerate", "Soulherder", "Reflector Mage"],
+      "mulligan": {
+        "lands": [2, 5],
+        "needs_any": [["Wall of Omens", "Reflector Mage", "Man-o'-War", "Mulldrifter", "Soulherder", "Restoration Angel", "Solemn Simulacrum", "Cloudgoat Ranger"]]
+      },
+      "key": ["Soulherder", "Restoration Angel"],
+      "tutor": []
+    },
+    {
+      "id": "elves",
+      "signature": ["Priest of Titania", "Lead the Stampede", "Quirion Ranger"],
+      "mulligan": {
+        "lands": [1, 4],
+        "needs_any": [["Fyndhorn Elves", "Elvish Mystic", "Llanowar Elves", "Priest of Titania", "Quirion Ranger", "Sagu Wildling"]]
+      },
+      "key": ["Priest of Titania", "Lead the Stampede", "Timberwatch Elf"],
+      "tutor": []
+    },
+    {
+      "id": "kaladesh-energy",
+      "signature": ["Aetherworks Marvel", "Rogue Refiner", "Whirler Virtuoso"],
+      "mulligan": {
+        "lands": [2, 4],
+        "needs_any": [["Attune with Aether", "Servant of the Conduit", "Rogue Refiner", "Longtusk Cub", "Whirler Virtuoso", "Harnessed Lightning", "Aether Meltdown"]]
+      },
+      "key": ["Longtusk Cub", "Whirler Virtuoso"],
+      "tutor": []
+    },
+    {
+      "id": "boros-energy",
+      "signature": ["Ajani, Nacatl Pariah", "Phlage, Titan of Fire's Fury", "Ocelot Pride"],
+      "mulligan": {
+        "lands": [1, 4],
+        "needs_any": [["Ajani, Nacatl Pariah", "Ocelot Pride", "Ragavan, Nimble Pilferer", "Guide of Souls", "Seasoned Pyromancer", "Galvanic Discharge", "Phlage, Titan of Fire's Fury"]]
+      },
+      "key": ["Phlage, Titan of Fire's Fury", "Ajani, Nacatl Pariah"],
+      "tutor": []
+    },
+    {
+      "id": "mono-red-prowess",
+      "signature": ["Monastery Swiftspear", "Soul-Scar Mage", "Monstrous Rage"],
+      "mulligan": {
+        "lands": [1, 3],
+        "needs_any": [["Monastery Swiftspear", "Soul-Scar Mage", "Emberheart Challenger", "Sunspine Lynx", "Screaming Nemesis", "Kumano Faces Kakkazan"]]
+      },
+      "key": ["Screaming Nemesis"],
+      "tutor": []
+    },
+    {
+      "id": "izzet-delver",
+      "signature": ["Delver of Secrets", "Dragon's Rage Channeler", "Murktide Regent"],
+      "mulligan": {
+        "lands": [1, 4],
+        "needs_any": [["Delver of Secrets", "Dragon's Rage Channeler", "Murktide Regent", "Cori-Steel Cutter", "Brainstorm", "Ponder", "Preordain"]]
+      },
+      "key": ["Murktide Regent", "Force of Will"],
+      "tutor": ["Volcanic Island", "Island"]
+    },
+    {
+      "id": "mono-white-equipment",
+      "signature": ["Stoneforge Mystic", "Puresteel Paladin", "Sram, Senior Edificer"],
+      "mulligan": {
+        "lands": [1, 4],
+        "needs_any": [["Stoneforge Mystic", "Puresteel Paladin", "Sram, Senior Edificer", "Kor Outfitter", "Savannah Lions", "Kor Duelist"]]
+      },
+      "key": ["Puresteel Paladin", "Sram, Senior Edificer"],
+      "tutor": ["Vulshok Morningstar", "Bonesplitter", "Sai of the Shinobi", "Captain's Claws", "Trusty Machete", "Armory of Iroas"]
+    },
+    {
+      "id": "affinity",
+      "signature": ["Kappa Cannoneer", "Mox Opal", "Pinnacle Emissary"],
+      "mulligan": {
+        "lands": [1, 4],
+        "needs_any": [["Mox Opal", "Pinnacle Emissary", "Kappa Cannoneer", "Emry, Lurker of the Loch", "Weapons Manufacturing", "Urza's Saga", "Arcbound Ravager", "Mishra's Bauble", "Claws of Gix"]]
+      },
+      "key": ["Kappa Cannoneer", "Urza's Saga"],
+      "tutor": ["Shadowspear", "Engineered Explosives", "Pithing Needle", "Welding Jar"]
+    },
+    {
+      "id": "mono-green-landfall",
+      "signature": ["Earthbender Ascension", "Mightform Harmonizer", "Sazh's Chocobo"],
+      "mulligan": {
+        "lands": [2, 5],
+        "needs_any": [["Llanowar Elves", "Icetill Explorer", "Badgermole Cub", "Sazh's Chocobo", "Mightform Harmonizer", "Earthbender Ascension", "Sapling Nursery"]]
+      },
+      "key": ["Mightform Harmonizer", "Icetill Explorer"],
+      "tutor": ["Ba Sing Se", "Forest"]
+    },
+    {
+      "id": "selesnya-ouroboroid",
+      "signature": ["Ouroboroid", "Gene Pollinator", "Brightglass Gearhulk"],
+      "mulligan": {
+        "lands": [2, 5],
+        "needs_any": [["Llanowar Elves", "Badgermole Cub", "Gene Pollinator", "Ouroboroid", "Spider Manifestation", "Nature's Rhythm"]]
+      },
+      "key": ["Ouroboroid", "Craterhoof Behemoth"],
+      "tutor": ["Ouroboroid", "Craterhoof Behemoth", "Brightglass Gearhulk", "Spider Manifestation"]
+    }
+  ]
+}

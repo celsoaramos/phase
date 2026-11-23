@@ -63,13 +63,14 @@ impl EffectTimingPolicy {
             // CR 613.4c + CR 514.2: a team-wide pump of the caster's own creatures
             // ("creatures you control get +2/+0 until end of turn") is the same combat
             // trick a single-target `Pump` is, and pays only in the combat window.
-            CombatBinding::Unbound if own_effects.iter().any(|effect| {
-                matches!(
-                    effect,
-                    Effect::PumpAll { power, toughness, target }
-                        if is_own_team_buff(power, toughness, target)
-                )
-            }) =>
+            CombatBinding::Unbound
+                if own_effects.iter().any(|effect| {
+                    matches!(
+                        effect,
+                        Effect::PumpAll { power, toughness, target }
+                            if is_own_team_buff(power, toughness, target)
+                    )
+                }) =>
             {
                 combat_trick_score(ctx)
             }

@@ -34,8 +34,20 @@ const AI: PlayerId = PlayerId(0);
 const OPP: PlayerId = PlayerId(1);
 
 fn artifact(state: &mut GameState, card: u64, owner: PlayerId, name: &str) -> ObjectId {
-    let id = create_object(state, CardId(card), owner, name.to_string(), Zone::Battlefield);
-    state.objects.get_mut(&id).unwrap().card_types.core_types.push(CoreType::Artifact);
+    let id = create_object(
+        state,
+        CardId(card),
+        owner,
+        name.to_string(),
+        Zone::Battlefield,
+    );
+    state
+        .objects
+        .get_mut(&id)
+        .unwrap()
+        .card_types
+        .core_types
+        .push(CoreType::Artifact);
     id
 }
 

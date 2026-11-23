@@ -49,6 +49,9 @@ pub struct AiSession {
     pub plan: HashMap<PlayerId, PlanSnapshot>,
     pub strategy: HashMap<PlayerId, StrategyProfile>,
     pub synergy: HashMap<PlayerId, SynergyGraph>,
+    /// MagicFinder (Etapa 4): the piloting guide matched to each seat's deck
+    /// (`deck_guide::guide_for_deck`). Read only with `AiConfig::deck_guides`.
+    pub guide: HashMap<PlayerId, Arc<crate::deck_guide::DeckGuide>>,
     pub memory: Arc<RwLock<PolicyMemory>>,
     /// Turn-scoped cache for opponent-turn projections. Key includes
     /// `turn_number` + `active_player`, so stale entries from prior turns
@@ -93,6 +96,7 @@ impl std::fmt::Debug for AiSession {
             .field("plan", &self.plan)
             .field("strategy", &self.strategy)
             .field("synergy", &self.synergy)
+            .field("guide", &self.guide)
             .field("memory", &self.memory)
             .field("projection_cache", &self.projection_cache)
             .field("prospective_fetch_prompt", &self.prospective_fetch_prompt)
@@ -126,6 +130,7 @@ impl AiSession {
         let mut plan = HashMap::new();
         let mut strategy = HashMap::new();
         let mut synergy = HashMap::new();
+        let mut guide = HashMap::new();
 
         for pool in &state.deck_pools {
             let deck = analysis_deck(&pool.current_main, &pool.current_commander);
@@ -134,7 +139,11 @@ impl AiSession {
             let snapshot = derive_snapshot(&player_features);
             let player_strategy = StrategyProfile::for_profile(&player_profile);
             let graph = SynergyGraph::build(&deck);
+            let deck_guide = crate::deck_guide::guide_for_deck(&pool.current_main);
             for seat in std::iter::once(pool.player).chain(pool_seats(state, pool.player)) {
+                if let Some(found) = &deck_guide {
+                    guide.insert(seat, Arc::clone(found));
+                }
                 deck_profile.insert(seat, player_profile.clone());
                 features.insert(seat, player_features.clone());
                 plan.insert(seat, snapshot.clone());
@@ -149,6 +158,7 @@ impl AiSession {
             plan,
             strategy,
             synergy,
+            guide,
             memory: Arc::default(),
             projection_cache: Arc::default(),
             prospective_fetch_prompt: Arc::default(),

@@ -113,7 +113,10 @@ fn load_arch_weight_file(path: &str) -> Result<ArchWeights, String> {
         .ok_or_else(|| format!("arch_weights={path}: no `archetypes` object"))?;
     let mut out = ArchWeights::new();
     for (name, fit) in map {
-        out.insert(name.clone(), weight_set_from_json(fit, &format!("{path}:{name}"))?);
+        out.insert(
+            name.clone(),
+            weight_set_from_json(fit, &format!("{path}:{name}"))?,
+        );
     }
     Ok(out)
 }
@@ -223,6 +226,7 @@ fn parse_spec(spec: &str) -> Result<Side, String> {
             "search_ms" => config.search.time_budget_ms = Some(num()? as u32),
             "csim" => config.combat_simulation = num()? != 0.0,
             "tsim" => config.turn_simulation = num()? != 0.0,
+            "guide" => config.deck_guides = num()? != 0.0,
             "tsim_ms" => config.turn_simulation_clock_ms = Some(num()? as u32),
             "tsim_lines" => config.turn_simulation_lines = num()? as usize,
             "tsim_worlds" => config.turn_simulation_worlds = num()? as u64,
@@ -230,8 +234,7 @@ fn parse_spec(spec: &str) -> Result<Side, String> {
             "weights" => config.weights = load_weight_file(v)?,
             "arch_weights" => arch_weights = Some(load_arch_weight_file(v)?),
             "arch" => {
-                let text =
-                    std::fs::read_to_string(v).map_err(|e| format!("arch={v}: {e}"))?;
+                let text = std::fs::read_to_string(v).map_err(|e| format!("arch={v}: {e}"))?;
                 arch_override = Some(
                     serde_json::from_str::<HashMap<String, String>>(&text)
                         .map_err(|e| format!("arch={v}: {e}"))?,
@@ -1053,7 +1056,9 @@ fn main() {
             ts_max as f64 / 1000.0
         );
         let (unmeasured, slow) = phase_ai::turn_sim_budget_stats();
-        eprintln!("turn_sim budget: {unmeasured} incumbents unmeasured, {slow} decisions over 1.5 s");
+        eprintln!(
+            "turn_sim budget: {unmeasured} incumbents unmeasured, {slow} decisions over 1.5 s"
+        );
         let (runs, dropped, steps) = phase_ai::turn_sim_playout_stats();
         eprintln!(
             "turn_sim playouts: {runs} run, {dropped} dropped, {:.0} steps each",

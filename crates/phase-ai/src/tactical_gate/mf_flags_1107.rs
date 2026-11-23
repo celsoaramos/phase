@@ -51,7 +51,9 @@ use engine::types::zones::Zone;
 use super::{GateDecision, TacticalFacts, TacticalWindow};
 use crate::policies::context::PolicyContext;
 use crate::policies::effect_classify::{effect_polarity, is_spell_beneficial, EffectPolarity};
-use crate::policies::removal_lethality::{outcome_is_lethal, pending_damage_to_object, PendingDamage};
+use crate::policies::removal_lethality::{
+    outcome_is_lethal, pending_damage_to_object, PendingDamage,
+};
 
 /// `MF_GATE_TRACE=1` names the gate that rejected a candidate (native only).
 fn trace(message: impl FnOnce() -> String) {
@@ -64,11 +66,23 @@ fn trace(message: impl FnOnce() -> String) {
 pub(super) fn assess_pre_cast(ctx: &PolicyContext<'_>) -> Option<GateDecision> {
     let gates: [(&str, fn(&PolicyContext<'_>) -> bool); 6] = [
         ("keyword_change_is_redundant", keyword_change_is_redundant),
-        ("loyalty_put_from_hand_has_no_card", loyalty_put_from_hand_has_no_card),
-        ("resolution_life_loss_is_lethal", resolution_life_loss_is_lethal),
-        ("flash_creature_in_opponent_beginning_phase", flash_creature_in_opponent_beginning_phase),
+        (
+            "loyalty_put_from_hand_has_no_card",
+            loyalty_put_from_hand_has_no_card,
+        ),
+        (
+            "resolution_life_loss_is_lethal",
+            resolution_life_loss_is_lethal,
+        ),
+        (
+            "flash_creature_in_opponent_beginning_phase",
+            flash_creature_in_opponent_beginning_phase,
+        ),
         ("mana_grant_outside_window", mana_grant_outside_window),
-        ("aura_cast_hosts_all_redundant", aura_cast_hosts_all_redundant),
+        (
+            "aura_cast_hosts_all_redundant",
+            aura_cast_hosts_all_redundant,
+        ),
     ];
     for (name, gate) in gates {
         if gate(ctx) {
@@ -76,7 +90,13 @@ pub(super) fn assess_pre_cast(ctx: &PolicyContext<'_>) -> Option<GateDecision> {
             return Some(GateDecision::Reject);
         }
     }
-    trace(|| format!("mf_flags_1107 allow {:?} effects={:?}", ctx.candidate.action, ctx.effects()));
+    trace(|| {
+        format!(
+            "mf_flags_1107 allow {:?} effects={:?}",
+            ctx.candidate.action,
+            ctx.effects()
+        )
+    });
     None
 }
 
@@ -141,7 +161,11 @@ fn is_self_tap_rider(effect: &Effect) -> bool {
 
 /// Every object on the battlefield that `filter` matches from `source_id`'s point
 /// of view (the `affected` population of an untargeted continuous effect).
-fn affected_population(state: &GameState, source_id: ObjectId, filter: &TargetFilter) -> Vec<ObjectId> {
+fn affected_population(
+    state: &GameState,
+    source_id: ObjectId,
+    filter: &TargetFilter,
+) -> Vec<ObjectId> {
     if matches!(filter, TargetFilter::SelfRef) {
         return vec![source_id];
     }
@@ -170,7 +194,9 @@ fn keyword_changes(static_abilities: &[StaticDefinition]) -> Option<Vec<KeywordC
         }
         for modification in &stat.modifications {
             match modification {
-                ContinuousModification::AddKeyword { keyword } => out.push(KeywordChange::Add(keyword)),
+                ContinuousModification::AddKeyword { keyword } => {
+                    out.push(KeywordChange::Add(keyword))
+                }
                 ContinuousModification::RemoveKeyword { keyword } => {
                     out.push(KeywordChange::Remove(keyword))
                 }
@@ -184,7 +210,11 @@ fn keyword_changes(static_abilities: &[StaticDefinition]) -> Option<Vec<KeywordC
     Some(out)
 }
 
-fn change_is_already_true(state: &GameState, object_id: ObjectId, change: KeywordChange<'_>) -> bool {
+fn change_is_already_true(
+    state: &GameState,
+    object_id: ObjectId,
+    change: KeywordChange<'_>,
+) -> bool {
     let Some(object) = state.objects.get(&object_id) else {
         return true;
     };
@@ -268,13 +298,20 @@ fn keyword_change_is_redundant(ctx: &PolicyContext<'_>) -> bool {
         if target.is_some() && recipients.is_empty() {
             return false;
         }
-        let all_redundant = recipients
-            .iter()
-            .all(|&id| changes.iter().all(|change| change_is_already_true(ctx.state, id, *change)));
+        let all_redundant = recipients.iter().all(|&id| {
+            changes
+                .iter()
+                .all(|change| change_is_already_true(ctx.state, id, *change))
+        });
         trace(|| {
             let keywords: Vec<String> = recipients
                 .iter()
-                .map(|id| format!("{id:?}:{:?}", ctx.state.objects.get(id).map(|o| o.keywords.clone())))
+                .map(|id| {
+                    format!(
+                        "{id:?}:{:?}",
+                        ctx.state.objects.get(id).map(|o| o.keywords.clone())
+                    )
+                })
                 .collect();
             format!("keyword_change recipients={recipients:?} keywords={keywords:?} redundant={all_redundant}")
         });
@@ -347,11 +384,15 @@ fn resolution_life_loss_is_lethal(ctx: &PolicyContext<'_>) -> bool {
     for effect in effects {
         if let Effect::LoseLife { amount, target } = effect {
             let on_self = match target {
-                None | Some(TargetFilter::Controller) | Some(TargetFilter::SourceController) => true,
+                None | Some(TargetFilter::Controller) | Some(TargetFilter::SourceController) => {
+                    true
+                }
                 Some(_) => false,
             };
             if on_self {
-                loss = loss.saturating_add(resolve_quantity(ctx.state, amount, ctx.ai_player, source_id).max(0));
+                loss = loss.saturating_add(
+                    resolve_quantity(ctx.state, amount, ctx.ai_player, source_id).max(0),
+                );
             }
         }
     }
@@ -513,7 +554,11 @@ fn is_aura(source: &engine::game::game_object::GameObject) -> bool {
             .any(|keyword| matches!(keyword, Keyword::Enchant(_)))
 }
 
-fn aura_adds_nothing_to(state: &GameState, source: &engine::game::game_object::GameObject, object_id: ObjectId) -> bool {
+fn aura_adds_nothing_to(
+    state: &GameState,
+    source: &engine::game::game_object::GameObject,
+    object_id: ObjectId,
+) -> bool {
     if !is_aura(source) {
         return false;
     }
@@ -541,7 +586,11 @@ fn aura_adds_nothing_to(state: &GameState, source: &engine::game::game_object::G
     // this gate cannot price).
     saw_keyword
         && source.trigger_definitions.iter_unchecked().next().is_none()
-        && source.replacement_definitions.iter_unchecked().next().is_none()
+        && source
+            .replacement_definitions
+            .iter_unchecked()
+            .next()
+            .is_none()
 }
 
 /// Removal whose rider lets the target's controller search for a basic land
@@ -582,7 +631,10 @@ fn land_removal_with_basic_compensation(ctx: &PolicyContext<'_>, object_id: Obje
 /// Damage that does not kill the chosen creature while another legal opposing
 /// creature target WOULD die (Chain Lightning at a 6/6 beside a 2/2). Only the
 /// AI's own fixed damage is read; the player as a target is left to scoring.
-fn nonlethal_burn_target_with_lethal_alternative(ctx: &PolicyContext<'_>, object_id: ObjectId) -> bool {
+fn nonlethal_burn_target_with_lethal_alternative(
+    ctx: &PolicyContext<'_>,
+    object_id: ObjectId,
+) -> bool {
     let Some(target) = ctx.state.objects.get(&object_id) else {
         return false;
     };
@@ -625,7 +677,10 @@ fn nonlethal_burn_target_with_lethal_alternative(ctx: &PolicyContext<'_>, object
 /// opponent's object while a legal target of the AI's own exists. The Aura case
 /// was already rejected in `anti_self_harm`; triggers (Optimistic Scavenger) and
 /// activated abilities were not.
-fn beneficial_target_on_opponent_with_own_alternative(ctx: &PolicyContext<'_>, object_id: ObjectId) -> bool {
+fn beneficial_target_on_opponent_with_own_alternative(
+    ctx: &PolicyContext<'_>,
+    object_id: ObjectId,
+) -> bool {
     let Some(target) = ctx.state.objects.get(&object_id) else {
         return false;
     };
@@ -646,7 +701,9 @@ fn beneficial_target_on_opponent_with_own_alternative(ctx: &PolicyContext<'_>, o
     if effects.iter().any(|effect| {
         matches!(
             effect,
-            Effect::GainControl { .. } | Effect::GainControlAll { .. } | Effect::ExchangeControl { .. }
+            Effect::GainControl { .. }
+                | Effect::GainControlAll { .. }
+                | Effect::ExchangeControl { .. }
         )
     }) {
         return false;

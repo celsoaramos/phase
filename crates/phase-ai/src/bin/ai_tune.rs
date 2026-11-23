@@ -170,6 +170,7 @@ fn eval_params_to_config(params: &[f64]) -> AiConfig {
         zone_quality: clamp(params[6]),
         card_advantage: clamp(params[7]),
         synergy: clamp(params[8]),
+        library_pressure: 0.0,
     };
 
     // Derive early/mid phases from 17Lands-learned ratios applied to CMA-ES late weights.
@@ -345,6 +346,7 @@ fn load_cma_tuned_config(path: &std::path::Path) -> Result<AiConfig, String> {
         zone_quality: field(weights, "zone_quality")?,
         card_advantage: field(weights, "card_advantage")?,
         synergy: field(weights, "synergy")?,
+        library_pressure: 0.0,
     };
     // Seed from the shipped Medium preset so a loaded tuned artifact keeps
     // Medium's combat model; only the tuned scalars are restored from the file.
@@ -390,6 +392,7 @@ fn scale_from_ratios(
             * ratio(target.card_advantage, reference.card_advantage))
         .clamp(0.01, 10.0),
         synergy: (base.synergy * ratio(target.synergy, reference.synergy)).clamp(0.01, 10.0),
+        library_pressure: 0.0,
     }
 }
 

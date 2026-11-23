@@ -21,6 +21,7 @@ pub mod context;
 pub mod damage_reflection;
 pub mod decision_kind;
 pub mod decision_receipt;
+pub mod deck_guide;
 pub mod deck_knowledge;
 pub mod deck_profile;
 pub mod determinize;

@@ -60,7 +60,9 @@ pub fn is_sacrifice_for_own_counter(ability: &engine::types::ability::AbilityDef
     if matches!(cost.target, TargetFilter::SelfRef) {
         return false;
     }
-    if ability.sub_ability.is_some() || ability.else_ability.is_some() || ability.condition.is_some()
+    if ability.sub_ability.is_some()
+        || ability.else_ability.is_some()
+        || ability.condition.is_some()
     {
         return false;
     }

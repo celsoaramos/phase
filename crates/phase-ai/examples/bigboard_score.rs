@@ -20,8 +20,10 @@ fn main() {
     let t = Instant::now();
     let db = (db_path != "-").then(|| {
         std::sync::Arc::new(
-            engine::database::card_db::CardDatabase::from_json_str(&std::fs::read_to_string(db_path).unwrap())
-                .expect("card db"),
+            engine::database::card_db::CardDatabase::from_json_str(
+                &std::fs::read_to_string(db_path).unwrap(),
+            )
+            .expect("card db"),
         )
     });
     eprintln!("card db {:.1}s", t.elapsed().as_secs_f64());
@@ -51,7 +53,8 @@ fn main() {
             s.rng_seed = 1;
             s.rng = engine::types::game_state::GameRng::seed_from_u64(1);
             s.rng_word_pos = 0;
-            let mut config = create_config_for_players(difficulty, Platform::Wasm, s.players.len() as u8);
+            let mut config =
+                create_config_for_players(difficulty, Platform::Wasm, s.players.len() as u8);
             // MEASURE=1: no wall clock (deterministic) — compares two builds by verdict, not by time.
             if std::env::var("MEASURE").is_ok() {
                 config = config.into_measurement(1);
@@ -61,7 +64,15 @@ fn main() {
             let ms = t.elapsed().as_secs_f64() * 1000.0;
             let summary: Vec<String> = scored
                 .iter()
-                .map(|(act, sc)| format!("{}:{:.2}", serde_json::to_value(act).unwrap()["type"].as_str().unwrap_or("?"), sc))
+                .map(|(act, sc)| {
+                    format!(
+                        "{}:{:.2}",
+                        serde_json::to_value(act).unwrap()["type"]
+                            .as_str()
+                            .unwrap_or("?"),
+                        sc
+                    )
+                })
                 .collect();
             println!("{lvl} #{r}: {ms:.0} ms · {}", summary.join(" "));
         }

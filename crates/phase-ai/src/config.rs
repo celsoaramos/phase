@@ -1467,6 +1467,11 @@ pub struct AiConfig {
     /// heuristic AI on both seats and keep a line that clearly wins
     /// (`turn_sim`). On for "Difícil" (VeryHard) and above.
     pub turn_simulation: bool,
+    /// MagicFinder lab (2026-11-22, Etapa 4): pilot by the deck's guide
+    /// (`deck_guide`): its win plan in the evaluation, its mulligan rules, its
+    /// key cards kept off the bottom and its search order. Off in every preset
+    /// until the lab measures it (`guide=1`).
+    pub deck_guides: bool,
     /// Whether policies may run uncached multi-turn projections at all. Off
     /// only inside a `turn_sim` playout: the playout already plays the
     /// opponent's turn, and a projection per policy call per step is what made
@@ -1705,6 +1710,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
         combat_lookahead,
         combat_simulation: difficulty >= AiDifficulty::VeryHard,
         turn_simulation: difficulty >= AiDifficulty::VeryHard,
+        deck_guides: false,
         projections: true,
         fetch_route_check: true,
         turn_simulation_clock_ms: None,

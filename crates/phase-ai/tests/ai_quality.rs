@@ -4106,7 +4106,12 @@ fn removal_targets_the_token_maker_not_its_token() {
         vec![ManaUnit::new(ManaType::Red, ObjectId(9_999), false, vec![])],
     );
     let mut runner = scenario.build();
-    runner.state_mut().objects.get_mut(&insect).unwrap().is_token = true;
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&insect)
+        .unwrap()
+        .is_token = true;
     runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
     let card_id = runner.state().objects[&shock].card_id;
     runner
@@ -4155,7 +4160,12 @@ fn holds_a_flash_aura_in_its_own_upkeep() {
         .id();
     scenario.with_mana_pool(
         P0,
-        vec![ManaUnit::new(ManaType::Blue, ObjectId(9_999), false, vec![])],
+        vec![ManaUnit::new(
+            ManaType::Blue,
+            ObjectId(9_999),
+            false,
+            vec![],
+        )],
     );
     let mut runner = scenario.build();
     runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };

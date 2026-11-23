@@ -44,7 +44,10 @@ fn main_phase_decision_runs_the_playouts_and_stays_legal() {
     let (before, ..) = phase_ai::turn_sim_stats();
     let action = choose(state, true);
     let (after, ..) = phase_ai::turn_sim_stats();
-    assert!(after > before, "the main-phase decision went through turn_sim");
+    assert!(
+        after > before,
+        "the main-phase decision went through turn_sim"
+    );
     let legal = engine::ai_support::legal_actions(state);
     assert!(
         legal.contains(&action),

@@ -253,14 +253,24 @@ fn advance(
             _ => match answer_prompt(input, state) {
                 Some(action) => action,
                 None => {
-                    trace(|| format!("combat_sim unsupported prompt {:?}", state.waiting_for.variant_name()));
+                    trace(|| {
+                        format!(
+                            "combat_sim unsupported prompt {:?}",
+                            state.waiting_for.variant_name()
+                        )
+                    });
                     return Reached::Unsupported;
                 }
             },
         };
         let described = format!("{action:?}");
         if apply_as_current_for_simulation(state, action).is_err() {
-            trace(|| format!("combat_sim replay refused {described} at {:?}", state.waiting_for.variant_name()));
+            trace(|| {
+                format!(
+                    "combat_sim replay refused {described} at {:?}",
+                    state.waiting_for.variant_name()
+                )
+            });
             return Reached::Unsupported;
         }
     }
@@ -397,13 +407,26 @@ fn finish_with_trick(
             .battlefield
             .iter()
             .filter_map(|id| plain.objects.get(id))
-            .filter(|o| o.card_types.core_types.contains(&engine::types::card_type::CoreType::Creature))
-            .map(|o| format!("{}@{} {}/{} dmg{}{}", o.name, o.controller.0, o.power.unwrap_or(0), o.toughness.unwrap_or(0), o.damage_marked, if o.tapped { " T" } else { "" }))
+            .filter(|o| {
+                o.card_types
+                    .core_types
+                    .contains(&engine::types::card_type::CoreType::Creature)
+            })
+            .map(|o| {
+                format!(
+                    "{}@{} {}/{} dmg{}{}",
+                    o.name,
+                    o.controller.0,
+                    o.power.unwrap_or(0),
+                    o.toughness.unwrap_or(0),
+                    o.damage_marked,
+                    if o.tapped { " T" } else { "" }
+                )
+            })
             .collect();
         format!(
             "combat_sim     after combat life {}×{} value {plain_value:.3} board {board:?}",
-            plain.players[input.player.0 as usize].life,
-            plain.players[opponent.0 as usize].life
+            plain.players[input.player.0 as usize].life, plain.players[opponent.0 as usize].life
         )
     });
     let Some(trick) = input.trick else {
@@ -495,10 +518,11 @@ pub(crate) fn doomed_at_end_step(state: &GameState, id: ObjectId) -> bool {
         let def = &entry.definition;
         matches!(def.mode, TriggerMode::Phase)
             && matches!(def.phase, Some(Phase::End))
-            && def
-                .execute
-                .as_deref()
-                .is_some_and(|execute| crate::cast_facts::collect_definition_effects(execute).into_iter().any(dooms_self))
+            && def.execute.as_deref().is_some_and(|execute| {
+                crate::cast_facts::collect_definition_effects(execute)
+                    .into_iter()
+                    .any(dooms_self)
+            })
     });
     if own_trigger {
         return true;
@@ -514,7 +538,10 @@ pub(crate) fn doomed_at_end_step(state: &GameState, id: ObjectId) -> bool {
         let at_end = matches!(
             delayed.condition,
             DelayedTriggerCondition::AtNextPhase { phase: Phase::End }
-                | DelayedTriggerCondition::AtNextPhaseForPlayer { phase: Phase::End, .. }
+                | DelayedTriggerCondition::AtNextPhaseForPlayer {
+                    phase: Phase::End,
+                    ..
+                }
         );
         at_end
             && crate::policies::context::collect_ability_effects(&delayed.ability)
@@ -539,10 +566,9 @@ fn doomed_value(state: &GameState, player: PlayerId) -> f64 {
         .battlefield
         .iter()
         .filter(|id| {
-            state
-                .objects
-                .get(id)
-                .is_some_and(|object| object.controller == player && doomed_at_end_step(state, **id))
+            state.objects.get(id).is_some_and(|object| {
+                object.controller == player && doomed_at_end_step(state, **id)
+            })
         })
         .map(|id| evaluate_creature(state, *id))
         .sum()
@@ -1062,7 +1088,9 @@ mod tests {
         s.at_phase(Phase::PreCombatMain);
         let bolt = s
             .add_creature(P0, "Ball Lightning", 6, 1)
-            .from_oracle_text("Trample, haste\nAt the beginning of the end step, sacrifice this creature.")
+            .from_oracle_text(
+                "Trample, haste\nAt the beginning of the end step, sacrifice this creature.",
+            )
             .id();
         let bear = s.add_creature(P0, "Bear", 2, 2).id();
         let theirs = s.add_creature(P1, "Ogre", 5, 5).id();
@@ -1093,12 +1121,21 @@ mod tests {
         let yargle = s.add_creature(P1, "Yargle", 18, 6).id();
         let r = s.build();
         // 3 + 3 ≥ 5: the two doomed bodies, not the Guildmage.
-        assert_eq!(gang_block(r.state(), omnath, &[mage, a, b]), Some(vec![a, b]));
+        assert_eq!(
+            gang_block(r.state(), omnath, &[mage, a, b]),
+            Some(vec![a, b])
+        );
         // 3 + 3 = 6 ≥ 6: the two doomed bodies kill the 18/6 too; the Guildmage stays out.
-        assert_eq!(gang_block(r.state(), yargle, &[mage, a, b]), Some(vec![a, b]));
+        assert_eq!(
+            gang_block(r.state(), yargle, &[mage, a, b]),
+            Some(vec![a, b])
+        );
         // A 7-toughness body needs all three (3 + 3 + 2 = 8).
         let big = s_big();
-        assert_eq!(gang_block(big.state(), big_target(&big), &big_blockers(&big)).map(|g| g.len()), Some(3));
+        assert_eq!(
+            gang_block(big.state(), big_target(&big), &big_blockers(&big)).map(|g| g.len()),
+            Some(3)
+        );
         // One blocker alone is the one-change alternative's job.
         assert_eq!(gang_block(r.state(), omnath, &[yargle]), None);
         // Nothing kills it: no group.
@@ -1118,7 +1155,11 @@ mod tests {
         s.build()
     }
     fn big_target(r: &engine::game::scenario::GameRunner) -> ObjectId {
-        *r.state().battlefield.iter().find(|id| r.state().objects[*id].name == "Wurm").unwrap()
+        *r.state()
+            .battlefield
+            .iter()
+            .find(|id| r.state().objects[*id].name == "Wurm")
+            .unwrap()
     }
     fn big_blockers(r: &engine::game::scenario::GameRunner) -> Vec<ObjectId> {
         r.state()

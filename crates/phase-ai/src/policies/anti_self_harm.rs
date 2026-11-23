@@ -211,7 +211,17 @@ fn source_is_instant_or_sorcery(ctx: &PolicyContext<'_>) -> bool {
     ctx.source_object().is_some_and(|source| {
         let types = &source.card_types.core_types;
         (types.contains(&CoreType::Instant) || types.contains(&CoreType::Sorcery))
-            && !types.iter().any(|t| matches!(t, CoreType::Creature | CoreType::Artifact | CoreType::Enchantment | CoreType::Planeswalker | CoreType::Battle | CoreType::Land))
+            && !types.iter().any(|t| {
+                matches!(
+                    t,
+                    CoreType::Creature
+                        | CoreType::Artifact
+                        | CoreType::Enchantment
+                        | CoreType::Planeswalker
+                        | CoreType::Battle
+                        | CoreType::Land
+                )
+            })
     })
 }
 

@@ -501,6 +501,7 @@ mod tests {
             zone_quality: 1.0,
             card_advantage: 1.0,
             synergy: 1.0,
+            library_pressure: 0.0,
         };
         // 1+…+9 = 45; both controls (energy 100, mana-development 200) are
         // excluded. Leaking energy alone gives 145, mana-development alone 245,

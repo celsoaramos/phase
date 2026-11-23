@@ -15,8 +15,8 @@ use engine::ai_support::{
     retarget_actions, root_may_yield_adverse_exchange, targeted_exchange_verdict,
     validated_candidate_actions_for_semantic_owner, AiDecisionContract, TargetedExchangeVerdict,
 };
-use engine::game::mana_payment::{mana_type_to_demand_index, outer_cost_color_demand, ColorDemand};
 use engine::game::game_object::ObjectIncarnationRefExt;
+use engine::game::mana_payment::{mana_type_to_demand_index, outer_cost_color_demand, ColorDemand};
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, Effect, ResolvedAbility, TargetFilter, TargetRef,
 };
@@ -4617,12 +4617,26 @@ pub(crate) fn build_ai_context_with_session(
         .get(&player)
         .cloned()
         .unwrap_or_default();
-    let adjusted_weights = crate::eval::EvalWeightSet {
+    let mut adjusted_weights = crate::eval::EvalWeightSet {
         early: deck_profile
             .adjust_weights_with(&config.archetype_multipliers, &config.weights.early),
         mid: deck_profile.adjust_weights_with(&config.archetype_multipliers, &config.weights.mid),
         late: deck_profile.adjust_weights_with(&config.archetype_multipliers, &config.weights.late),
     };
+    if config.deck_guides
+        && session
+            .guide
+            .get(&player)
+            .is_some_and(|guide| guide.win == Some(crate::deck_guide::WinPlan::Mill))
+    {
+        for weights in [
+            &mut adjusted_weights.early,
+            &mut adjusted_weights.mid,
+            &mut adjusted_weights.late,
+        ] {
+            weights.library_pressure = crate::deck_guide::MILL_WEIGHT;
+        }
+    }
     let strategy = session.strategy.get(&player).cloned().unwrap_or_default();
     let mut ctx = AiContext {
         deck_profile,
@@ -4656,6 +4670,51 @@ pub(crate) fn build_ai_context_with_session(
     };
 
     ctx
+}
+
+/// MagicFinder (Etapa 4): swap a guide key card the bottoming picked for a
+/// non-key card of the same kind (land for land, spell for spell) still in
+/// hand, so the land count the plan aimed at holds. With no such card the key
+/// card goes to the bottom as planned.
+fn keep_guide_key_cards_off_bottom(
+    state: &GameState,
+    player: PlayerId,
+    guide: &crate::deck_guide::DeckGuide,
+    exclude: Option<ObjectId>,
+    to_bottom: &mut [ObjectId],
+) {
+    let is_land = |id: &ObjectId| {
+        state
+            .objects
+            .get(id)
+            .is_some_and(|obj| obj.card_types.core_types.contains(&CoreType::Land))
+    };
+    let is_key = |id: &ObjectId| {
+        state
+            .objects
+            .get(id)
+            .is_some_and(|obj| guide.is_key(&obj.name))
+    };
+    let hand: Vec<ObjectId> = state.players[player.0 as usize]
+        .hand
+        .iter()
+        .copied()
+        .collect();
+    for slot in 0..to_bottom.len() {
+        let picked = to_bottom[slot];
+        if !is_key(&picked) {
+            continue;
+        }
+        let replacement = hand.iter().copied().find(|id| {
+            Some(*id) != exclude
+                && !to_bottom.contains(id)
+                && !is_key(id)
+                && is_land(id) == is_land(&picked)
+        });
+        if let Some(replacement) = replacement {
+            to_bottom[slot] = replacement;
+        }
+    }
 }
 
 fn build_ai_context(state: &GameState, player: PlayerId, config: &AiConfig) -> AiContext {
@@ -4764,7 +4823,7 @@ pub(crate) fn deterministic_choice(
                     PendingMulliganAction::UseSerumPowder { object_id } => Some(*object_id),
                     PendingMulliganAction::Keep => None,
                 };
-                let to_bottom = plan_aware_bottom_cards(
+                let mut to_bottom = plan_aware_bottom_cards(
                     state,
                     player,
                     *count as usize,
@@ -4772,6 +4831,17 @@ pub(crate) fn deterministic_choice(
                     plan,
                     exclude,
                 );
+                if config.deck_guides {
+                    if let Some(guide) = ctx.session.guide.get(&player) {
+                        keep_guide_key_cards_off_bottom(
+                            state,
+                            player,
+                            guide,
+                            exclude,
+                            &mut to_bottom,
+                        );
+                    }
+                }
                 return Some(GameAction::SelectCards { cards: to_bottom });
             }
             MulliganDecisionPhase::Declare => {
@@ -4781,8 +4851,18 @@ pub(crate) fn deterministic_choice(
                     .copied()
                     .collect();
                 let turn_order = crate::policies::mulligan::turn_order_for(state, player);
-                let decision = crate::policies::mulligan::MulliganRegistry::default()
+                let mut decision = crate::policies::mulligan::MulliganRegistry::default()
                     .evaluate_hand(&hand, state, features, plan, turn_order, mulligan_count);
+                if config.deck_guides {
+                    if let Some(keep) = ctx
+                        .session
+                        .guide
+                        .get(&player)
+                        .and_then(|guide| guide.mulligan_verdict(state, &hand, mulligan_count))
+                    {
+                        decision.keep = keep;
+                    }
+                }
                 // CR 103.5b + Serum Powder Oracle text: if the AI would mulligan
                 // and it has a Serum Powder in hand, prefer the Powder — it's a
                 // strictly better action than a mulligan (no mulligan count
@@ -5039,11 +5119,25 @@ pub(crate) fn deterministic_choice(
     // selection constraint, so ranking its output covers both the single-card
     // and combinatorial cases without a second local beam.
     if matches!(state.waiting_for, WaitingFor::SearchChoice { .. }) {
+        let guide = config
+            .deck_guides
+            .then(|| state.deck_pool_of(ai_player))
+            .flatten()
+            .and_then(|pool| crate::deck_guide::guide_for_deck(&pool.current_main));
+        let guide_bonus = |cards: &[ObjectId]| -> f64 {
+            guide.as_ref().map_or(0.0, |guide| {
+                cards
+                    .iter()
+                    .filter_map(|id| state.objects.get(id))
+                    .map(|obj| guide.tutor_bonus(&obj.name))
+                    .sum()
+            })
+        };
         let mut scored: Vec<_> = issued_selections(actions)
             .map(|cards| {
                 (
                     cards,
-                    score_search_choice_selection(state, ai_player, cards),
+                    score_search_choice_selection(state, ai_player, cards) + guide_bonus(cards),
                 )
             })
             .collect();

@@ -2454,15 +2454,14 @@ fn own_beginning_phase_cast_is_dominated(ctx: &PolicyContext<'_>) -> bool {
     let Some(object) = ctx.state.objects.get(object_id) else {
         return false;
     };
-    let spell_touches_library = object
-        .abilities
-        .iter()
-        .any(ability_touches_library);
-    let trigger_touches_library = object
-        .trigger_definitions
-        .as_slice()
-        .iter()
-        .any(|entry| entry.definition.execute.as_deref().is_some_and(ability_touches_library));
+    let spell_touches_library = object.abilities.iter().any(ability_touches_library);
+    let trigger_touches_library = object.trigger_definitions.as_slice().iter().any(|entry| {
+        entry
+            .definition
+            .execute
+            .as_deref()
+            .is_some_and(ability_touches_library)
+    });
     !spell_touches_library && !trigger_touches_library
 }
 
