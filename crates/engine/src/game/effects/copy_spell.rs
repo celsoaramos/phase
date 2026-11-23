@@ -2183,6 +2183,10 @@ mod tests {
             ObjectId(20),
             PlayerId(0),
         );
+        // The Chain cycle's copy is "that player MAY copy" — the parsed shape is
+        // optional (CR 707.10c); a mandatory subjectless copy is the controller's.
+        let mut copy_ability = copy_ability;
+        copy_ability.optional = true;
         let mut events = Vec::new();
         resolve(&mut state, &copy_ability, &mut events).unwrap();
         let copy_id = state.stack[1].id;
@@ -2909,6 +2913,9 @@ mod tests {
             ObjectId(10),
             PlayerId(0),
         );
+        // "That player may copy this spell" parses as an optional copy (CR 707.10c).
+        let mut copy_ability = copy_ability;
+        copy_ability.optional = true;
         let mut events = Vec::new();
 
         resolve(&mut state, &copy_ability, &mut events).unwrap();
