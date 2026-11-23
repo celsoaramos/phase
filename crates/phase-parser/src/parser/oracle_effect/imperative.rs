@@ -12891,12 +12891,13 @@ pub(super) fn parse_counter_ast(
         .parse(rest)
         .map(|(after, _)| after)
         .unwrap_or(rest);
-    if let Ok((_, stack_target)) =
+    if let Ok((stack_rest, stack_target)) =
         crate::parser::oracle_nom::target::parse_stack_object_target(stack_phrase)
     {
         let unless_pay = parse_counter_unless_pay(rest)?;
         return Some(ZoneCounterImperativeAst::Counter {
-            target: stack_target,
+            // CR 115.9b: "… that targets <X>" narrows every leg.
+            target: super::with_stack_object_that_clause(stack_target, stack_rest),
             source_rider: None,
             unless_pay,
             all: mass_consumed,

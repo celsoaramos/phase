@@ -308,3 +308,124 @@ fn kalamax_copy_of_monstrous_rage_leaves_one_role() {
         runner.state().waiting_for
     );
 }
+
+// Issue #551 (squad): "Counter target spell or ability that targets a permanent
+// you control" perdia a oração relativa — a tela oferecia uma Force of Will
+// (que mira uma MÁGICA) e o motor recusava o alvo. CR 115.9b.
+const NOT_OF_THIS_WORLD: &str =
+    "Counter target spell or ability that targets a permanent you control.";
+
+/// P0 põe `p0_spell` na pilha mirando `aim`; P1 responde com Not of This World.
+/// Devolve (id do que está na pilha, objetos oferecidos ao Not of This World).
+fn not_of_this_world_offers(aim_own_creature: bool, by_ability: bool) -> (ObjectId, Vec<ObjectId>) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let p1_bear = scenario.add_creature(P1, "P1 Bear", 2, 2).id();
+    let p0_bear = scenario.add_creature(P0, "P0 Bear", 2, 2).id();
+    let aim = if aim_own_creature { p0_bear } else { p1_bear };
+    let shock = scenario
+        .add_spell_to_hand_from_oracle(P0, "Shock", true, SHOCK)
+        .with_mana_cost(ManaCost::generic(0))
+        .with_color(vec![ManaColor::Red])
+        .id();
+    let rod = scenario
+        .add_artifact_from_oracle(
+            P0,
+            "Rod",
+            "{T}: This artifact deals 1 damage to target creature.",
+        )
+        .id();
+    let notw = scenario
+        .add_spell_to_hand_from_oracle(P1, "Not of This World", true, NOT_OF_THIS_WORLD)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    if by_ability {
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: rod,
+                ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
+            })
+            .expect("ativa");
+    } else {
+        let card_id = runner.state().objects[&shock].card_id;
+        runner
+            .act(GameAction::CastSpell {
+                object_id: shock,
+                card_id,
+                targets: vec![],
+                payment_mode: CastPaymentMode::Auto,
+            })
+            .expect("conjura");
+    }
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::TargetSelection { .. } | WaitingFor::TriggerTargetSelection { .. }
+    ) {
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(aim)),
+            })
+            .expect("alvo");
+    }
+    let on_stack = runner.state().stack.last().expect("algo na pilha").id;
+    runner.act(GameAction::PassPriority).expect("P0 passa");
+    let card_id = runner.state().objects[&notw].card_id;
+    let _ = runner.act(GameAction::CastSpell {
+        object_id: notw,
+        card_id,
+        targets: vec![],
+        payment_mode: CastPaymentMode::Auto,
+    });
+    let offered = offered_objects(runner.state());
+    // Com um alvo só, o motor escolhe sozinho: leia a pilha.
+    let chosen: Vec<ObjectId> = runner
+        .state()
+        .stack
+        .iter()
+        .filter(|e| e.id == notw)
+        .flat_map(|e| e.ability().map(|a| a.targets.clone()).unwrap_or_default())
+        .filter_map(|t| match t {
+            TargetRef::Object(o) => Some(o),
+            _ => None,
+        })
+        .collect();
+    (on_stack, if offered.is_empty() { chosen } else { offered })
+}
+
+#[test]
+fn not_of_this_world_counters_spell_targeting_my_permanent() {
+    let (stack_id, offered) = not_of_this_world_offers(false, false);
+    assert!(
+        offered.contains(&stack_id),
+        "Shock no meu Urso é alvo; {offered:?}"
+    );
+}
+
+#[test]
+fn not_of_this_world_ignores_spell_targeting_opponents_permanent() {
+    let (stack_id, offered) = not_of_this_world_offers(true, false);
+    assert!(
+        !offered.contains(&stack_id),
+        "Shock no Urso do próprio P0 não é alvo; {offered:?}"
+    );
+}
+
+#[test]
+fn not_of_this_world_counters_ability_targeting_my_permanent() {
+    let (stack_id, offered) = not_of_this_world_offers(false, true);
+    assert!(
+        offered.contains(&stack_id),
+        "habilidade no meu Urso é alvo; {offered:?}"
+    );
+}
+
+#[test]
+fn not_of_this_world_ignores_ability_targeting_opponents_permanent() {
+    let (stack_id, offered) = not_of_this_world_offers(true, true);
+    assert!(
+        !offered.contains(&stack_id),
+        "habilidade no Urso do P0 não é alvo; {offered:?}"
+    );
+}

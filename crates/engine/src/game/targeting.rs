@@ -3550,7 +3550,9 @@ fn add_stack_abilities(
         if entry.id == source_id {
             continue; // Don't target yourself
         }
-        if stack_ability_matches_filter(entry, filter, source_controller) {
+        if stack_ability_matches_filter(entry, filter, source_controller)
+            && stack_ability_targets_constraint_holds(state, entry, filter, source_id)
+        {
             targets.push(TargetRef::Object(entry.id));
         }
     }
@@ -3612,6 +3614,7 @@ fn stack_entry_matches_filter_with_context(
         | StackEntryKind::KeywordAction { .. } => {
             filter_targets_stack_abilities(filter)
                 && stack_ability_matches_filter(entry, filter, source_controller)
+                && stack_ability_targets_constraint_holds(state, entry, filter, source_id)
         }
         // CR 112.1 + CR 113.3b: combat damage on the stack is neither a spell
         // nor an ability, so no filter can name it — not as a target and not as
@@ -3622,6 +3625,63 @@ fn stack_entry_matches_filter_with_context(
         // `GameObject` rather than skipping it.
         StackEntryKind::CombatDamage { .. } => false,
     }
+}
+
+/// CR 115.9b: "spell or ability that targets <X>" (Not of This World): an
+/// ability leg narrowed by `And[StackAbility, Typed{Targets(X)}]` admits only
+/// an ability with at least one target matching X. Legs without the clause
+/// are unconstrained.
+fn stack_ability_targets_constraint_holds(
+    state: &GameState,
+    entry: &StackEntry,
+    filter: &TargetFilter,
+    source_id: ObjectId,
+) -> bool {
+    fn ability_leg_constraint(filter: &TargetFilter) -> Option<Option<TargetFilter>> {
+        match filter {
+            TargetFilter::StackAbility { .. } => Some(None),
+            TargetFilter::And { filters }
+                if filters
+                    .iter()
+                    .any(|f| matches!(f, TargetFilter::StackAbility { .. })) =>
+            {
+                Some(filters.iter().find_map(super::filter::extract_targets))
+            }
+            TargetFilter::Or { filters } => {
+                let legs: Vec<_> = filters.iter().filter_map(ability_leg_constraint).collect();
+                if legs.is_empty() {
+                    None
+                } else if legs.iter().any(Option::is_none) {
+                    // Some ability leg is unconstrained.
+                    Some(None)
+                } else {
+                    legs.into_iter().next()
+                }
+            }
+            _ => None,
+        }
+    }
+    let Some(Some(constraint)) = ability_leg_constraint(filter) else {
+        return true;
+    };
+    let source_controller_opt = state.objects.get(&source_id).map(|o| o.controller);
+    let bare_ctx = super::filter::FilterContext::from_source(state, source_id);
+    let targets = entry
+        .ability()
+        .map(super::ability_utils::declared_targets_in_chain)
+        .unwrap_or_default();
+    targets.iter().any(|t| match t {
+        TargetRef::Object(id) => {
+            super::filter::matches_target_filter(state, *id, &constraint, &bare_ctx)
+        }
+        TargetRef::Player(pid) => super::filter::player_matches_target_filter_in_state(
+            state,
+            &constraint,
+            *pid,
+            source_controller_opt,
+            Some(source_id),
+        ),
+    })
 }
 
 fn stack_ability_matches_filter(

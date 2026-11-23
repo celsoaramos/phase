@@ -22858,10 +22858,10 @@ fn try_parse_verb_and_target<'a>(
             .map(|(phrase, _)| phrase)
             .unwrap_or(rest_lower);
         let (parsed_target, rem) = parse_target_with_ctx(rest, ctx);
-        let target = if let Ok((_, stack_target)) =
+        let target = if let Ok((stack_rest, stack_target)) =
             crate::parser::oracle_nom::target::parse_stack_object_target(stack_phrase)
         {
-            stack_target
+            with_stack_object_that_clause(stack_target, stack_rest)
         } else if scan_contains_phrase(rest_lower, "activated or triggered ability") {
             // CR 701.6: "activated or triggered ability" is a special-case target
             // that maps to StackAbility. We still use parse_target's remainder to
@@ -54900,6 +54900,39 @@ fn add_filter_props(target: TargetFilter, props: &[FilterProp]) -> TargetFilter 
                 TargetFilter::Typed(TypedFilter::default().properties(props.to_vec())),
             ],
         },
+    }
+}
+
+/// CR 115.9b: a "that targets <X>" relative clause after a stack-object phrase
+/// ("Counter target spell or ability that targets a permanent you control" —
+/// Not of This World) narrows EVERY leg of the disjunction: each leg becomes
+/// `And[leg, Typed{Targets(X)}]`, the same shape `parse_target` gives the
+/// spell-only form (Turn Aside). Without a recognised clause the filter is
+/// returned as-is.
+pub(crate) fn with_stack_object_that_clause(filter: TargetFilter, rest: &str) -> TargetFilter {
+    let Some((props, _)) = crate::parser::oracle_target::parse_that_clause_suffix(rest, None)
+    else {
+        return filter;
+    };
+    if !props.iter().any(|p| {
+        matches!(
+            p,
+            FilterProp::Targets { .. } | FilterProp::TargetsOnly { .. }
+        )
+    }) {
+        return filter;
+    }
+    let narrow = |leg: TargetFilter| TargetFilter::And {
+        filters: vec![
+            leg,
+            TargetFilter::Typed(TypedFilter::default().properties(props.clone())),
+        ],
+    };
+    match filter {
+        TargetFilter::Or { filters } => TargetFilter::Or {
+            filters: filters.into_iter().map(narrow).collect(),
+        },
+        other => narrow(other),
     }
 }
 
