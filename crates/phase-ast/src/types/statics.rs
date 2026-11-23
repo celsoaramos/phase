@@ -1125,6 +1125,14 @@ pub enum StaticMode {
         max: u32,
     },
     CantBeTargeted,
+    /// CR 115.4: a descriptive targeting restriction narrower than Shroud or
+    /// Hexproof — "~ can't be the target of black or red spells your opponents
+    /// control" (Fiendslayer Paladin), "… of nongreen spells or abilities from
+    /// nongreen sources" (Gaea's Revenge). The affected object can't be the
+    /// target of a spell or ability whose source matches `restriction`.
+    CantBeTargetedBy {
+        restriction: TargetingRestriction,
+    },
     /// CR 101.2: Blanket casting prohibition — prevents the scoped player(s) from casting spells.
     /// E.g., Steel Golem: "You can't cast creature spells." (Controller scope + creature filter)
     CantBeCast {
@@ -2485,6 +2493,34 @@ pub enum StaticMode {
     Other(String),
 }
 
+/// CR 115.4: which spells and abilities a [`StaticMode::CantBeTargetedBy`]
+/// restriction stops from targeting the affected object.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TargetingRestriction {
+    /// Spells (objects on the stack) are restricted.
+    pub spells: bool,
+    /// Activated and triggered abilities are restricted (their source's
+    /// characteristics are what is checked — "abilities from red sources").
+    pub abilities: bool,
+    /// The color quality the restricted source must have.
+    pub quality: TargetingSourceQuality,
+    /// "your opponents control" — only sources controlled by an opponent of the
+    /// affected object's controller are restricted.
+    pub opponents_only: bool,
+}
+
+/// CR 105.2: the color quality of a [`TargetingRestriction`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum TargetingSourceQuality {
+    /// The source is any of these colors ("black or red").
+    AnyOf { colors: Vec<ManaColor> },
+    /// The source is none of these colors ("nongreen").
+    NoneOf { colors: Vec<ManaColor> },
+    /// CR 105.2c: the source is exactly one color ("monocolored").
+    Monocolored,
+}
+
 /// Fieldless discriminant mirror of [`StaticMode`], used for O(1) discriminant-only
 /// existence queries (see [`StaticModePresence`]) without touching each variant's payload.
 ///
@@ -2504,6 +2540,7 @@ pub enum StaticModeKind {
     MaxAttackersEachCombat,
     MaxBlockersEachCombat,
     CantBeTargeted,
+    CantBeTargetedBy,
     CantBeCast,
     CantBeActivated,
     CantSearchLibrary,
@@ -2661,6 +2698,7 @@ impl StaticMode {
             StaticMode::MaxAttackersEachCombat { .. } => StaticModeKind::MaxAttackersEachCombat,
             StaticMode::MaxBlockersEachCombat { .. } => StaticModeKind::MaxBlockersEachCombat,
             StaticMode::CantBeTargeted => StaticModeKind::CantBeTargeted,
+            StaticMode::CantBeTargetedBy { .. } => StaticModeKind::CantBeTargetedBy,
             StaticMode::CantBeCast { .. } => StaticModeKind::CantBeCast,
             StaticMode::CantBeActivated { .. } => StaticModeKind::CantBeActivated,
             StaticMode::CantSearchLibrary { .. } => StaticModeKind::CantSearchLibrary,
@@ -2839,6 +2877,7 @@ impl StaticMode {
             | StaticMode::MaxAttackersEachCombat { .. }
             | StaticMode::MaxBlockersEachCombat { .. }
             | StaticMode::CantBeTargeted
+            | StaticMode::CantBeTargetedBy { .. }
             | StaticMode::CantBeCast { .. }
             | StaticMode::CantBeActivated { .. }
             | StaticMode::CantSearchLibrary { .. }
@@ -3223,6 +3262,7 @@ impl StaticMode {
             | StaticMode::MaxAttackersEachCombat { .. }
             | StaticMode::MaxBlockersEachCombat { .. }
             | StaticMode::CantBeTargeted
+            | StaticMode::CantBeTargetedBy { .. }
             | StaticMode::CantBeCast { .. }
             | StaticMode::CantBeActivated { .. }
             | StaticMode::CantSearchLibrary { .. }
@@ -3357,6 +3397,7 @@ impl fmt::Display for StaticMode {
                 write!(f, "MaxBlockersEachCombat({max})")
             }
             StaticMode::CantBeTargeted => write!(f, "CantBeTargeted"),
+            StaticMode::CantBeTargetedBy { .. } => write!(f, "CantBeTargetedBy"),
             StaticMode::CantBeCast { who } => write!(f, "CantBeCast({who})"),
             StaticMode::CantBeActivated { who, .. } => write!(f, "CantBeActivated({who})"),
             StaticMode::CantSearchLibrary { cause } => write!(f, "CantSearchLibrary({cause})"),

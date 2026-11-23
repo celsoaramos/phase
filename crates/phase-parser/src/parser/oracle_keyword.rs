@@ -1339,12 +1339,190 @@ fn parse_craft_material_count(input: &str) -> Option<(&str, CostObjectCount)> {
 /// CR 702.11a: Hexproof restricts only opponents' spells/abilities), so callers
 /// map them onto the existing keyword targeting checks rather than a bespoke rule
 /// static, getting the correct controller scope for free.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CantBeTargetedScope {
     /// CR 702.18a: blanket — can't be targeted by ANY player (Shroud).
     AnyPlayer,
     /// CR 702.11a: only spells/abilities an opponent controls (Hexproof).
     OpponentsOnly,
+    /// CR 115.4: a color-qualified restriction narrower than both keywords
+    /// ("black or red spells your opponents control"). Not a keyword: callers
+    /// emit `StaticMode::CantBeTargetedBy`.
+    Restricted(crate::types::statics::TargetingRestriction),
+}
+
+impl CantBeTargetedScope {
+    /// The continuous modification that gives the affected object this
+    /// restriction: the Shroud / Hexproof keyword, or the restriction static.
+    pub(crate) fn modification(self) -> crate::types::ability::ContinuousModification {
+        use crate::types::ability::ContinuousModification;
+        match self {
+            CantBeTargetedScope::AnyPlayer => ContinuousModification::AddKeyword {
+                keyword: Keyword::Shroud,
+            },
+            CantBeTargetedScope::OpponentsOnly => ContinuousModification::AddKeyword {
+                keyword: Keyword::Hexproof,
+            },
+            CantBeTargetedScope::Restricted(restriction) => ContinuousModification::AddStaticMode {
+                mode: crate::types::statics::StaticMode::CantBeTargetedBy { restriction },
+            },
+        }
+    }
+}
+
+/// CR 105.2: one color quality word of a targeting restriction — "black",
+/// "nongreen" (negated) or "monocolored".
+#[derive(Clone, Copy)]
+enum RestrictionColorWord {
+    Color(crate::types::mana::ManaColor),
+    NonColor(crate::types::mana::ManaColor),
+    Monocolored,
+}
+
+fn parse_restriction_color_word(input: &str) -> OracleResult<'_, RestrictionColorWord> {
+    alt((
+        value(RestrictionColorWord::Monocolored, tag("monocolored")),
+        preceded(tag("non"), nom_primitives::parse_color).map(RestrictionColorWord::NonColor),
+        nom_primitives::parse_color.map(RestrictionColorWord::Color),
+    ))
+    .parse(input)
+}
+
+/// "black or red" / "white, blue, or black" / "nongreen" / "monocolored",
+/// folded into one quality. Mixed negation ("black or nongreen") is not a form
+/// the cards print and is rejected.
+fn parse_restriction_quality(
+    input: &str,
+) -> OracleResult<'_, crate::types::statics::TargetingSourceQuality> {
+    use crate::types::statics::TargetingSourceQuality;
+    let (mut rest, first) = parse_restriction_color_word(input)?;
+    let mut words = vec![first];
+    loop {
+        let sep = alt((
+            tag::<_, _, OracleError<'_>>(", or "),
+            tag(" or "),
+            tag(", "),
+        ))
+        .parse(rest);
+        let Ok((after_sep, _)) = sep else { break };
+        let Ok((after_word, word)) = parse_restriction_color_word(after_sep) else {
+            break;
+        };
+        words.push(word);
+        rest = after_word;
+    }
+    let quality = match words.as_slice() {
+        [RestrictionColorWord::Monocolored] => Some(TargetingSourceQuality::Monocolored),
+        _ if words
+            .iter()
+            .all(|w| matches!(w, RestrictionColorWord::Color(_))) =>
+        {
+            Some(TargetingSourceQuality::AnyOf {
+                colors: words
+                    .iter()
+                    .filter_map(|w| match w {
+                        RestrictionColorWord::Color(c) => Some(*c),
+                        _ => None,
+                    })
+                    .collect(),
+            })
+        }
+        _ if words
+            .iter()
+            .all(|w| matches!(w, RestrictionColorWord::NonColor(_))) =>
+        {
+            Some(TargetingSourceQuality::NoneOf {
+                colors: words
+                    .iter()
+                    .filter_map(|w| match w {
+                        RestrictionColorWord::NonColor(c) => Some(*c),
+                        _ => None,
+                    })
+                    .collect(),
+            })
+        }
+        _ => None,
+    };
+    match quality {
+        Some(q) => Ok((rest, q)),
+        None => Err(crate::parser::oracle_nom::error::oracle_err(input)),
+    }
+}
+
+/// " your opponents control" / " an opponent controls".
+fn parse_restriction_opponents(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        alt((
+            tag::<_, _, OracleError<'_>>(" your opponents control"),
+            tag(" an opponent controls"),
+        )),
+    )
+    .parse(input)
+}
+
+/// CR 115.4: the body after "can't be the target of " for a color-qualified
+/// restriction:
+///   `<quality> spells [opp] [or abilities [from <quality> sources] [opp]]`
+///   `<quality> spells or abilities from <quality> sources [opp]`
+/// (Fiendslayer Paladin, Karplusan Strider, Gaea's Revenge, Suq'ata Firewalker,
+/// Sphinx of the Guildpact, Thrun, Breaker of Silence).
+fn parse_targeting_restriction_body(
+    input: &str,
+) -> OracleResult<'_, crate::types::statics::TargetingRestriction> {
+    let (rest, quality) = parse_restriction_quality(input)?;
+    let (rest, _) = tag(" spells").parse(rest)?;
+    let (rest, spell_opp) = opt(parse_restriction_opponents).parse(rest)?;
+    let (rest, abilities) = opt((
+        tag(" or abilities"),
+        opt((tag(" from "), parse_restriction_quality, tag(" sources"))),
+        opt(parse_restriction_opponents),
+    ))
+    .parse(rest)?;
+    let (rest, _) = opt(tag(".")).parse(rest)?;
+    let (rest, _) = eof.parse(rest)?;
+    let mut opponents_only = spell_opp.is_some();
+    if let Some((_, from, ability_opp)) = &abilities {
+        // The "from <quality> sources" leg must name the same quality as the
+        // spell leg — two different qualities is not one restriction.
+        if let Some((_, from_quality, _)) = from {
+            if *from_quality != quality {
+                return Err(crate::parser::oracle_nom::error::oracle_err(input));
+            }
+        }
+        // "… spells your opponents control or abilities …" with the qualifier
+        // on only one leg would mean different scopes; the printed cards repeat it.
+        if spell_opp.is_some() && ability_opp.is_none() && from.is_some() {
+            return Err(crate::parser::oracle_nom::error::oracle_err(input));
+        }
+        opponents_only = opponents_only || ability_opp.is_some();
+    }
+    Ok((
+        rest,
+        crate::types::statics::TargetingRestriction {
+            spells: true,
+            abilities: abilities.is_some(),
+            quality,
+            opponents_only,
+        },
+    ))
+}
+
+/// The color-qualified restriction in a "can't be the target of …" predicate,
+/// if the predicate is one (see [`parse_targeting_restriction_body`]).
+fn parse_targeting_restriction(
+    predicate_lower: &str,
+) -> Option<crate::types::statics::TargetingRestriction> {
+    scan_at_word_boundaries(predicate_lower, |i| {
+        preceded(
+            alt((
+                tag::<_, _, OracleError<'_>>("can't be the target of "),
+                tag("cannot be the target of "),
+            )),
+            parse_targeting_restriction_body,
+        )
+        .parse(i)
+    })
 }
 
 /// Classify a predicate carrying a "can't be the target[ed]" prohibition.
@@ -1359,6 +1537,12 @@ pub(crate) fn classify_cant_be_targeted(predicate_lower: &str) -> Option<CantBeT
         || scan_contains(predicate_lower, "cannot be targeted");
     if !is_prohibition {
         return None;
+    }
+    // CR 115.4: a color qualifier on the spells ("black or red spells your
+    // opponents control") is narrower than either keyword — it must be checked
+    // before the bare opponents qualifier, which would read it as Hexproof.
+    if let Some(restriction) = parse_targeting_restriction(predicate_lower) {
+        return Some(CantBeTargetedScope::Restricted(restriction));
     }
     // CR 702.11a: an opponent-controlled qualifier makes this Hexproof, not Shroud.
     if scan_contains(predicate_lower, "your opponents control")

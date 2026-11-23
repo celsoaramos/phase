@@ -2874,6 +2874,12 @@ pub(crate) fn parse_static_line_inner(
                 StaticDefinition::new(StaticMode::CantBeTargeted)
                     .affected(TargetFilter::SelfRef)
                     .description(text.to_string())
+            } // CR 115.4: color-qualified ("black or red spells your opponents
+            // control") — narrower than both keywords, checked by its own mode.
+            crate::parser::oracle_keyword::CantBeTargetedScope::Restricted(restriction) => {
+                StaticDefinition::new(StaticMode::CantBeTargetedBy { restriction })
+                    .affected(TargetFilter::SelfRef)
+                    .description(text.to_string())
             }
         });
     }

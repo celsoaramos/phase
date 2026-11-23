@@ -3861,6 +3861,7 @@ fn static_mode_projected_count(mode: &crate::types::statics::StaticMode) -> Opti
         | StaticMode::MaxAttackersEachCombat { .. }
         | StaticMode::MaxBlockersEachCombat { .. }
         | StaticMode::CantBeTargeted
+        | StaticMode::CantBeTargetedBy { .. }
         | StaticMode::CantBeCast { .. }
         | StaticMode::CantBeActivated { .. }
         | StaticMode::CantSearchLibrary { .. }
@@ -7715,6 +7716,7 @@ fn static_mode_references_growing_class(mode: &crate::types::statics::StaticMode
         | StaticMode::MaxAttackersEachCombat { .. }
         | StaticMode::MaxBlockersEachCombat { .. }
         | StaticMode::CantBeTargeted
+        | StaticMode::CantBeTargetedBy { .. }
         | StaticMode::CantBeCast { .. }
         | StaticMode::CantBeActivated { .. }
         | StaticMode::CantSearchLibrary { .. }

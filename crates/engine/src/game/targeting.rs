@@ -263,6 +263,7 @@ fn find_legal_targets_with_context(
     // When the ability carries a captured trigger source, use the live object only if
     // `ExactLive`; otherwise use the captured LKI name.
     let source_projection_name = source_projection_name(state, target_ctx, source_id);
+    let source_is_spell = targeting_source_is_spell(state, target_ctx, source_id);
 
     // SpecificObject is runtime-bound (not used for target selection)
     if matches!(filter, TargetFilter::SpecificObject { .. }) {
@@ -492,6 +493,7 @@ fn find_legal_targets_with_context(
                                 source_id,
                                 source_ignores_hexproof,
                                 source_projection_name,
+                                source_is_spell,
                                 state,
                             ) {
                                 targets.push(TargetRef::Object(obj_id));
@@ -587,6 +589,7 @@ fn find_legal_targets_with_context(
                     source_id,
                     source_ignores_hexproof,
                     source_projection_name,
+                    source_is_spell,
                     state,
                 ) {
                     targets.push(TargetRef::Object(obj_id));
@@ -625,6 +628,7 @@ fn has_legal_target_with_context(
         crate::game::static_abilities::player_ignores_hexproof(state, source_controller);
 
     let source_projection_name = source_projection_name(state, target_ctx, source_id);
+    let source_is_spell = targeting_source_is_spell(state, target_ctx, source_id);
 
     let explicit_zones = extract_explicit_zones(filter);
     if !explicit_zones.is_empty() {
@@ -640,6 +644,7 @@ fn has_legal_target_with_context(
                         source_id,
                         source_ignores_hexproof,
                         source_projection_name,
+                        source_is_spell,
                         state,
                     ) {
                         return true;
@@ -668,6 +673,7 @@ fn has_legal_target_with_context(
                 source_id,
                 source_ignores_hexproof,
                 source_projection_name,
+                source_is_spell,
                 state,
             ) {
                 return true;
@@ -3843,6 +3849,80 @@ fn has_functioning_cant_be_targeted(
         .any(|def| matches!(def.mode, crate::types::statics::StaticMode::CantBeTargeted))
 }
 
+/// CR 115.4: whether `obj` carries an active `CantBeTargetedBy` restriction
+/// that `source_id` (the spell on the stack, or the source of an ability)
+/// matches.
+fn is_restricted_from_source(
+    obj: &crate::game::game_object::GameObject,
+    source_id: ObjectId,
+    source_controller: PlayerId,
+    source_is_spell: bool,
+    state: &GameState,
+) -> bool {
+    let Some(source) = state.objects.get(&source_id) else {
+        return false;
+    };
+    super::functioning_abilities::active_static_definitions(state, obj).any(|def| {
+        let crate::types::statics::StaticMode::CantBeTargetedBy { restriction } = &def.mode else {
+            return false;
+        };
+        targeting_restriction_matches(
+            restriction,
+            source,
+            source_is_spell,
+            source_controller,
+            obj.controller,
+        )
+    })
+}
+
+/// CR 115.4 + CR 112.1: is the targeting source a spell (rather than an
+/// activated or triggered ability)? A triggered ability's resolved form is also
+/// `AbilityKind::Spell`, so the trigger context decides; without an ability in
+/// context, a source on the stack is a spell.
+fn targeting_source_is_spell(
+    state: &GameState,
+    target_ctx: &super::filter::FilterContext,
+    source_id: ObjectId,
+) -> bool {
+    let Some(source) = state.objects.get(&source_id) else {
+        return false;
+    };
+    match target_ctx.ability {
+        Some(ability) => {
+            matches!(ability.kind, crate::types::ability::AbilityKind::Spell)
+                && ability.trigger_source.is_none()
+                && ability.trigger_definition_ref.is_none()
+                && source.zone != Zone::Battlefield
+        }
+        None => source.zone == Zone::Stack,
+    }
+}
+
+/// CR 115.4 + CR 105.2: does a source match a targeting restriction?
+pub(crate) fn targeting_restriction_matches(
+    restriction: &crate::types::statics::TargetingRestriction,
+    source: &crate::game::game_object::GameObject,
+    is_spell: bool,
+    source_controller: PlayerId,
+    protected_controller: PlayerId,
+) -> bool {
+    use crate::types::statics::TargetingSourceQuality;
+    if restriction.opponents_only && source_controller == protected_controller {
+        return false;
+    }
+    if (is_spell && !restriction.spells) || (!is_spell && !restriction.abilities) {
+        return false;
+    }
+    match &restriction.quality {
+        TargetingSourceQuality::AnyOf { colors } => source.color.iter().any(|c| colors.contains(c)),
+        TargetingSourceQuality::NoneOf { colors } => {
+            !source.color.iter().any(|c| colors.contains(c))
+        }
+        TargetingSourceQuality::Monocolored => source.color.len() == 1,
+    }
+}
+
 /// CR 608.2g: expose a parked resolving spell only while its object is still
 /// on the stack, without duplicating entries that are already live there.
 fn targetable_stack_spell_entries(state: &GameState) -> impl Iterator<Item = &StackEntry> {
@@ -4077,6 +4157,10 @@ fn can_target(
         source_id,
         source_ignores_hexproof,
         None,
+        state
+            .objects
+            .get(&source_id)
+            .is_some_and(|o| o.zone == Zone::Stack),
         state,
     )
 }
@@ -4089,6 +4173,7 @@ fn can_target_with_source_name(
     source_id: ObjectId,
     source_ignores_hexproof: bool,
     source_name: Option<&str>,
+    source_is_spell: bool,
     state: &GameState,
 ) -> bool {
     // CR 702.18a: Shroud prevents targeting by any player.
@@ -4142,6 +4227,11 @@ fn can_target_with_source_name(
     // it is handled by the Hexproof branch above rather than here.
     // Per-object (reads `obj`'s own static definitions) — correctly NOT hoisted.
     if has_functioning_cant_be_targeted(obj, state) {
+        return false;
+    }
+    // CR 115.4: a color-qualified "can't be the target of …" restriction
+    // (Fiendslayer Paladin). Not hexproof: "ignore hexproof" does not bypass it.
+    if is_restricted_from_source(obj, source_id, source_controller, source_is_spell, state) {
         return false;
     }
     // CR 702.21a: Ward is a triggered ability, not a targeting restriction.

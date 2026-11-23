@@ -7592,17 +7592,9 @@ fn build_restriction_clause(
     // scope (Hexproof leaves the controller able to target), reusing the enforced
     // keyword path rather than a scope-less rule static.
     if let Some(scope) = crate::parser::oracle_keyword::classify_cant_be_targeted(&lower) {
-        let keyword = match scope {
-            crate::parser::oracle_keyword::CantBeTargetedScope::AnyPlayer => {
-                crate::types::keywords::Keyword::Shroud
-            }
-            crate::parser::oracle_keyword::CantBeTargetedScope::OpponentsOnly => {
-                crate::types::keywords::Keyword::Hexproof
-            }
-        };
         let static_def = StaticDefinition::continuous()
             .affected(static_affected_for_application(&application))
-            .modifications(vec![ContinuousModification::AddKeyword { keyword }])
+            .modifications(vec![scope.modification()])
             .description(predicate.to_string());
         return Some(ParsedEffectClause {
             optional_targeting: false,
@@ -8096,6 +8088,10 @@ pub(crate) fn static_mode_needs_grant_propagation(mode: &StaticMode) -> bool {
             // bypass in replacement.rs::destroy_applier observes it via
             // active_static_definitions.
             | StaticMode::CantBeRegenerated
+            // CR 115.4: a granted color-qualified targeting restriction
+            // ("Enchanted creature can't be the target of black spells") is
+            // read off the recipient's active static definitions.
+            | StaticMode::CantBeTargetedBy { .. }
             // CR 702.18a: CantBeTargeted (the descriptive Shroud form) is granted to
             // a subject/target creature and must propagate onto its
             // `static_definitions` so the targeting check in `targeting.rs::can_target`

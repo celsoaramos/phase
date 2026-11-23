@@ -1981,11 +1981,7 @@ pub(crate) fn push_grant_clause_modifications(
     if let Some(scope) =
         crate::parser::oracle_keyword::classify_cant_be_targeted(part_lower.as_str())
     {
-        let keyword = match scope {
-            crate::parser::oracle_keyword::CantBeTargetedScope::AnyPlayer => Keyword::Shroud,
-            crate::parser::oracle_keyword::CantBeTargetedScope::OpponentsOnly => Keyword::Hexproof,
-        };
-        modifications.push(ContinuousModification::AddKeyword { keyword });
+        modifications.push(scope.modification());
         return;
     }
 

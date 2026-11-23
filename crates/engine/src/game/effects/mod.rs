@@ -10469,6 +10469,7 @@ fn static_mode_reads_filter_population(
         | StaticMode::MaxAttackersEachCombat { .. }
         | StaticMode::MaxBlockersEachCombat { .. }
         | StaticMode::CantBeTargeted
+        | StaticMode::CantBeTargetedBy { .. }
         | StaticMode::CantBeCast { .. }
         | StaticMode::CantSearchLibrary { .. }
         | StaticMode::RestrictLibrarySearchToTop { .. }

@@ -1813,6 +1813,12 @@ pub(crate) fn try_split_and_cant_be_targeted(text: &str) -> Option<Vec<StaticDef
                 .affected(affected)
                 .description(text.to_string())
         }
+        // CR 115.4: color-qualified restriction — its own mode.
+        crate::parser::oracle_keyword::CantBeTargetedScope::Restricted(restriction) => {
+            StaticDefinition::new(StaticMode::CantBeTargetedBy { restriction })
+                .affected(affected)
+                .description(text.to_string())
+        }
     };
     defs.push(companion);
     Some(defs)

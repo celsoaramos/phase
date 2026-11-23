@@ -428,6 +428,14 @@ fn drain_spell_copied_observer_triggers(
 /// a `TargetRef::Player` in scope unambiguously identifies the copy's
 /// controller.
 fn copy_controller(ability: &ResolvedAbility) -> PlayerId {
+    // CR 707.10 + CR 707.10c: an inherited player target names the copier only
+    // for the OPTIONAL "that player may copy this spell" (the Chain cycle). A
+    // mandatory subjectless "copy that spell" is the controller's instruction,
+    // even after an earlier clause targeted a player (Alania, Divergent Storm:
+    // "you may have target opponent draw a card. If you do, copy that spell").
+    if !ability.optional {
+        return ability.controller;
+    }
     ability
         .targets
         .iter()

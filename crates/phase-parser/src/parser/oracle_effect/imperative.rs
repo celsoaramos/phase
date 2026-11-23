@@ -19693,17 +19693,10 @@ fn try_parse_subjectless_cant(lower: &str) -> Option<ImperativeFamilyAst> {
     // (Hexproof leaves the controller able to target), reusing the enforced keyword
     // path rather than a scope-less rule static.
     if let Some(scope) = crate::parser::oracle_keyword::classify_cant_be_targeted(clean) {
-        let keyword = match scope {
-            crate::parser::oracle_keyword::CantBeTargetedScope::AnyPlayer => {
-                crate::types::keywords::Keyword::Shroud
-            }
-            crate::parser::oracle_keyword::CantBeTargetedScope::OpponentsOnly => {
-                crate::types::keywords::Keyword::Hexproof
-            }
-        };
         return Some(ImperativeFamilyAst::GainKeyword(Effect::GenericEffect {
-            static_abilities: vec![StaticDefinition::continuous()
-                .modifications(vec![ContinuousModification::AddKeyword { keyword }])],
+            static_abilities: vec![
+                StaticDefinition::continuous().modifications(vec![scope.modification()])
+            ],
             duration: Some(duration),
             target: None,
             end_cost: None,
