@@ -11,6 +11,7 @@ pub(crate) mod combat_sim;
 pub(crate) mod turn_sim;
 pub use turn_sim::{
     budget_stats as turn_sim_budget_stats, playout_stats as turn_sim_playout_stats,
+    response_stats as turn_sim_response_stats,
     stats as turn_sim_stats,
 };
 mod combat_tax;

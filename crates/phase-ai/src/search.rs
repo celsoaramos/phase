@@ -3197,7 +3197,9 @@ fn score_candidates_uncertified(
         prompt_answers,
     );
     let (state, ai_player) = (root_domain.state, root_domain.ai_player);
-    if !config.turn_simulation || !crate::turn_sim::applies(state, ai_player) {
+    if !config.turn_simulation
+        || !crate::turn_sim::applies_with(state, ai_player, config.response_simulation)
+    {
         return scored;
     }
     let context = build_ai_context_with_session(state, ai_player, config, Arc::clone(session));

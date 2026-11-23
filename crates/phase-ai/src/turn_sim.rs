@@ -81,6 +81,17 @@ static PLAYOUTS_DROPPED: AtomicU64 = AtomicU64::new(0);
 static PLAYOUT_STEPS: AtomicU64 = AtomicU64::new(0);
 static UNMEASURED: AtomicU64 = AtomicU64::new(0);
 static OVER_1500_MS: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_DECISIONS: AtomicU64 = AtomicU64::new(0);
+static RESPONSE_SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+/// `(response-window decisions measured, of them swapped)` — the lab's view of
+/// `AiConfig::response_simulation`.
+pub fn response_stats() -> (u64, u64) {
+    (
+        RESPONSE_DECISIONS.load(AtomicOrdering::Relaxed),
+        RESPONSE_SWITCHES.load(AtomicOrdering::Relaxed),
+    )
+}
 
 /// `(decisions whose incumbent could not be measured, decisions over 1.5 s)`.
 pub fn budget_stats() -> (u64, u64) {
@@ -137,16 +148,45 @@ pub(crate) struct TurnSimInput<'a> {
 
 /// Whether `state` is a decision this layer looks a turn ahead for.
 pub(crate) fn applies(state: &GameState, player: PlayerId) -> bool {
+    applies_with(state, player, false)
+}
+
+/// [`applies`], plus the response windows when `responses` is on.
+pub(crate) fn applies_with(state: &GameState, player: PlayerId, responses: bool) -> bool {
     if state.players.len() != 2 || state.format_config.team_based {
         return false;
     }
     if players::opponents(state, player).len() != 1 {
         return false;
     }
-    matches!(state.waiting_for, WaitingFor::Priority { player: p } if p == player)
-        && state.active_player == player
+    if !matches!(state.waiting_for, WaitingFor::Priority { player: p } if p == player) {
+        return false;
+    }
+    if state.active_player == player
         && state.stack.is_empty()
         && matches!(state.phase, Phase::PreCombatMain | Phase::PostCombatMain)
+    {
+        return true;
+    }
+    responses && is_response_window(state, player)
+}
+
+/// A priority window where the AI answers the opponent: the opponent's spell or
+/// ability on top of the stack (counter it, respond with removal or a trick),
+/// or, with an empty stack in the opponent's turn, the combat steps after
+/// attackers are declared and the end step (remove an attacker, flash in a
+/// blocker or a threat).
+fn is_response_window(state: &GameState, player: PlayerId) -> bool {
+    match state.stack.back() {
+        Some(top) => top.controller != player,
+        None => {
+            state.active_player != player
+                && matches!(
+                    state.phase,
+                    Phase::DeclareAttackers | Phase::DeclareBlockers | Phase::End
+                )
+        }
+    }
 }
 
 fn by_score_desc(a: &(GameAction, f64), b: &(GameAction, f64)) -> Ordering {
@@ -271,7 +311,9 @@ pub(crate) fn refine_root_turn(
     scored: Vec<(GameAction, f64)>,
     is_mana: impl Fn(&GameAction) -> bool,
 ) -> Vec<(GameAction, f64)> {
-    if scored.len() < 2 || !applies(input.state, input.player) {
+    if scored.len() < 2
+        || !applies_with(input.state, input.player, input.config.response_simulation)
+    {
         return scored;
     }
     let started = web_time::Instant::now();
@@ -279,8 +321,15 @@ pub(crate) fn refine_root_turn(
     let out = measure_lines(input, scored, is_mana);
     let micros = started.elapsed().as_micros() as u64;
     DECISIONS.fetch_add(1, AtomicOrdering::Relaxed);
-    if out.len() == 1 && before > 1 {
+    let switched = out.len() == 1 && before > 1;
+    if switched {
         SWITCHES.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    if !applies(input.state, input.player) {
+        RESPONSE_DECISIONS.fetch_add(1, AtomicOrdering::Relaxed);
+        if switched {
+            RESPONSE_SWITCHES.fetch_add(1, AtomicOrdering::Relaxed);
+        }
     }
     TOTAL_MICROS.fetch_add(micros, AtomicOrdering::Relaxed);
     MAX_MICROS.fetch_max(micros, AtomicOrdering::Relaxed);

@@ -1467,6 +1467,12 @@ pub struct AiConfig {
     /// heuristic AI on both seats and keep a line that clearly wins
     /// (`turn_sim`). On for "Difícil" (VeryHard) and above.
     pub turn_simulation: bool,
+    /// MagicFinder lab (2026-11-22, Etapa 1): also look a turn ahead at the
+    /// AI's RESPONSE windows — an opponent's spell or ability on top of the
+    /// stack, or the opponent's combat and end step — where the choice is
+    /// counter / remove / flash versus pass. Off in every preset until the lab
+    /// measures it (`rsim=1`).
+    pub response_simulation: bool,
     /// Whether policies may run uncached multi-turn projections at all. Off
     /// only inside a `turn_sim` playout: the playout already plays the
     /// opponent's turn, and a projection per policy call per step is what made
@@ -1705,6 +1711,7 @@ pub fn create_config(difficulty: AiDifficulty, platform: Platform) -> AiConfig {
         combat_lookahead,
         combat_simulation: difficulty >= AiDifficulty::VeryHard,
         turn_simulation: difficulty >= AiDifficulty::VeryHard,
+        response_simulation: false,
         projections: true,
         fetch_route_check: true,
         turn_simulation_clock_ms: None,

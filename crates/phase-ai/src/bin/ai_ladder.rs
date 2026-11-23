@@ -223,6 +223,7 @@ fn parse_spec(spec: &str) -> Result<Side, String> {
             "search_ms" => config.search.time_budget_ms = Some(num()? as u32),
             "csim" => config.combat_simulation = num()? != 0.0,
             "tsim" => config.turn_simulation = num()? != 0.0,
+            "rsim" => config.response_simulation = num()? != 0.0,
             "tsim_ms" => config.turn_simulation_clock_ms = Some(num()? as u32),
             "tsim_lines" => config.turn_simulation_lines = num()? as usize,
             "tsim_worlds" => config.turn_simulation_worlds = num()? as u64,
@@ -1052,6 +1053,8 @@ fn main() {
             ts_micros as f64 / ts_decisions as f64 / 1000.0,
             ts_max as f64 / 1000.0
         );
+        let (r_decisions, r_switches) = phase_ai::turn_sim_response_stats();
+        eprintln!("turn_sim responses: {r_decisions} decisions, {r_switches} swapped");
         let (unmeasured, slow) = phase_ai::turn_sim_budget_stats();
         eprintln!("turn_sim budget: {unmeasured} incumbents unmeasured, {slow} decisions over 1.5 s");
         let (runs, dropped, steps) = phase_ai::turn_sim_playout_stats();
