@@ -2857,6 +2857,20 @@ pub(crate) fn parse_static_line_inner(
     // --- "~ can't be the target" or "~ can't be targeted" ---
     // CR 702.18a / 702.11a: these descriptive phrasings ARE Shroud / Hexproof.
     if let Some(scope) = crate::parser::oracle_keyword::classify_cant_be_targeted(tp.lower) {
+        // CR 303.4e + CR 301.5d: "Enchanted/equipped creature can't be the target
+        // of …" (Canopy Cover) protects the ATTACHED permanent, not the Aura or
+        // Equipment itself. Without this the subject was dropped and the Aura
+        // got the protection while the creature stayed targetable.
+        if let Some(affected) = attached_cant_be_targeted_subject(tp.lower) {
+            // CR 702.18a / 702.11a / 115.4: the host gets Shroud, Hexproof or the
+            // color-qualified restriction, granted through the layer system.
+            return Some(
+                StaticDefinition::continuous()
+                    .affected(affected)
+                    .modifications(vec![scope.modification()])
+                    .description(text.to_string()),
+            );
+        }
         return Some(match scope {
             // CR 702.11a: "... your opponents control" — grant Hexproof so the
             // permanent's own controller can still target it.
@@ -4327,6 +4341,18 @@ fn parse_counters_cant_be_removed_static(
 
 /// Structural-marker site: "your opponents and/or planeswalkers they control"
 /// reads "they control" as a marker; the defender is the opponents either way.
+/// "enchanted creature can't be the target …" / "equipped creature cannot be
+/// targeted …": the attached-subject filter when the line's subject is the
+/// attached permanent (and nothing else stands between it and the predicate).
+fn attached_cant_be_targeted_subject(lower: &str) -> Option<TargetFilter> {
+    let (rest, filter) =
+        crate::parser::oracle_nom::condition::parse_attached_subject_target_filter(lower).ok()?;
+    let predicate_follows = [" can't be ", " cannot be "]
+        .iter()
+        .any(|p| rest.starts_with(p));
+    predicate_follows.then_some(filter)
+}
+
 #[cfg(test)]
 mod structural_marker_tests {
     use super::*;

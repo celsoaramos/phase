@@ -15,6 +15,7 @@ mod reflexive_this_way_delayed_s25;
 mod refurbished_familiar;
 mod regenerate_card_shields_creature;
 mod rejoin_the_fight_choose_pool;
+mod relatos_mesa_20261121_19;
 mod relatos_mesa_20261123_00;
 mod relic_of_progenitus_6446;
 mod remove_all_counters_transform;
