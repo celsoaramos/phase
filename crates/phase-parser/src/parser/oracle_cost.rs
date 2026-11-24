@@ -1207,7 +1207,13 @@ fn parse_single_cost_in(text: &str, channel: CostChannel) -> AbilityCost {
         let filter_text = strip_count_article_prefix(filter_start);
         let (filter, remainder) = parse_type_phrase_folding(filter_text);
         if remainder.trim().is_empty() {
-            let zone = extract_filter_zone(&filter);
+            // CR 112.1 + CR 405.1: "Exile an instant or sorcery spell you control"
+            // (Nivmagus Elemental) names a SPELL — an object on the stack, not a card
+            // in hand. Without the zone the payment layer inferred the hand, and the
+            // ability was activated with the stack empty and nothing exiled.
+            let zone = extract_filter_zone(&filter).or_else(|| {
+                filter_text_names_spell(&filter_text.to_lowercase()).then_some(Zone::Stack)
+            });
             return AbilityCost::Exile {
                 count,
                 zone,
@@ -2527,6 +2533,27 @@ fn try_strip_ability_word_cost(text: &str, channel: CostChannel) -> Option<Abili
         }
     }
     None
+}
+
+/// CR 112.1: the cost's object phrase names a spell ("an instant or sorcery spell
+/// you control", "a spell"), whose only zone is the stack (CR 405.1). "Spell card"
+/// names a card, not a spell, and keeps the existing zone inference.
+fn filter_text_names_spell(lower: &str) -> bool {
+    nom_primitives::scan_at_word_boundaries(lower, parse_spell_word).is_some()
+}
+
+/// The word "spell"/"spells" not followed by "card" or more letters.
+fn parse_spell_word(i: &str) -> nom::IResult<&str, (), super::oracle_nom::error::OracleError<'_>> {
+    let (rest, _) = alt((tag("spells"), tag("spell"))).parse(i)?;
+    let (rest, _) = nom::combinator::not(alt((
+        value((), tag(" card")),
+        value(
+            (),
+            nom::character::complete::satisfy(|c: char| c.is_alphanumeric()),
+        ),
+    )))
+    .parse(rest)?;
+    Ok((rest, ()))
 }
 
 fn extract_filter_zone(filter: &TargetFilter) -> Option<Zone> {
