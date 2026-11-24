@@ -327,6 +327,12 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
         return decision;
     }
 
+    // 24/11/2026 ("jogada ruim do robô" f909ba45): Chord of Calling with X stuck at 0
+    // and no mana-value-0 creature in the library searches for nothing.
+    if let Some(decision) = mf_flags_1124::assess_zero_x_creature_search(ctx) {
+        return decision;
+    }
+
     if zero_direct_spell_is_safe_to_reject(ctx) {
         return GateDecision::Reject;
     }

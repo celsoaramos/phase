@@ -95,12 +95,28 @@ fn stamina_before_combat_is_not_cast() {
 }
 
 #[test]
-fn giant_growth_before_combat_is_not_cast() {
+fn pure_pump_before_combat_is_left_to_effect_timing() {
+    // Coordinated Assault-like: no protective piece, so the gate stays out and the
+    // soft trick score of `EffectTiming` decides (upstream pins that in search.rs).
     let b = board(
         Phase::PreCombatMain,
         (
-            "Giant Growth",
-            "Target creature gets +3/+3 until end of turn.",
+            "Coordinated Assault",
+            "Up to two target creatures each get +1/+0 and gain first strike until end of turn.",
+        ),
+        false,
+    );
+    assert!(engine_offers_cast(&b.state, b.trick));
+    assert!(offers_cast(&scored(&b.state, P0), b.trick));
+}
+
+#[test]
+fn indestructible_trick_before_combat_is_not_cast() {
+    let b = board(
+        Phase::PreCombatMain,
+        (
+            "Gods Willing Lite",
+            "Target creature gets +1/+1 and gains indestructible until end of turn.",
         ),
         false,
     );
@@ -154,5 +170,80 @@ fn evasion_grant_before_combat_is_not_gated() {
     assert!(
         offers_cast(&scored(&b.state, P0), b.trick),
         "unblockable matters before blocks: not this gate's call"
+    );
+}
+
+// ---- Chord of Calling with X stuck at 0 (flag f909ba45) ----
+
+const CHORD: &str = "Search your library for a creature card with mana value X or less, put it onto the battlefield, then shuffle.";
+
+/// The robot's upkeep board of the flag: three Forests, no creature, Chord of Calling
+/// in hand. `library_creature_mv` stages one creature card in the library.
+fn chord_board(forests: usize, library_creature_mv: Option<u32>) -> (GameState, ObjectId) {
+    use engine::types::card_type::CoreType;
+    use engine::types::mana::{ManaColor, ManaCost, ManaCostShard};
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    for _ in 0..forests {
+        scenario.add_basic_land(P0, ManaColor::Green);
+    }
+    let chord = {
+        let mut b = scenario.add_spell_to_hand_from_oracle(P0, "Chord of Calling", true, CHORD);
+        b.with_mana_cost(ManaCost::Cost {
+            shards: vec![
+                ManaCostShard::X,
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+            ],
+            generic: 0,
+        });
+        b.id()
+    };
+    let staged =
+        library_creature_mv.map(|_| scenario.add_card_to_library_top(P0, "Library Creature"));
+    scenario.with_library_top(P0, &["Forest", "Forest"]);
+    scenario.add_creature(P1, "Josu Vess, Lich Knight", 4, 5);
+    let runner = scenario.build();
+    let mut state = runner.state().clone();
+    if let (Some(id), Some(mv)) = (staged, library_creature_mv) {
+        let card = state.objects.get_mut(&id).unwrap();
+        card.card_types.core_types.push(CoreType::Creature);
+        card.base_card_types = card.card_types.clone();
+        card.mana_cost = if mv == 0 {
+            ManaCost::Cost {
+                shards: vec![],
+                generic: 0,
+            }
+        } else {
+            ManaCost::generic(mv)
+        };
+    }
+    state.active_player = P0;
+    state.priority_player = P0;
+    state.waiting_for = WaitingFor::Priority { player: P0 };
+    (state, chord)
+}
+
+#[test]
+fn chord_with_x_zero_and_nothing_to_find_is_not_cast() {
+    let (state, chord) = chord_board(3, Some(3));
+    assert!(
+        engine_offers_cast(&state, chord),
+        "precondition: the engine offers Chord of Calling for X=0"
+    );
+    assert!(
+        !offers_cast(&scored(&state, P0), chord),
+        "X can only be 0 and the library has no mana-value-0 creature: the search finds nothing"
+    );
+}
+
+#[test]
+fn chord_with_x_zero_and_a_zero_drop_in_the_library_stays() {
+    let (state, chord) = chord_board(3, Some(0));
+    assert!(engine_offers_cast(&state, chord));
+    assert!(
+        offers_cast(&scored(&state, P0), chord),
+        "a mana-value-0 creature is a legal find at X=0: fail open"
     );
 }
