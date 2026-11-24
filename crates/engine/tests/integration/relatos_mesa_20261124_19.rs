@@ -12,6 +12,14 @@ use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
+fn p1p1(state: &engine::types::game_state::GameState, id: engine::types::identifiers::ObjectId) -> u32 {
+    state.objects[&id]
+        .counters
+        .get(&CounterType::Plus1Plus1)
+        .copied()
+        .unwrap_or(0)
+}
+
 const NIVMAGUS: &str =
     "Exile an instant or sorcery spell you control: Put two +1/+1 counters on this creature.";
 
@@ -47,7 +55,7 @@ fn nivmagus_cannot_activate_without_a_spell_on_the_stack() {
         "feitiço na MÃO não paga o custo"
     );
     assert_eq!(
-        runner.counters(niv, CounterType::Plus1Plus1),
+        p1p1(runner.state(), niv),
         0,
         "sem mágica na pilha não há o que exilar"
     );
@@ -94,5 +102,5 @@ fn nivmagus_exiles_own_instant_spell_from_the_stack() {
         }
         let _ = runner.act(GameAction::PassPriority);
     }
-    assert_eq!(runner.counters(niv, CounterType::Plus1Plus1), 2);
+    assert_eq!(p1p1(runner.state(), niv), 2);
 }
