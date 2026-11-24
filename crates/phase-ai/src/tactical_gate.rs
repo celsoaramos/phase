@@ -85,6 +85,7 @@ mod mf_flags_1107;
 mod mf_flags_1115;
 mod mf_flags_1116;
 mod mf_flags_1124;
+mod mf_flags_1124b;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateDecision {
@@ -330,6 +331,14 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     // 24/11/2026 ("jogada ruim do robô" f909ba45): Chord of Calling with X stuck at 0
     // and no mana-value-0 creature in the library searches for nothing.
     if let Some(decision) = mf_flags_1124::assess_zero_x_creature_search(ctx) {
+        return decision;
+    }
+
+    // 24/11/2026 ("jogada ruim do robô" ee2f4ebf, e347639b): Skirk Fire Marshal swept
+    // a board that had lethal on the attack. A symmetric damage sweep that kills more
+    // of the robot's own power than the opponents' is a net loss. Proof-backed;
+    // fails open.
+    if let Some(decision) = mf_flags_1124b::assess_self_sweeper(ctx) {
         return decision;
     }
 
