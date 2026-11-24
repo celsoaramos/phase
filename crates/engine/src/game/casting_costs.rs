@@ -6472,8 +6472,9 @@ pub(crate) fn handle_exile_permanent_for_cost(
                 player,
             )
             .with_granting_object(pending.ability.context.granting_object);
+            // CR 112.1: a stack exile leg pays with a spell on the stack.
             let eligible = state.objects.get(&id).is_some_and(|obj| {
-                obj.zone == Zone::Battlefield
+                matches!(obj.zone, Zone::Battlefield | Zone::Stack)
                     && filter
                         .as_ref()
                         .is_none_or(|f| super::filter::matches_target_filter(state, id, f, &ctx))
@@ -7461,7 +7462,15 @@ fn surface_next_interactive_activation_cost_leg(
         }));
     }
 
-    if let Some((count, exile_filter)) = super::casting::find_battlefield_exile_cost(cost) {
+    // CR 112.1: a stack exile leg ("Exile an instant or sorcery spell you
+    // control") chooses among spells on the stack through the same prompt.
+    let object_exile_leg = super::casting::find_battlefield_exile_cost(cost)
+        .map(|(count, filter)| (count, filter, Zone::Battlefield))
+        .or_else(|| {
+            super::casting::find_stack_exile_cost(cost)
+                .map(|(count, filter)| (count, filter, Zone::Stack))
+        });
+    if let Some((count, exile_filter, exile_zone)) = object_exile_leg {
         let effective_filter =
             super::cost_payability::cost_filter_before_x_announcement(Some(exile_filter));
         let eligible = super::cost_payability::eligible_exile_cost_objects(
@@ -7469,7 +7478,7 @@ fn surface_next_interactive_activation_cost_leg(
             player,
             source_id,
             granting_object,
-            Zone::Battlefield,
+            exile_zone,
             effective_filter.as_ref(),
             count,
         );
@@ -8072,7 +8081,8 @@ fn validate_x_mana_sacrifice_residual(
         && (unsupported_sacrifice
             || unsupported_sibling
             || super::casting::find_non_self_exile(cost).is_some()
-            || super::casting::find_battlefield_exile_cost(cost).is_some());
+            || super::casting::find_battlefield_exile_cost(cost).is_some()
+            || super::casting::find_stack_exile_cost(cost).is_some());
     if unhandled_x_residual {
         debug_assert!(
             !unhandled_x_residual,

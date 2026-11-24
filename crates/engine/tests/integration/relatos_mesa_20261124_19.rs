@@ -90,6 +90,15 @@ fn nivmagus_exiles_own_instant_spell_from_the_stack() {
             payment_mode: CastPaymentMode::Auto,
         })
         .expect("ativa com a mágica na pilha");
+    // CR 601.2h: o custo pede a escolha da mágica (a única elegível é Opt).
+    if let WaitingFor::PayCost { choices, .. } = &runner.state().waiting_for {
+        assert_eq!(choices, &vec![instant], "só a mágica própria na pilha paga");
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![instant],
+            })
+            .expect("paga o custo exilando Opt");
+    }
     assert_eq!(
         runner.state().objects[&instant].zone,
         Zone::Exile,
@@ -103,4 +112,8 @@ fn nivmagus_exiles_own_instant_spell_from_the_stack() {
         let _ = runner.act(GameAction::PassPriority);
     }
     assert_eq!(p1p1(runner.state(), niv), 2);
+    assert!(
+        runner.state().stack.is_empty(),
+        "Opt saiu da pilha e não resolve"
+    );
 }

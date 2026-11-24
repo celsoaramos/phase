@@ -26097,6 +26097,22 @@ pub(super) fn find_battlefield_exile_cost(cost: &AbilityCost) -> Option<(u32, &T
     }
 }
 
+/// CR 112.1 + CR 405.1: first non-self Exile leg whose source zone is the STACK
+/// ("Exile an instant or sorcery spell you control" — Nivmagus Elemental). The
+/// object is a spell, so it is chosen from the stack and paid through the same
+/// interactive `PayCost::ExilePermanent` prompt as a battlefield exile.
+pub(crate) fn find_stack_exile_cost(cost: &AbilityCost) -> Option<(u32, &TargetFilter)> {
+    match cost {
+        AbilityCost::Exile {
+            count,
+            zone: Some(Zone::Stack),
+            filter: Some(filter),
+        } if !matches!(filter, TargetFilter::SelfRef) => Some((*count, filter)),
+        AbilityCost::Composite { costs } => costs.iter().find_map(find_stack_exile_cost),
+        _ => None,
+    }
+}
+
 /// Sole detector for a non-self "discard from hand" cost leg. Returns the count
 /// expression, optional card filter, and the `CardSelectionMode` (player-chosen
 /// vs. game-selected) so a single authority drives both the casting/activation
@@ -26432,7 +26448,8 @@ pub(super) fn remove_selected_non_self_exile_cost(cost: AbilityCost) -> Option<A
                 .filter_map(|cost| {
                     if !removed
                         && (find_non_self_exile(&cost).is_some()
-                            || find_battlefield_exile_cost(&cost).is_some())
+                            || find_battlefield_exile_cost(&cost).is_some()
+                            || find_stack_exile_cost(&cost).is_some())
                     {
                         removed = true;
                         remove_selected_non_self_exile_cost(cost)

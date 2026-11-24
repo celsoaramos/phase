@@ -1091,7 +1091,10 @@ pub(crate) fn restrict_activation_prompt_to_joint_payment(
         PayCostKind::Discard => |c| super::casting::find_non_self_discard(c).is_some(),
         PayCostKind::ExileFromZone { .. } => |c| super::casting::find_non_self_exile(c).is_some(),
         PayCostKind::ExilePermanent { .. } => {
-            |c| super::casting::find_battlefield_exile_cost(c).is_some()
+            |c| {
+                super::casting::find_battlefield_exile_cost(c).is_some()
+                    || super::casting::find_stack_exile_cost(c).is_some()
+            }
         }
         PayCostKind::ReturnToHand => |c| super::casting::find_return_to_hand_cost(c).is_some(),
         PayCostKind::Reveal { .. }
