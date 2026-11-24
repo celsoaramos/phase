@@ -84,6 +84,7 @@ use crate::policies::strategy_helpers::{can_pay_ward_cost, ward_cost_against_ai}
 mod mf_flags_1107;
 mod mf_flags_1115;
 mod mf_flags_1116;
+mod mf_flags_1124;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateDecision {
@@ -316,6 +317,13 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     // +1/+1 counter on ~" (Arcbound Ravager) with no stack, no combat and no death
     // payoff throws a card away. Proof-backed; fails open.
     if let Some(decision) = mf_flags_1116::assess_sacrifice_for_counter(ctx) {
+        return decision;
+    }
+
+    // 24/11/2026 ("jogada ruim do robô" 76e88b36): an until-end-of-turn pump or
+    // grant (Supernatural Stamina) cast in the AI's own precombat main phase does the
+    // same work in combat and only shows the trick. Proof-backed; fails open.
+    if let Some(decision) = mf_flags_1124::assess_precombat_trick(ctx) {
         return decision;
     }
 
