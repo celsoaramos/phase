@@ -1897,7 +1897,29 @@ fn reapply_printed_faces_from_card_db(state: &mut GameState, db: &CardDatabase) 
                 obj.printed_ref = printed_ref_from_face(&card_face);
                 obj.base_printed_ref = obj.printed_ref.clone();
             } else {
+                // CR 702.84a + CR 400.7: a replacement installed during the game and
+                // bound to the host's stay on the battlefield (Unearth's "if it would
+                // leave the battlefield, exile it instead", Goryo's Vengeance) is not
+                // printed text, so re-stamping the printed face erased it on every
+                // restore (undo, reload): the unearthed permanent then went to the
+                // graveyard. Carry the runtime definitions over the re-stamp.
+                let runtime_replacements: Vec<ReplacementDefinition> = obj
+                    .base_replacement_definitions
+                    .iter()
+                    .filter(|def| is_runtime_non_copiable_replacement(def))
+                    .cloned()
+                    .collect();
                 apply_card_face_to_object(obj, &card_face);
+                if !runtime_replacements.is_empty() {
+                    let mut base = obj.base_replacement_definitions.as_ref().clone();
+                    for def in runtime_replacements {
+                        if !base.contains(&def) {
+                            base.push(def);
+                        }
+                    }
+                    obj.replacement_definitions = base.clone().into();
+                    obj.base_replacement_definitions = Arc::new(base);
+                }
                 if in_prototype_lifetime {
                     refreshed_ids.push(object_id);
                 } else if obj.prototype_form.is_some() {
