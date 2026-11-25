@@ -1076,6 +1076,18 @@ pub(crate) fn count_trigger_subjects_in_batch(
 ) -> Option<u32> {
     let filter = match valid_card {
         Some(f) if !matches!(f, TargetFilter::SelfRef) => f,
+        // CR 603.2c + CR 701.9a: "Whenever you discard one or more cards, ...
+        // that much/many" (Magmakin Artillerist) has no card filter, and each
+        // `Discarded` event carries an amount of 1 — without this the batch
+        // always read "that much" as 1, however many cards were discarded.
+        // Every discarded card in the firing group is one subject.
+        None if !events.is_empty()
+            && events
+                .iter()
+                .all(|event| matches!(event, GameEvent::Discarded { .. })) =>
+        {
+            return Some(usize_to_u32_saturating(events.len()));
+        }
         _ => return None,
     };
     let count = events.iter().fold(0u32, |acc, event| {
