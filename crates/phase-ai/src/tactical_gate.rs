@@ -86,6 +86,7 @@ mod mf_flags_1115;
 mod mf_flags_1116;
 mod mf_flags_1124;
 mod mf_flags_1124b;
+mod mf_flags_1125;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateDecision {
@@ -339,6 +340,15 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     // of the robot's own power than the opponents' is a net loss. Proof-backed;
     // fails open.
     if let Some(decision) = mf_flags_1124b::assess_self_sweeper(ctx) {
+        return decision;
+    }
+
+    // 25/11/2026 ("jogada ruim do robô" e8ee3d01, 3d498e2e): Wirewood Symbiote
+    // bounced an Elf to untap a creature when nothing of the robot's was tapped, and
+    // Magus of the Candelabra untapped lands that were already untapped. An untap
+    // with no tapped permanent of the robot's to reach does nothing for it.
+    // Proof-backed; fails open.
+    if let Some(decision) = mf_flags_1125::assess_futile_untap(ctx) {
         return decision;
     }
 
