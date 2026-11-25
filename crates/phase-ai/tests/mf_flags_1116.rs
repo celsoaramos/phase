@@ -25,9 +25,9 @@ fn scored(state: &GameState, player: PlayerId) -> Vec<GameAction> {
 }
 
 fn offers_activation(actions: &[GameAction], source: ObjectId) -> bool {
-    actions.iter().any(
-        |a| matches!(a, GameAction::ActivateAbility { source_id, .. } if *source_id == source),
-    )
+    actions
+        .iter()
+        .any(|a| matches!(a, GameAction::ActivateAbility { source_id, .. } if *source_id == source))
 }
 
 fn engine_offers_activation(state: &GameState, source: ObjectId) -> bool {

@@ -157,7 +157,7 @@ fn keyword_settles_after_blocks(keyword: &Keyword) -> bool {
 
 /// True when casting the spell itself pays something (prowess, "whenever you cast").
 /// Fails OPEN: any cast/copy trigger the AI controls counts.
-fn controls_cast_trigger(state: &GameState, player: PlayerId) -> bool {
+pub(super) fn controls_cast_trigger(state: &GameState, player: PlayerId) -> bool {
     let prowess = state.battlefield.iter().any(|id| {
         state
             .objects

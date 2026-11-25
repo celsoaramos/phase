@@ -97,7 +97,11 @@ fn mount_can_still_attack(state: &GameState, mount_id: ObjectId) -> bool {
 
 /// Anything other than "attacks while saddled" that a saddle could feed. Fails OPEN:
 /// every shape it does not recognise as worthless counts as value.
-fn saddle_has_value_without_attack(state: &GameState, player: PlayerId, mount_id: ObjectId) -> bool {
+fn saddle_has_value_without_attack(
+    state: &GameState,
+    player: PlayerId,
+    mount_id: ObjectId,
+) -> bool {
     let Some(mount) = state.objects.get(&mount_id) else {
         return true;
     };
@@ -165,17 +169,14 @@ fn ability_is_combat_only_grant(ability: &AbilityDefinition) -> bool {
     };
     let until_end_of_turn = matches!(duration, Some(Duration::UntilEndOfTurn))
         || matches!(ability.duration, Some(Duration::UntilEndOfTurn));
-    until_end_of_turn
-        && !static_abilities.is_empty()
-        && static_abilities.iter().all(|stat| {
-            !stat.modifications.is_empty()
-                && stat.modifications.iter().all(|modification| {
-                    matches!(
-                        modification,
-                        ContinuousModification::AddKeyword { keyword } if is_combat_only_keyword(keyword)
-                    )
-                })
+    until_end_of_turn && !static_abilities.is_empty() && static_abilities.iter().all(|stat| {
+        !stat.modifications.is_empty() && stat.modifications.iter().all(|modification| {
+            matches!(
+                modification,
+                ContinuousModification::AddKeyword { keyword } if is_combat_only_keyword(keyword)
+            )
         })
+    })
 }
 
 /// Keywords that only matter while attacking or blocking. Haste (unlocks {T}

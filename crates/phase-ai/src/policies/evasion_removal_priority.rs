@@ -99,7 +99,10 @@ fn engine_card_score(target: &engine::game::game_object::GameObject) -> f64 {
     let repeats_value = target.trigger_definitions.as_slice().iter().any(|entry| {
         let trigger = &entry.definition;
         !is_own_enters_trigger(trigger)
-            && trigger.execute.as_deref().is_some_and(produces_cards_or_tokens)
+            && trigger
+                .execute
+                .as_deref()
+                .is_some_and(produces_cards_or_tokens)
     });
     if repeats_value {
         ENGINE_CARD_BONUS

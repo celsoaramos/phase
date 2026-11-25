@@ -43,7 +43,9 @@ fn offers_activation(actions: &[GameAction], source: ObjectId, index: usize) -> 
 }
 
 fn offers_pass(actions: &[GameAction]) -> bool {
-    actions.iter().any(|a| matches!(a, GameAction::PassPriority))
+    actions
+        .iter()
+        .any(|a| matches!(a, GameAction::PassPriority))
 }
 
 fn engine_offers_activation(state: &GameState, source: ObjectId, index: usize) -> bool {
@@ -153,7 +155,10 @@ fn redundant_indestructible_grant_is_not_activated() {
     // `from_oracle_text` rebuilds the face and drops keywords pushed before it.
     let elf = scenario
         .add_creature(P0, "Iron-Shield Elf", 3, 1)
-        .from_oracle_text_with_keywords(&["Indestructible"], &format!("Indestructible\n{IRON_SHIELD_ABILITY}"))
+        .from_oracle_text_with_keywords(
+            &["Indestructible"],
+            &format!("Indestructible\n{IRON_SHIELD_ABILITY}"),
+        )
         .id();
     scenario.with_cards_in_hand(P0, &["Forest"]);
     scenario.add_creature(P1, "Bear", 3, 3);
@@ -245,7 +250,11 @@ fn loyalty_put_from_hand_is_offered_with_a_matching_card() {
         .iter()
         .position(|a| matches!(a.cost, Some(engine::types::ability::AbilityCost::Loyalty { amount }) if amount < 0))
         .unwrap();
-    assert!(offers_activation(&scored(runner.state(), P0), garruk, minus));
+    assert!(offers_activation(
+        &scored(runner.state(), P0),
+        garruk,
+        minus
+    ));
 }
 
 // ── Vampiric Tutor at 1 life ────────────────────────────────────────────────
@@ -266,9 +275,15 @@ fn life_loss_on_resolution_that_kills_the_ai_is_not_cast() {
     let mut runner = scenario.build();
     set_priority(runner.state_mut(), P0, Phase::PreCombatMain, P0);
 
-    assert!(engine_offers_cast(runner.state(), tutor), "the cast is legal at 1 life (CR 119.4 only guards COSTS)");
+    assert!(
+        engine_offers_cast(runner.state(), tutor),
+        "the cast is legal at 1 life (CR 119.4 only guards COSTS)"
+    );
     let actions = scored(runner.state(), P0);
-    assert!(!offers_cast(&actions, tutor), "losing 2 life at 1 life loses the game, got {actions:?}");
+    assert!(
+        !offers_cast(&actions, tutor),
+        "losing 2 life at 1 life loses the game, got {actions:?}"
+    );
     assert!(offers_pass(&actions));
 }
 
@@ -430,10 +445,13 @@ fn removal_with_basic_land_compensation_is_not_cast_at_an_only_basic_land() {
     let trophy = scenario
         .add_spell_to_hand_from_oracle(P0, "Assassin's Trophy", true, ASSASSINS_TROPHY)
         .id();
-    scenario.with_mana_pool(P0, vec![
-        ManaUnit::new(ManaType::Black, ObjectId(9_999), false, vec![]),
-        ManaUnit::new(ManaType::Green, ObjectId(9_999), false, vec![]),
-    ]);
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Black, ObjectId(9_999), false, vec![]),
+            ManaUnit::new(ManaType::Green, ObjectId(9_999), false, vec![]),
+        ],
+    );
     let mut runner = scenario.build();
     set_priority(runner.state_mut(), P0, Phase::End, P0);
 
@@ -455,23 +473,35 @@ fn removal_with_basic_land_compensation_picks_the_creature_over_the_basic_land()
     let trophy = scenario
         .add_spell_to_hand_from_oracle(P0, "Assassin's Trophy", true, ASSASSINS_TROPHY)
         .id();
-    scenario.with_mana_pool(P0, vec![
-        ManaUnit::new(ManaType::Black, ObjectId(9_999), false, vec![]),
-        ManaUnit::new(ManaType::Green, ObjectId(9_999), false, vec![]),
-    ]);
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Black, ObjectId(9_999), false, vec![]),
+            ManaUnit::new(ManaType::Green, ObjectId(9_999), false, vec![]),
+        ],
+    );
     let mut runner = scenario.build();
     set_priority(runner.state_mut(), P0, Phase::PreCombatMain, P0);
 
     let action = cast(runner.state_mut(), trophy);
     runner.act(action).expect("the cast is announced");
     assert!(
-        matches!(runner.state().waiting_for, WaitingFor::TargetSelection { .. }),
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ),
         "two legal targets: the engine asks, got {:?}",
         runner.state().waiting_for
     );
     let targets = target_objects(&scored(runner.state(), P0));
-    assert!(targets.contains(&bear), "the creature is the real target, got {targets:?}");
-    assert!(!targets.contains(&swamp), "the basic land is rejected, got {targets:?}");
+    assert!(
+        targets.contains(&bear),
+        "the creature is the real target, got {targets:?}"
+    );
+    assert!(
+        !targets.contains(&swamp),
+        "the basic land is rejected, got {targets:?}"
+    );
 }
 
 // ── Chain Lightning at the 6/6 beside a 2/2 ─────────────────────────────────
@@ -483,7 +513,12 @@ fn burn_that_misses_its_kill_is_not_aimed_at_the_big_creature() {
     let big = scenario.add_creature(P1, "Katilda", 6, 6).id();
     let small = scenario.add_creature(P1, "Jukai Naturalist", 2, 2).id();
     let bolt = scenario
-        .add_spell_to_hand_from_oracle(P0, "Chain Lightning", false, "Chain Lightning deals 3 damage to any target.")
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Chain Lightning",
+            false,
+            "Chain Lightning deals 3 damage to any target.",
+        )
         .id();
     scenario.with_mana_pool(P0, mana(ManaType::Red, 1));
     let mut runner = scenario.build();
@@ -491,10 +526,19 @@ fn burn_that_misses_its_kill_is_not_aimed_at_the_big_creature() {
 
     let action = cast(runner.state_mut(), bolt);
     runner.act(action).expect("the cast is announced");
-    assert!(matches!(runner.state().waiting_for, WaitingFor::TargetSelection { .. }));
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::TargetSelection { .. }
+    ));
     let targets = target_objects(&scored(runner.state(), P0));
-    assert!(targets.contains(&small), "the 2/2 dies to 3 damage, got {targets:?}");
-    assert!(!targets.contains(&big), "3 damage into a 6/6 while a 2/2 would die, got {targets:?}");
+    assert!(
+        targets.contains(&small),
+        "the 2/2 dies to 3 damage, got {targets:?}"
+    );
+    assert!(
+        !targets.contains(&big),
+        "3 damage into a 6/6 while a 2/2 would die, got {targets:?}"
+    );
 }
 
 // ── Optimistic Scavenger's counter on the opponent's creature ───────────────
@@ -506,7 +550,11 @@ fn beneficial_counter_is_not_aimed_at_the_opponents_creature() {
     let mine = scenario.add_creature(P0, "Scavenger", 1, 1).id();
     let theirs = scenario.add_creature(P1, "Virulent Emissary", 1, 1).id();
     let source = scenario
-        .add_artifact_from_oracle(P0, "Counter Engine", "{1}: Put a +1/+1 counter on target creature.")
+        .add_artifact_from_oracle(
+            P0,
+            "Counter Engine",
+            "{1}: Put a +1/+1 counter on target creature.",
+        )
         .id();
     scenario.with_mana_pool(P0, mana(ManaType::Colorless, 1));
     let mut runner = scenario.build();
@@ -519,22 +567,34 @@ fn beneficial_counter_is_not_aimed_at_the_opponents_creature() {
             payment_mode: CastPaymentMode::Auto,
         })
         .expect("the activation is announced");
-    assert!(matches!(runner.state().waiting_for, WaitingFor::TargetSelection { .. }));
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::TargetSelection { .. }
+    ));
     let targets = target_objects(&scored(runner.state(), P0));
-    assert!(targets.contains(&mine), "the AI's own creature takes the counter, got {targets:?}");
-    assert!(!targets.contains(&theirs), "a +1/+1 counter on the opponent's creature, got {targets:?}");
+    assert!(
+        targets.contains(&mine),
+        "the AI's own creature takes the counter, got {targets:?}"
+    );
+    assert!(
+        !targets.contains(&theirs),
+        "a +1/+1 counter on the opponent's creature, got {targets:?}"
+    );
 }
 
 // ── Monstrous Rage: pump plus Role token waits for the blocks ───────────────
 
-const MONSTROUS_RAGE: &str = "Target creature gets +2/+0 until end of turn. Create a Monster Role token attached to it.";
+const MONSTROUS_RAGE: &str =
+    "Target creature gets +2/+0 until end of turn. Create a Monster Role token attached to it.";
 
 #[test]
 fn pump_with_role_token_is_not_cast_in_precombat_main_or_end_step() {
     for phase in [Phase::PreCombatMain, Phase::End] {
         let mut scenario = GameScenario::new();
         scenario.at_phase(phase);
-        scenario.add_creature(P0, "Monastery Swiftspear", 1, 2).haste();
+        scenario
+            .add_creature(P0, "Monastery Swiftspear", 1, 2)
+            .haste();
         scenario.add_creature(P1, "Gavony Dawnguard", 3, 3);
         let rage = scenario
             .add_spell_to_hand_from_oracle(P0, "Monstrous Rage", true, MONSTROUS_RAGE)
@@ -579,7 +639,10 @@ fn casting_the_commander_from_the_command_zone_outscores_a_filler_of_the_same_si
     let (Some(c), Some(f)) = (score_of(commander), score_of(filler)) else {
         panic!("both casts must be offered, got {scored:?}");
     };
-    assert!(c > f, "commander {c} must outscore the same-size filler {f}");
+    assert!(
+        c > f,
+        "commander {c} must outscore the same-size filler {f}"
+    );
     let _ = HashMap::<PlayerId, u8>::new();
     let _ = HashSet::<PlayerId>::new();
 }

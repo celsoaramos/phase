@@ -13,7 +13,8 @@ use phase_ai::config::{create_config, AiDifficulty, Platform};
 use phase_ai::score_candidates;
 
 const VAULTER: &str = "Whenever this creature saddles a Mount or crews a Vehicle during your main phase, that Mount or Vehicle gains flying until end of turn.";
-const OX_ATTACK: &str = "Whenever this creature attacks while saddled, put a +1/+1 counter on target creature.";
+const OX_ATTACK: &str =
+    "Whenever this creature attacks while saddled, put a +1/+1 counter on target creature.";
 
 fn scored(state: &GameState, player: PlayerId) -> Vec<GameAction> {
     let config = create_config(AiDifficulty::VeryHard, Platform::Native);

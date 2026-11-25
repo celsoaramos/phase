@@ -87,6 +87,7 @@ mod mf_flags_1116;
 mod mf_flags_1124;
 mod mf_flags_1124b;
 mod mf_flags_1125;
+mod mf_flags_1125b;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateDecision {
@@ -349,6 +350,14 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     // with no tapped permanent of the robot's to reach does nothing for it.
     // Proof-backed; fails open.
     if let Some(decision) = mf_flags_1125::assess_futile_untap(ctx) {
+        return decision;
+    }
+
+    // 25/11/2026 ("jogada ruim do robô" 7dee6cac): Aether Meltdown (-4/-0) cast on
+    // the robot's own creature, with no creature on the opponent's side, only for
+    // its enters energy. A harmful Aura with no opponent permanent to enchant hurts
+    // the robot. Proof-backed; fails open.
+    if let Some(decision) = mf_flags_1125b::assess_self_harmful_aura(ctx) {
         return decision;
     }
 
@@ -2431,15 +2440,14 @@ fn own_beginning_phase_cast_is_dominated(ctx: &PolicyContext<'_>) -> bool {
     let Some(object) = ctx.state.objects.get(object_id) else {
         return false;
     };
-    let spell_touches_library = object
-        .abilities
-        .iter()
-        .any(ability_touches_library);
-    let trigger_touches_library = object
-        .trigger_definitions
-        .as_slice()
-        .iter()
-        .any(|entry| entry.definition.execute.as_deref().is_some_and(ability_touches_library));
+    let spell_touches_library = object.abilities.iter().any(ability_touches_library);
+    let trigger_touches_library = object.trigger_definitions.as_slice().iter().any(|entry| {
+        entry
+            .definition
+            .execute
+            .as_deref()
+            .is_some_and(ability_touches_library)
+    });
     !spell_touches_library && !trigger_touches_library
 }
 

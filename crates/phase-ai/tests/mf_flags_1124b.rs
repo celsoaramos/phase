@@ -23,9 +23,9 @@ fn scored(state: &GameState, player: PlayerId) -> Vec<GameAction> {
 }
 
 fn offers_activation(actions: &[GameAction], source: ObjectId) -> bool {
-    actions.iter().any(
-        |a| matches!(a, GameAction::ActivateAbility { source_id, .. } if *source_id == source),
-    )
+    actions
+        .iter()
+        .any(|a| matches!(a, GameAction::ActivateAbility { source_id, .. } if *source_id == source))
 }
 
 fn engine_offers(state: &GameState, source: ObjectId) -> bool {
@@ -39,7 +39,13 @@ fn engine_offers(state: &GameState, source: ObjectId) -> bool {
 
 /// `own` Goblins of `own_size`/`own_size` for the robot, `opp` creatures of
 /// `opp_size` for the opponent at `opp_life`.
-fn board(own: usize, own_size: i32, opp: usize, opp_size: i32, opp_life: i32) -> (GameState, ObjectId) {
+fn board(
+    own: usize,
+    own_size: i32,
+    opp: usize,
+    opp_size: i32,
+    opp_life: i32,
+) -> (GameState, ObjectId) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::BeginCombat);
     let marshal = {
