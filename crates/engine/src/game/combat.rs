@@ -3035,6 +3035,30 @@ impl BlockDeclarationConstraints {
                 Some(blocker_assignment_choices(blocker, &attackers, maximum))
             })
             .collect::<Vec<_>>();
+        // CR 509.1c: the maximum is defined over whole declarations, so the
+        // order in which a blocker's local choices are explored cannot change
+        // the answer — the search stays exhaustive under the score → length →
+        // lex order. Exploring the choices that obey the most requirements
+        // first finds the maximum on the first descent, and the upper-bound
+        // pruning then cuts every other branch at once. Empty-first ordering
+        // instead rebuilt the maximum one blocker per level, which made a lure
+        // (Breaker of Armies) against a wide token board grow as O(n⁴).
+        let choices = choices
+            .into_iter()
+            .map(|mut local| {
+                local.sort_by_cached_key(|choice| {
+                    std::cmp::Reverse(
+                        requirements
+                            .iter()
+                            .filter(|requirement| {
+                                requirement_is_satisfied(state, requirement, choice)
+                            })
+                            .count(),
+                    )
+                });
+                local
+            })
+            .collect::<Vec<_>>();
 
         let mut future_requirement_satisfaction =
             vec![vec![false; requirements.len()]; choices.len() + 1];
