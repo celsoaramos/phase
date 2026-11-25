@@ -88,6 +88,7 @@ mod mf_flags_1124;
 mod mf_flags_1124b;
 mod mf_flags_1125;
 mod mf_flags_1125b;
+mod mf_flags_1125c;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateDecision {
@@ -358,6 +359,14 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     // its enters energy. A harmful Aura with no opponent permanent to enchant hurts
     // the robot. Proof-backed; fails open.
     if let Some(decision) = mf_flags_1125b::assess_self_harmful_aura(ctx) {
+        return decision;
+    }
+
+    // 25/11/2026 ("jogada ruim do robô" e8fac237): paying Tyvar's Stand, the robot
+    // kept sacrificing creatures to Ashnod's Altar after its pool and Arcane Signet
+    // already covered the cost. A sacrifice-for-mana the payment does not need
+    // throws a permanent away. Proof-backed; fails open.
+    if let Some(decision) = mf_flags_1125c::assess_needless_sacrifice_for_mana(ctx) {
         return decision;
     }
 
