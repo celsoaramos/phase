@@ -89,6 +89,7 @@ mod mf_flags_1124b;
 mod mf_flags_1125;
 mod mf_flags_1125b;
 mod mf_flags_1125c;
+mod mf_flags_1126;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateDecision {
@@ -367,6 +368,19 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     // already covered the cost. A sacrifice-for-mana the payment does not need
     // throws a permanent away. Proof-backed; fails open.
     if let Some(decision) = mf_flags_1125c::assess_needless_sacrifice_for_mana(ctx) {
+        return decision;
+    }
+
+    // 26/11/2026 ("jogada ruim do robô" f5d3e488, 25b8bcba): Rite of Replication
+    // and Shapesharer copied the robot's own commander, and the legend rule took
+    // the copy. A copy whose every source is such a legend loses a card.
+    if let Some(decision) = mf_flags_1126::assess_legend_copy(ctx) {
+        return decision;
+    }
+
+    // 26/11/2026 ("jogada ruim do robô" b8efa67b, 855aecdc): Budoka Gardener
+    // tapped to put a land from a hand with no land in it. Proof-backed; fails open.
+    if let Some(decision) = mf_flags_1126::assess_futile_hand_land_drop(ctx) {
         return decision;
     }
 
@@ -1289,6 +1303,12 @@ fn reject_futile_target(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<G
     // `cast_targets_are_all_futile` too, so a spell with only such targets is
     // not cast.
     if mf_flags_1107::reject_target(ctx, target) {
+        return Some(GateDecision::Reject);
+    }
+    // 26/11/2026 (flags f5d3e488, 25b8bcba): a copy of a legend the robot
+    // already has is lost to the legend rule (CR 704.5j) while another target
+    // is not.
+    if mf_flags_1126::reject_legend_copy_target(ctx, target) {
         return Some(GateDecision::Reject);
     }
     None
