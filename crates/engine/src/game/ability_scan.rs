@@ -4214,9 +4214,12 @@ fn scan_trigger_constraint(x: &TriggerConstraint, mode: ScanMode) -> Axes {
             filter,
             n: _,
             comparator: _,
-        } => filter.as_ref().map_or(Axes::NONE, |f| {
-            scan_target_filter(f, FilterReadContext::LiveBoardCensus, mode)
-        }),
+        }
+        | TriggerConstraint::NthSpellOfTurn { filter, n: _ } => {
+            filter.as_ref().map_or(Axes::NONE, |f| {
+                scan_target_filter(f, FilterReadContext::LiveBoardCensus, mode)
+            })
+        }
         // CR 109.5 + CR 603.2: the gate reads the triggering event's cause
         // relative to the trigger's controller — routed through the shared
         // controller-ref classifier rather than assumed read-free.

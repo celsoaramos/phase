@@ -10282,7 +10282,8 @@ fn trigger_constraint_reads_filter_population(
     use crate::types::ability::TriggerConstraint;
     let has_filter = |filter: &TargetFilter| filter::filter_operands_contain(filter, leaf);
     match constraint {
-        TriggerConstraint::NthSpellThisTurn { filter, .. } => {
+        TriggerConstraint::NthSpellThisTurn { filter, .. }
+        | TriggerConstraint::NthSpellOfTurn { filter, .. } => {
             filter.as_ref().is_some_and(has_filter)
         }
         // Filter-free: nothing to read.

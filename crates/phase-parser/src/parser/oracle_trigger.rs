@@ -4739,6 +4739,7 @@ fn constraint_counts_per_definition(constraint: &TriggerConstraint) -> bool {
         | TriggerConstraint::OncePerOpponentPerTurn => true,
         TriggerConstraint::OnlyDuringYourTurn
         | TriggerConstraint::NthSpellThisTurn { .. }
+        | TriggerConstraint::NthSpellOfTurn { .. }
         | TriggerConstraint::NthDrawThisTurn { .. }
         | TriggerConstraint::OnlyDuringOpponentsTurn
         | TriggerConstraint::OnlyDuringYourMainPhase
@@ -21930,7 +21931,58 @@ fn try_parse_nth_spell_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefin
     if let Some(result) = try_parse_nth_spell_any_player(lower) {
         return Some(result);
     }
+    // Branch 4: "the <ordinal> [qualifier] spell of a turn is cast"
+    if let Some(result) = try_parse_nth_spell_of_turn(lower) {
+        return Some(result);
+    }
     None
+}
+
+/// CR 603.2: "the <ordinal> [qualifier] spell of a turn is cast" / "... each turn
+/// is cast" (Nullstone Gargoyle: "the first noncreature spell of a turn"; Erayo,
+/// Soratami Ascendant: "the fourth spell of a turn"). The subject is the spell,
+/// not a player, so the ordinal counts every player's spells this turn — the
+/// turn-wide `NthSpellOfTurn` constraint, not the per-caster `NthSpellThisTurn`.
+fn try_parse_nth_spell_of_turn(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
+    let (rest, _) = preceded(
+        opt(alt((
+            tag::<_, _, OracleError<'_>>("whenever "),
+            tag("when "),
+        ))),
+        tag("the "),
+    )
+    .parse(lower.trim())
+    .ok()?;
+    let (n, rest) = parse_ordinal(rest)?;
+    let (tail, payload) = alt((
+        terminated(
+            take_until::<_, _, OracleError<'_>>(" of a turn is cast"),
+            tag(" of a turn is cast"),
+        ),
+        terminated(take_until(" each turn is cast"), tag(" each turn is cast")),
+    ))
+    .parse(rest.trim_start())
+    .ok()?;
+    if !tail.trim_end_matches([',', '.']).trim().is_empty() {
+        return None;
+    }
+    let payload = payload.trim();
+    // The payload must end in the head noun "spell" ("spell", "noncreature
+    // spell"); anything else is not this grammar.
+    let filter = if payload == "spell" {
+        None
+    } else {
+        let (type_text, _) =
+            crate::parser::oracle_nom::primitives::split_once_on(payload, " spell")
+                .ok()
+                .map(|(_, (pre, post))| (pre, post))
+                .filter(|(_, post)| post.trim().is_empty())?;
+        Some(type_only_filter(type_text.trim())?)
+    };
+    let mut def = make_base();
+    def.mode = TriggerMode::SpellCast;
+    def.constraint = Some(TriggerConstraint::NthSpellOfTurn { n, filter });
+    Some((TriggerMode::SpellCast, def))
 }
 
 enum OtherThanFirstSpellParse {
@@ -24763,6 +24815,7 @@ fn turn_window_condition(constraint: TriggerConstraint) -> Option<TriggerConditi
         TriggerConstraint::OncePerTurn { .. }
         | TriggerConstraint::OncePerGame
         | TriggerConstraint::NthSpellThisTurn { .. }
+        | TriggerConstraint::NthSpellOfTurn { .. }
         | TriggerConstraint::NthDrawThisTurn { .. }
         | TriggerConstraint::OnlyDuringYourMainPhase
         | TriggerConstraint::AtClassLevel { .. }

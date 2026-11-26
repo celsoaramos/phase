@@ -5860,7 +5860,9 @@ fn detect_duration_this_turn(
     if evidence.any::<TriggerConstraint>(|x| {
         matches!(
             x,
-            TriggerConstraint::NthSpellThisTurn { .. } | TriggerConstraint::NthDrawThisTurn { .. }
+            TriggerConstraint::NthSpellThisTurn { .. }
+                | TriggerConstraint::NthSpellOfTurn { .. }
+                | TriggerConstraint::NthDrawThisTurn { .. }
         )
     }) {
         return;

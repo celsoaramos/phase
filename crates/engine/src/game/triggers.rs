@@ -16717,6 +16717,7 @@ pub fn phase_trigger_scoped_to_turn_of(
             TriggerConstraint::OncePerTurn { .. }
             | TriggerConstraint::OncePerGame
             | TriggerConstraint::NthSpellThisTurn { .. }
+            | TriggerConstraint::NthSpellOfTurn { .. }
             | TriggerConstraint::NthDrawThisTurn { .. }
             | TriggerConstraint::AtClassLevel { .. }
             | TriggerConstraint::MaxTimesPerTurn { .. }
@@ -16935,6 +16936,42 @@ fn check_trigger_constraint_with_ref(
             });
             comparator.evaluate(count as i32, *n as i32)
         }
+        // CR 603.2: Turn-wide spell count ("the first noncreature spell of a
+        // turn"). The triggering spell is the caster's latest record; it must
+        // match the filter, and the matching spells cast this turn by EVERY
+        // player (the triggering one included) must total exactly `n`.
+        TriggerConstraint::NthSpellOfTurn { n, filter } => {
+            let caster = match event {
+                Some(GameEvent::SpellCast { controller: c, .. }) => *c,
+                _ => return false,
+            };
+            let matches = |record: &crate::types::game_state::SpellCastRecord, player: PlayerId| {
+                filter.as_ref().is_none_or(|filter| {
+                    spell_record_matches_filter(record, filter, player, &state.all_creature_types)
+                })
+            };
+            let Some(current) = state
+                .spells_cast_this_turn_by_player
+                .get(&caster)
+                .and_then(|spells| spells.back())
+            else {
+                return false;
+            };
+            if !matches(current, caster) {
+                return false;
+            }
+            let count: usize = state
+                .spells_cast_this_turn_by_player
+                .iter()
+                .map(|(player, spells)| {
+                    spells
+                        .iter()
+                        .filter(|record| matches(record, *player))
+                        .count()
+                })
+                .sum();
+            count == *n as usize
+        }
         // CR 121.2: Use the ordinal stamped onto the individual draw event
         // rather than the final per-turn count after a multi-card draw batch.
         TriggerConstraint::NthDrawThisTurn { n } => {
@@ -17018,6 +17055,7 @@ fn matched_trigger_constraint_allows_admission(
             | TriggerConstraint::OnlyDuringOpponentsTurn
             | TriggerConstraint::OnlyDuringYourMainPhase
             | TriggerConstraint::NthSpellThisTurn { .. }
+            | TriggerConstraint::NthSpellOfTurn { .. }
             | TriggerConstraint::NthDrawThisTurn { .. }
             | TriggerConstraint::EventSourceControlledBy { .. }
             | TriggerConstraint::AtClassLevel { .. },
@@ -19269,6 +19307,7 @@ fn record_trigger_fired_with_ref(
         | TriggerConstraint::OnlyDuringOpponentsTurn
         | TriggerConstraint::OnlyDuringYourMainPhase
         | TriggerConstraint::NthSpellThisTurn { .. }
+        | TriggerConstraint::NthSpellOfTurn { .. }
         | TriggerConstraint::NthDrawThisTurn { .. }
         | TriggerConstraint::EventSourceControlledBy { .. }
         | TriggerConstraint::AtClassLevel { .. } => {
