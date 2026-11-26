@@ -5257,6 +5257,9 @@ fn fmt_trigger_constraint(c: &crate::types::ability::TriggerConstraint) -> Strin
                 None => format!("{timing} spell this turn"),
             }
         }
+        TC::NthDrawThisTurn { n } => format!("on your {} draw this turn", fmt_ordinal(*n)),
+        TC::OnlyDuringOpponentsTurn => "only during opponent's turn".into(),
+        TC::OnlyDuringYourMainPhase => "only during your main phase".into(),
         TC::NthSpellOfTurn { n, filter } => match filter {
             Some(f) => format!(
                 "on the {} {} spell of the turn",
@@ -5265,9 +5268,6 @@ fn fmt_trigger_constraint(c: &crate::types::ability::TriggerConstraint) -> Strin
             ),
             None => format!("on the {} spell of the turn", fmt_ordinal(*n)),
         },
-        TC::NthDrawThisTurn { n } => format!("on your {} draw this turn", fmt_ordinal(*n)),
-        TC::OnlyDuringOpponentsTurn => "only during opponent's turn".into(),
-        TC::OnlyDuringYourMainPhase => "only during your main phase".into(),
         TC::AtClassLevel { level } => format!("at class level {level}"),
         TC::MaxTimesPerTurn { max } => format!("first {max} times each turn"),
         TC::OncePerOpponentPerTurn => "once per opponent per turn".into(),

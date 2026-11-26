@@ -40291,15 +40291,6 @@ pub enum TriggerConstraint {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         filter: Option<TargetFilter>,
     },
-    /// CR 603.2: "Whenever the Nth [qualifier] spell of a turn is cast" (Nullstone
-    /// Gargoyle, Erayo, Soratami Ascendant) — fires when the triggering spell is the
-    /// `n`th spell matching `filter` cast this turn by ANY player. Unlike
-    /// `NthSpellThisTurn`, the count spans every player's spells, not the caster's.
-    NthSpellOfTurn {
-        n: u32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        filter: Option<TargetFilter>,
-    },
     /// "Whenever you draw your Nth card each turn" — fires exactly when the
     /// triggering draw event's per-turn ordinal equals `n`.
     NthDrawThisTurn { n: u32 },
@@ -40309,6 +40300,15 @@ pub enum TriggerConstraint {
     /// (precombat or postcombat). Used by cards that print "during your
     /// main phase" as a trigger timing restriction.
     OnlyDuringYourMainPhase,
+    /// CR 603.2: "Whenever the Nth [qualifier] spell of a turn is cast" (Nullstone
+    /// Gargoyle, Erayo, Soratami Ascendant) — fires when the triggering spell is the
+    /// `n`th spell matching `filter` cast this turn by ANY player. Unlike
+    /// `NthSpellThisTurn`, the count spans every player's spells, not the caster's.
+    NthSpellOfTurn {
+        n: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<TargetFilter>,
+    },
     /// CR 716.2a: "When this Class becomes level N" — fire only at the specified level.
     AtClassLevel { level: u8 },
     /// CR 603.4: "This ability triggers only the first N times each turn." — generalizes
