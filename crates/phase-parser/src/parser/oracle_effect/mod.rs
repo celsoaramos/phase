@@ -1115,6 +1115,50 @@ fn rewrite_cost_paid_exiled_reflexive_for_effect_exile_parent(
     condition
 }
 
+/// CR 701.9a + CR 608.2c: "If a land card is discarded this way, …" after a
+/// "Discard a card, then draw a card." (Lord Windgrace) names the DISCARD, but
+/// `ZoneChangedThisWay` reads the zone changes of the instruction right before
+/// it — the draw — so the gate checked the DRAWN card. When the previous
+/// clause is a draw and an earlier clause of the same chain is a discard, read
+/// the discard-caused tracked set instead: the same set Seasoned Pyromancer's
+/// "for each nonland card discarded this way" counts across its draw. A draw
+/// never moves a card "this way" in the passive verbs that grammar reads
+/// (destroyed/exiled/sacrificed/returned/discarded/milled/countered), so the
+/// rewrite cannot steal a gate that meant the draw.
+fn rewrite_discarded_this_way_across_draw(
+    condition: Option<AbilityCondition>,
+    clauses: &[ClauseIr],
+) -> Option<AbilityCondition> {
+    let Some(AbilityCondition::ZoneChangedThisWay {
+        filter,
+        destination: None,
+    }) = &condition
+    else {
+        return condition;
+    };
+    let mut effects = clauses
+        .iter()
+        .rev()
+        .filter(|clause| !matches!(clause.disposition, ClauseDisposition::Continue { .. }))
+        .map(|clause| &clause.parsed.effect);
+    if !matches!(effects.next(), Some(Effect::Draw { .. })) {
+        return condition;
+    }
+    if !effects.any(|effect| matches!(effect, Effect::Discard { .. })) {
+        return condition;
+    }
+    Some(AbilityCondition::QuantityCheck {
+        lhs: QuantityExpr::Ref {
+            qty: QuantityRef::FilteredTrackedSetSize {
+                filter: Box::new(filter.clone()),
+                caused_by: Some(crate::types::ability::ThisWayCause::Discarded),
+            },
+        },
+        comparator: Comparator::GE,
+        rhs: QuantityExpr::Fixed { value: 1 },
+    })
+}
+
 /// CR 608.2c + CR 701.20a: whether the referent of a following "that card" is
 /// produced by a single-hit reveal-until — the only producer proven to stamp
 /// exactly one card snapshot as the demonstrative (`effect_context_object`)
@@ -48435,6 +48479,9 @@ fn parse_effect_chain_ir_body(
             condition,
             builder.clauses(),
         );
+        // CR 701.9a: "If a [type] card is discarded this way" past an intervening
+        // draw reads the discard, not the draw (Lord Windgrace).
+        let condition = rewrite_discarded_this_way_across_draw(condition, builder.clauses());
         // CR 608.2k: "if it doesn't have <kw>" after a cost-paid parent reads the
         // cost-paid object, not the (empty) target slot — see the helper for the
         // three-slot rationale (Jhoira of the Ghitu). Input shapes are disjoint
