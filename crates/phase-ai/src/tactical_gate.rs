@@ -91,6 +91,7 @@ mod mf_flags_1125b;
 mod mf_flags_1125c;
 mod mf_flags_1126;
 mod mf_flags_1126b;
+mod mf_flags_1126c;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateDecision {
@@ -306,6 +307,11 @@ fn assess_candidate(ctx: &PolicyContext<'_>) -> GateDecision {
         // opponent's turn for nothing. Proof-backed; fails open.
         GameAction::SaddleMount { .. } => {
             mf_flags_1115::assess_saddle(ctx).unwrap_or(GateDecision::Allow)
+        }
+        // 26/11/2026 ("jogada ruim do robô" 6eec8f76): Station on a Spacecraft that
+        // already met every STATION threshold taps a creature for nothing.
+        GameAction::ActivateStation { .. } => {
+            mf_flags_1126c::assess_station(ctx).unwrap_or(GateDecision::Allow)
         }
         _ => GateDecision::Allow,
     }
