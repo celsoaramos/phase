@@ -208,9 +208,14 @@ pub(crate) fn is_opening_hand_begin_game(lower: &str) -> bool {
 }
 
 pub(crate) fn is_ability_activate_cost_static(lower: &str) -> bool {
-    scan_contains(lower, "abilities you activate")
+    (scan_contains(lower, "abilities you activate")
         && scan_contains(lower, "cost")
-        && scan_contains(lower, "less to activate")
+        && scan_contains(lower, "less to activate"))
+        // CR 702.6a + CR 601.2f: "Equip costs you pay cost {N} less." (Auriok
+        // Steelshaper) is the same equip-ability discount, not an Equip keyword line.
+        || tag::<_, _, OracleError<'_>>("equip costs you pay cost ")
+            .parse(lower)
+            .is_ok()
 }
 
 pub(crate) fn is_damage_prevention_pattern(lower: &str) -> bool {

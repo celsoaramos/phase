@@ -3175,6 +3175,38 @@ pub(crate) fn parse_static_line_inner(
         );
     }
 
+    // --- "Equip costs you pay cost {N} less." ---
+    // CR 702.6a + CR 601.2f: Auriok Steelshaper's wording of the equip-ability
+    // discount. The cost "you pay" is the cost of an equip ability you activate,
+    // so it is the same activator-scoped `ReduceAbilityCost { keyword: "equip" }`
+    // as "Equip abilities you activate cost {N} less to activate."
+    if let Some((amount, _)) = nom_on_lower(tp.original, tp.lower, |i| {
+        let (i, _) = tag("equip costs you pay cost ").parse(i)?;
+        let (i, amt) =
+            nom::sequence::delimited(tag("{"), nom_primitives::parse_number, tag("}")).parse(i)?;
+        let (i, _) = tag(" less").parse(i)?;
+        let (i, _) = opt(tag(".")).parse(i)?;
+        if !i.trim().is_empty() {
+            return Err(oracle_err(i));
+        }
+        Ok((i, amt))
+    }) {
+        return Some(
+            StaticDefinition::new(StaticMode::ReduceAbilityCost {
+                mode: CostModifyMode::Reduce,
+                keyword: "equip".to_string(),
+                amount,
+                minimum_mana: None,
+                dynamic_count: None,
+                exemption: ActivationExemption::None,
+                activator: Some(PlayerFilter::Controller),
+                targets: None,
+                frequency: None,
+            })
+            .description(text.to_string()),
+        );
+    }
+
     // --- "{Ability} abilities you activate cost {N} less to activate" ---
     // CR 601.2f: Ability-type-specific cost reduction (e.g., Silver-Fur Master, Fluctuator).
     if nom_primitives::scan_contains(tp.lower, "abilities you activate")
