@@ -90,6 +90,7 @@ mod mf_flags_1125;
 mod mf_flags_1125b;
 mod mf_flags_1125c;
 mod mf_flags_1126;
+mod mf_flags_1126b;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GateDecision {
@@ -381,6 +382,20 @@ fn assess_pre_cast(ctx: &PolicyContext<'_>) -> GateDecision {
     // 26/11/2026 ("jogada ruim do robô" b8efa67b, 855aecdc): Budoka Gardener
     // tapped to put a land from a hand with no land in it. Proof-backed; fails open.
     if let Some(decision) = mf_flags_1126::assess_futile_hand_land_drop(ctx) {
+        return decision;
+    }
+
+    // 26/11/2026 ("jogada ruim do robô" e2cd4180): Heroic Intervention cast in the
+    // robot's own combat damage step with nothing of the opponent's on the stack.
+    // Pure protection with nothing to protect against lapses at cleanup.
+    if let Some(decision) = mf_flags_1126b::assess_idle_protection(ctx) {
+        return decision;
+    }
+
+    // 26/11/2026 ("jogada ruim do robô" dcaaede3): Seam Rip cast against an
+    // opponent with no nonland permanent. Its only ability is an enters trigger
+    // with no legal target (CR 603.3d), so the card does nothing.
+    if let Some(decision) = mf_flags_1126b::assess_targetless_enters_permanent(ctx) {
         return decision;
     }
 
