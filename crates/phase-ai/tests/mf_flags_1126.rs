@@ -183,17 +183,36 @@ fn flag_b8efa67b_budoka_gardener_needs_a_land_in_hand() {
     );
 }
 
+/// The tactical gate alone on `state` (no scoring): does it keep the activation?
+fn gate_keeps_activation(state: &GameState, source: ObjectId) -> bool {
+    let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+    let mut context = phase_ai::context::AiContext::empty(&config.weights);
+    context.player = P1;
+    let decision = engine::ai_support::build_decision_context(state);
+    let candidates = decision.candidates.clone();
+    phase_ai::tactical_gate::gate_candidates(state, &decision, candidates, P1, &config, &context)
+        .iter()
+        .any(|gated| {
+            matches!(gated.candidate.action, GameAction::ActivateAbility { source_id, .. } if source_id == source)
+        })
+}
+
 /// The same position with Phyrexian Arena turned into a land card: now there is
-/// something to put onto the battlefield.
+/// something to put onto the battlefield, and the gate keeps the activation
+/// (whether to use it is left to scoring).
 #[test]
 fn budoka_gardener_with_a_land_in_hand_stays_open() {
     let (mut state, budoka) = budoka();
+    assert!(
+        !gate_keeps_activation(&state, budoka),
+        "sem terreno, o gate recusa"
+    );
     let arena = hand_card(&state, P1, "Phyrexian Arena");
     let object = state.objects.get_mut(&arena).unwrap();
     object.card_types.core_types = vec![CoreType::Land];
     object.base_card_types.core_types = vec![CoreType::Land];
     assert!(
-        offers_activation(&scored(&state, P1), budoka),
+        gate_keeps_activation(&state, budoka),
         "com terreno na mão, o gate não recusa"
     );
 }
