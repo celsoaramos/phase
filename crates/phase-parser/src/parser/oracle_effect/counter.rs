@@ -2,14 +2,14 @@ use crate::parser::oracle_nom::error::{oracle_err, OracleError, OracleResult};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_until};
 use nom::character::complete::space1;
-use nom::combinator::{all_consuming, eof, opt, peek, value, verify};
+use nom::combinator::{all_consuming, eof, not, opt, peek, value, verify};
 use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
 use crate::types::ability::{
     ChosenCounterCountCondition, Comparator, CounterMoveSelection, CounterTransferMode,
     DoublePTMode, DoubleTarget, Effect, EventCounterReproductionCount, FilterProp, MultiTargetSpec,
-    ObjectScope, QuantityExpr, QuantityRef, TargetFilter, XModification,
+    ObjectScope, QuantityExpr, QuantityRef, TargetChoiceTiming, TargetFilter, XModification,
 };
 use crate::types::counter::{parse_counter_type, CounterType};
 use crate::types::mana::ManaColor;
@@ -1172,6 +1172,21 @@ pub(super) fn try_parse_remove_counter(lower: &str, ctx: &mut ParseContext) -> O
         .is_some()
     {
         return None;
+    }
+
+    // CR 122.1 + CR 608.2d: "from all permanents" / "from each planeswalker"
+    // describes a whole population, not a target: nothing is announced, and
+    // the effect applies to every matching permanent as it resolves (Aether
+    // Snap, Dust of Moments, Pestilent Haze, Oblivion Stone). "each of <N>"
+    // is the exact-selection grammar handled above and is excluded.
+    if alt((
+        tag::<_, _, OracleError<'_>>("all "),
+        terminated(tag("each "), not(tag("of "))),
+    ))
+    .parse(target_text)
+    .is_ok()
+    {
+        ctx.declared_target_choice_timing = Some(TargetChoiceTiming::Resolution);
     }
 
     let target = resolve_remove_counter_from_target(target_text, ctx);

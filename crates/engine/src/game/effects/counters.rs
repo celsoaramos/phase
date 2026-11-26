@@ -2569,6 +2569,14 @@ pub(super) fn counter_removal_targets(
                 target @ (TargetFilter::TrackedSet { .. } | TargetFilter::TrackedSetFiltered { .. }),
             ..
         } => crate::game::targeting::resolved_object_ids_for_filter(state, ability, target),
+        // CR 122.1 + CR 608.2d: "remove all counters from all permanents" /
+        // "remove two time counters from each permanent" (Aether Snap, Dust of
+        // Moments) names no target: every permanent matching the description
+        // loses counters as the effect resolves.
+        Effect::RemoveCounter { target, .. } => {
+            nontargeted_counter_population_ids(state, ability, target)
+                .unwrap_or_else(|| resolve_defined_or_targets(state, ability))
+        }
         _ => resolve_defined_or_targets(state, ability),
     }
 }
