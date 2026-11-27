@@ -19,10 +19,10 @@
 
 use engine::game::players::is_opponent;
 use engine::game::targeting::find_legal_targets;
-use engine::types::ability::{ContinuousModification, Duration, Effect};
+use engine::types::ability::{ContinuousModification, Duration, Effect, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{StackEntry, StackEntryKind, WaitingFor};
 use engine::types::keywords::Keyword;
 use engine::types::phase::Phase;
 use engine::types::triggers::TriggerMode;
@@ -48,12 +48,14 @@ pub(super) fn assess_idle_protection(ctx: &PolicyContext<'_>) -> Option<GateDeci
     if effects.is_empty() || !effects.iter().all(|effect| is_protection_only(effect)) {
         return None;
     }
-    // An opponent's spell or ability on the stack is what the protection answers.
-    let threat_on_stack = ctx
-        .state
-        .stack
-        .iter()
-        .any(|entry| is_opponent(ctx.state, ctx.ai_player, entry.controller));
+    // An opponent's spell or ability on the stack is what the protection answers
+    // — unless it provably cannot touch a permanent (27/11, fd448b10: a
+    // Meteorite's "2 damage to any target" aimed at the robot itself; the
+    // protection only reaches permanents, CR 702.11b + CR 702.12b).
+    let threat_on_stack = ctx.state.stack.iter().any(|entry| {
+        is_opponent(ctx.state, ctx.ai_player, entry.controller)
+            && !entry_only_damages_players(entry)
+    });
     if threat_on_stack || combat_damage_still_ahead(ctx) {
         return None;
     }
@@ -67,6 +69,42 @@ pub(super) fn assess_idle_protection(ctx: &PolicyContext<'_>) -> Option<GateDeci
         );
     }
     Some(GateDecision::Reject)
+}
+
+/// CR 115.1 + CR 120.3: a stack entry whose every step is targeted damage aimed
+/// only at players hurts no permanent. Fails closed (= "may be a threat") on any
+/// other effect, untargeted step, redirect or excess rider.
+fn entry_only_damages_players(entry: &StackEntry) -> bool {
+    let ability = match &entry.kind {
+        StackEntryKind::ActivatedAbility { ability, .. }
+        | StackEntryKind::TriggeredAbility { ability, .. } => ability.as_ref(),
+        StackEntryKind::Spell {
+            ability: Some(ability),
+            ..
+        } => ability.as_ref(),
+        _ => return false,
+    };
+    let mut node = Some(ability);
+    while let Some(step) = node {
+        let Effect::DealDamage {
+            damage_source: None,
+            excess: None,
+            ..
+        } = &step.effect
+        else {
+            return false;
+        };
+        if step.targets.is_empty()
+            || step
+                .targets
+                .iter()
+                .any(|target| !matches!(target, TargetRef::Player(_)))
+        {
+            return false;
+        }
+        node = step.sub_ability.as_deref();
+    }
+    true
 }
 
 /// CR 510.1: combat damage is still to be dealt while a combat exists and the
