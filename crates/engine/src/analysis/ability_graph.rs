@@ -1525,8 +1525,16 @@ fn collect_effects_in_effect<'a>(
         // `AbilityDefinition` payload), so it is invisible to the sibling recursions
         // above. Descend it too — otherwise a randomness effect nested inside a
         // replacement install escapes every `collect_effects` consumer.
-        Effect::CreateDrawReplacement { replacement_effect }
-        | Effect::CreatePlaneswalkReplacement { replacement_effect } => {
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            then,
+        } => {
+            collect_effects_in_effect(replacement_effect, None, out);
+            if let Some(then) = then {
+                collect_effects(then, out);
+            }
+        }
+        Effect::CreatePlaneswalkReplacement { replacement_effect } => {
             collect_effects_in_effect(replacement_effect, None, out);
         }
         _ => {}

@@ -9767,7 +9767,9 @@ fn resolve_guards_in_effect(effect: &mut Effect) {
     match effect {
         // CR 614.11 / CR 614.1a: a one-shot draw or planeswalk replacement nests a
         // substitute `Effect`, which may itself be a definition carrier.
-        Effect::CreateDrawReplacement { replacement_effect }
+        Effect::CreateDrawReplacement {
+            replacement_effect, ..
+        }
         | Effect::CreatePlaneswalkReplacement { replacement_effect } => {
             resolve_guards_in_effect(replacement_effect)
         }
@@ -10893,7 +10895,7 @@ fn demote_lifetimes_in_replacement(replacement: &mut ReplacementDefinition) {
 fn demote_lifetimes_in_effect(effect: &mut Effect) {
     match effect {
         // --- nested effect, same shape ---
-        Effect::CreateDrawReplacement { replacement_effect }
+        Effect::CreateDrawReplacement { replacement_effect, .. }
         | Effect::CreatePlaneswalkReplacement { replacement_effect } => {
             demote_lifetimes_in_effect(replacement_effect)
         }
@@ -11711,7 +11713,9 @@ fn render_effect_descriptions(effect: &mut Effect, card_name: &str) {
         Effect::AddTargetReplacement { replacement, .. } => {
             render_replacement_descriptions(replacement, card_name)
         }
-        Effect::CreateDrawReplacement { replacement_effect }
+        Effect::CreateDrawReplacement {
+            replacement_effect, ..
+        }
         | Effect::CreatePlaneswalkReplacement { replacement_effect } => {
             render_effect_descriptions(replacement_effect, card_name)
         }

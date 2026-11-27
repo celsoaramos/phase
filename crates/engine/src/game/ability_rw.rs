@@ -3883,7 +3883,10 @@ fn legacy_effect(x: &Effect) -> bool {
         // batch prompt this flag feeds is never consulted for it.
         Effect::EpicCopy { .. } => false,
         Effect::CreateDelayedTrigger { effect, .. } => legacy_definition(effect),
-        Effect::CreateDrawReplacement { replacement_effect } => legacy_effect(replacement_effect),
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            then,
+        } => legacy_effect(replacement_effect) || then.as_deref().is_some_and(legacy_definition),
         Effect::RollDie { count, results, .. } => {
             legacy_quantity_expr(count) || results.iter().any(|r| legacy_definition(&r.effect))
         }
@@ -6256,7 +6259,7 @@ fn rw_effect(
                 .unwrap_or_else(RwProfile::empty),
             None,
         ),
-        Effect::CreateDrawReplacement { replacement_effect } => {
+        Effect::CreateDrawReplacement { replacement_effect, .. } => {
             let (mut b, _) = rw_effect(replacement_effect, None, pscope, chain_move_owner);
             b.drop_writes();
             (b, None)

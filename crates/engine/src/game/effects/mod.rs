@@ -19619,7 +19619,9 @@ fn nested_payload_reads_created_referent(effect: &Effect) -> bool {
     });
     reads
         || match effect {
-            Effect::CreateDrawReplacement { replacement_effect }
+            Effect::CreateDrawReplacement {
+                replacement_effect, ..
+            }
             | Effect::CreatePlaneswalkReplacement { replacement_effect } => {
                 effect_reads_created_referent(replacement_effect)
             }
@@ -52410,6 +52412,7 @@ mod tests {
                 "CreateDrawReplacement",
                 Effect::CreateDrawReplacement {
                     replacement_effect: Box::new(placement()),
+                    then: None,
                 },
             ),
             (

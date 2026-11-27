@@ -942,6 +942,7 @@ fn installed_coin_replacements_round_trip_and_execute_the_selected_bound_branch(
             let install = match family {
                 ReplacementEvent::Draw => Effect::CreateDrawReplacement {
                     replacement_effect: Box::new(substitute),
+                    then: None,
                 },
                 ReplacementEvent::Planeswalk => Effect::CreatePlaneswalkReplacement {
                     replacement_effect: Box::new(substitute),

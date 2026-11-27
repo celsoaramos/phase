@@ -7536,6 +7536,7 @@ mod tests {
                 "CreateDrawReplacement",
                 Effect::CreateDrawReplacement {
                     replacement_effect: Box::new(draw_one()),
+                    then: None,
                 },
             ),
             (

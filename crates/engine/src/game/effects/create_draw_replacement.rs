@@ -35,7 +35,11 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let Effect::CreateDrawReplacement { replacement_effect } = &ability.effect else {
+    let Effect::CreateDrawReplacement {
+        replacement_effect,
+        then,
+    } = &ability.effect
+    else {
         return Err(EffectError::InvalidParam(
             "expected CreateDrawReplacement effect".to_string(),
         ));
@@ -51,6 +55,18 @@ pub fn resolve(
         ability.source_id,
         ability.controller,
     );
+    // CR 608.2c: a multi-instruction substitute (Mangara's Tome: pick the top
+    // card of the exiled pile, then put it into its owner's hand) runs its
+    // remaining instructions as the substitute's sub-ability chain.
+    if let Some(then) = then {
+        substitute.sub_ability = Some(Box::new(
+            crate::game::ability_utils::build_resolved_from_def(
+                then,
+                ability.source_id,
+                ability.controller,
+            ),
+        ));
+    }
     crate::game::ability_utils::materialize_coin_branches(&mut substitute);
 
     // CR 614.1a + CR 113.7a: anchor the installing controller at resolution
@@ -109,6 +125,7 @@ mod tests {
                     amount: QuantityExpr::Fixed { value: 5 },
                     player: TargetFilter::Controller,
                 }),
+                then: None,
             },
             vec![],
             source,
@@ -245,6 +262,7 @@ mod tests {
         let install = ResolvedAbility::new(
             Effect::CreateDrawReplacement {
                 replacement_effect: Box::new(token_payload),
+                then: None,
             },
             vec![],
             source,

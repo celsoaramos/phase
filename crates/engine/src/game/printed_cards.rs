@@ -4950,6 +4950,7 @@ mod tests {
                 library_position: None,
                 library_players: None,
             }),
+            then: None,
         };
         walk_effect(&draw_repl, &mut names);
 

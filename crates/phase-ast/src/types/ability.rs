@@ -25187,6 +25187,12 @@ pub enum Effect {
     /// the post-replacement continuation. RUNTIME: create_draw_replacement::resolve.
     CreateDrawReplacement {
         replacement_effect: Box<Effect>,
+        /// CR 608.2c: the rest of the substitute when it is more than one
+        /// instruction (Mangara's Tome: pick the top card of the exiled pile,
+        /// then put it into its owner's hand). Runs after `replacement_effect`
+        /// as its sub-ability chain, inside the same replaced draw.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        then: Option<Box<AbilityDefinition>>,
     },
     /// CR 614.1a + CR 611.2 + CR 901.9c: Install a floating "if a player would
     /// planeswalk as a result of rolling the planar die, [replacement_effect]

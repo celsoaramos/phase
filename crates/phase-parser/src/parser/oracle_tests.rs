@@ -33050,6 +33050,7 @@ fn render_net_reaches_every_nested_description_carrier() {
                 "probe",
                 planted("create_draw_replacement"),
             )),
+            then: None,
         }));
     tags.push("create_draw_replacement");
 

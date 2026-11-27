@@ -9608,7 +9608,7 @@ fn parse_oneshot_target_source_prevent(norm_lower: &str, ctx: &ParseContext) -> 
 /// "the next time you would draw a card this turn, [effect] instead" (Words of
 /// Worship: "you gain 5 life"; Words of Wilding: "create a 2/2 green Bear
 /// creature token"). Mirrors `parse_oneshot_damage_replacement` for the Draw
-/// event class, lowering to `Effect::CreateDrawReplacement { replacement_effect }`.
+/// event class, lowering to `Effect::CreateDrawReplacement { replacement_effect, .. }`.
 ///
 /// The detector IS the parser: the branch is gated by the `tag("the next time ")`
 /// prefix combinator + a `peek` for "would draw"; it returns `None` on any
@@ -9640,12 +9640,27 @@ pub(crate) fn parse_oneshot_draw_replacement(norm_lower: &str) -> Option<Effect>
     // combinator, never byte math.
     let (_, (_, after_turn)) = nom_primitives::split_once_on(after_prefix, "this turn").ok()?;
     let payload_text = after_turn.trim_start_matches([',', ' ']);
-    // Drop the trailing "instead" so the payload parser sees only the effect.
-    let payload_text = match nom_primitives::split_once_on(payload_text, "instead") {
-        Ok((_, (before, _))) => before,
-        Err(_) => payload_text,
+    // CR 614.1a: "instead" may also LEAD the substitute ("this turn, instead
+    // put the top card of the exiled pile into its owner's hand" — Mangara's
+    // Tome) rather than trail it (Words of Worship). Both orders name the same
+    // replacement; strip whichever is present.
+    let payload_text = match tag::<_, _, OracleError<'_>>("instead ").parse(payload_text) {
+        Ok((rest, _)) => rest.trim_end_matches('.').trim(),
+        Err(_) => match nom_primitives::split_once_on(payload_text, "instead") {
+            Ok((_, (before, _))) => before,
+            Err(_) => payload_text,
+        }
+        .trim(),
+    };
+
+    // CR 406.3 + CR 608.2c: "the top card of the exiled pile" reads the
+    // face-down pile this permanent exiled (Mangara's Tome's ETB): the pile was
+    // shuffled face down, so its top card is one of those cards chosen at
+    // random. Two instructions — pick it, then move it — so the second rides in
+    // `then`.
+    if let Some(destination) = parse_exiled_pile_top_card_move(payload_text) {
+        return Some(destination);
     }
-    .trim();
 
     let payload = crate::parser::oracle_effect::parse_effect(payload_text);
     // Honest-gap guard 1: an Unimplemented payload is not a clean replacement.
@@ -9671,6 +9686,68 @@ pub(crate) fn parse_oneshot_draw_replacement(norm_lower: &str) -> Option<Effect>
 
     Some(Effect::CreateDrawReplacement {
         replacement_effect: Box::new(payload),
+        then: None,
+    })
+}
+
+/// CR 406.3 + CR 608.2c: "put the top card of the exiled pile into its owner's
+/// hand" — the substitute of Mangara's Tome's draw replacement. The pile is the
+/// set of cards this source exiled face down and shuffled (`ExiledBySource`),
+/// so its top card is a uniformly random member of that set.
+fn parse_exiled_pile_top_card_move(payload: &str) -> Option<Effect> {
+    use crate::types::ability::{
+        AbilityDefinition, AbilityKind, CardSelectionMode, LibraryInstructionActor,
+        ZoneChoiceCandidateSource,
+    };
+    use crate::types::zones::Zone;
+    let (rest, _) = (
+        alt((tag::<_, _, OracleError<'_>>("put "), tag("puts "))),
+        tag("the top card of the exiled pile into its owner's hand"),
+    )
+        .parse(payload)
+        .ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    let pick = Effect::ChooseFromZone {
+        count: 1,
+        zone: Zone::Exile,
+        additional_zones: Vec::new(),
+        zone_owner: Default::default(),
+        filter: Some(TargetFilter::ExiledBySource),
+        chooser: Default::default(),
+        candidate_source: ZoneChoiceCandidateSource::Direct,
+        reciprocal_role: None,
+        gather_role: None,
+        up_to: false,
+        selection: CardSelectionMode::Random,
+        constraint: None,
+    };
+    let move_to_hand = Effect::ChangeZone {
+        actor: LibraryInstructionActor::Controller,
+        library_shuffle: Default::default(),
+        origin: Some(Zone::Exile),
+        destination: Zone::Hand,
+        target: TargetFilter::TrackedSet {
+            id: crate::types::identifiers::TrackedSetId(0),
+        },
+        owner_library: false,
+        enter_transformed: false,
+        enters_under: None,
+        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+        enters_attacking: false,
+        up_to: false,
+        enter_with_counters: vec![],
+        conditional_enter_with_counters: vec![],
+        face_down_profile: None,
+        enters_modified_if: None,
+    };
+    Some(Effect::CreateDrawReplacement {
+        replacement_effect: Box::new(pick),
+        then: Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            move_to_hand,
+        ))),
     })
 }
 
@@ -35142,7 +35219,9 @@ mod snapshot_tests {
         )
         .expect("Words of Worship draw replacement must parse");
         match effect {
-            Effect::CreateDrawReplacement { replacement_effect } => {
+            Effect::CreateDrawReplacement {
+                replacement_effect, ..
+            } => {
                 assert!(
                     matches!(*replacement_effect, Effect::GainLife { .. }),
                     "payload must be GainLife, got {replacement_effect:?}"
@@ -35174,7 +35253,9 @@ mod snapshot_tests {
         )
         .expect("Words of Wilding draw replacement must parse");
         match effect {
-            Effect::CreateDrawReplacement { replacement_effect } => {
+            Effect::CreateDrawReplacement {
+                replacement_effect, ..
+            } => {
                 assert!(
                     matches!(*replacement_effect, Effect::Token { .. }),
                     "payload must be a Token, got {replacement_effect:?}"
