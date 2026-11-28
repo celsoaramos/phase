@@ -20549,6 +20549,21 @@ pub(super) fn handle_tap_land_for_mana(
     // is revalidated against live engine-authored options before any cost or
     // production is applied.
     let option = mana_sources::live_land_mana_option_for_selection(state, player, selection)?;
+    // CR 106.4: a deferred any-combination row keeps its output open so the
+    // ordinary mana-choice prompt asks for each unit's color.
+    if matches!(
+        selection.output,
+        crate::types::mana::ManaSourceOutput::DeferredColorChoice { .. }
+    ) {
+        return mana_sources::activate_mana_source_option_with_output(
+            state,
+            player,
+            &option,
+            selection.output,
+            events,
+            resume,
+        );
+    }
     mana_sources::activate_mana_source_option(state, player, &option, events, resume)
 }
 

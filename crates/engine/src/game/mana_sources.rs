@@ -407,6 +407,16 @@ pub fn activatable_mana_actions_for_player(state: &GameState, player: PlayerId) 
                 if let Some(selection) = option.semantic_selection(state) {
                     actions.push(GameAction::TapLandForMana { selection });
                 }
+                // CR 106.4: "Add N mana in any combination of colors" chooses each
+                // unit independently. The planner rows above name one color for
+                // the whole output (N of that color); a manual tap must also be
+                // able to ask for the per-unit combination (Cascading Cataracts).
+                if let Some(selection) = land_any_combination_selection(state, &option) {
+                    let action = GameAction::TapLandForMana { selection };
+                    if !actions.contains(&action) {
+                        actions.push(action);
+                    }
+                }
             }
         }
 
@@ -525,9 +535,20 @@ fn activatable_land_mana_actions_for_object(
         mana_activation_gates,
     )
     .into_iter()
-    .filter_map(|option| option.semantic_selection(state))
-    .map(|selection| GameAction::TapLandForMana { selection })
-    .collect()
+    .fold(Vec::new(), |mut actions, option| {
+        if let Some(selection) = option.semantic_selection(state) {
+            actions.push(GameAction::TapLandForMana { selection });
+        }
+        // CR 106.4: the deferred any-combination row, collapsed per ability
+        // (see `activatable_mana_actions_for_player`).
+        if let Some(selection) = land_any_combination_selection(state, &option) {
+            let action = GameAction::TapLandForMana { selection };
+            if !actions.contains(&action) {
+                actions.push(action);
+            }
+        }
+        actions
+    })
 }
 
 /// CR 605.3a: Complete semantic capabilities for mana activation, across lands
@@ -745,15 +766,37 @@ pub(crate) fn live_land_mana_option_for_selection(
     let object_id = selection.source.object_id;
     let aura_sources = taps_for_mana_trigger_sources(state);
     let gates = mana_abilities::ManaActivationGates::compute(state);
-    let mut matches = activatable_land_mana_options_indexed_gated(
+    let matches = activatable_land_mana_options_indexed_gated(
         state,
         object_id,
         player,
         &aura_sources,
         &gates,
     )
-    .into_iter()
-    .filter(|option| option.semantic_selection(state).as_ref() == Some(selection));
+    .into_iter();
+    if matches!(
+        selection.output,
+        ManaSourceOutput::DeferredColorChoice { .. }
+    ) {
+        // CR 106.4: the deferred any-combination row names the ability, not a
+        // color; every per-color planner row of that ability collapses to it.
+        let mut deferred = matches.filter(|option| {
+            land_any_combination_selection(state, option).as_ref() == Some(selection)
+        });
+        let option = deferred.next().ok_or_else(|| {
+            EngineError::ActionNotAllowed(
+                "Mana source selection is stale or no longer legal".to_string(),
+            )
+        })?;
+        if deferred.any(|other| other.ability_index != option.ability_index) {
+            return Err(EngineError::InvalidAction(
+                "Mana source selection ambiguously matches multiple live capabilities".to_string(),
+            ));
+        }
+        return Ok(option);
+    }
+    let mut matches =
+        matches.filter(|option| option.semantic_selection(state).as_ref() == Some(selection));
     let option = matches.next().ok_or_else(|| {
         EngineError::ActionNotAllowed(
             "Mana source selection is stale or no longer legal".to_string(),
@@ -765,6 +808,48 @@ pub(crate) fn live_land_mana_option_for_selection(
         ));
     }
     Ok(option)
+}
+
+/// CR 106.4: The deferred manual-tap row for a land ability that adds mana "in
+/// any combination of colors" with more than one color available. `None` for
+/// every other production (their concrete rows already name the full output)
+/// and for land rows carrying Aura `TapsForMana` bonuses, whose concrete rows
+/// keep the per-aura override provenance.
+pub(crate) fn land_any_combination_selection(
+    state: &GameState,
+    option: &ManaSourceOption,
+) -> Option<ManaSourceSelection> {
+    if !option.taps_for_mana_overrides.is_empty() {
+        return None;
+    }
+    let ability_index = option.ability_index?;
+    let produced = state
+        .objects
+        .get(&option.object_id)
+        .and_then(|object| object.abilities.get(ability_index))
+        .and_then(|ability| match &*ability.effect {
+            Effect::Mana { produced, .. } => Some(produced),
+            _ => None,
+        })?;
+    let multi_unit_combination = match produced {
+        ManaProduction::AnyCombination {
+            count,
+            color_options,
+        } => {
+            color_options.len() > 1
+                && !matches!(count, QuantityExpr::Fixed { value } if *value <= 1)
+        }
+        _ => false,
+    };
+    if !multi_unit_combination {
+        return None;
+    }
+    let selection = manual_selection_for_option(state, option)?;
+    matches!(
+        selection.output,
+        ManaSourceOutput::DeferredColorChoice { .. }
+    )
+    .then_some(selection)
 }
 
 /// Resolve the exact output of an already revalidated land-mana option without
